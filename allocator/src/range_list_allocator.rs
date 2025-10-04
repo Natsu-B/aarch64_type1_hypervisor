@@ -704,15 +704,24 @@ impl MemoryBlock {
             vec.push((i.address, i.size));
         }
 
-        // clean memory region
-        self.regions = RegionContainer(RegionData::Global(
-            [MemoryRegions {
-                address: 0,
-                size: 0,
-            }; 128],
-        ));
+        // clean memory region (free list)
+        match &mut self.regions.0 {
+            RegionData::Global(buf) => {
+                buf.fill(MemoryRegions {
+                    address: 0,
+                    size: 0,
+                });
+                self.region_capacity = buf.len() as u32; // = 128
+            }
+            RegionData::Heap(slice) => {
+                slice.fill(MemoryRegions {
+                    address: 0,
+                    size: 0,
+                });
+                self.region_capacity = slice.len() as u32;
+            }
+        }
         self.region_size = 0;
-        self.region_capacity = 128;
 
         self.allocatable = true;
 
