@@ -653,12 +653,12 @@ impl MemoryBlock {
         self.reserved_region_capacity = new_reserved_capacity;
     }
 
-    pub fn allocate_region(&mut self, layout: Layout) -> Option<usize> {
+    pub fn allocate_region(&mut self, size: usize, align: usize) -> Option<usize> {
         if !self.allocatable {
             return None;
         }
         self.ensure_overflow_headroom();
-        self.allocate_region_internal(layout.size(), layout.align())
+        self.allocate_region_internal(size, align)
     }
 
     pub fn deallocate_region(&mut self, ptr: usize, layout: Layout) {
@@ -1192,8 +1192,7 @@ mod tests {
                 size: 0x1000,
             })
             .unwrap();
-        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
-        assert_eq!(allocator.allocate_region(layout), None);
+        assert_eq!(allocator.allocate_region(0x100, 0x10), None);
     }
 
     #[test]
@@ -1207,8 +1206,7 @@ mod tests {
             .unwrap();
         allocator.check_regions().unwrap();
 
-        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
-        let ptr = allocator.allocate_region(layout);
+        let ptr = allocator.allocate_region(0x100, 0x10);
         assert_eq!(ptr, Some(0x1000));
         assert_eq!(allocator.region_size, 1);
         assert_eq!(
@@ -1231,8 +1229,7 @@ mod tests {
             .unwrap();
         allocator.check_regions().unwrap();
 
-        let layout = Layout::from_size_align(0x200, 0x10).unwrap();
-        assert_eq!(allocator.allocate_region(layout), None);
+        assert_eq!(allocator.allocate_region(0x200, 0x10), None);
     }
 
     #[test]
@@ -1252,8 +1249,7 @@ mod tests {
             .unwrap();
         allocator.check_regions().unwrap();
 
-        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
-        let ptr = allocator.allocate_region(layout);
+        let ptr = allocator.allocate_region(0x100, 0x10);
         assert_eq!(ptr, Some(0x1100));
         assert_eq!(allocator.region_size, 1);
         assert_eq!(
@@ -1276,8 +1272,7 @@ mod tests {
             .unwrap();
         allocator.check_regions().unwrap();
 
-        let layout = Layout::from_size_align(0x100, 0x100).unwrap();
-        let ptr = allocator.allocate_region(layout);
+        let ptr = allocator.allocate_region(0x100, 0x100);
         assert_eq!(ptr, Some(0x1100));
 
         // Check that the original region is split correctly
@@ -1321,16 +1316,14 @@ mod tests {
         // So we need to reach region_size = 119 to trigger it on the next allocation.
         // Initial region_size is 1. We need 118 splits.
         for _ in 0..119 {
-            let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
-            assert!(allocator.allocate_region(layout).is_some());
+            assert!(allocator.allocate_region(0x10, 0x1000).is_some());
             // Each allocation creates a split, increasing region_size.
         }
         // After 118 allocations, region_size should be 119.
         assert_eq!(allocator.region_size, 119);
         assert_eq!(allocator.region_capacity, initial_region_capacity);
         // This allocation should trigger overflow_wrapping.
-        let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
-        assert!(allocator.allocate_region(layout).is_some());
+        assert!(allocator.allocate_region(0x10, 0x1000).is_some());
         // Verify that the capacities have been doubled.
         assert_eq!(allocator.region_capacity, initial_region_capacity * 2);
         assert_eq!(
@@ -1342,8 +1335,7 @@ mod tests {
         assert_eq!(allocator.region_size, 120);
 
         // Verify that we can still allocate after wrapping.
-        let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
-        assert!(allocator.allocate_region(layout).is_some());
+        assert!(allocator.allocate_region(0x10, 0x1000).is_some());
         assert_eq!(allocator.region_size, 121);
     }
 
@@ -1359,7 +1351,9 @@ mod tests {
         allocator.check_regions().unwrap();
 
         let layout = Layout::from_size_align(0x100, 0x10).unwrap();
-        let ptr = allocator.allocate_region(layout).expect("alloc failed");
+        let ptr = allocator
+            .allocate_region(0x100, 0x10)
+            .expect("alloc failed");
         assert_eq!(ptr, 0x1000);
         // After alloc: regions becomes [0x1100, 0xF00]
         assert_eq!(allocator.region_size, 1);
@@ -1395,8 +1389,8 @@ mod tests {
         allocator.check_regions().unwrap();
 
         let l = Layout::from_size_align(0x100, 0x100).unwrap();
-        let p1 = allocator.allocate_region(l).unwrap(); // 0x1000..0x1100
-        let p2 = allocator.allocate_region(l).unwrap(); // 0x1100..0x1200
+        let p1 = allocator.allocate_region(0x100, 0x100).unwrap(); // 0x1000..0x1100
+        let p2 = allocator.allocate_region(0x100, 0x100).unwrap(); // 0x1100..0x1200
         assert_eq!(p1, 0x1000);
         assert_eq!(p2, 0x1100);
 
@@ -1453,9 +1447,9 @@ mod tests {
 
         // Allocate three adjacent blocks so reserved merges into one
         let l = Layout::from_size_align(0x100, 0x100).unwrap();
-        let p1 = allocator.allocate_region(l).unwrap(); // 0x1000..0x1100
-        let p2 = allocator.allocate_region(l).unwrap(); // 0x1100..0x1200
-        let p3 = allocator.allocate_region(l).unwrap(); // 0x1200..0x1300
+        let p1 = allocator.allocate_region(0x100, 0x100).unwrap(); // 0x1000..0x1100
+        let p2 = allocator.allocate_region(0x100, 0x100).unwrap(); // 0x1100..0x1200
+        let p3 = allocator.allocate_region(0x100, 0x100).unwrap(); // 0x1200..0x1300
         assert_eq!((p1, p2, p3), (0x1000, 0x1100, 0x1200));
 
         // Free list: [0x1300, 0xD00]

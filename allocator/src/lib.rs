@@ -104,7 +104,7 @@ where
         if let Some(range_list_allocator) = range_list_allocator_guard.get_mut() {
             let layout =
                 Layout::from_size_align(MAX_ALLOCATABLE_BYTES, MAX_ALLOCATABLE_BYTES).ok()?;
-            range_list_allocator.allocate_region(layout)
+            range_list_allocator.allocate_region(layout.size(), layout.align())
         } else {
             None
         }
@@ -120,7 +120,8 @@ where
         if max(layout.size(), layout.align()) > MAX_ALLOCATABLE_BYTES {
             let mut range_list_allocator_guard = self.range_list_allocator.lock();
             if let Some(range_list_allocator) = range_list_allocator_guard.get_mut()
-                && let Some(heap_mem) = range_list_allocator.allocate_region(layout)
+                && let Some(heap_mem) =
+                    range_list_allocator.allocate_region(layout.size(), layout.align())
             {
                 return heap_mem as *mut u8;
             }
@@ -215,6 +216,20 @@ pub fn finalize() -> Result<(), &'static str> {
     } else {
         Err("allocator not initialized")
     }
+}
+
+pub fn allocate_with_size_and_align(size: usize, align: usize) -> Result<usize, &'static str> {
+    let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
+    let Some(block) = guard.get_mut() else {
+        return Err("allocator not initialized");
+    };
+    if !block.is_finalized() {
+        return Err("allocator not finalized");
+    }
+
+    block
+        .allocate_region(size, align)
+        .ok_or("failed to allocate")
 }
 
 /// Finalizes the global allocator for boot handoff.
