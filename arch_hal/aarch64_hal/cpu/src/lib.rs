@@ -14,3 +14,17 @@ pub fn setup_hypervisor_registers() {
     let hcr_el2 = HCR_EL2_RW | HCR_EL2_API;
     unsafe { asm!("msr hcr_el2, {}", in(reg) hcr_el2) };
 }
+
+pub fn get_id_aa64mmfr0_el1() -> u64 {
+    let id: u64;
+    unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) id) };
+    id
+}
+
+pub fn set_vtcr_el2(vtcr_el2: u64) {
+    unsafe { asm!("msr vtcr_el2, {}", in(reg)vtcr_el2) };
+}
+
+pub fn set_vttbr_el2(vttbr_el2: u64) {
+    unsafe { asm!("msr vttbr_el2, {}", in(reg) vttbr_el2) };
+}

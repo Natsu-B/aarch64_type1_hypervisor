@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cpu = { path = "../cpu" }
 allocator = { path = "../../../allocator" }
 typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }

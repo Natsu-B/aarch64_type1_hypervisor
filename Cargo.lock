@@ -111,6 +111,7 @@ name = "paging"
 version = "0.1.0"
 dependencies = [
  "allocator",
+ "cpu",
  "typestate",
  "typestate_macro",
 ]

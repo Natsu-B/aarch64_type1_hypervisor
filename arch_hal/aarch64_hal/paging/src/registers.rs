@@ -147,32 +147,61 @@ bitregs! {
         // Stage-2 initial lookup level selector.
         // Encodings depend on TG0 and, when DS==1, the combination {SL2, SL0}.
         // If inconsistent with T0SZ/TG0, stage-2 Translation fault.
-        pub(crate) sl0@[7:6],
+        // currently only not implemented FEAT_TTST is supported
+        pub(crate) sl0@[7:6] as SL0 {
+            // If VTCR_EL2.TG0 is 0b00 (4KB granule), start at level 2. If VTCR_EL2.TG0 is 0b10 (16KB granule) or 0b01 (64KB granule), start at level 3.
+            Level2 = 0b00,
+            // If VTCR_EL2.TG0 is 0b00 (4KB granule), start at level 1. If VTCR_EL2.TG0 is 0b10 (16KB granule) or 0b01 (64KB granule), start at level 2.
+            Level1 = 0b01,
+            // If VTCR_EL2.TG0 is 0b00 (4KB granule), start at level 0. If VTCR_EL2.TG0 is 0b10 (16KB granule) or 0b01 (64KB granule), start at level 1.
+            Level0 = 0b10,
+        },
 
         // Inner cacheability for stage-2 table walks:
         //   0b00 = Inner Non-cacheable
         //   0b01 = Inner WB RA WA Cacheable
         //   0b10 = Inner WT RA nWA Cacheable
         //   0b11 = Inner WB RA nWA Cacheable
-        pub(crate) irgn0@[9:8],
+        // Use orgn0 enum
+        pub(crate) irgn0@[9:8] as InnerCache {
+            NonCacheable = 0b00,
+            WBRAWACacheable = 0b01,
+            WTRAnWACacheable = 0b10,
+            WBRAnWACacheable = 0b11,
+        },
 
         // Outer cacheability for stage-2 table walks:
         //   0b00 = Outer Non-cacheable
         //   0b01 = Outer WB RA WA Cacheable
         //   0b10 = Outer WT RA nWA Cacheable
         //   0b11 = Outer WB RA nWA Cacheable
-        pub(crate) orgn0@[11:10],
+        pub(crate) orgn0@[11:10] as OuterCache {
+            NonCacheable = 0b00,
+            WBRAWACacheable = 0b01,
+            WTRAnWACacheable = 0b10,
+            WBRAnWACacheable = 0b11,
+        },
 
         // Shareability for stage-2 table walks:
         //   0b00 = Non-shareable
         //   0b10 = Outer Shareable
         //   0b11 = Inner Shareable
         //   0b01 = Reserved
-        pub(crate) sh0@[13:12],
+        pub(crate) sh0@[13:12] as Shareability {
+            NonShareable = 0b00,
+            OuterSharable = 0b10,
+            InnerSharable = 0b11,
+            Reserved = 0b01,
+        },
 
         // Translation granule for stage 2:
         //   0b00 = 4KB, 0b01 = 64KB, 0b10 = 16KB, 0b11 = Reserved
-        pub(crate) tg0@[15:14],
+        pub(crate) tg0@[15:14] as TG0 {
+            Granule4KB = 0b00,
+            Granule64KB = 0b01,
+            Granule16KB = 0b10,
+            Reserved = 0b11,
+        },
 
         // Output Physical Address Size of stage-2 translation:
         //   0b000=32b, 0b001=36b, 0b010=40b, 0b011=42b, 0b100=44b, 0b101=48b,
