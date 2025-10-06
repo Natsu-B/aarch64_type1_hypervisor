@@ -115,6 +115,8 @@ impl Stage2Paging {
 
         cpu::set_vtcr_el2(vtcr_el2);
         cpu::set_vttbr_el2(table as u64);
+        cpu::dsb_ish();
+        cpu::isb();
         Ok(())
     }
 
@@ -193,6 +195,7 @@ impl Stage2Paging {
                 )?;
             }
         }
+        cpu::clean_dcache_poc(table_addr, PAGE_TABLE_SIZE * num_of_tables);
         Ok(table_addr)
     }
 
@@ -262,6 +265,7 @@ impl Stage2Paging {
                 )?;
             }
         }
+        cpu::clean_dcache_poc(table_addr.as_ptr() as usize, PAGE_TABLE_SIZE);
         Ok(())
     }
 
