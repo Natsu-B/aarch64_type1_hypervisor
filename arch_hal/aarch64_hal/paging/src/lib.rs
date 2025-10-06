@@ -7,6 +7,7 @@ use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::InnerCache;
 use crate::registers::OuterCache;
 use crate::registers::PARange;
+use crate::registers::PhysicalAddressSize;
 use crate::registers::SL0;
 use crate::registers::Shareability;
 use crate::registers::TG0;
@@ -85,16 +86,32 @@ impl Stage2Paging {
             Some(pa) => {
                 match pa {
                     // pa size == ipa size
-                    PARange::PA32bits4GB => (32, 32, SL0::Level1, 1, 1),
-                    PARange::PA36bits64GB => (36, 28, SL0::Level1, 1, 1),
-                    PARange::PA40bits1TB => (40, 24, SL0::Level1, 1, 2),
-                    PARange::PA42bits4TB => (42, 22, SL0::Level1, 1, 8),
-                    PARange::PA44bits16TB => (44, 20, SL0::Level0, 0, 1),
-                    PARange::PA48bits256TB => (48, 16, SL0::Level0, 0, 1),
+                    PARange::PA32bits4GB => {
+                        (PhysicalAddressSize::AddressSize32b, 32, SL0::Level1, 1, 1)
+                    }
+                    PARange::PA36bits64GB => {
+                        (PhysicalAddressSize::AddressSize36b, 28, SL0::Level1, 1, 1)
+                    }
+                    PARange::PA40bits1TB => {
+                        (PhysicalAddressSize::AddressSize40b, 24, SL0::Level1, 1, 2)
+                    }
+                    PARange::PA42bits4TB => {
+                        (PhysicalAddressSize::AddressSize42b, 22, SL0::Level1, 1, 8)
+                    }
+                    PARange::PA44bits16TB => {
+                        (PhysicalAddressSize::AddressSize44b, 20, SL0::Level0, 0, 1)
+                    }
+                    PARange::PA48bits256TB => {
+                        (PhysicalAddressSize::AddressSize48b, 16, SL0::Level0, 0, 1)
+                    }
                     // ipa 52bit is not supported
                     // ipa size == 48bit
-                    PARange::PA52bits4PB => (52, 16, SL0::Level0, 0, 1),
-                    PARange::PA56bits64PB => (56, 16, SL0::Level0, 0, 1),
+                    PARange::PA52bits4PB => {
+                        (PhysicalAddressSize::AddressSize52b, 16, SL0::Level0, 0, 1)
+                    }
+                    PARange::PA56bits64PB => {
+                        (PhysicalAddressSize::AddressSize56b, 16, SL0::Level0, 0, 1)
+                    }
                 }
             }
             None => return Err(PagingErr::Corrupted),
@@ -110,7 +127,7 @@ impl Stage2Paging {
             .set_enum(VTCR_EL2::orgn0, OuterCache::WBRAnWACacheable)
             .set_enum(VTCR_EL2::sh0, Shareability::InnerSharable)
             .set_enum(VTCR_EL2::tg0, TG0::Granule4KB)
-            .set(VTCR_EL2::ps, ps)
+            .set_enum(VTCR_EL2::ps, ps)
             .bits();
 
         cpu::set_vtcr_el2(vtcr_el2);

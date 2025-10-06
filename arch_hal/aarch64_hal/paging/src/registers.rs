@@ -207,7 +207,16 @@ bitregs! {
         //   0b000=32b, 0b001=36b, 0b010=40b, 0b011=42b, 0b100=44b, 0b101=48b,
         //   0b110=52b when LPA2 semantics apply (DS==1); otherwise behaves as 48b.
         //   0b111=Reserved (do not program unless documented by the implementation).
-        pub(crate) ps@[18:16],
+        pub(crate) ps@[18:16] as PhysicalAddressSize {
+            AddressSize32b = 0b000,
+            AddressSize36b = 0b001,
+            AddressSize40b = 0b010,
+            AddressSize42b = 0b011,
+            AddressSize44b = 0b100,
+            AddressSize48b = 0b101,
+            AddressSize52b = 0b110,
+            AddressSize56b = 0b111,
+        },
 
         // VMID size control:
         //   0b0 = 8-bit VMID
