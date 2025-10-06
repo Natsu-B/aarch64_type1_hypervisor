@@ -110,8 +110,39 @@ macro_rules! bitregs {
                 let bits = (core::mem::size_of::<$ty>() as u32) * 8;
                 debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:set: out-of-range field");
                 let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
+                debug_assert!((v & !val) == (0 as $ty), "bitregs:set: value has bits outside the field");
                 let mask: $ty = val << off;
                 self.0 = (self.0 & !mask) | ((v & val) << off);
+                self
+            }
+
+            /// Generic getter via a value-level field marker with raw value.
+            pub fn get_raw<F>(&self, _f: F) -> $ty
+            where
+                F: $crate::bitflags::FieldSpec<$Name>,
+            {
+                let off = F::OFF; let sz = F::SZ;
+                let bits = (core::mem::size_of::<$ty>() as u32) * 8;
+                debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:get_raw: out-of-range field");
+                let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
+                let mask: $ty = val << off;
+                self.0 & mask
+            }
+
+            /// Generic setter via a value-level field marker (builder style) with raw value.
+            pub fn set_raw<F>(mut self, _f: F, v: $ty) -> Self
+            where
+                F: $crate::bitflags::FieldSpec<$Name>,
+            {
+                let off = F::OFF; let sz = F::SZ;
+                let bits = (core::mem::size_of::<$ty>() as u32) * 8;
+                debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:set_raw: out-of-range field");
+                let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
+                let mask: $ty = val << off;
+
+                debug_assert!((v & !mask) == (0 as $ty), "bitregs:set_raw: value has bits outside the field");
+
+                self.0 = (self.0 & !mask) | (v & mask);
                 self
             }
 
