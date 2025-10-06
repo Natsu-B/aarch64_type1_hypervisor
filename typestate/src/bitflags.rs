@@ -27,6 +27,9 @@ impl<Reg, const OFF: u32, const SZ: u32> Field<Reg, OFF, SZ> {
 ///
 /// - Integer types: u8 / u16 / u32 / u64 / u128
 /// - Bit ranges: `@[MSB:LSB]` (ARM-like) or `(offset, size)`
+/// - Union views use absolute bit positions (`@[MSB:LSB]` relative to the register)
+/// - Every `union` must be fully covered by its views; offsets written inside each `view`
+///   are still absolute and checked against the union span
 /// - Reserved: `reserved@[..] [res0|res1|ignore]` / `reserved(off, sz) [..]`
 /// - Compile-time checks:
 ///   * Every item fits into the register width
@@ -52,6 +55,21 @@ impl<Reg, const OFF: u32, const SZ: u32> Field<Reg, OFF, SZ> {
 ///             baz3 = 0b11,
 ///         },
 ///         reserved@[31:10] [ignore],
+///     }
+/// }
+///
+/// bitregs!{
+///     pub struct WithUnion: u32 {
+///         union view0@[15:0] {
+///             view Words {
+///                 pub low@[7:0],
+///                 pub high@[15:8],
+///             },
+///             view Raw {
+///                 pub value@[15:0],
+///             },
+///         },
+///         reserved@[31:16] [ignore],
 ///     }
 /// }
 /// ```
@@ -215,6 +233,51 @@ macro_rules! bitregs {
 
     (@fields $Name:ident : $ty:ty ; ) => {};
 
+    // ---- union @[MSB:LSB]
+    (@fields $Name:ident : $ty:ty ;
+        union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($views:tt)* } , $($rest:tt)*
+    ) => {
+        bitregs!{ @fields $Name : $ty ;
+            union $Union ( ($lsb) , (($msb) - ($lsb) + 1) ) { $($views)* },
+            $($rest)*
+        }
+    };
+    (@fields $Name:ident : $ty:ty ;
+        union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($views:tt)* }
+    ) => {
+        bitregs!{ @fields $Name : $ty ;
+            union $Union ( ($lsb) , (($msb) - ($lsb) + 1) ) { $($views)* }
+        }
+    };
+
+    (@fields $Name:ident : $ty:ty ;
+        union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($views:tt)* } $($rest:tt)+
+    ) => {
+        bitregs!{ @fields $Name : $ty ;
+            union $Union ( ($lsb) , (($msb) - ($lsb) + 1) ) { $($views)* },
+            $($rest)+
+        }
+    };
+
+    // ---- union (off, sz)
+    (@fields $Name:ident : $ty:ty ;
+        union $Union:ident ( $off:expr , $sz:expr ) { $($views:tt)* } , $($rest:tt)*
+    ) => {
+        bitregs!{@union $Name : $ty ; $Union ; ($off) ; ($sz) ; { $($views)* }}
+        bitregs!{ @fields $Name : $ty ; $($rest)* }
+    };
+    (@fields $Name:ident : $ty:ty ;
+        union $Union:ident ( $off:expr , $sz:expr ) { $($views:tt)* }
+    ) => {
+        bitregs!{@union $Name : $ty ; $Union ; ($off) ; ($sz) ; { $($views)* }}
+    };
+    (@fields $Name:ident : $ty:ty ;
+        union $Union:ident ( $off:expr , $sz:expr ) { $($views:tt)* } $($rest:tt)+
+    ) => {
+        bitregs!{@union $Name : $ty ; $Union ; ($off) ; ($sz) ; { $($views)* }}
+        bitregs!{ @fields $Name : $ty ; $($rest)+ }
+    };
+
     // ---- reserved @[MSB:LSB] → normalized (off, sz)
     (@fields $Name:ident : $ty:ty ;
         reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] , $($rest:tt)*
@@ -259,17 +322,13 @@ macro_rules! bitregs {
     (@fields $Name:ident : $ty:ty ;
         $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] , $($rest:tt)*
     ) => {
-        bitregs!{ @fields $Name : $ty ;
-            $fvis $Field ( ($lsb) , (($msb) - ($lsb) + 1) ),
-            $($rest)*
-        }
+        bitregs!{@field_emit_plain $Name : $ty ; $fvis $Field ; ($lsb) ; (($msb) - ($lsb) + 1)}
+        bitregs!{ @fields $Name : $ty ; $($rest)* }
     };
     (@fields $Name:ident : $ty:ty ;
         $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ]
     ) => {
-        bitregs!{ @fields $Name : $ty ;
-            $fvis $Field ( ($lsb) , (($msb) - ($lsb) + 1) ),
-        }
+        bitregs!{@field_emit_plain $Name : $ty ; $fvis $Field ; ($lsb) ; (($msb) - ($lsb) + 1)}
     };
 
     // ---- enum field @[MSB:LSB]
@@ -277,19 +336,15 @@ macro_rules! bitregs {
         $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] as $E:ident
         { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)*
     ) => {
-        bitregs!{ @fields $Name : $ty ;
-            $fvis $Field ( ($lsb) , (($msb) - ($lsb) + 1) ) as $E { $($V = $val),+ },
-            $($rest)*
-        }
+        bitregs!{@field_emit_enum $Name : $ty ; $fvis $Field ; $E ; ($lsb) ; (($msb) - ($lsb) + 1) ; { $($V = $val),+ }}
+        bitregs!{ @fields $Name : $ty ; $($rest)* }
     };
-    // ---- enum field @[MSB:LSB] （末尾カンマなし版を追加）
+    // ---- enum field @[MSB:LSB]
     (@fields $Name:ident : $ty:ty ;
         $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] as $E:ident
         { $($V:ident = $val:expr),+ $(,)? }
     ) => {
-        bitregs!{ @fields $Name : $ty ;
-            $fvis $Field ( ($lsb) , (($msb) - ($lsb) + 1) ) as $E { $($V = $val),+ }
-        }
+        bitregs!{@field_emit_enum $Name : $ty ; $fvis $Field ; $E ; ($lsb) ; (($msb) - ($lsb) + 1) ; { $($V = $val),+ }}
     };
     (@fields $Name:ident : $ty:ty ;
         $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] as $E:ident [ $acc:ident ]
@@ -299,29 +354,261 @@ macro_rules! bitregs {
     // ---- plain field (off, sz)
     (@fields $Name:ident : $ty:ty ;
         $fvis:vis $Field:ident ( $off:expr , $sz:expr ) , $($rest:tt)*
+    ) => { compile_error!("bitregs: field layout must use @[MSB:LSB]"); };
+    (@fields $Name:ident : $ty:ty ;
+        $fvis:vis $Field:ident ( $off:expr , $sz:expr )
+    ) => { compile_error!("bitregs: field layout must use @[MSB:LSB]"); };
+    (@fields $Name:ident : $ty:ty ;
+        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)*
+    ) => { compile_error!("bitregs: field layout must use @[MSB:LSB]"); };
+    (@fields $Name:ident : $ty:ty ;
+        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? }
+    ) => { compile_error!("bitregs: field layout must use @[MSB:LSB]"); };
+    (@fields $Name:ident : $ty:ty ;
+        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) [ $acc:ident ]
+    ) => { compile_error!("bitregs: access qualifiers are not supported; remove the [...]"); };
+
+    (@field_emit_plain $Name:ident : $ty:ty ;
+        $fvis:vis $Field:ident ; $off:expr ; $sz:expr
     ) => {
         impl $Name {
             /// Value-level field marker (associated const)
             #[allow(non_upper_case_globals)]
             $fvis const $Field:
-                $crate::bitflags::Field<$Name, { ($off as u32) }, { ($sz as u32) }> =
-                $crate::bitflags::Field::<$Name, { ($off as u32) }, { ($sz as u32) }>::new();
+                $crate::bitflags::Field<$Name, { (($off) as u32) }, { (($sz) as u32) }> =
+                $crate::bitflags::Field::<$Name, { (($off) as u32) }, { (($sz) as u32) }>::new();
         }
+        const _: () = {
+            let bits = (core::mem::size_of::<$ty>() as u32) * 8;
+            let off = ($off) as u32; let sz = ($sz) as u32;
+            let cond = sz > 0 && off < bits && off + sz <= bits;
+            let _ = [()][(!cond) as usize];
+        };
+    };
+
+    (@field_emit_enum $Name:ident : $ty:ty ;
+        $fvis:vis $Field:ident ; $E:ident ; $off:expr ; $sz:expr ; { $($V:ident = $val:expr),+ }
+    ) => {
+        #[repr(u128)]
+        #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+        $fvis enum $E { $( $V = $val ),+ }
+        impl From<$E> for $ty { fn from(e: $E) -> $ty { e as u128 as $ty } }
+        impl ::core::convert::TryFrom<$ty> for $E {
+            type Error = ();
+            fn try_from(x: $ty) -> Result<Self, ()> {
+                match x as u128 { $( v if v == $E::$V as u128 => Ok($E::$V), )+ _ => Err(()) }
+            }
+        }
+        const _: () = {
+            let sz = ($sz) as u32;
+            let vmax = if sz >= 128 { u128::MAX } else { (1u128 << sz) - 1 };
+            $( { let cond = ($val as u128) <= vmax; let _ = [()][(!cond) as usize]; } )+
+        };
+
+        bitregs!{@field_emit_plain $Name : $ty ; $fvis $Field ; $off ; $sz}
+    };
+
+    // =========================
+    // Union expansion helpers
+    // =========================
+
+    (@union $Name:ident : $ty:ty ; $Union:ident ; $off:expr ; $sz:expr ; { $($views:tt)* }) => {
         const _: () = {
             let bits = (core::mem::size_of::<$ty>() as u32) * 8;
             let off = $off as u32; let sz = $sz as u32;
             let cond = sz > 0 && off < bits && off + sz <= bits;
             let _ = [()][(!cond) as usize];
         };
-        bitregs!{ @fields $Name : $ty ; $($rest)* }
-    };
-    (@fields $Name:ident : $ty:ty ;
-        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) [ $acc:ident ]
-    ) => { compile_error!("bitregs: access qualifiers are not supported; remove the [...]"); };
 
-    // ---- enum field (off, sz)
-    (@fields $Name:ident : $ty:ty ;
-        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)*
+        impl $Name {
+            #[allow(non_upper_case_globals)]
+            pub const $Union:
+                $crate::bitflags::Field<$Name, { ($off as u32) }, { ($sz as u32) }> =
+                $crate::bitflags::Field::<$Name, { ($off as u32) }, { ($sz as u32) }>::new();
+        }
+
+        bitregs!{@union_views $Name : $ty ; $Union ; ($off as u32) ; ($sz as u32) ; $($views)* }
+    };
+
+    (@union $Name:ident : $ty:ty ; $Union:ident ; $off:expr ; $sz:expr ; ) => {
+        const _: () = {
+            let bits = (core::mem::size_of::<$ty>() as u32) * 8;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < bits && off + sz <= bits;
+            let _ = [()][(!cond) as usize];
+        };
+
+        impl $Name {
+            #[allow(non_upper_case_globals)]
+            pub const $Union:
+                $crate::bitflags::Field<$Name, { ($off as u32) }, { ($sz as u32) }> =
+                $crate::bitflags::Field::<$Name, { ($off as u32) }, { ($sz as u32) }>::new();
+        }
+    };
+
+    (@union_views $Name:ident : $ty:ty ; $Union:ident ; $base_off:expr ; $base_sz:expr ; ) => {};
+    (@union_views $Name:ident : $ty:ty ; $Union:ident ; $base_off:expr ; $base_sz:expr ;
+        view $View:ident { $($body:tt)* } , $($rest:tt)*
+    ) => {
+        bitregs!{@union_view $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; { $($body)* }}
+        bitregs!{@union_views $Name : $ty ; $Union ; $base_off ; $base_sz ; $($rest)*}
+    };
+    (@union_views $Name:ident : $ty:ty ; $Union:ident ; $base_off:expr ; $base_sz:expr ;
+        view $View:ident { $($body:tt)* }
+    ) => {
+        bitregs!{@union_view $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; { $($body)* }}
+    };
+    (@union_views $Name:ident : $ty:ty ; $Union:ident ; $base_off:expr ; $base_sz:expr ;
+        view $View:ident { $($body:tt)* } $($rest:tt)+
+    ) => {
+        bitregs!{@union_view $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; { $($body)* }}
+        bitregs!{@union_views $Name : $ty ; $Union ; $base_off ; $base_sz ; $($rest)+}
+    };
+
+    (@union_view $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ; { $($body:tt)* }) => {
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($body)* }
+
+        const _: () = {
+            let view_mask: $ty = $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($body)*);
+            let view_overlap: $ty = $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, 0 as $ty; $($body)*);
+            let full_mask: $ty = {
+                let bits = (core::mem::size_of::<$ty>() as u32) * 8;
+                let off = $base_off as u32;
+                let sz = $base_sz as u32;
+                let local_mask = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
+                local_mask << off
+            };
+            // Compile-time guard: the view must cover the union span without overlaps
+            let _ = [()][(!(view_mask == full_mask)) as usize];
+            let _ = [()][(!(view_overlap == (0 as $ty))) as usize];
+        };
+    };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ; ) => {};
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] , $($rest:tt)*
+    ) => {
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            reserved(
+                (bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb) - ($lsb) + 1)
+            )[ $attr ],
+            $($rest)*
+        }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ]
+    ) => {
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            reserved(
+                (bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb) - ($lsb) + 1)
+            )[ $attr ]
+        }
+    };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        reserved ( $off:expr , $sz:expr ) [ $attr:ident ] , $($rest:tt)*
+    ) => {
+        const _: () = {
+            let sz_total = $base_sz as u32;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < sz_total && off + sz <= sz_total;
+            let _ = [()][(!cond) as usize];
+        };
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)* }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        reserved ( $off:expr , $sz:expr ) [ $attr:ident ]
+    ) => {
+        const _: () = {
+            let sz_total = $base_sz as u32;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < sz_total && off + sz <= sz_total;
+            let _ = [()][(!cond) as usize];
+        };
+    };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] , $($rest:tt)*
+    ) => {
+        bitregs!{@union_view_field_emit_plain $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ;
+            (bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ;
+            (($msb) - ($lsb) + 1)
+        }
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)* }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ]
+    ) => {
+        bitregs!{@union_view_field_emit_plain $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ;
+            (bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ;
+            (($msb) - ($lsb) + 1)
+        }
+    };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] as $E:ident
+        { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)*
+    ) => {
+        bitregs!{@union_view_field_emit_enum $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ; $E ;
+            (bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ;
+            (($msb) - ($lsb) + 1) ; { $($V = $val),+ }
+        }
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)* }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] as $E:ident
+        { $($V:ident = $val:expr),+ $(,)? }
+    ) => {
+        bitregs!{@union_view_field_emit_enum $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ; $E ;
+            (bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ;
+            (($msb) - ($lsb) + 1) ; { $($V = $val),+ }
+        }
+    };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] [ $acc:ident ] $(,)? $($rest:tt)*
+    ) => { compile_error!("bitregs: access qualifiers are not supported inside union view; remove the [...]"); };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) , $($rest:tt)*
+    ) => { compile_error!("bitregs: union view fields must use @[MSB:LSB] syntax"); };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident ( $off:expr , $sz:expr )
+    ) => { compile_error!("bitregs: union view fields must use @[MSB:LSB] syntax"); };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident as $E:ident { $($body:tt)* } , $($rest:tt)*
+    ) => { compile_error!("bitregs: union view fields must include @[MSB:LSB]"); };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident as $E:ident { $($body:tt)* }
+    ) => { compile_error!("bitregs: union view fields must include @[MSB:LSB]"); };
+
+    (@union_view_field_emit_plain $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident ; $off:expr ; $sz:expr
+    ) => {
+        impl $Name {
+            #[allow(non_upper_case_globals)]
+            $fvis const $Field:
+                $crate::bitflags::Field<$Name, { (($base_off as u32) + ($off as u32)) }, { ($sz as u32) }> =
+                $crate::bitflags::Field::<$Name, { (($base_off as u32) + ($off as u32)) }, { ($sz as u32) }>::new();
+        }
+        const _: () = {
+            let sz_total = $base_sz as u32;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < sz_total && off + sz <= sz_total;
+            let _ = [()][(!cond) as usize];
+        };
+    };
+
+    (@union_view_field_emit_enum $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident ; $E:ident ; $off:expr ; $sz:expr ; { $($V:ident = $val:expr),+ }
     ) => {
         #[repr(u128)]
         #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -339,58 +626,14 @@ macro_rules! bitregs {
             $( { let cond = ($val as u128) <= vmax; let _ = [()][(!cond) as usize]; } )+
         };
 
-        impl $Name {
-            #[allow(non_upper_case_globals)]
-            $fvis const $Field:
-                $crate::bitflags::Field<$Name, { ($off as u32) }, { ($sz as u32) }> =
-                $crate::bitflags::Field::<$Name, { ($off as u32) }, { ($sz as u32) }>::new();
+        bitregs!{@union_view_field_emit_plain $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ; $off ; $sz
         }
-        const _: () = {
-            let bits = (core::mem::size_of::<$ty>() as u32) * 8;
-            let off = $off as u32; let sz = $sz as u32;
-            let cond = sz > 0 && off < bits && off + sz <= bits;
-            let _ = [()][(!cond) as usize];
-        };
-        bitregs!{ @fields $Name : $ty ; $($rest)* }
     };
-    // ---- enum field (off, sz) 末尾カンマなし（ここで終端）
-    (@fields $Name:ident : $ty:ty ;
-        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident
-        { $($V:ident = $val:expr),+ $(,)? }
-    ) => {
-        #[repr(u128)]
-        #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-        $fvis enum $E { $( $V = $val ),+ }
-        impl From<$E> for $ty { fn from(e: $E) -> $ty { e as u128 as $ty } }
-        impl ::core::convert::TryFrom<$ty> for $E {
-            type Error = ();
-            fn try_from(x: $ty) -> Result<Self, ()> {
-                match x as u128 { $( v if v == $E::$V as u128 => Ok($E::$V), )+ _ => Err(()) }
-            }
-        }
-        const _: () = {
-            let sz = $sz as u32;
-            let vmax = if sz >= 128 { u128::MAX } else { (1u128 << sz) - 1 };
-            $( { let cond = ($val as u128) <= vmax; let _ = [()][(!cond) as usize]; } )+
-        };
 
-        impl $Name {
-            #[allow(non_upper_case_globals)]
-            $fvis const $Field:
-                $crate::bitflags::Field<$Name, { ($off as u32) }, { ($sz as u32) }> =
-                $crate::bitflags::Field::<$Name, { ($off as u32) }, { ($sz as u32) }>::new();
-        }
-        const _: () = {
-            let bits = (core::mem::size_of::<$ty>() as u32) * 8;
-            let off = $off as u32; let sz = $sz as u32;
-            let cond = sz > 0 && off < bits && off + sz <= bits;
-            let _ = [()][(!cond) as usize];
-        };
-    };
-    (@fields $Name:ident : $ty:ty ;
-        $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident [ $acc:ident ]
-        { $($V:ident = $val:expr),+ $(,)? }
-    ) => { compile_error!("bitregs: access qualifiers are not supported; remove the [...]"); };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] as $E:ident [ $acc:ident ] { $($body:tt)* } $(,)? $($rest:tt)*
+    ) => { compile_error!("bitregs: access qualifiers are not supported inside union view; remove the [...]"); };
 
     // =========================
     // Helpers: masks & folding
@@ -400,6 +643,25 @@ macro_rules! bitregs {
     (@mask<$ty:ty> ($off:expr, $sz:expr)) => {{
         let bits = (core::mem::size_of::<$ty>() as u32) * 8;
         ((if ($sz as u32) >= bits { !0 as $ty } else { ((1 as $ty) << ($sz as u32)) - (1 as $ty) }) << ($off as u32))
+    }};
+
+    // View mask helper (offset relative to union base)
+    (@view_mask<$ty:ty> $base_off:expr; ($off:expr, $sz:expr)) => {{
+        let bits = (core::mem::size_of::<$ty>() as u32) * 8;
+        let base = $base_off as u32;
+        let off = $off as u32;
+        let sz = $sz as u32;
+        ((if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) }) << (base + off))
+    }};
+
+    // Translate an absolute bit offset into the union-local offset.
+    (@union_local_off $base_off:expr ; $base_sz:expr ; $abs_off:expr) => {{
+        let base = $base_off as u32;
+        let span = $base_sz as u32;
+        let abs = $abs_off as u32;
+        let cond = abs >= base && abs < base + span;
+        let _ = [()][(!cond) as usize];
+        abs - base
     }};
 
     // Reserved mask collectors (for res0/res1)
@@ -422,6 +684,14 @@ macro_rules! bitregs {
     (@collect_res<$ty:ty> $k:ident; $acc:expr; reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] ) => {
         bitregs!{@collect_res<$ty> $k; $acc; reserved( ($lsb), (($msb)-($lsb)+1) )[ $attr ],}
     };
+    (@collect_res<$ty:ty> $k:ident; $acc:expr; union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } , $($rest:tt)* ) => {
+        bitregs!{@collect_res<$ty> $k; $acc; $($rest)*}
+    };
+    (@collect_res<$ty:ty> $k:ident; $acc:expr; union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } ) => { $acc };
+    (@collect_res<$ty:ty> $k:ident; $acc:expr; union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } , $($rest:tt)* ) => {
+        bitregs!{@collect_res<$ty> $k; $acc; $($rest)*}
+    };
+    (@collect_res<$ty:ty> $k:ident; $acc:expr; union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } ) => { $acc };
     (@collect_res<$ty:ty> $k:ident; $acc:expr; $other:tt , $($rest:tt)* ) => {
         bitregs!{@collect_res<$ty> $k; $acc; $($rest)*}
     };
@@ -454,6 +724,24 @@ macro_rules! bitregs {
     (@collect_mask<$ty:ty>; $acc:expr; reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] $(,)? $($rest:tt)* ) => {
         bitregs!{@collect_mask<$ty>; $acc; reserved( ($lsb), (($msb)-($lsb)+1) )[ $attr ], $($rest)*}
     };
+    (@collect_mask<$ty:ty>; $acc:expr; union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } , $($rest:tt)* ) => {
+        bitregs!{@collect_mask<$ty>; ($acc | bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))}); $($rest)*}
+    };
+    (@collect_mask<$ty:ty>; $acc:expr; union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } ) => {
+        ($acc | bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))})
+    };
+    (@collect_mask<$ty:ty>; $acc:expr; union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } $($rest:tt)+ ) => {
+        bitregs!{@collect_mask<$ty>; ($acc | bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))}); $($rest)+}
+    };
+    (@collect_mask<$ty:ty>; $acc:expr; union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } , $($rest:tt)* ) => {
+        bitregs!{@collect_mask<$ty>; ($acc | bitregs!{@mask<$ty>($off,$sz)}); $($rest)*}
+    };
+    (@collect_mask<$ty:ty>; $acc:expr; union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } ) => {
+        ($acc | bitregs!{@mask<$ty>($off,$sz)})
+    };
+    (@collect_mask<$ty:ty>; $acc:expr; union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } $($rest:tt)+ ) => {
+        bitregs!{@collect_mask<$ty>; ($acc | bitregs!{@mask<$ty>($off,$sz)}); $($rest)+}
+    };
     (@collect_mask<$ty:ty>; $acc:expr; $other:tt , $($rest:tt)* ) => {
         bitregs!{@collect_mask<$ty>; $acc; $($rest)*}
     };
@@ -473,6 +761,22 @@ macro_rules! bitregs {
             ($oacc | ($uacc & bitregs!{@mask<$ty>($off,$sz)}));
             $($rest)*}
         };
+    };
+
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)*
+    ) => {
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ( 0 , $base_sz ) as $E { $($V = $val),+ },
+            $($rest)*
+        }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? }
+    ) => {
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ;
+            $fvis $Field ( 0 , $base_sz ) as $E { $($V = $val),+ }
+        }
     };
     (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
         reserved ( $off:expr , $sz:expr ) [ $attr:ident ]
@@ -527,6 +831,64 @@ macro_rules! bitregs {
     ) => {
         bitregs!{@collect_overlap<$ty>; $uacc; $oacc; reserved( ($lsb), (($msb)-($lsb)+1) )[ $attr ], $($rest)*}
     };
+    (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
+        union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } , $($rest:tt)*
+    ) => {
+        {
+            bitregs!{@collect_overlap<$ty>;
+                ($uacc | bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))});
+                ($oacc | ($uacc & bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))}));
+                $($rest)*
+            }
+        }
+    };
+    (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
+        union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* }
+    ) => {
+        {
+            ($oacc | ($uacc & bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))}))
+        }
+    };
+    (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
+        union $Union:ident @ [ $msb:tt : $lsb:tt ] { $($body:tt)* } $($rest:tt)+
+    ) => {
+        {
+            bitregs!{@collect_overlap<$ty>;
+                ($uacc | bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))});
+                ($oacc | ($uacc & bitregs!{@mask<$ty>($lsb, (($msb)-($lsb)+1))}));
+                $($rest)+
+            }
+        }
+    };
+    (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
+        union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } , $($rest:tt)*
+    ) => {
+        {
+            bitregs!{@collect_overlap<$ty>;
+                ($uacc | bitregs!{@mask<$ty>($off,$sz)});
+                ($oacc | ($uacc & bitregs!{@mask<$ty>($off,$sz)}));
+                $($rest)*
+            }
+        }
+    };
+    (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
+        union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* }
+    ) => {
+        {
+            ($oacc | ($uacc & bitregs!{@mask<$ty>($off,$sz)}))
+        }
+    };
+    (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr;
+        union $Union:ident ( $off:expr , $sz:expr ) { $($body:tt)* } $($rest:tt)+
+    ) => {
+        {
+            bitregs!{@collect_overlap<$ty>;
+                ($uacc | bitregs!{@mask<$ty>($off,$sz)});
+                ($oacc | ($uacc & bitregs!{@mask<$ty>($off,$sz)}));
+                $($rest)+
+            }
+        }
+    };
     (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr; $other:tt , $($rest:tt)* ) => {
         bitregs!{@collect_overlap<$ty>; $uacc; $oacc; $($rest)*}
     };
@@ -536,15 +898,149 @@ macro_rules! bitregs {
     (@collect_overlap<$ty:ty>; $uacc:expr; $oacc:expr; $other:tt ) => { $oacc };
 }
 
+// =========================
+// Helpers for union views
+// =========================
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bitregs_internal_view_mask_fold {
+    ($ty:ty, $base_off:expr, $base_sz:expr; ) => { 0 as $ty };
+    ($ty:ty, $base_off:expr, $base_sz:expr; reserved ( $off:expr , $sz:expr ) [ $attr:ident ] , $($rest:tt)* ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+            | $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; reserved ( $off:expr , $sz:expr ) [ $attr:ident ] ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] , $($rest:tt)* ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz;
+            reserved(
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb)-($lsb)+1)
+            )[ $attr ], $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz;
+            reserved(
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb)-($lsb)+1)
+            )[ $attr ])
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) , $($rest:tt)* ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+            | $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)* ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+            | $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? } ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] $( $tail:tt )* ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz;
+            $fvis $Field (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb)-($lsb)+1)
+            ) $( $tail )*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)* ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; (0, $base_sz)}
+            | $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? } ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; (0, $base_sz)}
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $other:tt , $($rest:tt)* ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $other:tt $($rest:tt)+ ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; $other:tt ) => { 0 as $ty };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __bitregs_internal_view_overlap_fold {
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; ) => { 0 as $ty };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; reserved ( $off:expr , $sz:expr ) [ $attr:ident ] , $($rest:tt)* ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        ( ($running & mask)
+            | $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, ($running | mask); $($rest)*) )
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; reserved ( $off:expr , $sz:expr ) [ $attr:ident ] ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        $running & mask
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] , $($rest:tt)* ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running;
+            reserved(
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb)-($lsb)+1)
+            )[ $attr ], $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; reserved @ [ $msb:tt : $lsb:tt ] [ $attr:ident ] ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running;
+            reserved(
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb)-($lsb)+1)
+            )[ $attr ])
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) , $($rest:tt)* ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        ( ($running & mask)
+            | $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, ($running | mask); $($rest)*) )
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        $running & mask
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)* ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        ( ($running & mask)
+            | $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, ($running | mask); $($rest)*) )
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident ( $off:expr , $sz:expr ) as $E:ident { $($V:ident = $val:expr),+ $(,)? } ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        $running & mask
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] $( $tail:tt )* ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running;
+            $fvis $Field (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($lsb)}) ,
+                (($msb)-($lsb)+1)
+            ) $( $tail )*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? } , $($rest:tt)* ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; (0, $base_sz)};
+        ( ($running & mask)
+            | $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, ($running | mask); $($rest)*) )
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? } ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; (0, $base_sz)};
+        $running & mask
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $other:tt , $($rest:tt)* ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $other:tt $($rest:tt)+ ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $other:tt ) => { 0 as $ty };
+}
+
 #[cfg(test)]
 mod test {
-    use super::*;
-
     bitregs! {
         pub(super) struct Timer: u32 {
             pub period@[7:0],
             reserved@[15:8] [res0],
-            pub enable(16, 1),
+            pub enable@[16:16],
             reserved@[23:17] [ignore],
             reserved@[31:24] [res1],
         }
@@ -559,9 +1055,36 @@ mod test {
                 Fault = 0b011,
             },
             reserved@[7:3] [res0],
-            pub error(8, 1),
+            pub error@[8:8],
             reserved@[13:9] [ignore],
             reserved@[15:14] [res1],
+        }
+    }
+
+    bitregs! {
+        pub(super) struct Packet: u16 {
+            union hdr@[7:0] {
+                view split {
+                    pub lo@[3:0],
+                    pub hi@[7:4],
+                }
+                view kind {
+                    pub kind@[7:0] as Kind {
+                        A = 0b0000_0001,
+                        B = 0b0000_0010,
+                        C = 0b0001_0000,
+                        D = 0b0010_0000,
+                    }
+                }
+                view flags {
+                    pub enabled@[0:0],
+                    reserved@[2:1] [res0],
+                    pub err@[3:3],
+                    reserved@[7:4] [ignore],
+                }
+            }
+
+            reserved@[15:8] [res1],
         }
     }
 
@@ -592,5 +1115,24 @@ mod test {
         let reg = Status::new().set(Status::state, 0b111);
 
         assert_eq!(reg.get_enum(Status::state), None::<State>);
+    }
+
+    #[test]
+    fn bitregs_union_views_share_bits() {
+        let reg = Packet::new().set(Packet::lo, 0x5).set(Packet::hi, 0xA);
+
+        assert_eq!(reg.get(Packet::lo), 0x5);
+        assert_eq!(reg.get(Packet::hi), 0xA);
+        assert_eq!(reg.bits() & 0x00FF, 0xA5);
+
+        let reg = Packet::new().set_enum(Packet::kind, Kind::C);
+        assert_eq!(reg.get(Packet::hi), 0x1);
+        assert_eq!(reg.get(Packet::lo), 0x0);
+        assert_eq!(reg.get_enum(Packet::kind), Some(Kind::C));
+
+        let reg = Packet::new().set(Packet::enabled, 1).set(Packet::err, 1);
+        assert_eq!(reg.get(Packet::enabled), 1);
+        assert_eq!(reg.get(Packet::err), 1);
+        assert_eq!(reg.bits() & 0x000F, 0b1001);
     }
 }
