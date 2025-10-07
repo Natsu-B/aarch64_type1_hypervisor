@@ -40,16 +40,19 @@ pub fn set_vttbr_el2(vttbr_el2: u64) {
     unsafe { asm!("msr vttbr_el2, {}", in(reg) vttbr_el2) };
 }
 
+pub fn set_hcr_el2(hcr: u64) {
+    unsafe { asm!("msr hcr_el2, {}", in(reg) hcr) };
+}
+
+
+
 pub fn clean_dcache_poc(addr: usize, size: usize) {
     if size == 0 {
         return;
     }
     let line_size = dcache_line_size();
     let start = addr & !(line_size - 1);
-    let end = addr
-        .saturating_add(size)
-        .saturating_add(line_size - 1)
-        & !(line_size - 1);
+    let end = addr.saturating_add(size).saturating_add(line_size - 1) & !(line_size - 1);
     let mut current = start;
     unsafe {
         while current < end {
@@ -66,6 +69,18 @@ pub fn dsb_ish() {
 
 pub fn isb() {
     unsafe { asm!("isb") };
+}
+
+pub fn flush_tlb_el2_el1() {
+    unsafe {
+        asm!(
+            "
+            dsb ishst
+            tlbi vmalls12e1is
+            dsb ish
+            isb"
+        )
+    };
 }
 
 pub fn get_parange() -> Option<PARange> {

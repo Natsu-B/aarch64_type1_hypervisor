@@ -5,6 +5,7 @@ use cpu::registers::PARange;
 
 use crate::descriptor::Stage2_48bitLeafDescriptor;
 use crate::descriptor::Stage2_48bitTableDescriptor;
+use crate::registers::HCR_EL2;
 use crate::registers::InnerCache;
 use crate::registers::OuterCache;
 use crate::registers::PhysicalAddressSize;
@@ -130,8 +131,7 @@ impl Stage2Paging {
 
         cpu::set_vtcr_el2(vtcr_el2);
         cpu::set_vttbr_el2(table as u64);
-        cpu::dsb_ish();
-        cpu::isb();
+        cpu::flush_tlb_el2_el1();
         Ok(())
     }
 
@@ -308,6 +308,18 @@ impl Stage2Paging {
         *ipa = data[*i].ipa;
         *size = data[*i].size;
         Ok(())
+    }
+
+    pub fn enable_stage2_translation() {
+        let hcr = HCR_EL2::new()
+            .set(HCR_EL2::vm, 0b1)
+            .set(HCR_EL2::fmo, 0b1)
+            .set(HCR_EL2::imo, 0b1)
+            .set(HCR_EL2::amo, 0b1)
+            .set(HCR_EL2::api, 0b1)
+            .set(HCR_EL2::rw, 0b1)
+            .bits();
+        cpu::set_hcr_el2(hcr);
     }
 }
 
