@@ -9,6 +9,9 @@ use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
+use arch_hal::paging::Stage2Paging;
+use arch_hal::paging::Stage2PagingSetting;
+use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use core::alloc::Layout;
@@ -23,6 +26,7 @@ use core::ptr;
 use core::ptr::slice_from_raw_parts_mut;
 use core::slice;
 use core::time::Duration;
+use core::usize;
 use dtb::DtbGenerator;
 use dtb::DtbParser;
 use file::OpenOptions;
@@ -73,8 +77,12 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
             .unwrap();
     let dtb = DtbParser::init(dtb_ptr).unwrap();
-    dtb.find_node(None, Some("arm,pl011"), &mut |addr, _size| {
+    let mut pl011_addr = None;
+    let mut pl011_size = None;
+    dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
         debug_uart::init(addr);
+        pl011_addr = Some(addr);
+        pl011_size = Some(size);
         ControlFlow::Break(())
     })
     .unwrap();
@@ -115,12 +123,40 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     allocator::add_reserved_region(dtb_ptr, dtb.get_size()).unwrap();
     allocator::finalize().unwrap();
     println!("allocator setup success!!!");
+    // setup paging
+    println!("start paging...");
+    let pl011_addr = pl011_addr.unwrap();
+    let pl011_size = pl011_size.unwrap();
+    println!("pl011 addr: 0x{:X}, size: 0x{:X}", pl011_addr, pl011_size);
+    let parange = match cpu::get_parange().unwrap() {
+        cpu::registers::PARange::PA32bits4GB => 32,
+        cpu::registers::PARange::PA36bits64GB => 36,
+        cpu::registers::PARange::PA40bits1TB => 40,
+        cpu::registers::PARange::PA42bits4TB => 42,
+        cpu::registers::PARange::PA44bits16TB => 44,
+        cpu::registers::PARange::PA48bits256TB => 48,
+        cpu::registers::PARange::PA52bits4PB => 52,
+        cpu::registers::PARange::PA56bits64PB => 56,
+    };
+    let paging_data: [Stage2PagingSetting; 2] = [
+        Stage2PagingSetting {
+            ipa: 0x0000,
+            pa: 0x0000,
+            size: pl011_addr,
+        },
+        Stage2PagingSetting {
+            ipa: pl011_addr + pl011_size,
+            pa: pl011_addr + pl011_size,
+            size: (1 << parange) - pl011_addr - pl011_size,
+        },
+    ];
+    Stage2Paging::init_stage2paging(&paging_data).unwrap();
+    Stage2Paging::enable_stage2_translation();
+    println!("paging success!!!");
     let mut file_driver = None;
     dtb.find_node(None, Some("virtio,mmio"), &mut |addr, size| {
         if let Ok(driver) = StorageDevice::new_virtio(addr) {
             file_driver = Some(driver);
-            // workaround
-            return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
     })
