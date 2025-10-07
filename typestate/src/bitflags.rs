@@ -114,7 +114,14 @@ macro_rules! bitregs {
             {
                 let off = F::OFF; let sz = F::SZ;
                 let bits = (core::mem::size_of::<$ty>() as u32) * 8;
-                debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:get: out-of-range field");
+                debug_assert!(
+                    sz > 0 && off < bits && off + sz <= bits,
+                    "bitregs:get: out-of-range field \
+                    (reg={}, field={}, off={}, sz={}, reg_bits={})",
+                    stringify!($Name),
+                    core::any::type_name::<F>(),
+                    off, sz, bits
+                );
                 let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
                 (self.0 >> off) & val
             }
@@ -126,9 +133,23 @@ macro_rules! bitregs {
             {
                 let off = F::OFF; let sz = F::SZ;
                 let bits = (core::mem::size_of::<$ty>() as u32) * 8;
-                debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:set: out-of-range field");
+                debug_assert!(
+                    sz > 0 && off < bits && off + sz <= bits,
+                    "bitregs:set: out-of-range field \
+                    (reg={}, field={}, off={}, sz={}, reg_bits={})",
+                    stringify!($Name),
+                    core::any::type_name::<F>(),
+                    off, sz, bits
+                );
                 let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
-                debug_assert!((v & !val) == (0 as $ty), "bitregs:set: value has bits outside the field");
+                debug_assert!(
+                    (v & !val) == (0 as $ty),
+                    "bitregs:set: value has bits outside the field \
+                    (reg={}, field={}, off={}, sz={}, value=0x{:X}, allowed_mask=0x{:X})",
+                    stringify!($Name),
+                    core::any::type_name::<F>(),
+                    off, sz, v, val
+                );
                 let mask: $ty = val << off;
                 self.0 = (self.0 & !mask) | ((v & val) << off);
                 self
@@ -141,7 +162,14 @@ macro_rules! bitregs {
             {
                 let off = F::OFF; let sz = F::SZ;
                 let bits = (core::mem::size_of::<$ty>() as u32) * 8;
-                debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:get_raw: out-of-range field");
+                debug_assert!(
+                    sz > 0 && off < bits && off + sz <= bits,
+                    "bitregs:get_raw: out-of-range field \
+                    (reg={}, field={}, off={}, sz={}, reg_bits={})",
+                    stringify!($Name),
+                    core::any::type_name::<F>(),
+                    off, sz, bits
+                );
                 let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
                 let mask: $ty = val << off;
                 self.0 & mask
@@ -154,12 +182,24 @@ macro_rules! bitregs {
             {
                 let off = F::OFF; let sz = F::SZ;
                 let bits = (core::mem::size_of::<$ty>() as u32) * 8;
-                debug_assert!(sz > 0 && off < bits && off + sz <= bits, "bitregs:set_raw: out-of-range field");
+                debug_assert!(
+                    sz > 0 && off < bits && off + sz <= bits,
+                    "bitregs:set_raw: out-of-range field \
+                    (reg={}, field={}, off={}, sz={}, reg_bits={})",
+                    stringify!($Name),
+                    core::any::type_name::<F>(),
+                    off, sz, bits
+                );
                 let val: $ty = if sz >= bits { !0 as $ty } else { ((1 as $ty) << sz) - (1 as $ty) };
                 let mask: $ty = val << off;
-
-                debug_assert!((v & !mask) == (0 as $ty), "bitregs:set_raw: value has bits outside the field");
-
+                debug_assert!(
+                    (v & !mask) == (0 as $ty),
+                    "bitregs:set_raw: value has bits outside the field \
+                    (reg={}, field={}, off={}, sz={}, raw_value=0x{:X}, allowed_mask=0x{:X})",
+                    stringify!($Name),
+                    core::any::type_name::<F>(),
+                    off, sz, v, mask
+                );
                 self.0 = (self.0 & !mask) | (v & mask);
                 self
             }
