@@ -171,6 +171,7 @@ impl Stage2Paging {
             // is block descriptor
             if top_table_level != 0 && (pa | ipa) & (top_level - 1) == 0 && size >= top_level {
                 // block descriptor
+                debug_assert_eq!(table[idx], 0);
                 table[idx] = Stage2_48bitLeafDescriptor::new_block(pa as u64, top_table_level);
                 pa += top_level;
                 ipa += top_level;
@@ -195,6 +196,7 @@ impl Stage2Paging {
                 for j in &mut *next_level_table {
                     *j = 0;
                 }
+                debug_assert_eq!(table[idx], 0);
                 table[idx] =
                     Stage2_48bitTableDescriptor::new_descriptor(next_level_table_addr as u64);
                 let start_ipa = ipa & !(top_level - 1);
@@ -237,7 +239,9 @@ impl Stage2Paging {
                 // check table level 3 is aligned PAGE_SIZE
                 debug_assert_eq!((*pa | *ipa | *size) & (PAGE_TABLE_SIZE - 1), 0);
                 // block descriptor
-                table_addr[(*ipa - start_ipa) >> table_level_offset] = if table_level == 3 {
+                let idx = (*ipa - start_ipa) >> table_level_offset;
+                debug_assert_eq!(table_addr[idx], 0);
+                table_addr[idx] = if table_level == 3 {
                     Stage2_48bitLeafDescriptor::new_page(*pa as u64)
                 } else {
                     Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level)
@@ -265,7 +269,9 @@ impl Stage2Paging {
                 for j in &mut *next_level_table {
                     *j = 0;
                 }
-                table_addr[(*ipa - start_ipa) >> table_level_offset] =
+                let idx = (*ipa - start_ipa) >> table_level_offset;
+                debug_assert_eq!(table_addr[idx], 0);
+                table_addr[idx] =
                     Stage2_48bitTableDescriptor::new_descriptor(next_level_table_addr as u64);
                 let start_ipa = *ipa & !(table_level_size - 1);
                 Self::setup_stage2_translation_recursive(
