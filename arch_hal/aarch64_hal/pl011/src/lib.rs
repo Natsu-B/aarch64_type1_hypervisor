@@ -235,7 +235,7 @@ impl Pl011Uart {
         while (self.registers.flags.read() & UARTFR::BUSY_MASK) != UARTFR(0) {
             core::hint::spin_loop();
         }
-        while (self.registers.flags.read() & UARTFR::TXFE_MASK) != UARTFR(0) {
+        while (self.registers.flags.read() & UARTFR::TXFE_MASK) == UARTFR(0) {
             core::hint::spin_loop();
         }
     }
