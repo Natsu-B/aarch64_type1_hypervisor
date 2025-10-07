@@ -2,6 +2,10 @@
 
 use core::arch::asm;
 
+use crate::registers::ID_AA64MMFR0_EL1;
+use crate::registers::PARange;
+pub mod registers;
+
 fn dcache_line_size() -> usize {
     let ctr_el0: u64;
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
@@ -62,4 +66,9 @@ pub fn dsb_ish() {
 
 pub fn isb() {
     unsafe { asm!("isb") };
+}
+
+pub fn get_parange() -> Option<PARange> {
+    let id = ID_AA64MMFR0_EL1::from_bits(get_id_aa64mmfr0_el1());
+    id.get_enum(ID_AA64MMFR0_EL1::parange)
 }

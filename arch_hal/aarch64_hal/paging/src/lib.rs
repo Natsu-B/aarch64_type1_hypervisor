@@ -1,12 +1,12 @@
 #![no_std]
 #![recursion_limit = "1024"]
 
+use cpu::registers::PARange;
+
 use crate::descriptor::Stage2_48bitLeafDescriptor;
 use crate::descriptor::Stage2_48bitTableDescriptor;
-use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::InnerCache;
 use crate::registers::OuterCache;
-use crate::registers::PARange;
 use crate::registers::PhysicalAddressSize;
 use crate::registers::SL0;
 use crate::registers::Shareability;
@@ -44,8 +44,6 @@ impl Stage2Paging {
         if data.is_empty() {
             return Err(PagingErr::Corrupted);
         }
-        let id_aa64mmfr0_el1 = ID_AA64MMFR0_EL1::from_bits(cpu::get_id_aa64mmfr0_el1());
-        let parange: Option<PARange> = id_aa64mmfr0_el1.get_enum(ID_AA64MMFR0_EL1::parange);
 
         // Concatenated translation tables (AArch64, Stage-2)
         // --------------------------------------------------
@@ -81,41 +79,41 @@ impl Stage2Paging {
         //
         // WHY
         // • Eliminates one top-level lookup, reducing table-walk overhead.
-        let (ps, t0sz, initial_lookup_level, initial_lookup_level_i8, num_of_tables) = match parange
-        {
-            Some(pa) => {
-                match pa {
-                    // pa size == ipa size
-                    PARange::PA32bits4GB => {
-                        (PhysicalAddressSize::AddressSize32b, 32, SL0::Level1, 1, 1)
-                    }
-                    PARange::PA36bits64GB => {
-                        (PhysicalAddressSize::AddressSize36b, 28, SL0::Level1, 1, 1)
-                    }
-                    PARange::PA40bits1TB => {
-                        (PhysicalAddressSize::AddressSize40b, 24, SL0::Level1, 1, 2)
-                    }
-                    PARange::PA42bits4TB => {
-                        (PhysicalAddressSize::AddressSize42b, 22, SL0::Level1, 1, 8)
-                    }
-                    PARange::PA44bits16TB => {
-                        (PhysicalAddressSize::AddressSize44b, 20, SL0::Level0, 0, 1)
-                    }
-                    PARange::PA48bits256TB => {
-                        (PhysicalAddressSize::AddressSize48b, 16, SL0::Level0, 0, 1)
-                    }
-                    // ipa 52bit is not supported
-                    // ipa size == 48bit
-                    PARange::PA52bits4PB => {
-                        (PhysicalAddressSize::AddressSize52b, 16, SL0::Level0, 0, 1)
-                    }
-                    PARange::PA56bits64PB => {
-                        (PhysicalAddressSize::AddressSize56b, 16, SL0::Level0, 0, 1)
+        let (ps, t0sz, initial_lookup_level, initial_lookup_level_i8, num_of_tables) =
+            match cpu::get_parange() {
+                Some(pa) => {
+                    match pa {
+                        // pa size == ipa size
+                        PARange::PA32bits4GB => {
+                            (PhysicalAddressSize::AddressSize32b, 32, SL0::Level1, 1, 1)
+                        }
+                        PARange::PA36bits64GB => {
+                            (PhysicalAddressSize::AddressSize36b, 28, SL0::Level1, 1, 1)
+                        }
+                        PARange::PA40bits1TB => {
+                            (PhysicalAddressSize::AddressSize40b, 24, SL0::Level1, 1, 2)
+                        }
+                        PARange::PA42bits4TB => {
+                            (PhysicalAddressSize::AddressSize42b, 22, SL0::Level1, 1, 8)
+                        }
+                        PARange::PA44bits16TB => {
+                            (PhysicalAddressSize::AddressSize44b, 20, SL0::Level0, 0, 1)
+                        }
+                        PARange::PA48bits256TB => {
+                            (PhysicalAddressSize::AddressSize48b, 16, SL0::Level0, 0, 1)
+                        }
+                        // ipa 52bit is not supported
+                        // ipa size == 48bit
+                        PARange::PA52bits4PB => {
+                            (PhysicalAddressSize::AddressSize52b, 16, SL0::Level0, 0, 1)
+                        }
+                        PARange::PA56bits64PB => {
+                            (PhysicalAddressSize::AddressSize56b, 16, SL0::Level0, 0, 1)
+                        }
                     }
                 }
-            }
-            None => return Err(PagingErr::Corrupted),
-        };
+                None => return Err(PagingErr::Corrupted),
+            };
 
         // mapping page table
         let table = Self::setup_stage2_translation(data, initial_lookup_level_i8, num_of_tables)?;
