@@ -9,8 +9,6 @@ use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
-use arch_hal::paging::Stage2Paging;
-use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
@@ -29,9 +27,11 @@ use core::time::Duration;
 use core::usize;
 use dtb::DtbGenerator;
 use dtb::DtbParser;
-use file::OpenOptions;
-use file::StorageDevice;
+use file::AlignedSliceBox;
 use typestate::Le;
+
+static LINUX: &[u8] = include_bytes!("../../bin/Image");
+static DTB: &[u8] = include_bytes!("../../bin/qemu_mod.dtb");
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -123,98 +123,25 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     allocator::add_reserved_region(dtb_ptr, dtb.get_size()).unwrap();
     allocator::finalize().unwrap();
     println!("allocator setup success!!!");
-    // setup paging
-    println!("start paging...");
-    let pl011_addr = pl011_addr.unwrap();
-    let pl011_size = pl011_size.unwrap();
-    println!("pl011 addr: 0x{:X}, size: 0x{:X}", pl011_addr, pl011_size);
-    let parange = match cpu::get_parange().unwrap() {
-        cpu::registers::PARange::PA32bits4GB => 32,
-        cpu::registers::PARange::PA36bits64GB => 36,
-        cpu::registers::PARange::PA40bits1TB => 40,
-        cpu::registers::PARange::PA42bits4TB => 42,
-        cpu::registers::PARange::PA44bits16TB => 44,
-        cpu::registers::PARange::PA48bits256TB => 48,
-        cpu::registers::PARange::PA52bits4PB => 52,
-        cpu::registers::PARange::PA56bits64PB => 56,
-    };
-    let paging_data: [Stage2PagingSetting; 2] = [
-        Stage2PagingSetting {
-            ipa: 0x0000,
-            pa: 0x0000,
-            size: pl011_addr,
-        },
-        Stage2PagingSetting {
-            ipa: pl011_addr + pl011_size,
-            pa: pl011_addr + pl011_size,
-            size: (1 << parange) - pl011_addr - pl011_size,
-        },
-    ];
-    Stage2Paging::init_stage2paging(&paging_data).unwrap();
-    Stage2Paging::enable_stage2_translation();
-    println!("paging success!!!");
-    let mut file_driver = None;
-    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, size| {
-        if let Ok(driver) = StorageDevice::new_virtio(addr) {
-            file_driver = Some(driver);
-        }
-        ControlFlow::Continue(())
-    })
-    .unwrap();
-    let file_driver = file_driver.unwrap();
-    let linux = file_driver
-        .open(0, "/image", &file::OpenOptions::Read)
-        .unwrap();
+
     println!("get linux header");
-    let mut linux_header: MaybeUninit<LinuxHeader> = MaybeUninit::uninit();
-    linux
-        .read_at(0, unsafe {
-            &mut *slice_from_raw_parts_mut(
-                &mut linux_header as *mut _ as *mut MaybeUninit<u8>,
-                size_of::<LinuxHeader>(),
-            )
-        })
-        .unwrap();
-    let linux_header = unsafe { linux_header.assume_init() };
+    let linux_header = unsafe { &*(LINUX.as_ptr() as *const LinuxHeader) };
     // check
     if linux_header.magic != LinuxHeader::MAGIC {
         panic!("invalid linux header");
     }
     let image_size = linux_header.image_size.read() as usize;
     let text_offset = linux_header.text_offset.read() as usize;
-    let linux_image = unsafe {
-        alloc(
-            Layout::from_size_align(
-                image_size + text_offset,
-                0x2 * 0x1000 * 0x1000, /* 2MiB */
-            )
-            .unwrap(),
-        )
-    };
-    if linux_image.is_null() {
-        panic!("allocation failed");
-    }
-    println!("load linux image");
-    linux
-        .read_at(0, unsafe {
-            &mut *slice_from_raw_parts_mut(
-                linux_image.add(text_offset) as *mut MaybeUninit<u8>,
-                linux.size().unwrap() as usize,
-            )
-        })
-        .unwrap();
-    let jump_addr = unsafe { linux_image.add(text_offset) };
-    let modified = file_driver
-        .open(0, "/qemu.dtb", &OpenOptions::Read)
-        .unwrap()
-        .read(8)
-        .unwrap();
+    let linux = AlignedSliceBox::new_uninit_with_align(image_size, 0x2 * 0x1000 * 0x1000).unwrap();
+    let mut linux = unsafe { linux.assume_init() };
+    unsafe { &mut linux[..LINUX.len()].copy_from_slice(&LINUX) };
+    let jump_addr = linux.as_ptr() as usize + text_offset;
+    let modified = DTB;
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
-
-    drop(file_driver);
-    println!("file system closed");
-    // setup HCR_EL2
-    cpu::setup_hypervisor_registers();
+    println!("set up linux data");
+    // workaround
+    let tmp = Box::new(1);
+    drop(tmp);
     let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, stack_start));
@@ -230,7 +157,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     new_dtb
         .make_dtb(dtb_data, reserved_memory.as_ref())
         .unwrap();
-    let base = (jump_addr as usize) - text_offset;
     unsafe {
         core::arch::asm!(
             "mrs x9, HCR_EL2",
@@ -260,35 +186,17 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         );
     }
 
-    println!("jumping linux...");
+    println!("jumping linux...\njump addr: 0x{:X}", jump_addr as usize);
 
+    // jump linux
     unsafe {
-        core::arch::asm!("isb");
-        core::arch::asm!("dsb sy");
+        core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
+
+        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
+            jump_addr as usize,
+        )(dtb_data.as_ptr() as usize, 0, 0, 0);
     }
-
-    const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
-    unsafe {
-        core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
-        core::arch::asm!("msr elr_el2, {}", in(reg)el1_main as *const fn() as usize as u64);
-        core::arch::asm!("eret", options(noreturn));
-    }
-}
-
-fn el1_main() -> ! {
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
-
-    // TODO
-    // // jump linux
-    // unsafe {
-    //     core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
-
-    //     core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
-    //         jump_addr as usize,
-    //     )(dtb_data.as_ptr() as usize, 0, 0, 0);
-    // }
+    unreachable!();
 }
 
 fn str_to_usize(s: &str) -> Option<usize> {

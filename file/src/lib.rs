@@ -8,6 +8,7 @@ use block_device_api::IoError;
 use filesystem::FileSystemErr;
 use filesystem::PartitionIndex;
 
+pub use filesystem::aligned_box::AlignedSliceBox;
 pub use filesystem::filesystem::FileHandle;
 pub use filesystem::filesystem::OpenOptions;
 
