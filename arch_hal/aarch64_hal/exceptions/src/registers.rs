@@ -213,8 +213,9 @@ bitregs! {
         pub(crate) ec@[31:26] as ExceptionClass {
             // unknown reason
             UnknownReason                  = 0b00_0000,
-            TrapedWFInstruction            = 0b00_0001,
+            TrappedWFInstruction            = 0b00_0001,
             InstructionAbortFromLowerLevel = 0b10_0000,
+            DataAbortFormLowerLevel        = 0b10_0100,
         },
         pub(crate) iss2@[55:32],
         reserved@[63:56] [res0],

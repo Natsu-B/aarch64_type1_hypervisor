@@ -29,7 +29,7 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
     let reg = unsafe { &mut *reg };
     let esr_el2 = ESR_EL2::from_bits(cpu::get_esr_el2());
     match esr_el2.get_enum::<_, ExceptionClass>(ESR_EL2::ec) {
-        Some(ec) if ec == ExceptionClass::InstructionAbortFromLowerLevel => {
+        Some(ec) if ec == ExceptionClass::DataAbortFormLowerLevel => {
             // Data Abort
             if esr_el2.get(ESR_EL2::isv) == 0 {
                 panic!("Data Abort Info is not available");
