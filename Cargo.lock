@@ -8,9 +8,9 @@ version = "0.1.0"
 dependencies = [
  "aarch64_test",
  "cpu",
- "mutex",
+ "exceptions",
  "paging",
- "pl011",
+ "print",
 ]
 
 [[package]]
@@ -51,6 +51,10 @@ version = "0.1.0"
 [[package]]
 name = "cpu"
 version = "0.1.0"
+dependencies = [
+ "typestate",
+ "typestate_macro",
+]
 
 [[package]]
 name = "dtb"
@@ -74,6 +78,16 @@ dependencies = [
  "elf",
  "file",
  "typestate",
+]
+
+[[package]]
+name = "exceptions"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+ "print",
+ "typestate",
+ "typestate_macro",
 ]
 
 [[package]]
@@ -117,9 +131,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pl011"
+name = "print"
 version = "0.1.0"
 dependencies = [
+ "mutex",
  "typestate",
  "typestate_macro",
 ]

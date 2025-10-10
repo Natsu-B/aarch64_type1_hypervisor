@@ -16,6 +16,12 @@ impl<Reg, const OFF: u32, const SZ: u32> FieldSpec<Reg> for Field<Reg, OFF, SZ> 
     const SZ: u32 = SZ;
 }
 
+impl<Reg, const OFF: u32, const SZ: u32> Default for Field<Reg, OFF, SZ> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Reg, const OFF: u32, const SZ: u32> Field<Reg, OFF, SZ> {
     #[inline]
     pub const fn new() -> Self {
