@@ -4,11 +4,13 @@
 #![recursion_limit = "256"]
 
 extern crate alloc;
+mod handler;
 mod systimer;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
+use arch_hal::exceptions;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011;
@@ -41,7 +43,7 @@ unsafe extern "C" {
     static mut _STACK_TOP: usize;
 }
 
-static PL011_UART_ADDR: usize = 0x900_0000;
+const PL011_UART_ADDR: usize = 0x900_0000;
 
 #[repr(C)]
 struct LinuxHeader {
@@ -153,6 +155,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     Stage2Paging::init_stage2paging(&paging_data).unwrap();
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");
+    println!("setup exception");
+    exceptions::setup_exception();
+    handler::setup_handler();
     let mut file_driver = None;
     dtb.find_node(None, Some("virtio,mmio"), &mut |addr, size| {
         if let Ok(driver) = StorageDevice::new_virtio(addr) {
@@ -230,36 +235,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     new_dtb
         .make_dtb(dtb_data, reserved_memory.as_ref())
         .unwrap();
-    let base = (jump_addr as usize) - text_offset;
-    unsafe {
-        core::arch::asm!(
-            "mrs x9, HCR_EL2",
-            "bic x9, x9, #(1 << 0)",
-            "orr x9, x9, #(1 << 31)",
-            "msr HCR_EL2, x9",
-            "isb",
-            options(nostack, preserves_flags)
-        );
-
-        core::arch::asm!(
-            "tlbi alle2",
-            "dsb sy",
-            "isb",
-            options(nostack, preserves_flags)
-        );
-
-        core::arch::asm!(
-            "mrs x9, SCTLR_EL2",
-            "bic x9, x9, #(1 << 0)",  // M = 0 (MMU off)
-            "bic x9, x9, #(1 << 2)",  // C = 0 (D-cache disable)
-            "bic x9, x9, #(1 << 12)", // I = 0 (I-cache disable)
-            "msr SCTLR_EL2, x9",
-            "dsb sy",
-            "isb",
-            options(nostack, preserves_flags)
-        );
-    }
-
     println!("jumping linux...");
 
     unsafe {
@@ -271,11 +246,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     unsafe {
         core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg)el1_main as *const fn() as usize as u64);
+        core::arch::asm!("msr sp_el1, {}", in(reg) unsafe {alloc::alloc::alloc(Layout::from_size_align_unchecked(0x1000, 0x1000))});
         core::arch::asm!("eret", options(noreturn));
     }
 }
 
 fn el1_main() -> ! {
+    unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, b'h') };
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
