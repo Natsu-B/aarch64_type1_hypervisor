@@ -32,6 +32,30 @@ pub fn get_id_aa64mmfr0_el1() -> u64 {
     id
 }
 
+pub fn get_esr_el2() -> u64 {
+    let esr_el2: u64;
+    unsafe { asm!("mrs {}, esr_el2", out(reg) esr_el2) };
+    esr_el2
+}
+
+pub fn get_far_el2() -> u64 {
+    let far_el2: u64;
+    unsafe { asm!("mrs {}, far_el2", out(reg) far_el2) };
+    far_el2
+}
+
+pub fn get_hpfar_el2() -> u64 {
+    let hpfar_el2: u64;
+    unsafe { asm!("mrs {}, hpfar_el2", out(reg) hpfar_el2) };
+    hpfar_el2
+}
+
+pub fn get_elr_el2() -> u64 {
+    let elr_el2: u64;
+    unsafe { asm!("mrs {}, elr_el2", out(reg) elr_el2) };
+    elr_el2
+}
+
 pub fn set_vtcr_el2(vtcr_el2: u64) {
     unsafe { asm!("msr vtcr_el2, {}", in(reg)vtcr_el2) };
 }
@@ -44,7 +68,13 @@ pub fn set_hcr_el2(hcr: u64) {
     unsafe { asm!("msr hcr_el2, {}", in(reg) hcr) };
 }
 
+pub fn set_vbar_el2(vbar: u64) {
+    unsafe { asm!("msr vbar_el2, {}", in(reg) vbar) };
+}
 
+pub fn set_elr_el2(elr_el2: u64) {
+    unsafe { asm!("msr elr_el2, {}", in(reg) elr_el2) };
+}
 
 pub fn clean_dcache_poc(addr: usize, size: usize) {
     if size == 0 {
