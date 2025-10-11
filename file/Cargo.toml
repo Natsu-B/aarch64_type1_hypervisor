@@ -7,10 +7,9 @@ edition = "2024"
 block-device = { path = "block-device" }
 block-device-api = { path = "block-device-api" }
 filesystem = { path = "filesystem" }
-allocator = { path = "../allocator" }
 
 [dev-dependencies]
-arch_hal = { path = "../arch_hal", features = ["uefi-test"] }
+arch_hal = { path = "../arch_hal", default-features = false, features = ["uefi-test"] }
 
 [lib]
 doctest = false

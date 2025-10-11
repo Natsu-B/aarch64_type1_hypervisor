@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-uefi-test = ["aarch64_test"]
+default = ["paging"]
+paging = ["dep:paging"]
+uefi-test = ["dep:aarch64_test"]
 
 [dependencies]
-paging = { path = "./paging" }
+paging = { path = "./paging", optional = true }
 print = { path = "./print" }
 cpu = { path = "./cpu" }
 exceptions = { path = "./exceptions" }

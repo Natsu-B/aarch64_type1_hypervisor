@@ -82,7 +82,7 @@ r#"
 
 .section .text
 .balign 0x800
-.size   exception_table, 0x800
+// .size   exception_table, 0x800
 .global exception_table
 exception_table:
 
