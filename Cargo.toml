@@ -1,4 +1,5 @@
 [workspace]
+resolver = "3"
 members = [
     "allocator",
     "bootloader",
@@ -13,7 +14,6 @@ members = [
     "elf",
     "arch_hal",
 ]
-build-std-features = ["compiler-builtins-mem"]
 
 [profile.release]
 panic = 'abort'

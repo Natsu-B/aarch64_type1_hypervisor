@@ -1,6 +1,0 @@
-[build]
-#rustflags = ["-C", "link-args=/debug:dwarf"]
-
-
-[target.aarch64-unknown-none]
-#rustflags = ["-C", "link-arg=--build-id=none"]

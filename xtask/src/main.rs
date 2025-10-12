@@ -42,10 +42,14 @@ fn build(args: &[String]) -> Result<String, &'static str> {
     eprintln!("\n--- Building bootloader package: {} ---", pkg);
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
+        .arg("-Z")
+        .arg("build-std=core,alloc,compiler_builtins")
+        .arg("-Z")
+        .arg("build-std-features=compiler-builtins-mem")
         .arg("-p")
         .arg(pkg)
         .arg("--target")
-        .arg("aarch64-unknown-none")
+        .arg("aarch64-unknown-none-softfloat")
         .args(args)
         .env("XTASK_BUILD", "1")
         .stdin(Stdio::null())
@@ -70,7 +74,7 @@ fn build(args: &[String]) -> Result<String, &'static str> {
     eprintln!("\n--- Searching for built binary... ---");
     let mut binary_dir = std::env::current_dir().unwrap();
     binary_dir.push("target");
-    binary_dir.push("aarch64-unknown-none");
+    binary_dir.push("aarch64-unknown-none-softfloat");
     binary_dir.push("debug");
     binary_dir.push("elf-hypervisor");
     let mut binary_new_dir = std::env::current_dir().unwrap();

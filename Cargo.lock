@@ -8,9 +8,10 @@ version = "0.1.0"
 dependencies = [
  "aarch64_test",
  "cpu",
- "mutex",
+ "exceptions",
  "paging",
- "pl011",
+ "print",
+ "psci",
 ]
 
 [[package]]
@@ -51,6 +52,10 @@ version = "0.1.0"
 [[package]]
 name = "cpu"
 version = "0.1.0"
+dependencies = [
+ "typestate",
+ "typestate_macro",
+]
 
 [[package]]
 name = "dtb"
@@ -77,10 +82,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "exceptions"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+ "print",
+ "psci",
+ "typestate",
+ "typestate_macro",
+]
+
+[[package]]
 name = "file"
 version = "0.1.0"
 dependencies = [
- "allocator",
  "arch_hal",
  "block-device",
  "block-device-api",
@@ -91,7 +106,6 @@ dependencies = [
 name = "filesystem"
 version = "0.1.0"
 dependencies = [
- "allocator",
  "block-device-api",
  "mutex",
  "typestate",
@@ -117,9 +131,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pl011"
+name = "print"
 version = "0.1.0"
 dependencies = [
+ "mutex",
  "typestate",
  "typestate_macro",
 ]
@@ -131,6 +146,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psci"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+ "print",
 ]
 
 [[package]]

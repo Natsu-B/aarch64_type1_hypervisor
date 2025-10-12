@@ -313,10 +313,11 @@ impl Stage2Paging {
     pub fn enable_stage2_translation() {
         let hcr = HCR_EL2::new()
             .set(HCR_EL2::vm, 0b1)
-            .set(HCR_EL2::fmo, 0b1)
-            .set(HCR_EL2::imo, 0b1)
-            .set(HCR_EL2::amo, 0b1)
+            // .set(HCR_EL2::fmo, 0b1)
+            // .set(HCR_EL2::imo, 0b1)
+            // .set(HCR_EL2::amo, 0b1)
             .set(HCR_EL2::api, 0b1)
+            .set(HCR_EL2::tsc, 0b1)
             .set(HCR_EL2::rw, 0b1)
             .bits();
         cpu::set_hcr_el2(hcr);

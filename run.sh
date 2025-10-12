@@ -53,4 +53,4 @@ qemu-system-aarch64 \
   -nographic \
   -device virtio-blk-device,drive=disk \
   -drive file="$DISK_IMG",format=raw,if=none,media=disk,id=disk \
-  -gdb tcp::1234
+  -gdb tcp::1234 #-S

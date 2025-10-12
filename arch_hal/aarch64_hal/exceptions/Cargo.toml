@@ -1,8 +1,11 @@
 [package]
-name = "cpu"
+name = "exceptions"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cpu = { path = "../cpu" }
 typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
+print = { path = "../print" }
+psci = { path = "../psci" }

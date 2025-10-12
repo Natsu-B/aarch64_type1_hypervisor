@@ -16,6 +16,12 @@ impl<Reg, const OFF: u32, const SZ: u32> FieldSpec<Reg> for Field<Reg, OFF, SZ> 
     const SZ: u32 = SZ;
 }
 
+impl<Reg, const OFF: u32, const SZ: u32> Default for Field<Reg, OFF, SZ> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Reg, const OFF: u32, const SZ: u32> Field<Reg, OFF, SZ> {
     #[inline]
     pub const fn new() -> Self {
@@ -612,6 +618,68 @@ macro_rules! bitregs {
         }
     };
 
+    // nested union definitions inside a view: absolute form
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } , $($rest:tt)*
+    ) => {
+        const _: () = {
+            let span = $base_sz as u32;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < span && off + sz <= span;
+            let _ = [()][(!cond) as usize];
+        };
+        bitregs!{@union $Name : $ty ; $Inner ; (($base_off as u32) + ($off as u32)) ; ($sz) ; { $($ibody)* }}
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)* }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } $($rest:tt)+
+    ) => {
+        const _: () = {
+            let span = $base_sz as u32;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < span && off + sz <= span;
+            let _ = [()][(!cond) as usize];
+        };
+        bitregs!{@union $Name : $ty ; $Inner ; (($base_off as u32) + ($off as u32)) ; ($sz) ; { $($ibody)* }}
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)+ }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* }
+    ) => {
+        const _: () = {
+            let span = $base_sz as u32;
+            let off = $off as u32; let sz = $sz as u32;
+            let cond = sz > 0 && off < span && off + sz <= span;
+            let _ = [()][(!cond) as usize];
+        };
+        bitregs!{@union $Name : $ty ; $Inner ; (($base_off as u32) + ($off as u32)) ; ($sz) ; { $($ibody)* }}
+    };
+
+    // nested union definitions inside a view: @[MSB:LSB] form
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } , $($rest:tt)*
+    ) => {
+        bitregs!{@union $Name : $ty ; $Inner ;
+            (($base_off as u32) + bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ;
+            (($imsb) - ($ilsb) + 1) ; { $($ibody)* }}
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)* }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } $($rest:tt)+
+    ) => {
+        bitregs!{@union $Name : $ty ; $Inner ;
+            (($base_off as u32) + bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ;
+            (($imsb) - ($ilsb) + 1) ; { $($ibody)* }}
+        bitregs!{@union_view_fields $Name : $ty ; $Union ; $View ; $base_off ; $base_sz ; $($rest)+ }
+    };
+    (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
+        union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* }
+    ) => {
+        bitregs!{@union $Name : $ty ; $Inner ;
+            (($base_off as u32) + bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ;
+            (($imsb) - ($ilsb) + 1) ; { $($ibody)* }}
+    };
+
     (@union_view_fields $Name:ident : $ty:ty ; $Union:ident ; $View:ident ; $base_off:expr ; $base_sz:expr ;
         $fvis:vis $Field:ident @ [ $msb:tt : $lsb:tt ] [ $acc:ident ] $(,)? $($rest:tt)*
     ) => { compile_error!("bitregs: access qualifiers are not supported inside union view; remove the [...]"); };
@@ -995,6 +1063,40 @@ macro_rules! __bitregs_internal_view_mask_fold {
     ($ty:ty, $base_off:expr, $base_sz:expr; $fvis:vis $Field:ident as $E:ident { $($V:ident = $val:expr),+ $(,)? } ) => {
         $crate::bitregs!{@view_mask<$ty> $base_off; (0, $base_sz)}
     };
+    ($ty:ty, $base_off:expr, $base_sz:expr; union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } , $($rest:tt)* ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+            | $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } $($rest:tt)+ ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+            | $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)+)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } ) => {
+        $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)}
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } , $($rest:tt)* ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz;
+            union $Inner (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ,
+                (($imsb) - ($ilsb) + 1)
+            ) { $($ibody)* },
+            $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } $($rest:tt)+ ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz;
+            union $Inner (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ,
+                (($imsb) - ($ilsb) + 1)
+            ) { $($ibody)* },
+            $($rest)+)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr; union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } ) => {
+        $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz;
+            union $Inner (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ,
+                (($imsb) - ($ilsb) + 1)
+            ) { $($ibody)* })
+    };
     ($ty:ty, $base_off:expr, $base_sz:expr; $other:tt , $($rest:tt)* ) => {
         $crate::__bitregs_internal_view_mask_fold!($ty, $base_off, $base_sz; $($rest)*)
     };
@@ -1065,6 +1167,55 @@ macro_rules! __bitregs_internal_view_overlap_fold {
         let mask = $crate::bitregs!{@view_mask<$ty> $base_off; (0, $base_sz)};
         $running & mask
     }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr;
+        union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } , $($rest:tt)*
+    ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        ( ($running & mask)
+            | $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, ($running | mask); $($rest)*) )
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr;
+        union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* } $($rest:tt)+
+    ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        ( ($running & mask)
+            | $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, ($running | mask); $($rest)+) )
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr;
+        union $Inner:ident ( $off:expr , $sz:expr ) { $($ibody:tt)* }
+    ) => {{
+        let mask = $crate::bitregs!{@view_mask<$ty> $base_off; ($off,$sz)};
+        $running & mask
+    }};
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr;
+        union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } , $($rest:tt)*
+    ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running;
+            union $Inner (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ,
+                (($imsb) - ($ilsb) + 1)
+            ) { $($ibody)* },
+            $($rest)*)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr;
+        union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* } $($rest:tt)+
+    ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running;
+            union $Inner (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ,
+                (($imsb) - ($ilsb) + 1)
+            ) { $($ibody)* },
+            $($rest)+)
+    };
+    ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr;
+        union $Inner:ident @ [ $imsb:tt : $ilsb:tt ] { $($ibody:tt)* }
+    ) => {
+        $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running;
+            union $Inner (
+                ($crate::bitregs!{@union_local_off $base_off ; $base_sz ; ($ilsb)}) ,
+                (($imsb) - ($ilsb) + 1)
+            ) { $($ibody)* })
+    };
     ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $other:tt , $($rest:tt)* ) => {
         $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running; $($rest)*)
     };
@@ -1072,6 +1223,90 @@ macro_rules! __bitregs_internal_view_overlap_fold {
         $crate::__bitregs_internal_view_overlap_fold!($ty, $base_off, $base_sz, $running; $($rest)*)
     };
     ($ty:ty, $base_off:expr, $base_sz:expr, $running:expr; $other:tt ) => { 0 as $ty };
+}
+
+#[cfg(test)]
+mod tests {
+    bitregs! {
+        /// nested union test
+        pub(super) struct PacketNested: u16 {
+            union hdr@[7:0] {
+                view split {
+                    pub lo@[3:0],
+                    pub hi@[7:4],
+                }
+                view nested {
+                    union inner@[3:0] {
+                        view halves {
+                            pub lower@[1:0],
+                            pub upper@[3:2],
+                        }
+                        view raw {
+                            pub raw4@[3:0],
+                        }
+                    }
+                    pub top_hi@[7:4],
+                }
+                view raw { pub raw8@[7:0], }
+            }
+            reserved@[15:8] [ignore],
+        }
+    }
+
+    bitregs! {
+        pub(super) struct Timer: u32 {
+            pub period@[7:0],
+            reserved@[15:8] [res0],
+            pub enable@[16:16],
+            reserved@[23:17] [ignore],
+            reserved@[31:24] [res1],
+        }
+    }
+
+    bitregs! {
+        pub(super) struct Status: u16 {
+            pub state@[2:0] as State {
+                Idle = 0b000,
+                Busy = 0b001,
+                Done = 0b010,
+                Fault = 0b011,
+            },
+            reserved@[7:3] [res0],
+            pub error@[8:8],
+            reserved@[13:9] [ignore],
+            reserved@[15:14] [res1],
+        }
+    }
+
+    #[test]
+    fn nested_union_basic() {
+        let reg = PacketNested::new()
+            .set(PacketNested::lower, 0b01)
+            .set(PacketNested::upper, 0b10)
+            .set(PacketNested::top_hi, 0xA);
+        assert_eq!(reg.bits() & 0x00FF, 0xA9);
+
+        let reg = PacketNested::new().set(PacketNested::raw8, 0x5C);
+        assert_eq!(reg.get(PacketNested::hi), 0x5);
+        assert_eq!(reg.get(PacketNested::lo), 0xC & 0xF);
+        assert_eq!(reg.get(PacketNested::raw4), 0xC & 0xF);
+    }
+
+    #[test]
+    fn reserved_and_enum_behaviour() {
+        let reg = Timer::new().set(Timer::period, 0xAA).set(Timer::enable, 1);
+        // res1 high bits stay set, res0 cleared.
+        assert_eq!(reg.bits(), 0xFF01_00AA);
+        assert_eq!(reg.get(Timer::period), 0xAA);
+        assert_eq!(reg.get(Timer::enable), 1);
+
+        let status = Status::new()
+            .set_enum(Status::state, State::Busy)
+            .set(Status::error, 1);
+        assert_eq!(status.get_enum(Status::state), Some(State::Busy));
+        assert_eq!(status.get(Status::error), 1);
+        assert_eq!(status.bits() & 0xC000, 0xC000); // res1 bits forced high
+    }
 }
 
 #[cfg(test)]
