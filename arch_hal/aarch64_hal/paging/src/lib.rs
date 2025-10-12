@@ -317,6 +317,7 @@ impl Stage2Paging {
             // .set(HCR_EL2::imo, 0b1)
             // .set(HCR_EL2::amo, 0b1)
             .set(HCR_EL2::api, 0b1)
+            .set(HCR_EL2::tsc, 0b1)
             .set(HCR_EL2::rw, 0b1)
             .bits();
         cpu::set_hcr_el2(hcr);

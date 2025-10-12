@@ -49,7 +49,7 @@ sudo losetup -d "$LOOP"
 qemu-system-aarch64 \
   -M virt,gic-version=3,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
-  -smp 1 -bios "$BIN/u-boot.bin" -cpu cortex-a55 -m 4G \
+  -smp 4 -bios "$BIN/u-boot.bin" -cpu cortex-a55 -m 4G \
   -nographic \
   -device virtio-blk-device,drive=disk \
   -drive file="$DISK_IMG",format=raw,if=none,media=disk,id=disk \

@@ -1,5 +1,5 @@
-use crate::Registers;
 use core::ffi::CStr;
+use cpu::Registers;
 use print::println;
 
 #[inline(always)]

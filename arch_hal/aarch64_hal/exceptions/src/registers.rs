@@ -208,14 +208,21 @@ bitregs! {
                 // Instruction Syndrome Valid
                 pub(crate) isv@[24:24],
             }
+
+            view smc_aarch64 {
+                pub(crate) imm16@[15:0],
+                reserved@[24:16] [res0],
+            }
         }
         pub(crate) il@[25:25],
         pub(crate) ec@[31:26] as ExceptionClass {
             // unknown reason
             UnknownReason                  = 0b00_0000,
-            TrappedWFInstruction            = 0b00_0001,
+            TrappedWFInstruction           = 0b00_0001,
             InstructionAbortFromLowerLevel = 0b10_0000,
             DataAbortFormLowerLevel        = 0b10_0100,
+            // SMC Instruction Exception in Aarch64 state
+            SMCInstructionExecution        = 0b01_0111,
         },
         pub(crate) iss2@[55:32],
         reserved@[63:56] [res0],

@@ -6,6 +6,42 @@ use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::PARange;
 pub mod registers;
 
+#[repr(C)]
+pub struct Registers {
+    pub x0: u64,
+    pub x1: u64,
+    pub x2: u64,
+    pub x3: u64,
+    pub x4: u64,
+    pub x5: u64,
+    pub x6: u64,
+    pub x7: u64,
+    pub x8: u64,
+    pub x9: u64,
+    pub x10: u64,
+    pub x11: u64,
+    pub x12: u64,
+    pub x13: u64,
+    pub x14: u64,
+    pub x15: u64,
+    pub x16: u64,
+    pub x17: u64,
+    pub x18: u64,
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    pub x29: u64,
+    pub x30: u64,
+    pub x31: u64,
+}
+
 fn dcache_line_size() -> usize {
     let ctr_el0: u64;
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
@@ -17,13 +53,6 @@ pub fn get_current_el() -> u64 {
     let current_el: u64;
     unsafe { asm!("mrs {}, currentel", out(reg) current_el) };
     current_el >> 2
-}
-
-pub fn setup_hypervisor_registers() {
-    const HCR_EL2_RW: u64 = 1 << 31;
-    const HCR_EL2_API: u64 = 1 << 41;
-    let hcr_el2 = HCR_EL2_RW | HCR_EL2_API;
-    unsafe { asm!("msr hcr_el2, {}", in(reg) hcr_el2) };
 }
 
 pub fn get_id_aa64mmfr0_el1() -> u64 {

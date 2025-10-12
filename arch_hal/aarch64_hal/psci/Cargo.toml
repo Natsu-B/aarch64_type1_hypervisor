@@ -1,0 +1,8 @@
+[package]
+name = "psci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpu = { path = "../cpu" }
+print = { path = "../print" }
