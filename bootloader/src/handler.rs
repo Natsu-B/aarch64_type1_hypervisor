@@ -1,7 +1,6 @@
 use crate::UART_ADDR;
 use arch_hal::cpu;
 use arch_hal::exceptions;
-use arch_hal::print_right;
 use arch_hal::println;
 use core::arch::asm;
 use core::ptr::read_volatile;
