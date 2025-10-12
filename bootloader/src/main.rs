@@ -1,4 +1,5 @@
 #![feature(once_cell_get_mut)]
+#![feature(sync_unsafe_cell)]
 #![no_std]
 #![no_main]
 #![recursion_limit = "256"]
@@ -18,6 +19,7 @@ use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use core::alloc::Layout;
 use core::arch::naked_asm;
+use core::cell::SyncUnsafeCell;
 use core::ffi::CStr;
 use core::ffi::c_char;
 use core::fmt::Write;
@@ -42,6 +44,10 @@ unsafe extern "C" {
     static mut _PROGRAM_END: usize;
     static mut _STACK_TOP: usize;
 }
+
+static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
 
 const PL011_UART_ADDR: usize = 0x900_0000;
 
@@ -88,6 +94,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         ControlFlow::Break(())
     })
     .unwrap();
+    unsafe { *UART_ADDR.get() = pl011_addr };
     println!("debug uart starting...\r\n");
     assert_eq!(cpu::get_current_el(), 2);
 
@@ -209,6 +216,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         })
         .unwrap();
     let jump_addr = unsafe { linux_image.add(text_offset) };
+    unsafe { *LINUX_ADDR.get() = jump_addr as usize };
     let modified = file_driver
         .open(0, "/qemu.dtb", &OpenOptions::Read)
         .unwrap()
@@ -233,6 +241,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     new_dtb
         .make_dtb(dtb_data, reserved_memory.as_ref())
         .unwrap();
+    unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
     println!("jumping linux...");
 
     unsafe {
@@ -253,29 +262,26 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
+        core::arch::asm!("msr sctlr_el2, {}", in(reg) 0);
         cpu::isb();
         core::arch::asm!("eret", options(noreturn));
     }
 }
 
 extern "C" fn el1_main() {
-    let hello = "hello world from el1_main";
+    let hello = "hello world from el1_main\n";
     for i in hello.as_bytes() {
         unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
     }
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+
+    // jump linux
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
+
+        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
+            *LINUX_ADDR.get() as usize
+        )(*DTB_ADDR.get(), 0, 0, 0);
     }
-
-    // TODO
-    // // jump linux
-    // unsafe {
-    //     core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
-
-    //     core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
-    //         jump_addr as usize,
-    //     )(dtb_data.as_ptr() as usize, 0, 0, 0);
-    // }
 }
 
 fn str_to_usize(s: &str) -> Option<usize> {
