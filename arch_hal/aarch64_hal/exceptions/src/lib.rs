@@ -40,7 +40,8 @@ r#"
     .endm
 
     .macro CALL_COMMON_HANDLER name_label
-    adr  x1, \name_label
+    adrp x1, \name_label
+    add  x1, x1, :lo12:\name_label
     b    {common_handler}
     .endm
 

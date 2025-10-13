@@ -1,15 +1,16 @@
 #![no_std]
+#![feature(once_cell_get_mut)]
+#![feature(sync_unsafe_cell)]
 
 pub mod pl011;
-
-use core::cell::OnceCell;
+use core::cell::SyncUnsafeCell;
 use core::fmt::Write;
 use core::fmt::{self};
 
-use mutex::SpinLock;
 use pl011::Pl011Uart;
 
-pub static DEBUG_UART: SpinLock<OnceCell<Pl011Uart>> = SpinLock::new(OnceCell::new());
+#[deprecated(note = "DEBUG_UART uses SyncUnsafeCell so do not use it in multicore system")]
+pub static DEBUG_UART: SyncUnsafeCell<Option<Pl011Uart>> = SyncUnsafeCell::new(None);
 
 #[macro_export]
 macro_rules! print {
@@ -38,13 +39,13 @@ pub mod debug_uart {
 
     pub fn init(base_address: usize) {
         let uart = Pl011Uart::new(base_address);
-        let debug_uart = DEBUG_UART.lock();
-        debug_uart.set(uart).unwrap();
+        let debug_uart = unsafe { &mut *DEBUG_UART.get() };
+        *debug_uart = Some(uart);
     }
 }
 
 pub fn _print(args: fmt::Arguments) {
-    let mut debug_uart = DEBUG_UART.lock();
-    let uart = debug_uart.get_mut().unwrap();
+    let uart = unsafe { &mut *(DEBUG_UART.get()) };
+    let uart = uart.get_or_insert_with(|| Pl011Uart::new(0x10_7D00_1000));
     uart.write_fmt(args).unwrap();
 }

@@ -219,8 +219,10 @@ impl UARTICR {
 
 #[derive(Debug)]
 pub struct Pl011Uart {
-    registers: &'static Pl011Peripherals,
+    pub(crate) registers: &'static Pl011Peripherals,
 }
+
+unsafe impl Sync for Pl011Uart {}
 
 impl Pl011Uart {
     pub fn new(base_address: usize) -> Self {

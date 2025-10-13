@@ -10,12 +10,11 @@ PHDRS
 }
 
 _ALIGN_SIZE = 0x1000;
-_RAM_BASE   = 0x40400000;
+_RAM_BASE   = 0x200000;
 
 SECTIONS {
   . = _RAM_BASE;
   _PROGRAM_START = .;
-  . = . + SIZEOF_HEADERS;
 
   .text : ALIGN(_ALIGN_SIZE) {
     *(.text .text.*)
