@@ -1,5 +1,5 @@
 [package]
-name = "elf-hypervisor"
+name = "rpi_boot"
 version = "0.1.0"
 edition = "2024"
 
