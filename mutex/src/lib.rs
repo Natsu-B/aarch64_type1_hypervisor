@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 
+use core::cell::Cell;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::ops::Deref;
@@ -80,6 +81,93 @@ impl<T> Deref for SpinLockGuard<'_, T> {
 }
 
 impl<T> DerefMut for SpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+#[inline(always)]
+fn lock_none(_: &AtomicBool) {}
+
+#[inline(always)]
+fn lock_atomic(locked: &AtomicBool) {
+    while locked
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline(always)]
+fn unlock_atomic(locked: &AtomicBool) {
+    locked.store(false, Ordering::Release);
+}
+
+type LockFn = fn(&AtomicBool);
+type UnLockFn = fn(&AtomicBool);
+
+pub struct RawSpinLock<T: ?Sized> {
+    lock_fn: Cell<LockFn>,
+    unlock_fn: Cell<UnLockFn>,
+    locked: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+pub struct RawSpinLockGuard<'a, T> {
+    lock: &'a RawSpinLock<T>,
+}
+
+unsafe impl<T: ?Sized + Send> Send for RawSpinLock<T> {}
+unsafe impl<T: ?Sized + Send> Sync for RawSpinLock<T> {}
+
+impl<T> RawSpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            lock_fn: Cell::new(lock_none),
+            unlock_fn: Cell::new(lock_none),
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    pub fn lock(&self) -> RawSpinLockGuard<'_, T> {
+        self.lock_fn.get()(&self.locked);
+        RawSpinLockGuard { lock: self }
+    }
+
+    /// Switches the lock into an atomic spin lock once multiple CPUs are active.
+    ///
+    /// Until this is called, [`lock`](Self::lock) is effectively a no-op so the
+    /// raw lock can be used during single-threaded bring-up without paying the
+    /// cost of atomic instructions.
+    pub fn enable_atomic(&self) {
+        self.lock_fn.set(lock_atomic);
+        self.unlock_fn.set(unlock_atomic);
+    }
+}
+
+#[cfg(test)]
+impl<T: ?Sized> RawSpinLock<T> {
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Acquire)
+    }
+}
+
+impl<T> Drop for RawSpinLockGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.unlock_fn.get()(&self.lock.locked);
+    }
+}
+
+impl<T> Deref for RawSpinLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for RawSpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.lock.data.get() }
     }
@@ -209,6 +297,50 @@ mod tests {
     use core::time::Duration;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn raw_spinlock_defaults_to_noop_locking() {
+        let lock = RawSpinLock::new(0usize);
+
+        let guard1 = lock.lock();
+        {
+            let mut guard2 = lock.lock();
+            *guard2 = 1;
+        }
+
+        assert_eq!(*guard1, 1);
+        drop(guard1);
+
+        let guard = lock.lock();
+        assert_eq!(*guard, 1);
+        drop(guard);
+    }
+
+    #[test]
+    fn raw_spinlock_enable_atomic_switches_to_atomic() {
+        let lock = RawSpinLock::new(0u32);
+
+        assert!(!lock.is_locked());
+
+        {
+            let _guard = lock.lock();
+            // No locking applied yet.
+            assert!(!lock.is_locked());
+        }
+
+        lock.enable_atomic();
+
+        let guard = lock.lock();
+        assert!(lock.is_locked());
+        drop(guard);
+
+        assert!(!lock.is_locked());
+
+        let guard = lock.lock();
+        assert!(lock.is_locked());
+        drop(guard);
+        assert!(!lock.is_locked());
+    }
 
     #[test]
     fn spinlock_test() {
