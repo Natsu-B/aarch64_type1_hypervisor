@@ -6,10 +6,10 @@ use core::cell::OnceCell;
 use core::fmt::Write;
 use core::fmt::{self};
 
-use mutex::SpinLock;
+use mutex::RawSpinLock;
 use pl011::Pl011Uart;
 
-pub static DEBUG_UART: SpinLock<OnceCell<Pl011Uart>> = SpinLock::new(OnceCell::new());
+pub static DEBUG_UART: RawSpinLock<OnceCell<Pl011Uart>> = RawSpinLock::new(OnceCell::new());
 
 #[macro_export]
 macro_rules! print {
@@ -40,6 +40,10 @@ pub mod debug_uart {
         let uart = Pl011Uart::new(base_address);
         let debug_uart = DEBUG_UART.lock();
         debug_uart.set(uart).unwrap();
+    }
+
+    pub fn enable_atomic() {
+        DEBUG_UART.enable_atomic();
     }
 }
 

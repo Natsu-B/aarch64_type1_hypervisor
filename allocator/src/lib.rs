@@ -12,7 +12,7 @@ use core::cell::OnceCell;
 use core::cmp::max;
 use core::ptr::null_mut;
 
-use mutex::SpinLock;
+use mutex::RawSpinLock;
 
 use crate::buddy_allocator::BuddyAllocator;
 use crate::range_list_allocator::MemoryBlock;
@@ -48,22 +48,22 @@ macro_rules! levels {
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MemoryAllocator<4096> = MemoryAllocator {
-    range_list_allocator: SpinLock::new(OnceCell::new()),
-    buddy_allocator: SpinLock::new(OnceCell::new()),
+    range_list_allocator: RawSpinLock::new(OnceCell::new()),
+    buddy_allocator: RawSpinLock::new(OnceCell::new()),
 };
 
 #[cfg(test)]
 static GLOBAL_ALLOCATOR: MemoryAllocator<4096> = MemoryAllocator {
-    range_list_allocator: SpinLock::new(OnceCell::new()),
-    buddy_allocator: SpinLock::new(OnceCell::new()),
+    range_list_allocator: RawSpinLock::new(OnceCell::new()),
+    buddy_allocator: RawSpinLock::new(OnceCell::new()),
 };
 
 struct MemoryAllocator<const MAX_ALLOCATABLE_BYTES: usize>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
-    range_list_allocator: SpinLock<OnceCell<MemoryBlock>>,
-    buddy_allocator: SpinLock<OnceCell<BuddyAllocator<MAX_ALLOCATABLE_BYTES>>>,
+    range_list_allocator: RawSpinLock<OnceCell<MemoryBlock>>,
+    buddy_allocator: RawSpinLock<OnceCell<BuddyAllocator<MAX_ALLOCATABLE_BYTES>>>,
 }
 
 unsafe impl<const MAX_ALLOCATABLE_BYTES: usize> Sync for MemoryAllocator<MAX_ALLOCATABLE_BYTES> where
@@ -232,10 +232,14 @@ pub fn allocate_with_size_and_align(size: usize, align: usize) -> Result<usize, 
         .ok_or("failed to allocate")
 }
 
-/// Finalizes the global allocator for boot handoff.
+/// Finalizes the global allocator before handing off control.
 ///
-/// This function is intended to be called just before transferring control
-/// to another kernel or ELF payload (e.g. Linux).
+/// This function should be called right before transferring execution
+/// to another kernel or ELF payload (e.g., Linux).
+///
+/// # Safety
+/// - Do not call this after `enable_atomic` has been invoked.
+/// - This function does not support atomic access and may cause a deadlock.
 pub fn trim_for_boot(reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
     let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
     let Some(block) = guard.get_mut() else {
@@ -245,4 +249,9 @@ pub fn trim_for_boot(reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'stat
         return Err("allocator not finalized");
     }
     block.trim_for_boot(reserve_bytes)
+}
+
+pub fn enable_atomic() {
+    GLOBAL_ALLOCATOR.range_list_allocator.enable_atomic();
+    GLOBAL_ALLOCATOR.buddy_allocator.enable_atomic();
 }
