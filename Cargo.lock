@@ -166,6 +166,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi_boot"
+version = "0.1.0"
+dependencies = [
+ "allocator",
+ "arch_hal",
+ "dtb",
+ "elf",
+ "file",
+ "typestate",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"

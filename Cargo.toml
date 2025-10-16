@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "allocator",
     "rpi_boot",
+    "bootloader",
     "dtb",
     "mutex",
     "xtask",

@@ -1,0 +1,17 @@
+[package]
+name = "elf-hypervisor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dtb = { path = "../dtb" }
+allocator = { path = "../allocator" }
+typestate = { path = "../typestate" }
+file = { path = "../file" }
+elf = { path = "../elf" }
+arch_hal = { path = "../arch_hal" }
+
+[profile.release]
+panic = 'abort'
+[profile.dev]
+panic = 'abort'
