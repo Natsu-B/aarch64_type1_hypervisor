@@ -3,18 +3,19 @@
 
 use core::panic;
 use std::fs;
+use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
 fn main() {
-    let mut args = std::env::args().skip(1); // 実行ファイル名 (xtask) をスキップ
+    // Skip the executable name (xtask)
+    let mut args = std::env::args().skip(1);
 
     let command = args.next();
 
-    // イテレータの残りをすべて収集して引数リストを作成
     let remaining_args: Vec<String> = args.collect();
 
-    // command は Option<String> なので、.as_deref() を使って &str に変換してマッチさせる
     match command.as_deref() {
         Some("build") => {
             let _ = build(&remaining_args).unwrap();
@@ -36,8 +37,14 @@ fn main() {
     }
 }
 
-fn build(args: &[String]) -> Result<String, &'static str> {
-    // Build bootloader crate only (package name = elf-hypervisor)
+fn build(args: &[String]) -> Result<String, String> {
+    match args.first().map(String::as_str) {
+        Some("rpi5") => build_rpi5(&args[1..]),
+        _ => build_bootloader(args),
+    }
+}
+
+fn build_bootloader(args: &[String]) -> Result<String, String> {
     let pkg = "elf-hypervisor";
     eprintln!("\n--- Building bootloader package: {} ---", pkg);
     let mut cmd = Command::new("cargo");
@@ -71,27 +78,152 @@ fn build(args: &[String]) -> Result<String, &'static str> {
     }
 
     eprintln!("\n--- Bootloader built successfully ---");
-    eprintln!("\n--- Searching for built binary... ---");
-    let mut binary_dir = std::env::current_dir().unwrap();
-    binary_dir.push("target");
-    binary_dir.push("aarch64-unknown-none-softfloat");
-    binary_dir.push("debug");
-    binary_dir.push("elf-hypervisor");
-    let mut binary_new_dir = std::env::current_dir().unwrap();
-    binary_new_dir.push("bin");
-    let _ = fs::create_dir(binary_new_dir.clone());
-    binary_new_dir.push("elf-hypervisor.elf");
-    std::fs::copy(binary_dir, binary_new_dir.clone()).expect("failed to copy built binary");
-    Ok(binary_new_dir.to_string_lossy().into_owned())
+    let profile = resolve_profile(args);
+    copy_artifact_to_bin("elf-hypervisor", "elf-hypervisor.elf", &profile)
 }
 
-fn run(args: &[String]) -> Result<(), &'static str> {
-    let binary_path = build(args)?;
+fn build_rpi5(args: &[String]) -> Result<String, String> {
+    let pkg = "rpi_boot";
+    eprintln!("\n--- Building rpi5 package: {} ---", pkg);
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("-Z")
+        .arg("build-std=core,alloc,compiler_builtins")
+        .arg("-Z")
+        .arg("build-std-features=compiler-builtins-mem")
+        .arg("-p")
+        .arg(pkg)
+        .arg("--target")
+        .arg("aarch64-unknown-none-softfloat")
+        .args(args)
+        .env("XTASK_BUILD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    eprintln!("Running: {:?}", cmd);
+    let status = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", pkg, e))
+        .wait()
+        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", pkg, e));
+    if !status.success() {
+        eprintln!(
+            "Error: cargo build failed for package '{}' with status: {:?}",
+            pkg, status
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    eprintln!("\n--- rpi_boot built successfully ---");
+    let profile = resolve_profile(args);
+    copy_artifact_to_bin("rpi_boot", "rpi_boot.elf", &profile)
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("rpi5") => run_rpi5(&args[1..]),
+        _ => {
+            run_default(args);
+        }
+    }
+}
+
+fn run_default(args: &[String]) -> ! {
+    let binary_path = build_bootloader(args).unwrap_or_else(|err| {
+        panic!("Failed to build bootloader: {}", err);
+    });
 
     eprintln!("\n--- Running ./run.sh ---");
     use std::os::unix::process::CommandExt;
-    let _ = Command::new("./run.sh").arg(&binary_path).args(args).exec();
-    unreachable!();
+    let err = Command::new("./run.sh").arg(&binary_path).args(args).exec();
+    panic!("Failed to exec ./run.sh: {}", err);
+}
+
+fn run_rpi5(args: &[String]) -> Result<(), String> {
+    let elf_path = PathBuf::from(build_rpi5(args)?);
+    let img_path = elf_path.with_extension("img");
+
+    eprintln!(
+        "\n--- Converting {} to raw image: {} ---",
+        elf_path.display(),
+        img_path.display()
+    );
+
+    let status = Command::new("rust-objcopy")
+        .arg("-O")
+        .arg("binary")
+        .arg(&elf_path)
+        .arg(&img_path)
+        .status()
+        .map_err(|err| match err.kind() {
+            io::ErrorKind::NotFound => "rust-objcopy is required but not available in PATH. \
+                 Enter the nix develop shell or install rust-objcopy."
+                .to_string(),
+            _ => format!("Failed to launch rust-objcopy: {}", err),
+        })?;
+
+    if status.success() {
+        eprintln!("Image generated at {}", img_path.display());
+        Ok(())
+    } else {
+        Err(format!("rust-objcopy exited with status {}", status))
+    }
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    std::env::current_dir().map_err(|e| format!("Failed to determine workspace root: {}", e))
+}
+
+fn copy_artifact_to_bin(
+    binary_name: &str,
+    destination_name: &str,
+    profile: &str,
+) -> Result<String, String> {
+    let workspace = workspace_root()?;
+    let artifact_path = workspace
+        .join("target")
+        .join("aarch64-unknown-none-softfloat")
+        .join(profile)
+        .join(binary_name);
+
+    let bin_dir = workspace.join("bin");
+    fs::create_dir_all(&bin_dir).map_err(|e| format!("Failed to create bin directory: {}", e))?;
+
+    let destination = bin_dir.join(destination_name);
+    fs::copy(&artifact_path, &destination).map_err(|e| {
+        format!(
+            "Failed to copy {} to {}: {}",
+            artifact_path.display(),
+            destination.display(),
+            e
+        )
+    })?;
+
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+fn resolve_profile(args: &[String]) -> String {
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--profile=") {
+            return value.to_owned();
+        }
+    }
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--profile" {
+            if let Some(value) = iter.next() {
+                return value.clone();
+            }
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--release") {
+        return "release".to_owned();
+    }
+
+    "debug".to_owned()
 }
 
 fn test(args: &[String]) {
