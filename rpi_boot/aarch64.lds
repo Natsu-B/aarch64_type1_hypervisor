@@ -1,44 +1,47 @@
-OUTPUT_FORMAT(elf64-aarch64)
+OUTPUT_ARCH(aarch64)
 ENTRY(_start)
 
-PHDRS
-{
-    headers PT_PHDR PHDRS;
-    text PT_LOAD FILEHDR PHDRS;
-    rodata PT_LOAD;
-    data PT_LOAD;
+PHDRS {
+  text    PT_LOAD FLAGS(0x5);  /* RX */
+  rodata  PT_LOAD FLAGS(0x4);  /* R */
+  data    PT_LOAD FLAGS(0x6);  /* RW */
+  payload PT_LOAD FLAGS(0x4);  /* R  */
 }
 
-_ALIGN_SIZE = 0x1000;
-_RAM_BASE   = 0x200000;
+SECTIONS
+{
+    . = 0x200000;
+    _PROGRAM_START = .;
 
-SECTIONS {
-  . = _RAM_BASE;
-  _PROGRAM_START = .;
+    .text ALIGN(8) : {
+        *(.text.boot)
+        *(.text*)
+    } :text
 
-  .text : ALIGN(_ALIGN_SIZE) {
-    *(.text .text.*)
-  }
+    .rodata ALIGN(8) : {
+        *(.rodata*)
+    } : rodata
 
-  .data : ALIGN(_ALIGN_SIZE) {
-    *(.data .data.*)
-  }
+    .data ALIGN(8) : {
+        *(.data*)
+    } :data
 
-  .rodata : ALIGN(_ALIGN_SIZE) {
-    *(.rodata .rodata.*)
-  }
+    .bss ALIGN(8) : {
+        _BSS_START = .;
+        *(.bss*)
+        . = ALIGN(8);
+        _BSS_END = .;
+    } :data
 
-  .bss : ALIGN(_ALIGN_SIZE) {
-    _BSS_START = .;
-    *(.bss .bss.*)
-    _BSS_END = .;
-  }
+    .img ALIGN(0x1000) : {
+        __linux_image_start = .;
+        KEEP(*(.img*))
+        . = ALIGN(0x1000);
+        __linux_image_end = .;
+    } :payload
 
-  .got : ALIGN(_ALIGN_SIZE) {
-    *(.got .got.*)
-  }
-  _PROGRAM_END = .;
+    _PROGRAM_END = .;
 
-  . = 0x50000000;
-  _STACK_TOP = .;
+    . = _PROGRAM_END + 0x1000;
+    _STACK_TOP = .;
 }
