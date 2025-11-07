@@ -232,10 +232,16 @@ impl Pl011Uart {
     }
 
     pub fn flush(&self) {
-        while (self.registers.flags.read() & UARTFR::BUSY_MASK) != UARTFR(0) {
-            core::hint::spin_loop();
-        }
-        while (self.registers.flags.read() & UARTFR::TXFE_MASK) == UARTFR(0) {
+        // enable pl011 for flushing
+        self.registers
+            .control
+            .set_bits(UARTCR::UARTEN_MASK + UARTCR::TXE_MASK);
+        self.registers.control.clear_bits(UARTCR::CTSEN_MASK);
+        self.registers.line_control.clear_bits(UARTLCR::BRK_MASK);
+        // wait until flushed
+        let mut spin = 0;
+        while (self.registers.flags.read() & UARTFR::BUSY_MASK) != UARTFR(0) && spin <= 1000 {
+            spin += 1;
             core::hint::spin_loop();
         }
     }
