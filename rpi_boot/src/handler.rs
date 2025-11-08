@@ -20,6 +20,13 @@ fn data_abort_handler(
     access_width: SyndromeAccessSize,
     write_access: WriteNotRead,
 ) {
+    println!(
+        "data abort trapped: addr: {:X}, access_width: {:?}, write?: {}, data: {}",
+        address,
+        access_width,
+        write_access == WriteNotRead::WritingMemoryAbort,
+        *register
+    );
     unsafe {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
@@ -41,29 +48,20 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-                if let Some(uart) = *UART_ADDR.get()
-                    && (uart..uart + 0x1000).contains(&(address as usize))
-                {
-                    if uart == address as usize && reg_val == b'\n' as u64 {
-                        println!("\nhypervisor: alive");
+                match access_width {
+                    SyndromeAccessSize::Byte => {
+                        write_volatile(address as *mut u8, reg_val as u8);
                     }
-                    match access_width {
-                        SyndromeAccessSize::Byte => {
-                            write_volatile(address as *mut u8, reg_val as u8);
-                        }
-                        SyndromeAccessSize::HalfWord => {
-                            write_volatile(address as *mut u16, reg_val as u16);
-                        }
-                        SyndromeAccessSize::Word => {
-                            write_volatile(address as *mut u32, reg_val as u32);
-                        }
-                        SyndromeAccessSize::DoubleWord => {
-                            write_volatile(address as *mut u64, reg_val as u64);
-                        }
+                    SyndromeAccessSize::HalfWord => {
+                        write_volatile(address as *mut u16, reg_val as u16);
                     }
-                } else {
-                    panic!("invalid abort addr: 0x{:X}", address);
-                };
+                    SyndromeAccessSize::Word => {
+                        write_volatile(address as *mut u32, reg_val as u32);
+                    }
+                    SyndromeAccessSize::DoubleWord => {
+                        write_volatile(address as *mut u64, reg_val as u64);
+                    }
+                }
             }
         }
     }

@@ -28,6 +28,7 @@ use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
 use core::ptr::slice_from_raw_parts_mut;
+use core::ptr::write_volatile;
 use core::slice;
 use core::time::Duration;
 use core::usize;
@@ -36,7 +37,8 @@ use dtb::DtbParser;
 use file::AlignedSliceBox;
 use typestate::Le;
 
-static LINUX: &[u8] = include_bytes!("../../bin/Image");
+#[unsafe(link_section = ".img")]
+static LINUX: [u8; include_bytes!("../../bin/Image").len()] = *include_bytes!("../../bin/Image");
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -44,12 +46,18 @@ unsafe extern "C" {
     static mut _PROGRAM_START: usize;
     static mut _PROGRAM_END: usize;
     static mut _STACK_TOP: usize;
+    static __linux_image_start: u8;
+    static __linux_image_end: u8;
 }
 
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
-static PL011_UART_ADDR: usize = 0x10_7D00_1000;
+static RP1_BASE: usize = 0x1c_0000_0000;
+static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
+static RP1_PAD: usize = RP1_BASE + 0xf_0000;
+static PL011_UART_ADDR: usize = RP1_BASE + 0x3_0000;
+// static PL011_UART_ADDR: usize = 0x10_7D00_1000;
 
 #[repr(C)]
 struct LinuxHeader {
@@ -96,7 +104,13 @@ loop:
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     let program_start = unsafe { &raw mut _PROGRAM_START } as *const _ as usize;
-    let stack_start = unsafe { &raw mut _STACK_TOP } as *const _ as usize;
+    let program_end = unsafe { &raw mut _PROGRAM_END } as *const _ as usize;
+
+    debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000);
+    cpu::isb();
+    cpu::dsb_ish();
+    debug_uart::write("HelloWorld!!!");
+    println!("debug uart starting...\r\n");
 
     println!("setup exception");
     exceptions::setup_exception();
@@ -104,16 +118,6 @@ extern "C" fn main() -> ! {
 
     const DTB_PTR: usize = 0x2000_0000;
     let dtb = DtbParser::init(DTB_PTR).unwrap();
-    let mut pl011_addr = None;
-    let mut pl011_size = None;
-    dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
-        debug_uart::init(addr);
-        pl011_addr = Some(addr);
-        pl011_size = Some(size);
-        ControlFlow::Break(())
-    })
-    .unwrap();
-    println!("debug uart starting...\r\n");
     assert_eq!(cpu::get_current_el(), 2);
 
     let mut systimer = SystemTimer::new();
@@ -121,20 +125,30 @@ extern "C" fn main() -> ! {
     println!("setup allocator");
     allocator::init();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
+        println!("available region addr=0x{:X}, size=0x{:X}", addr, size);
         allocator::add_available_region(addr, size).unwrap();
         ControlFlow::Continue(())
     })
     .unwrap();
     dtb.find_memory_reservation_block(&mut |addr, size| {
+        println!("reserved (memreserve) addr=0x{:X}, size=0x{:X}", addr, size);
         allocator::add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
     dtb.find_reserved_memory_node(
         &mut |addr, size| {
+            println!(
+                "reserved (node static) addr=0x{:X}, size=0x{:X}",
+                addr, size
+            );
             allocator::add_reserved_region(addr, size).unwrap();
             ControlFlow::Continue(())
         },
         &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
+            println!(
+                "reserved (node dynamic) size=0x{:X}, align={:?}, range={:?}",
+                size, align, alloc_range
+            );
             if allocator::allocate_dynamic_reserved_region(size, align, alloc_range)
                 .unwrap()
                 .is_some()
@@ -146,16 +160,34 @@ extern "C" fn main() -> ! {
         },
     )
     .unwrap();
-    allocator::add_reserved_region(program_start, stack_start - program_start).unwrap();
+    println!(
+        "reserved program image addr=0x{:X}, size=0x{:X}",
+        program_start,
+        program_end - program_start
+    );
+    allocator::add_reserved_region(program_start, program_end - program_start).unwrap();
+    println!(
+        "reserved dtb addr=0x{:X}, size=0x{:X}",
+        DTB_PTR,
+        dtb.get_size()
+    );
     allocator::add_reserved_region(DTB_PTR, dtb.get_size()).unwrap();
+    println!("finalizing allocator...");
     allocator::finalize().unwrap();
+    println!("allocator free regions after finalize:");
+    allocator::for_each_free_region(|addr, size| {
+        println!("  free: addr=0x{:X}, size=0x{:X}", addr, size);
+    })
+    .unwrap();
+    println!("allocator reserved regions after finalize:");
+    allocator::for_each_reserved_region(|addr, size| {
+        println!("  reserved: addr=0x{:X}, size=0x{:X}", addr, size);
+    })
+    .unwrap();
     println!("allocator setup success!!!");
 
     // setup paging
     println!("start paging...");
-    let pl011_addr = pl011_addr.unwrap();
-    let pl011_size = pl011_size.unwrap();
-    println!("pl011 addr: 0x{:X}, size: 0x{:X}", pl011_addr, pl011_size);
     let parange = match cpu::get_parange().unwrap() {
         cpu::registers::PARange::PA32bits4GB => 32,
         cpu::registers::PARange::PA36bits64GB => 36,
@@ -166,16 +198,18 @@ extern "C" fn main() -> ! {
         cpu::registers::PARange::PA52bits4PB => 52,
         cpu::registers::PARange::PA56bits64PB => 56,
     };
-    let paging_data: [Stage2PagingSetting; 2] = [
+    let ipa_space = 1usize << parange;
+    const PAGE_SIZE: usize = 0x1000;
+    let mut paging_data = [
         Stage2PagingSetting {
-            ipa: 0x0000,
-            pa: 0x0000,
-            size: pl011_addr,
+            ipa: 0,
+            pa: 0,
+            size: 0xfff000,
         },
         Stage2PagingSetting {
-            ipa: pl011_addr + pl011_size,
-            pa: pl011_addr + pl011_size,
-            size: (1 << parange) - pl011_addr - pl011_size,
+            ipa: 0xfff000 + 0x1000,
+            pa: 0xfff000 + 0x1000,
+            size: ipa_space - 0xfff000 - 0x1000,
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data).unwrap();
@@ -192,7 +226,7 @@ extern "C" fn main() -> ! {
     let text_offset = linux_header.text_offset.read() as usize;
     let linux = AlignedSliceBox::new_uninit_with_align(image_size, 0x2 * 0x1000 * 0x1000).unwrap();
     let mut linux = unsafe { linux.assume_init() };
-    unsafe { &mut linux[..LINUX.len()].copy_from_slice(&LINUX) };
+    linux[..LINUX.len()].copy_from_slice(&LINUX);
     let jump_addr = linux.as_ptr() as usize + text_offset;
     unsafe { *LINUX_ADDR.get() = jump_addr as usize };
     let mut modified: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(dtb.get_size());
@@ -211,7 +245,7 @@ extern "C" fn main() -> ! {
     drop(tmp);
     let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
     println!("allocator closed");
-    reserved_memory.push((program_start, stack_start));
+    reserved_memory.push((program_start, program_end));
 
     let new_dtb = DtbGenerator::new(&dtb_modified);
     let dtb_size = new_dtb.get_required_size(reserved_memory.len());
@@ -262,16 +296,19 @@ extern "C" fn el1_main() {
     unsafe {
         core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
 
-        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
-            *LINUX_ADDR.get() as usize
-        )(*DTB_ADDR.get(), 0, 0, 0);
+        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(*LINUX_ADDR.get())(
+            *DTB_ADDR.get(),
+            0,
+            0,
+            0,
+        );
     }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
-    debug_uart.init(4400_0000, 115200);
+    debug_uart.init(4800_0000, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
     debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}

@@ -33,7 +33,11 @@ SECTIONS
         _BSS_END = .;
     } :data
 
-    .img ALIGN(0x1000) : {
+    . = . + 0x10000;
+
+    _STACK_TOP = .;
+
+    .img ALIGN(0x2 * 0x1000 * 0x1000) : {
         __linux_image_start = .;
         KEEP(*(.img*))
         . = ALIGN(0x1000);
@@ -41,7 +45,4 @@ SECTIONS
     } :payload
 
     _PROGRAM_END = .;
-
-    . = _PROGRAM_END + 0x1000;
-    _STACK_TOP = .;
 }
