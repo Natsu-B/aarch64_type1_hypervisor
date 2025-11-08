@@ -373,7 +373,8 @@ impl MemoryBlock {
     /// This function operates under the following assumption:
     /// 1.  **Caller-Guaranteed Sort**: The `regions` and `reserved_regions` slices
     ///     are guaranteed by the caller to be pre-sorted by their base address.
-    /// 2.  Each `reserved_region` must be fully contained within a single `region`.
+    /// 2.  Reserved regions may partially overlap or span multiple regions; only the
+    ///     overlapping portions are subtracted. Non-overlapping parts are ignored.
     pub fn check_regions(&mut self) -> Result<(), &'static str> {
         const MAX_REGIONS: usize = 120; // A safe upper limit to allow for splits.
         if self.region_size as usize > MAX_REGIONS
@@ -386,72 +387,49 @@ impl MemoryBlock {
             return Ok(()); // Nothing to do if there are no reserved regions.
         }
 
-        let regions = &mut self.regions;
-        let reserved_regions = &self.reserved_regions[..self.reserved_region_size as usize];
-
         let mut region_idx: usize = 0;
 
-        for reserved_region in reserved_regions {
-            // Advance `region_idx` to find the region that could contain the reserved_region.
-            while region_idx < self.region_size as usize
-                && regions[region_idx].end() <= reserved_region.address
-            {
-                region_idx += 1;
-            }
+        for i in 0..self.reserved_region_size as usize {
+            let reserved_region = self.reserved_regions[i];
+            let mut cursor = reserved_region.address;
+            let reserved_end = reserved_region.end();
+            let mut processed = false;
 
-            if region_idx == self.region_size as usize {
-                return Err("invalid reserved region: located outside of all available regions");
-            }
-
-            if reserved_region.address < regions[region_idx].address
-                || reserved_region.end() > regions[region_idx].end()
-            {
-                return Err("the memory region is smaller than the reserved region");
-            }
-
-            let starts_at_same_address = regions[region_idx].address == reserved_region.address;
-            let ends_at_same_address = regions[region_idx].end() == reserved_region.end();
-
-            match (starts_at_same_address, ends_at_same_address) {
-                // Case 1: The reserved region perfectly matches the available region.
-                (true, true) => {
-                    regions.copy_within((region_idx + 1)..(self.region_size as usize), region_idx);
-                    self.region_size -= 1;
-                }
-                // Case 2: The reserved region is at the beginning of the available region.
-                (true, false) => {
-                    let subtracted_size = reserved_region.size;
-                    regions[region_idx].address += subtracted_size;
-                    regions[region_idx].size -= subtracted_size;
-                }
-                // Case 3: The reserved region is at the end of the available region.
-                (false, true) => {
-                    regions[region_idx].size -= reserved_region.size;
-                }
-                // Case 4: The reserved region is in the middle, splitting the available region.
-                (false, false) => {
-                    let new_region_count = self.region_size as usize + 1;
-                    if new_region_count > self.region_capacity as usize {
-                        return Err("region buffer overflow after splitting");
-                    }
-
-                    let original_region_end = regions[region_idx].end();
-
-                    regions[region_idx].size =
-                        reserved_region.address - regions[region_idx].address;
-
-                    let new_region = MemoryRegions {
-                        address: reserved_region.end(),
-                        size: original_region_end - reserved_region.end(),
-                    };
-
-                    let insert_idx = region_idx + 1;
-                    regions.copy_within(insert_idx..self.region_size as usize, insert_idx + 1);
-                    regions[insert_idx] = new_region;
-
-                    self.region_size += 1;
+            while cursor < reserved_end {
+                while region_idx < self.region_size as usize
+                    && self.regions[region_idx].end() <= cursor
+                {
                     region_idx += 1;
                 }
+
+                if region_idx == self.region_size as usize {
+                    // Remaining reserved portion lies outside the known available regions.
+                    cursor = reserved_end;
+                    processed = true;
+                    break;
+                }
+
+                if reserved_end <= self.regions[region_idx].address {
+                    cursor = reserved_end;
+                    processed = true;
+                    break;
+                }
+
+                let clipped_start = max(cursor, self.regions[region_idx].address);
+                let clipped_end = min(reserved_end, self.regions[region_idx].end());
+
+                if clipped_start >= clipped_end {
+                    cursor = clipped_end;
+                    continue;
+                }
+
+                processed = true;
+                self.subtract_reserved_segment(&mut region_idx, clipped_start, clipped_end)?;
+                cursor = clipped_end;
+            }
+
+            if cursor < reserved_end && !processed {
+                return Err("invalid reserved region: located outside of all available regions");
             }
         }
 
@@ -465,6 +443,67 @@ impl MemoryBlock {
         self.reserved_region_size = 0;
 
         self.allocatable = true;
+        Ok(())
+    }
+
+    fn subtract_reserved_segment(
+        &mut self,
+        region_idx: &mut usize,
+        start: usize,
+        end: usize,
+    ) -> Result<(), &'static str> {
+        debug_assert!(start < end);
+
+        let idx = *region_idx;
+        let regions = &mut self.regions;
+        let region_address = regions[idx].address;
+        let region_end = regions[idx].end();
+
+        debug_assert!(start >= region_address);
+        debug_assert!(end <= region_end);
+
+        let starts_at_same_address = region_address == start;
+        let ends_at_same_address = region_end == end;
+        let subtracted_size = end - start;
+
+        match (starts_at_same_address, ends_at_same_address) {
+            (true, true) => {
+                regions.copy_within((idx + 1)..(self.region_size as usize), idx);
+                self.region_size -= 1;
+                let last_idx = self.region_size as usize;
+                regions[last_idx] = MemoryRegions {
+                    address: 0,
+                    size: 0,
+                };
+            }
+            (true, false) => {
+                regions[idx].address += subtracted_size;
+                regions[idx].size -= subtracted_size;
+            }
+            (false, true) => {
+                regions[idx].size -= subtracted_size;
+            }
+            (false, false) => {
+                let new_region_count = self.region_size as usize + 1;
+                if new_region_count > self.region_capacity as usize {
+                    return Err("region buffer overflow after splitting");
+                }
+
+                let original_end = region_end;
+                regions[idx].size = start - region_address;
+
+                let insert_idx = idx + 1;
+                regions.copy_within(insert_idx..self.region_size as usize, insert_idx + 1);
+                regions[insert_idx] = MemoryRegions {
+                    address: end,
+                    size: original_end - end,
+                };
+
+                self.region_size += 1;
+                *region_idx += 1;
+            }
+        }
+
         Ok(())
     }
 
@@ -728,6 +767,18 @@ impl MemoryBlock {
         self.remove_reserved_alloc_record(allocate, reserve_bytes);
         self.add_free_region_merge(allocate, reserve_bytes);
         Ok(vec)
+    }
+
+    pub fn for_each_free_region<F: FnMut(usize, usize)>(&self, mut f: F) {
+        for region in self.regions[..self.region_size as usize].iter() {
+            f(region.address, region.size);
+        }
+    }
+
+    pub fn for_each_reserved_region<F: FnMut(usize, usize)>(&self, mut f: F) {
+        for region in self.reserved_regions[..self.reserved_region_size as usize].iter() {
+            f(region.address, region.size);
+        }
     }
 }
 
@@ -1095,6 +1146,87 @@ mod tests {
     }
 
     #[test]
+    fn check_regions_does_not_align_without_reserved_regions() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1234,
+                size: 0x5000,
+            })
+            .unwrap();
+
+        allocator.check_regions().expect("reconcile pass failed");
+
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1234,
+                size: 0x5000
+            }
+        );
+    }
+
+    #[test]
+    fn allocations_are_page_aligned() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x0,
+                size: 0x3FC0_0000,
+            })
+            .unwrap();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x4000_0000,
+                size: 0xC000_0000,
+            })
+            .unwrap();
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x0,
+                size: 0x80_000,
+            })
+            .unwrap();
+        allocator
+            .add_reserved_region_dynamic(0x4000_000, None, Some((0, 0x4000_0000)))
+            .unwrap()
+            .expect("dynamic reserved region allocation failed");
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x3FD1_67A0,
+                size: 0xA1,
+            })
+            .unwrap();
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x80_000,
+                size: 0x3E0_0000,
+            })
+            .unwrap();
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x2000_0000,
+                size: 0x13B29,
+            })
+            .unwrap();
+
+        allocator.check_regions().unwrap();
+
+        let addr_big = allocator
+            .allocate_region_internal(0x8000, 0x8000)
+            .expect("failed to allocate 32KiB aligned block");
+        assert_eq!(addr_big & 0x7FFF, 0);
+
+        for _ in 0..0x1000 {
+            let addr = allocator
+                .allocate_region_internal(0x1_000, 0x1000)
+                .expect("failed to allocate 4KiB page");
+            assert_eq!(addr & 0xFFF, 0);
+        }
+    }
+
+    #[test]
     fn check_regions_error_outside() {
         let mut allocator = MemoryBlock::init();
         allocator
@@ -1109,9 +1241,14 @@ mod tests {
                 size: 0x100,
             })
             .unwrap();
+        assert_eq!(allocator.check_regions(), Ok(()));
+        assert_eq!(allocator.region_size, 1);
         assert_eq!(
-            allocator.check_regions(),
-            Err("invalid reserved region: located outside of all available regions")
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x1000
+            }
         );
     }
 
@@ -1130,10 +1267,8 @@ mod tests {
                 size: 0x200,
             })
             .unwrap();
-        assert_eq!(
-            allocator.check_regions(),
-            Err("the memory region is smaller than the reserved region")
-        );
+        assert_eq!(allocator.check_regions(), Ok(()));
+        assert_eq!(allocator.region_size, 0);
     }
 
     #[test]
