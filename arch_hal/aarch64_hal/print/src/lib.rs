@@ -36,10 +36,20 @@ pub mod debug_uart {
     use crate::DEBUG_UART;
     use crate::pl011;
 
-    pub fn init(base_address: usize) {
-        let uart = Pl011Uart::new(base_address);
+    pub fn init(base_address: usize, uart_clk: u32) {
         let debug_uart = DEBUG_UART.lock();
-        debug_uart.set(uart).unwrap();
+        if debug_uart.get().is_none() {
+            let uart = Pl011Uart::new(base_address);
+            uart.init(uart_clk, 115200);
+            let _ = debug_uart.set(uart);
+        }
+    }
+
+    pub fn write(s: &str) {
+        let mut debug_uart = DEBUG_UART.lock();
+        if let Some(uart) = debug_uart.get_mut() {
+            let _ = uart.write(s);
+        }
     }
 
     pub fn enable_atomic() {
@@ -49,6 +59,7 @@ pub mod debug_uart {
 
 pub fn _print(args: fmt::Arguments) {
     let mut debug_uart = DEBUG_UART.lock();
-    let uart = debug_uart.get_mut().unwrap();
-    uart.write_fmt(args).unwrap();
+    if let Some(uart) = debug_uart.get_mut() {
+        let _ = uart.write_fmt(args);
+    }
 }

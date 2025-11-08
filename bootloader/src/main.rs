@@ -88,7 +88,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let mut pl011_addr = None;
     let mut pl011_size = None;
     dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
-        debug_uart::init(addr);
+        debug_uart::init(addr, 48 * 1000 * 1000);
         pl011_addr = Some(addr);
         pl011_size = Some(size);
         ControlFlow::Break(())
