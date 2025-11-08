@@ -142,7 +142,8 @@ fn run_default(args: &[String]) -> ! {
 
 fn run_rpi5(args: &[String]) -> Result<(), String> {
     let elf_path = PathBuf::from(build_rpi5(args)?);
-    let img_path = elf_path.with_extension("img");
+    let mut img_path = elf_path.clone();
+    img_path.set_file_name("kernel_2712.img");
 
     eprintln!(
         "\n--- Converting {} to raw image: {} ---",
