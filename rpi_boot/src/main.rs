@@ -52,12 +52,11 @@ unsafe extern "C" {
 
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
-pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
 static RP1_BASE: usize = 0x1c_0000_0000;
 static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
 static RP1_PAD: usize = RP1_BASE + 0xf_0000;
-static PL011_UART_ADDR: usize = RP1_BASE + 0x3_0000;
-// static PL011_UART_ADDR: usize = 0x10_7D00_1000;
+// static PL011_UART_ADDR: usize = RP1_BASE + 0x3_0000;
+static PL011_UART_ADDR: usize = 0x10_7D00_1000;
 
 #[repr(C)]
 struct LinuxHeader {
@@ -106,7 +105,8 @@ extern "C" fn main() -> ! {
     let program_start = unsafe { &raw mut _PROGRAM_START } as *const _ as usize;
     let program_end = unsafe { &raw mut _PROGRAM_END } as *const _ as usize;
 
-    debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000);
+    // debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000);
+    debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000);
     cpu::isb();
     cpu::dsb_ish();
     debug_uart::write("HelloWorld!!!");
@@ -209,7 +209,12 @@ extern "C" fn main() -> ! {
         Stage2PagingSetting {
             ipa: 0xfff000 + 0x1000,
             pa: 0xfff000 + 0x1000,
-            size: ipa_space - 0xfff000 - 0x1000,
+            size: PL011_UART_ADDR - 0xfff000 - 0x1000,
+        },
+        Stage2PagingSetting {
+            ipa: PL011_UART_ADDR + 0x1000,
+            pa: PL011_UART_ADDR + 0x1000,
+            size: ipa_space - PL011_UART_ADDR - 0x1000,
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data).unwrap();

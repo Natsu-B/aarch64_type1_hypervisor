@@ -10,11 +10,14 @@ PHDRS {
 
 SECTIONS
 {
-    . = 0x200000;
+    . = 0x80000;
     _PROGRAM_START = .;
 
+    .text.boot : {
+        *(.text.boot*)
+    } : text
+
     .text ALIGN(8) : {
-        *(.text.boot)
         *(.text*)
     } :text
 
