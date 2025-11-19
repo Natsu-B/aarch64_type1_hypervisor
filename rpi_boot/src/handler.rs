@@ -1,4 +1,3 @@
-use crate::UART_ADDR;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::println;
@@ -8,6 +7,8 @@ use core::ptr::write_volatile;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
+
+use crate::PL011_UART_ADDR;
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
@@ -20,13 +21,6 @@ fn data_abort_handler(
     access_width: SyndromeAccessSize,
     write_access: WriteNotRead,
 ) {
-    println!(
-        "data abort trapped: addr: {:X}, access_width: {:?}, write?: {}, data: {}",
-        address,
-        access_width,
-        write_access == WriteNotRead::WritingMemoryAbort,
-        *register
-    );
     unsafe {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
@@ -47,6 +41,20 @@ fn data_abort_handler(
                 let reg_val = match reg_size {
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
+                };
+                let uart = PL011_UART_ADDR;
+                if (uart..uart + 0x1000).contains(&(address as usize)) {
+                    if uart == address as usize && reg_val == b'\n' as u64 {
+                        println!("\nhypervisor: alive");
+                    }
+                } else {
+                    println!(
+                        "data abort trapped: addr: {:X}, access_width: {:?}, write?: {}, data: {}",
+                        address,
+                        access_width,
+                        write_access == WriteNotRead::WritingMemoryAbort,
+                        *register
+                    );
                 };
                 match access_width {
                     SyndromeAccessSize::Byte => {
