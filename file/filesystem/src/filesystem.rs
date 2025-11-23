@@ -89,6 +89,7 @@ pub enum OpenOptions {
     Write,
 }
 
+#[must_use]
 pub trait FileSystemTrait {
     // file
     fn open(
@@ -98,23 +99,27 @@ pub trait FileSystemTrait {
         path: &str,
         opts: &OpenOptions,
     ) -> Result<FileHandle, FileSystemErr>;
+
     fn create_file(
         &self,
         block_device: &Arc<dyn BlockDevice>,
         file_system: &Arc<dyn FileSystemTrait>,
         path: &str,
     ) -> Result<FileHandle, FileSystemErr>;
+
     fn remove_file(
         &self,
         block_device: &Arc<dyn BlockDevice>,
         path: &str,
     ) -> Result<(), FileSystemErr>;
+
     fn copy(
         &self,
         block_device: &Arc<dyn BlockDevice>,
         from: &str,
         to: &str,
     ) -> Result<(), FileSystemErr>;
+
     fn rename(
         &self,
         block_device: &Arc<dyn BlockDevice>,
@@ -128,6 +133,7 @@ pub trait FileSystemTrait {
         block_device: &Arc<dyn BlockDevice>,
         path: &str,
     ) -> Result<(), FileSystemErr>;
+
     fn remove_dir(
         &self,
         block_device: &Arc<dyn BlockDevice>,

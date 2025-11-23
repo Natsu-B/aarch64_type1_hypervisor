@@ -165,6 +165,9 @@ impl FAT32FileSystem {
         let cluster_bytes = self.cluster_size_bytes();
         let sector_bytes = self.volume.bytes_per_sector as usize;
 
+        // Track long directory entry count across clusters so LFN sequences that
+        // span a cluster boundary can still be matched with their short entry.
+        let mut lde_num = 0;
         for cluster in FAT32FATIter::new(block_device, self, dir_cluster) {
             let cluster = cluster?;
             let mut data = AlignedSliceBox::<u8>::new_uninit_with_align(cluster_bytes, 2).unwrap();
@@ -172,7 +175,6 @@ impl FAT32FileSystem {
                 .read_at(cluster.lba, &mut data)
                 .map_err(from_io_err)?;
             let data = unsafe { data.assume_init() };
-            let mut lde_num = 0;
             'outer: for entry_off in
                 (0..cluster_bytes).step_by(size_of::<FAT32ByteDirectoryEntry>())
             {
@@ -1122,8 +1124,10 @@ impl FAT32FileSystem {
         let sector_size = self.volume.bytes_per_sector as usize;
         let entry_size = size_of::<FAT32ByteDirectoryEntry>();
         let mut buffer = vec![0u8; cluster_size];
+        let mut cluster_lbas = Vec::new();
         for info in FAT32FATIter::new(block_device, self, dir_cluster) {
             let info = info?;
+            cluster_lbas.push(info.lba);
             let start = info.lba;
             let end = start + self.volume.sectors_per_cluster as u64;
             if meta.entry_lba < start || meta.entry_lba >= end {
@@ -1139,19 +1143,41 @@ impl FAT32FileSystem {
                 return Err(FileSystemErr::Corrupted);
             }
             buffer[entry_off] = 0xE5;
-            while entry_off >= entry_size {
-                let prev = entry_off - entry_size;
-                let attr = buffer[prev + FAT32DirectoryEntryAttribute::OFFSET];
-                if attr != FAT32DirectoryEntryAttribute::ATTR_LONG_NAME.raw() {
-                    break;
+            let mut current_cluster_idx = cluster_lbas.len() - 1;
+            let mut dirty = true;
+            loop {
+                if entry_off >= entry_size {
+                    let prev = entry_off - entry_size;
+                    let attr = buffer[prev + FAT32DirectoryEntryAttribute::OFFSET];
+                    if attr != FAT32DirectoryEntryAttribute::ATTR_LONG_NAME.raw() {
+                        if dirty {
+                            block_device
+                                .write_at(cluster_lbas[current_cluster_idx], &buffer)
+                                .map_err(from_io_err)?;
+                        }
+                        return Ok(());
+                    }
+                    buffer[prev] = 0xE5;
+                    entry_off = prev;
+                    dirty = true;
+                    continue;
                 }
-                buffer[prev] = 0xE5;
-                entry_off = prev;
+                if dirty {
+                    block_device
+                        .write_at(cluster_lbas[current_cluster_idx], &buffer)
+                        .map_err(from_io_err)?;
+                    dirty = false;
+                }
+                if current_cluster_idx == 0 {
+                    return Ok(());
+                }
+                current_cluster_idx -= 1;
+                let mut uninit = slice_as_uninit(&mut buffer);
+                block_device
+                    .read_at(cluster_lbas[current_cluster_idx], &mut uninit)
+                    .map_err(from_io_err)?;
+                entry_off = buffer.len();
             }
-            block_device
-                .write_at(info.lba, &buffer)
-                .map_err(from_io_err)?;
-            return Ok(());
         }
         Err(FileSystemErr::Corrupted)
     }
