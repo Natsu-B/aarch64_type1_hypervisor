@@ -91,6 +91,30 @@ pub fn get_hcr_el2() -> u64 {
     hcr_el2
 }
 
+pub fn get_mair_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, mair_el2", val = out(reg) val) };
+    val
+}
+
+pub fn get_tcr_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, tcr_el2", val = out(reg) val) };
+    val
+}
+
+pub fn get_ttbr0_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, ttbr0_el2", val = out(reg) val) };
+    val
+}
+
+pub fn get_sctlr_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, sctlr_el2", val = out(reg) val) };
+    val
+}
+
 pub fn set_vtcr_el2(vtcr_el2: u64) {
     unsafe { asm!("msr vtcr_el2, {}", in(reg)vtcr_el2) };
 }

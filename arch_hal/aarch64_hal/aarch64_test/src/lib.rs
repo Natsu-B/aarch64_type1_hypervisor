@@ -1,9 +1,11 @@
 #![no_std]
 
+#[cfg(feature = "bump-allocator")]
 extern crate alloc;
 
 use core::arch::asm;
 
+#[cfg(feature = "bump-allocator")]
 mod allocator {
     use core::alloc::GlobalAlloc;
     use core::alloc::Layout;

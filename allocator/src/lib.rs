@@ -151,7 +151,7 @@ where
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "no-alloc-error-handler")))]
 #[alloc_error_handler]
 fn panic(layout: Layout) -> ! {
     pr_debug!("allocator panicked!!: {:?}", layout);
