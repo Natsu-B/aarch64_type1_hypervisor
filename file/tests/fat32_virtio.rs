@@ -13,6 +13,12 @@ use file::StorageDeviceErr;
 use filesystem::FileSystemErr;
 
 const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+const HELLO_TXT: &str = "HelloWorld, from FAT32 txt file!!!";
+const HELLO_WRITE_PAYLOAD: &str =
+    "FAT32 write path updated this file with a longer piece of text to verify overwrites.";
+const HELLO_APPEND_PAYLOAD: &str =
+    " Additional appended payload to ensure extending a file is also supported.";
+const HELLO_FINAL_TXT: &str = "FAT32 write path updated this file with a longer piece of text to verify overwrites. Additional appended payload to ensure extending a file is also supported.";
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
@@ -39,9 +45,46 @@ fn run() -> Result<(), &'static str> {
     let txt = handle.read(1).unwrap();
     let txt = str::from_utf8(&txt).unwrap();
     println!("device text: {}", txt);
-    assert_eq!("HelloWorld, from FAT32 txt file!!!", txt);
+    assert_eq!(HELLO_TXT, txt);
     handle.flush().unwrap();
     assert_eq!(handle.size().unwrap(), txt.len() as u64);
+
+    // FAT32 write tests
+    let mut hello_writer = device
+        .open(0, "/hello.txt", &file::OpenOptions::Write)
+        .unwrap();
+    let written = hello_writer
+        .write_at(0, HELLO_WRITE_PAYLOAD.as_bytes())
+        .unwrap();
+    assert_eq!(written as usize, HELLO_WRITE_PAYLOAD.len());
+    hello_writer.flush().unwrap();
+    assert_eq!(
+        hello_writer.size().unwrap(),
+        HELLO_WRITE_PAYLOAD.len() as u64
+    );
+    let read_back = device
+        .open(0, "/hello.txt", &file::OpenOptions::Read)
+        .unwrap();
+    let txt = read_back.read(1).unwrap();
+    let txt = str::from_utf8(&txt).unwrap();
+    assert_eq!(HELLO_WRITE_PAYLOAD, txt);
+
+    let append_written = hello_writer
+        .write_at(
+            HELLO_WRITE_PAYLOAD.len() as u64,
+            HELLO_APPEND_PAYLOAD.as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(append_written as usize, HELLO_APPEND_PAYLOAD.len());
+    hello_writer.flush().unwrap();
+    assert_eq!(hello_writer.size().unwrap(), HELLO_FINAL_TXT.len() as u64);
+    let read_back = device
+        .open(0, "/hello.txt", &file::OpenOptions::Read)
+        .unwrap();
+    let txt = read_back.read(1).unwrap();
+    let txt = str::from_utf8(&txt).unwrap();
+    assert_eq!(HELLO_FINAL_TXT, txt);
+
     let handle = device
         .open(
             0,

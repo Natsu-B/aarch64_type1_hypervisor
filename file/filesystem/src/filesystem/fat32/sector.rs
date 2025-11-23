@@ -32,7 +32,7 @@ pub(crate) struct FAT32BootSector {
     bpb_ext_flags: Le<Unaligned<u16>>,
     bpb_fs_ver: Le<Unaligned<u16>>,
     pub(crate) bpb_root_clus: Le<Unaligned<u32>>,
-    bpb_fs_info: Le<Unaligned<u16>>,
+    pub(crate) bpb_fs_info: Le<Unaligned<u16>>,
     bpb_bk_boot_sec: Le<Unaligned<u16>>,
     bpb_reserved: [u8; 12],
     bs_drv_num: u8,

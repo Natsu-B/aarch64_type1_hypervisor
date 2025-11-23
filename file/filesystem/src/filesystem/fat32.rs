@@ -1,107 +1,50 @@
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use block_device_api::BlockDevice;
-use core::mem::MaybeUninit;
-use typestate::Le;
-use typestate::Unaligned;
-use typestate::unalign_read;
-
 use crate::FileSystemErr;
 use crate::aligned_box::AlignedSliceBox;
 use crate::filesystem::DirMeta;
 use crate::filesystem::FileHandle;
 use crate::filesystem::FileSystemTrait;
 use crate::filesystem::OpenOptions;
+use crate::filesystem::fat::FatType;
+use crate::filesystem::fat::FatVolume;
+use crate::filesystem::fat32::fat::FAT32FAT;
 use crate::filesystem::fat32::fat::FAT32FATIter;
-use crate::filesystem::fat32::sector::FAT32BootSector;
 use crate::filesystem::fat32::sector::FAT32ByteDirectoryEntry;
 use crate::filesystem::fat32::sector::FAT32DirectoryEntryAttribute;
 use crate::filesystem::fat32::sector::FAT32LongDirectoryEntry;
 use crate::from_io_err;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use block_device_api::BlockDevice;
+use core::cmp;
+use core::convert::TryInto;
+use core::mem::MaybeUninit;
+use core::mem::size_of;
 mod fat;
 pub(crate) mod sector;
 
 pub(crate) struct FAT32FileSystem {
-    /// Bytes per sector (BPB_BytsPerSec).
-    /// Almost always 512, 1024, 2048, or 4096.
-    bytes_per_sector: u16,
-
-    /// Number of sectors per cluster (BPB_SecPerClus).
-    /// Defines the cluster size in sectors; fundamental for cluster <-> sector calculations.
-    sectors_per_cluster: u8,
-
-    /// Number of reserved sectors (BPB_RsvdSecCnt).
-    /// Includes the boot sector, FSInfo, backup boot sector, and unused reserved area.
-    reserved_sectors: u16,
-
-    /// Number of FAT copies (BPB_NumFATs).
-    /// Usually 2 for redundancy.
-    num_fats: u8,
-
-    /// Sectors per FAT (BPB_FATSz32).
-    /// The length of one FAT table in sectors.
-    sectors_per_fat: u32,
-
-    /// The starting cluster number of the root directory (BPB_RootClus).
-    /// Typically cluster #2.
+    volume: FatVolume,
     root_dir_cluster: u32,
-
-    /// Hidden sectors before this volume (BPB_HiddSec).
-    /// Used to translate volume-relative LBAs into absolute disk LBAs.
-    hidden_sector: u32,
-
-    /// Total sector count of the volume (BPB_TotSec16/32).
-    /// Used for volume size calculations and sanity checks.
-    total_sectors: u32,
-
-    /// Total number of clusters in the data region.
-    /// Used to validate FAT type (e.g., FAT12, FAT16, FAT32) and for boundary checks.
-    count_of_clusters: u32,
-
-    /// first data sector
-    first_data_sectors: u64,
 }
 
 impl FAT32FileSystem {
-    pub(crate) fn new(
-        block_size: usize,
-        boot_sector: &FAT32BootSector,
-        count_of_clusters: u32,
-        first_sector: u64,
-    ) -> Result<Self, FileSystemErr> {
-        let bytes_per_sector = unalign_read!(boot_sector.bpb_bytes_per_sec => Le<Unaligned<u16>>);
-        match bytes_per_sector {
-            512 | 1024 | 2048 | 4096 => {}
-            _ => return Err(FileSystemErr::Corrupted),
+    pub(crate) fn new(volume: FatVolume) -> Result<Self, FileSystemErr> {
+        if volume.kind != FatType::Fat32 {
+            return Err(FileSystemErr::UnsupportedFileSystem);
         }
-        let sectors_per_cluster = boot_sector.bpb_sec_per_clus;
-        match sectors_per_cluster {
-            1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 => {}
-            _ => return Err(FileSystemErr::Corrupted),
-        }
-        let reserved_sectors = unalign_read!(boot_sector.bpb_rsvd_sec_cnt => Le<Unaligned <u16>>);
-        let num_fats = boot_sector.bpb_num_fats;
-        let sectors_per_fat = unalign_read!(boot_sector.bpb_fat_sz_32 => Le<Unaligned <u32>>);
-        let hidden_sector = unalign_read!(boot_sector.bpb_hidd_sec => Le<Unaligned<u32>>);
-        if bytes_per_sector != block_size as u16 {
-            return Err(FileSystemErr::Corrupted); // hidden_sector may corrupted?
-        }
-        if hidden_sector as u64 != first_sector || num_fats == 0 || reserved_sectors == 0 {
+        let Some(root) = volume.root_dir_cluster else {
             return Err(FileSystemErr::Corrupted);
-        }
+        };
         Ok(Self {
-            bytes_per_sector,
-            sectors_per_cluster,
-            reserved_sectors,
-            num_fats,
-            sectors_per_fat,
-            root_dir_cluster: unalign_read!(boot_sector.bpb_root_clus => Le::<Unaligned<u32>>),
-            hidden_sector,
-            total_sectors: unalign_read!(boot_sector.bpb_tot_sec_32 => Le::<Unaligned<u32>>),
-            count_of_clusters,
-            first_data_sectors: reserved_sectors as u64
-                + (num_fats as u64 * sectors_per_fat as u64),
+            volume,
+            root_dir_cluster: root,
         })
+    }
+
+    fn cluster_size_bytes(&self) -> usize {
+        self.volume.cluster_size_bytes()
     }
 
     fn is_encode_83(name: &str) -> Result<Option<(&str, &str)>, FileSystemErr> {
@@ -143,7 +86,11 @@ impl FAT32FileSystem {
         Ok(Some(unsafe { (ret8.assume_init(), ret3) }))
     }
 
-    fn calculate_next_dir(sde: &FAT32ByteDirectoryEntry) -> DirMeta {
+    fn calculate_next_dir(
+        sde: &FAT32ByteDirectoryEntry,
+        entry_lba: u64,
+        entry_offset: u16,
+    ) -> DirMeta {
         let cluster =
             ((sde.dir_fst_clus_hi.read() as u32) << 16) | sde.dir_fst_clus_lo.read() as u32;
         DirMeta {
@@ -153,6 +100,8 @@ impl FAT32FileSystem {
                 == FAT32DirectoryEntryAttribute::ATTR_READ_ONLY,
             first_cluster: cluster,
             file_size: sde.dir_file_size.read(),
+            entry_lba,
+            entry_offset,
         }
     }
 
@@ -207,21 +156,21 @@ impl FAT32FileSystem {
         file_name: &str,
     ) -> Result<Option<DirMeta>, FileSystemErr> {
         let is_short_name = Self::is_encode_83(file_name)?;
+        let cluster_bytes = self.cluster_size_bytes();
+        let sector_bytes = self.volume.bytes_per_sector as usize;
 
-        for lba in FAT32FATIter::new(block_device, self, dir_cluster) {
-            let lba = lba?;
-            let mut data = AlignedSliceBox::<u8>::new_uninit_with_align(
-                self.sectors_per_cluster as usize * block_device.block_size(),
-                2,
-            )
-            .unwrap();
-            block_device.read_at(lba, &mut data).map_err(from_io_err)?;
+        for cluster in FAT32FATIter::new(block_device, self, dir_cluster) {
+            let cluster = cluster?;
+            let mut data = AlignedSliceBox::<u8>::new_uninit_with_align(cluster_bytes, 2).unwrap();
+            block_device
+                .read_at(cluster.lba, &mut data)
+                .map_err(from_io_err)?;
             let data = unsafe { data.assume_init() };
             let mut lde_num = 0;
-            'outer: for i in (0..self.sectors_per_cluster as usize * block_device.block_size())
-                .step_by(size_of::<FAT32ByteDirectoryEntry>())
+            'outer: for entry_off in
+                (0..cluster_bytes).step_by(size_of::<FAT32ByteDirectoryEntry>())
             {
-                let entry_ptr = unsafe { data.as_ptr().add(i) };
+                let entry_ptr = unsafe { data.as_ptr().add(entry_off) };
                 let name0 = unsafe { *entry_ptr };
 
                 if name0 == 0x00 {
@@ -232,12 +181,14 @@ impl FAT32FileSystem {
                     continue;
                 }
 
-                if FAT32DirectoryEntryAttribute::is_sde(data.as_ptr() as usize + i) {
+                if FAT32DirectoryEntryAttribute::is_sde(data.as_ptr() as usize + entry_off) {
                     let lde = lde_num;
                     lde_num = 0;
                     let sde = unsafe {
-                        &*((data.as_ptr() as usize + i) as *const FAT32ByteDirectoryEntry)
+                        &*((data.as_ptr() as usize + entry_off) as *const FAT32ByteDirectoryEntry)
                     };
+                    let entry_lba = cluster.lba + (entry_off / sector_bytes) as u64;
+                    let entry_offset = (entry_off % sector_bytes) as u16;
                     if sde.dir_attr & FAT32DirectoryEntryAttribute::ATTR_VOLUME_ID
                         == FAT32DirectoryEntryAttribute::ATTR_VOLUME_ID
                     {
@@ -262,81 +213,86 @@ impl FAT32FileSystem {
                                 continue 'outer;
                             }
                         }
-                        return Ok(Some(Self::calculate_next_dir(sde)));
-                    } else {
-                        if lde == 0 {
-                            continue;
-                        }
-                        if lde != file_name.len().div_ceil(13) {
-                            continue;
-                        }
-                        let mut check_sum: u8 = 0;
-                        for i in 0..11 {
-                            check_sum = check_sum.rotate_right(1).wrapping_add(sde.dir_name[i]);
-                        }
-                        let mut file_name = file_name;
-                        for j in 0..lde {
-                            let lde_ref = unsafe {
-                                &*((data.as_ptr() as usize + i
-                                    - (j + 1) * size_of::<FAT32LongDirectoryEntry>())
-                                    as *const FAT32LongDirectoryEntry)
-                            };
-                            let ord = lde_ref.ldir_ord;
-                            let seq = ord & 0x3F;
-                            let last = (ord & 0x40) != 0;
-                            let expected = (j + 1) as u8;
+                        return Ok(Some(Self::calculate_next_dir(sde, entry_lba, entry_offset)));
+                    }
+                    if lde == 0 {
+                        continue;
+                    }
+                    if lde != file_name.len().div_ceil(13) {
+                        continue;
+                    }
+                    let mut check_sum: u8 = 0;
+                    for i in 0..11 {
+                        check_sum = check_sum.rotate_right(1).wrapping_add(sde.dir_name[i]);
+                    }
+                    let mut long_name = file_name;
+                    for j in 0..lde {
+                        let lde_ref = unsafe {
+                            &*((data.as_ptr() as usize + entry_off
+                                - (j + 1) * size_of::<FAT32LongDirectoryEntry>())
+                                as *const FAT32LongDirectoryEntry)
+                        };
+                        let ord = lde_ref.ldir_ord;
+                        let seq = ord & 0x3F;
+                        let last = (ord & 0x40) != 0;
+                        let expected = (j + 1) as u8;
 
-                            if seq != expected {
+                        if seq != expected {
+                            return Err(FileSystemErr::Corrupted);
+                        }
+                        if j == lde - 1 {
+                            if !last {
                                 return Err(FileSystemErr::Corrupted);
                             }
+                        } else if last {
+                            return Err(FileSystemErr::Corrupted);
+                        }
+                        if lde_ref.ldir_chksum != check_sum || lde_ref.ldir_fst_clus_lo != 0 {
+                            return Err(FileSystemErr::Corrupted);
+                        }
+                        if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name1, &mut long_name)? {
+                            continue 'outer;
+                        }
+                        if long_name.is_empty() || long_name.bytes().all(|c| c == b' ' || c == b'.')
+                        {
                             if j == lde - 1 {
-                                if !last {
-                                    return Err(FileSystemErr::Corrupted);
-                                }
-                            } else if last {
-                                return Err(FileSystemErr::Corrupted);
-                            }
-                            if lde_ref.ldir_chksum != check_sum || lde_ref.ldir_fst_clus_lo != 0 {
-                                return Err(FileSystemErr::Corrupted);
-                            }
-                            if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name1, &mut file_name)?
-                            {
+                                return Ok(Some(Self::calculate_next_dir(
+                                    sde,
+                                    entry_lba,
+                                    entry_offset,
+                                )));
+                            } else {
                                 continue 'outer;
                             }
-                            if file_name.is_empty()
-                                || file_name.bytes().all(|c| c == b' ' || c == b'.')
-                            {
-                                if j == lde - 1 {
-                                    return Ok(Some(Self::calculate_next_dir(sde)));
-                                } else {
-                                    continue 'outer;
-                                }
-                            }
-                            if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name2, &mut file_name)?
-                            {
+                        }
+                        if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name2, &mut long_name)? {
+                            continue 'outer;
+                        }
+                        if long_name.is_empty() || long_name.bytes().all(|c| c == b' ' || c == b'.')
+                        {
+                            if j == lde - 1 {
+                                return Ok(Some(Self::calculate_next_dir(
+                                    sde,
+                                    entry_lba,
+                                    entry_offset,
+                                )));
+                            } else {
                                 continue 'outer;
                             }
-                            if file_name.is_empty()
-                                || file_name.bytes().all(|c| c == b' ' || c == b'.')
-                            {
-                                if j == lde - 1 {
-                                    return Ok(Some(Self::calculate_next_dir(sde)));
-                                } else {
-                                    continue 'outer;
-                                }
-                            }
-                            if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name3, &mut file_name)?
-                            {
+                        }
+                        if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name3, &mut long_name)? {
+                            continue 'outer;
+                        }
+                        if long_name.is_empty() || long_name.bytes().all(|c| c == b' ' || c == b'.')
+                        {
+                            if j == lde - 1 {
+                                return Ok(Some(Self::calculate_next_dir(
+                                    sde,
+                                    entry_lba,
+                                    entry_offset,
+                                )));
+                            } else {
                                 continue 'outer;
-                            }
-                            if file_name.is_empty()
-                                || file_name.bytes().all(|c| c == b' ' || c == b'.')
-                            {
-                                if j == lde - 1 {
-                                    return Ok(Some(Self::calculate_next_dir(sde)));
-                                } else {
-                                    continue 'outer;
-                                }
                             }
                         }
                     }
@@ -347,6 +303,157 @@ impl FAT32FileSystem {
         }
         Ok(None)
     }
+
+    fn collect_cluster_chain(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        first_cluster: u32,
+    ) -> Result<Vec<u32>, FileSystemErr> {
+        let mut chain = Vec::new();
+        if first_cluster == 0 {
+            return Ok(chain);
+        }
+        for entry in FAT32FATIter::new(block_device, self, first_cluster) {
+            chain.push(entry?.cluster);
+        }
+        Ok(chain)
+    }
+
+    fn ensure_cluster_capacity(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        chain: &mut Vec<u32>,
+        needed: usize,
+        meta: &mut DirMeta,
+    ) -> Result<(), FileSystemErr> {
+        if needed == 0 || chain.len() >= needed {
+            if meta.first_cluster == 0 && !chain.is_empty() {
+                meta.first_cluster = chain[0];
+            }
+            return Ok(());
+        }
+        let mut last = chain.last().copied();
+        while chain.len() < needed {
+            let new_cluster = self.find_free_cluster(block_device)?;
+            self.write_fat_entry(block_device, new_cluster, FAT32FAT::END_OF_CHAIN)?;
+            if let Some(prev) = last {
+                self.write_fat_entry(block_device, prev, new_cluster)?;
+            } else if meta.first_cluster != 0 {
+                self.write_fat_entry(block_device, meta.first_cluster, new_cluster)?;
+            } else {
+                meta.first_cluster = new_cluster;
+            }
+            self.zero_cluster(block_device, new_cluster)?;
+            chain.push(new_cluster);
+            last = Some(new_cluster);
+        }
+        if meta.first_cluster == 0 && !chain.is_empty() {
+            meta.first_cluster = chain[0];
+        }
+        Ok(())
+    }
+
+    fn find_free_cluster(&self, block_device: &Arc<dyn BlockDevice>) -> Result<u32, FileSystemErr> {
+        let mut sector_cache = vec![0u8; self.volume.bytes_per_sector as usize];
+        let mut cached_sector = None;
+        let max_cluster = self.volume.count_of_clusters + 1;
+        for cluster in 2..=max_cluster {
+            let entry_byte = cluster as u64 * size_of::<FAT32FAT>() as u64;
+            let sector_index = entry_byte / self.volume.bytes_per_sector as u64;
+            if cached_sector != Some(sector_index) {
+                let lba = self.fat_lba(0, sector_index);
+                let mut uninit = slice_as_uninit(&mut sector_cache);
+                block_device
+                    .read_at(lba, &mut uninit)
+                    .map_err(from_io_err)?;
+                cached_sector = Some(sector_index);
+            }
+            let offset = (entry_byte % self.volume.bytes_per_sector as u64) as usize;
+            let value = u32::from_le_bytes(
+                sector_cache[offset..offset + size_of::<FAT32FAT>()]
+                    .try_into()
+                    .unwrap(),
+            ) & FAT32FAT::MASK;
+            if value == 0 {
+                return Ok(cluster);
+            }
+        }
+        Err(FileSystemErr::NoSpace)
+    }
+
+    fn write_fat_entry(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        cluster: u32,
+        value: u32,
+    ) -> Result<(), FileSystemErr> {
+        let entry_byte = cluster as u64 * size_of::<FAT32FAT>() as u64;
+        let sector_index = entry_byte / self.volume.bytes_per_sector as u64;
+        let offset = (entry_byte % self.volume.bytes_per_sector as u64) as usize;
+        let mut sector_buf = vec![0u8; self.volume.bytes_per_sector as usize];
+        for fat_idx in 0..self.volume.num_fats {
+            let lba = self.fat_lba(fat_idx, sector_index);
+            let mut uninit = slice_as_uninit(&mut sector_buf);
+            block_device
+                .read_at(lba, &mut uninit)
+                .map_err(from_io_err)?;
+            sector_buf[offset..offset + size_of::<FAT32FAT>()]
+                .copy_from_slice(&(value & FAT32FAT::MASK).to_le_bytes());
+            block_device
+                .write_at(lba, &sector_buf)
+                .map_err(from_io_err)?;
+        }
+        Ok(())
+    }
+
+    fn fat_lba(&self, fat_idx: u8, sector_index: u64) -> u64 {
+        self.volume.fat_region_lba()
+            + sector_index
+            + fat_idx as u64 * self.volume.sectors_per_fat as u64
+    }
+
+    fn zero_cluster(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        cluster: u32,
+    ) -> Result<(), FileSystemErr> {
+        let buf = vec![0u8; self.cluster_size_bytes()];
+        let lba = self.volume.cluster_to_lba(cluster)?;
+        block_device.write_at(lba, &buf).map_err(from_io_err)
+    }
+
+    fn update_dir_entry(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        meta: &DirMeta,
+    ) -> Result<(), FileSystemErr> {
+        if meta.entry_lba == 0 {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let mut sector = vec![0u8; self.volume.bytes_per_sector as usize];
+        let mut uninit = slice_as_uninit(&mut sector);
+        block_device
+            .read_at(meta.entry_lba, &mut uninit)
+            .map_err(from_io_err)?;
+        let offset = meta.entry_offset as usize;
+        if offset + size_of::<FAT32ByteDirectoryEntry>() > sector.len() {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let entry_ptr = unsafe { sector.as_mut_ptr().add(offset) as *mut FAT32ByteDirectoryEntry };
+        let entry = unsafe { &mut *entry_ptr };
+        entry.dir_file_size.write(meta.file_size);
+        entry.dir_fst_clus_lo.write(meta.first_cluster as u16);
+        entry
+            .dir_fst_clus_hi
+            .write(((meta.first_cluster >> 16) & 0xFFFF) as u16);
+        block_device
+            .write_at(meta.entry_lba, &sector)
+            .map_err(from_io_err)
+    }
+}
+
+fn slice_as_uninit(buf: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len()) }
 }
 
 impl FileSystemTrait for FAT32FileSystem {
@@ -369,6 +476,8 @@ impl FileSystemTrait for FAT32FileSystem {
             is_dir: false,
             first_cluster: 0,
             file_size: 0,
+            entry_lba: 0,
+            entry_offset: 0,
         };
         for dir_name in path.as_str().split('/') {
             if dir_name.is_empty() {
@@ -440,7 +549,7 @@ impl FileSystemTrait for FAT32FileSystem {
     ) -> Result<u64, FileSystemErr> {
         let file_size = meta.file_size as u64;
         let bs = block_device.block_size();
-        let spc = self.sectors_per_cluster as usize;
+        let spc = self.volume.sectors_per_cluster as usize;
         let bpc = (bs * spc) as u64;
 
         if offset > file_size {
@@ -465,8 +574,8 @@ impl FileSystemTrait for FAT32FileSystem {
         let mut sectors_remaining = sectors_needed;
         let mut tmp_ptr_sectors = 0usize;
 
-        for (i, lba) in FAT32FATIter::new(block_device, self, meta.first_cluster).enumerate() {
-            let lba = lba?;
+        for (i, info) in FAT32FATIter::new(block_device, self, meta.first_cluster).enumerate() {
+            let info = info?;
             if i < start_cluster {
                 continue;
             }
@@ -487,7 +596,7 @@ impl FileSystemTrait for FAT32FileSystem {
             let byte_len = read_sectors * bs;
             block_device
                 .read_at(
-                    lba + first_sector_in_this_cluster as u64,
+                    info.lba + first_sector_in_this_cluster as u64,
                     &mut tmp[byte_off..byte_off + byte_len],
                 )
                 .map_err(from_io_err)?;
@@ -510,5 +619,89 @@ impl FileSystemTrait for FAT32FileSystem {
         dst.copy_from_slice(src);
 
         Ok(to_read as u64)
+    }
+
+    fn write_at(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        offset: u64,
+        buf: &[u8],
+        meta: &mut DirMeta,
+    ) -> Result<u64, FileSystemErr> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if meta.is_dir {
+            return Err(FileSystemErr::IsDir);
+        }
+        if meta.is_readonly || block_device.is_read_only().map_err(from_io_err)? {
+            return Err(FileSystemErr::ReadOnly);
+        }
+        if offset > meta.file_size as u64 {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let new_size = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(FileSystemErr::TooBigBuffer)?;
+        if new_size > u32::MAX as u64 {
+            return Err(FileSystemErr::TooBigBuffer);
+        }
+        let cluster_size = self.cluster_size_bytes();
+        let required_clusters = if new_size == 0 {
+            0
+        } else {
+            ((new_size + cluster_size as u64 - 1) / cluster_size as u64) as usize
+        };
+        let mut chain = self.collect_cluster_chain(block_device, meta.first_cluster)?;
+        self.ensure_cluster_capacity(block_device, &mut chain, required_clusters, meta)?;
+
+        let mut remaining = buf.len();
+        let mut buf_offset = 0usize;
+        let mut current_offset = offset;
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let mut cluster_buf = Vec::with_capacity(cluster_size);
+        unsafe {
+            cluster_buf.set_len(cluster_size);
+        }
+        while remaining > 0 {
+            let cluster_index = if cluster_size == 0 {
+                0
+            } else {
+                (current_offset / cluster_size as u64) as usize
+            };
+            let cluster = *chain.get(cluster_index).ok_or(FileSystemErr::Corrupted)?;
+            let lba = self.volume.cluster_to_lba(cluster)?;
+            let mut uninit = slice_as_uninit(cluster_buf.as_mut_slice());
+            block_device
+                .read_at(lba, &mut uninit)
+                .map_err(from_io_err)?;
+            let within_cluster = (current_offset % cluster_size as u64) as usize;
+            let writable = cmp::min(cluster_size - within_cluster, remaining);
+            cluster_buf[within_cluster..within_cluster + writable]
+                .copy_from_slice(&buf[buf_offset..buf_offset + writable]);
+            block_device
+                .write_at(lba, &cluster_buf)
+                .map_err(from_io_err)?;
+            remaining -= writable;
+            buf_offset += writable;
+            current_offset += writable as u64;
+        }
+
+        let mut need_update_entry = false;
+        if new_size > meta.file_size as u64 {
+            meta.file_size = new_size as u32;
+            need_update_entry = true;
+        }
+        if meta.first_cluster == 0 && !chain.is_empty() {
+            meta.first_cluster = chain[0];
+            need_update_entry = true;
+        }
+
+        if need_update_entry {
+            self.update_dir_entry(block_device, meta)?;
+        }
+        Ok(buf.len() as u64)
     }
 }
