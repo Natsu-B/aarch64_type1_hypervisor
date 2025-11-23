@@ -42,6 +42,26 @@ qemu-system-aarch64 \
 RETCODE=$?
 
 if [ $RETCODE -eq 0 ]; then
+    # Mount the disk image again to check the created file
+    sudo mount -o loop,offset=$((2048 * 512)) $DISK_IMG $DISK_MOUNT_DIR
+    if [ ! -d "$DISK_MOUNT_DIR/testdir" ]; then
+        echo "FAIL: testdir not found"
+        sudo umount $DISK_MOUNT_DIR
+        exit 1
+    fi
+    if [ ! -f "$DISK_MOUNT_DIR/testdir/testfile.txt" ]; then
+        echo "FAIL: testfile.txt not found"
+        sudo umount $DISK_MOUNT_DIR
+        exit 1
+    fi
+    if [ "$(sudo cat $DISK_MOUNT_DIR/testdir/testfile.txt)" != "test content" ]; then
+        echo "FAIL: testfile.txt content mismatch"
+        sudo umount $DISK_MOUNT_DIR
+        exit 1
+    fi
+    echo "Host check: PASS"
+    sudo rm -rf "$DISK_MOUNT_DIR/testdir"
+    sudo umount $DISK_MOUNT_DIR
     exit 0
 elif [ $RETCODE -eq 1 ]; then
     printf "\nFailed\n"

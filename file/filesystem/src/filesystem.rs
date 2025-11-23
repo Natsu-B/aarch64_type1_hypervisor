@@ -89,7 +89,7 @@ pub enum OpenOptions {
     Write,
 }
 
-pub(crate) trait FileSystemTrait {
+pub trait FileSystemTrait {
     // file
     fn open(
         &self,
@@ -98,13 +98,41 @@ pub(crate) trait FileSystemTrait {
         path: &str,
         opts: &OpenOptions,
     ) -> Result<FileHandle, FileSystemErr>;
-    fn remove_file(&self, path: &str) -> Result<(), FileSystemErr>;
-    fn copy(&self, from: &str, to: &str) -> Result<(), FileSystemErr>;
-    fn rename(&self, from: &str, to: &str) -> Result<(), FileSystemErr>;
+    fn create_file(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        file_system: &Arc<dyn FileSystemTrait>,
+        path: &str,
+    ) -> Result<FileHandle, FileSystemErr>;
+    fn remove_file(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr>;
+    fn copy(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FileSystemErr>;
+    fn rename(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FileSystemErr>;
 
     // dir
-    fn create_dir(&self, path: &str) -> Result<(), FileSystemErr>;
-    fn remove_dir(&self, path: &str) -> Result<(), FileSystemErr>;
+    fn create_dir(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr>;
+    fn remove_dir(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr>;
 
     fn read(
         &self,
@@ -149,23 +177,25 @@ pub struct FileHandle {
 }
 
 impl FileHandle {
+    fn upgrade_device(&self) -> Result<Arc<dyn BlockDevice>, FileSystemErr> {
+        self.dev_handle.upgrade().ok_or(FileSystemErr::Closed)
+    }
+
+    fn upgrade_handles(
+        &self,
+    ) -> Result<(Arc<dyn BlockDevice>, Arc<dyn FileSystemTrait>), FileSystemErr> {
+        let dev = self.upgrade_device()?;
+        let file = self.file_handle.upgrade().ok_or(FileSystemErr::Closed)?;
+        Ok((dev, file))
+    }
+
     pub fn read(&self, align: usize) -> Result<AlignedSliceBox<u8>, FileSystemErr> {
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
-        let Some(file) = self.file_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let (dev, file) = self.upgrade_handles()?;
         file.read(&dev, align, &self.meta)
     }
 
     pub fn read_at(&self, offset: u64, buf: &mut [MaybeUninit<u8>]) -> Result<u64, FileSystemErr> {
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
-        let Some(file) = self.file_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let (dev, file) = self.upgrade_handles()?;
         file.read_at(&dev, offset, buf, &self.meta)
     }
 
@@ -173,12 +203,7 @@ impl FileHandle {
         if self.opts != OpenOptions::Write {
             return Err(FileSystemErr::ReadOnly);
         }
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
-        let Some(file) = self.file_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let (dev, file) = self.upgrade_handles()?;
         file.write_at(&dev, offset, buf, &mut self.meta)
     }
 
@@ -187,9 +212,7 @@ impl FileHandle {
     }
 
     pub fn flush(&self) -> Result<(), FileSystemErr> {
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let dev = self.upgrade_device()?;
         dev.flush().map_err(from_io_err)
     }
 }

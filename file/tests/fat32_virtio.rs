@@ -8,6 +8,7 @@ use arch_hal::debug_uart;
 use arch_hal::exit_failure;
 use arch_hal::exit_success;
 use arch_hal::println;
+use core::str;
 use file::StorageDevice;
 use file::StorageDeviceErr;
 use filesystem::FileSystemErr;
@@ -109,6 +110,141 @@ fn run() -> Result<(), &'static str> {
         .open(0, "/EFI/BOOT/BOOTAA64.EFI", &file::OpenOptions::Read)
         .unwrap();
     efi.read(1).unwrap();
+
+    test_dir_and_file_ops(&device)?;
+
+    // Create a file and directory to check from host
+    device.create_dir(0, "/testdir").unwrap();
+    let mut handle = device.create_file(0, "/testdir/testfile.txt").unwrap();
+    handle.write_at(0, "test content".as_bytes()).unwrap();
+    handle.flush().unwrap();
+
+    Ok(())
+}
+
+fn test_dir_and_file_ops(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing directory and file operations");
+
+    // 8.3 directory
+    let dir_8_3 = "/DIR83";
+    device.create_dir(0, dir_8_3).unwrap();
+    // create long name file
+    let file_name = "/DIR83/very_long_long_example_text.TXT";
+    device.create_file(0, file_name).unwrap();
+    let mut file_handle = device
+        .open(0, file_name, &file::OpenOptions::Write)
+        .unwrap();
+    assert_eq!(file_handle.size().unwrap(), 0);
+    let write_txt = "hello fat32 world!!!!!!!";
+    assert_eq!(
+        file_handle.write_at(0, write_txt.as_bytes()).unwrap(),
+        write_txt.len() as u64
+    );
+    assert_eq!(file_handle.size().unwrap(), write_txt.len() as u64);
+    assert_eq!(
+        str::from_utf8(&*file_handle.read(1).unwrap()).unwrap(),
+        write_txt
+    );
+    device.remove_file(0, file_name).unwrap();
+    device
+        .open(0, file_name, &file::OpenOptions::Read)
+        .unwrap_err();
+
+    device.remove_dir(0, dir_8_3).unwrap();
+    assert_eq!(
+        device
+            .open(0, dir_8_3, &file::OpenOptions::Read)
+            .unwrap_err(),
+        StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
+    );
+
+    // Long name directory
+    let dir_long = "/long_dir_name";
+    device.create_dir(0, dir_long).unwrap();
+    device.remove_dir(0, dir_long).unwrap();
+    assert_eq!(
+        device
+            .open(0, dir_long, &file::OpenOptions::Read)
+            .unwrap_err(),
+        StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
+    );
+
+    // 8.3 file
+    let file_8_3 = "/FILE83.TXT";
+    let handle = device.create_file(0, file_8_3).unwrap();
+    handle.flush().unwrap();
+    device.open(0, file_8_3, &file::OpenOptions::Read).unwrap();
+    device.remove_file(0, file_8_3).unwrap();
+    assert_eq!(
+        device
+            .open(0, file_8_3, &file::OpenOptions::Read)
+            .unwrap_err(),
+        StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
+    );
+
+    // Long name file
+    let file_long = "/long_file_name.txt";
+    let handle = device.create_file(0, file_long).unwrap();
+    handle.flush().unwrap();
+    device.open(0, file_long, &file::OpenOptions::Read).unwrap();
+    device.remove_file(0, file_long).unwrap();
+    assert_eq!(
+        device
+            .open(0, file_long, &file::OpenOptions::Read)
+            .unwrap_err(),
+        StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
+    );
+
+    // Rename file
+    let rename_from = "/rename_from.txt";
+    let rename_to = "/rename_to.txt";
+    let mut handle = device.create_file(0, rename_from).unwrap();
+    let content = "rename test";
+    handle.write_at(0, content.as_bytes()).unwrap();
+    handle.flush().unwrap();
+    device.rename(0, rename_from, rename_to).unwrap();
+    assert_eq!(
+        device
+            .open(0, rename_from, &file::OpenOptions::Read)
+            .unwrap_err(),
+        StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
+    );
+    let handle = device.open(0, rename_to, &file::OpenOptions::Read).unwrap();
+    let read_content = handle.read(1).unwrap();
+    assert_eq!(str::from_utf8(&read_content).unwrap(), content);
+    device.remove_file(0, rename_to).unwrap();
+
+    // Rename directory
+    let rename_dir_from = "/rename_dir_from";
+    let rename_dir_to = "/rename_dir_to";
+    device.create_dir(0, rename_dir_from).unwrap();
+    device.rename(0, rename_dir_from, rename_dir_to).unwrap();
+    assert_eq!(
+        device
+            .open(0, rename_dir_from, &file::OpenOptions::Read)
+            .unwrap_err(),
+        StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
+    );
+    device.remove_dir(0, rename_dir_to).unwrap();
+
+    // Copy file
+    let copy_from = "/copy_from.txt";
+    let copy_to = "/copy_to.txt";
+    let mut handle = device.create_file(0, copy_from).unwrap();
+    let content = "copy test";
+    handle.write_at(0, content.as_bytes()).unwrap();
+    handle.flush().unwrap();
+    device.copy(0, copy_from, copy_to).unwrap();
+    let handle_from = device.open(0, copy_from, &file::OpenOptions::Read).unwrap();
+    let handle_to = device.open(0, copy_to, &file::OpenOptions::Read).unwrap();
+    let content_from = handle_from.read(1).unwrap();
+    let content_to = handle_to.read(1).unwrap();
+    assert_eq!(str::from_utf8(&content_from).unwrap(), content);
+    assert_eq!(str::from_utf8(&content_to).unwrap(), content);
+    device.remove_file(0, copy_from).unwrap();
+    device.remove_file(0, copy_to).unwrap();
+
+    println!("Directory and file operations test: PASS");
     Ok(())
 }
 

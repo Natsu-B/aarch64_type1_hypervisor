@@ -7,6 +7,9 @@ edition = "2024"
 block-device = { path = "block-device" }
 block-device-api = { path = "block-device-api" }
 filesystem = { path = "filesystem" }
+mutex = { path = "../mutex" }
+typestate = { path = "../typestate" }
+typestate_macro = { path = "../typestate_macro" }
 
 [dev-dependencies]
 arch_hal = { path = "../arch_hal", default-features = false, features = ["uefi-test"] }

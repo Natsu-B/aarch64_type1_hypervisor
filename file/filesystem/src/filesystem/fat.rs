@@ -5,8 +5,9 @@ use typestate::Unaligned;
 use typestate::unalign_read;
 
 use crate::FileSystemErr;
-use crate::PartitionIndex;
 use crate::filesystem::fat32::sector::FAT32BootSector;
+
+const FAT_BOOT_SIGNATURE: u16 = 0xAA55;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FatType {
@@ -43,8 +44,7 @@ impl FatVolume {
             return Ok(None);
         }
         let boot = unsafe { &*(boot_sector.as_ptr() as *const FAT32BootSector) };
-        if unalign_read!(boot.bs_boot_sign => Le<Unaligned<u16>>) != PartitionIndex::BOOT_SIGNATURE
-        {
+        if unalign_read!(boot.bs_boot_sign => Le<Unaligned<u16>>) != FAT_BOOT_SIGNATURE {
             return Ok(None);
         }
 

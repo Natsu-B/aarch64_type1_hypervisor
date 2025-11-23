@@ -100,6 +100,9 @@ dependencies = [
  "block-device",
  "block-device-api",
  "filesystem",
+ "mutex",
+ "typestate",
+ "typestate_macro",
 ]
 
 [[package]]

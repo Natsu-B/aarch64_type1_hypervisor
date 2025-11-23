@@ -29,6 +29,12 @@ pub(crate) struct FAT32FileSystem {
     root_dir_cluster: u32,
 }
 
+#[derive(Clone, Copy)]
+struct DirEntrySpan {
+    start_cluster: u32,
+    start_offset: usize,
+}
+
 impl FAT32FileSystem {
     pub(crate) fn new(volume: FatVolume) -> Result<Self, FileSystemErr> {
         if volume.kind != FatType::Fat32 {
@@ -218,7 +224,12 @@ impl FAT32FileSystem {
                     if lde == 0 {
                         continue;
                     }
-                    if lde != file_name.len().div_ceil(13) {
+                    let required_entries = file_name
+                        .len()
+                        .checked_add(13)
+                        .ok_or(FileSystemErr::TooBigBuffer)?
+                        / 13;
+                    if lde != required_entries {
                         continue;
                     }
                     let mut check_sum: u8 = 0;
@@ -261,8 +272,6 @@ impl FAT32FileSystem {
                                     entry_lba,
                                     entry_offset,
                                 )));
-                            } else {
-                                continue 'outer;
                             }
                         }
                         if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name2, &mut long_name)? {
@@ -276,8 +285,6 @@ impl FAT32FileSystem {
                                     entry_lba,
                                     entry_offset,
                                 )));
-                            } else {
-                                continue 'outer;
                             }
                         }
                         if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name3, &mut long_name)? {
@@ -291,8 +298,6 @@ impl FAT32FileSystem {
                                     entry_lba,
                                     entry_offset,
                                 )));
-                            } else {
-                                continue 'outer;
                             }
                         }
                     }
@@ -450,6 +455,832 @@ impl FAT32FileSystem {
             .write_at(meta.entry_lba, &sector)
             .map_err(from_io_err)
     }
+
+    fn split_path_components<'a>(path: &'a str) -> Result<Vec<&'a str>, FileSystemErr> {
+        let mut chars = path.chars();
+        match chars.next() {
+            Some('/') => {}
+            Some(_) => return Err(FileSystemErr::NotRootDir),
+            None => return Err(FileSystemErr::InvalidInput),
+        }
+        let mut components = Vec::new();
+        for comp in chars.as_str().split('/') {
+            if comp.is_empty() {
+                return Err(FileSystemErr::InvalidInput);
+            }
+            components.push(comp);
+        }
+        if components.is_empty() {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        Ok(components)
+    }
+
+    fn resolve_directory<'a>(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        components: &[&'a str],
+    ) -> Result<(u32, Option<DirMeta>), FileSystemErr> {
+        let mut dir_cluster = self.root_dir_cluster;
+        let mut dir_meta = None;
+        for comp in components {
+            let Some(meta) =
+                self.search_file_name_with_cluster_dir(block_device, dir_cluster, comp)?
+            else {
+                return Err(FileSystemErr::NotFound);
+            };
+            if !meta.is_dir {
+                return Err(FileSystemErr::NotDir);
+            }
+            dir_cluster = meta.first_cluster;
+            dir_meta = Some(meta);
+        }
+        Ok((dir_cluster, dir_meta))
+    }
+
+    fn ensure_directory_writable(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        parent_meta: Option<&DirMeta>,
+    ) -> Result<(), FileSystemErr> {
+        if block_device.is_read_only().map_err(from_io_err)? {
+            return Err(FileSystemErr::ReadOnly);
+        }
+        if let Some(meta) = parent_meta {
+            if meta.is_readonly {
+                return Err(FileSystemErr::ReadOnly);
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_short_name_bytes(name: &str) -> Result<[u8; 11], FileSystemErr> {
+        let Some((base, ext)) = Self::is_encode_83(name)? else {
+            return Err(FileSystemErr::UnsupportedFileName);
+        };
+        let mut encoded = [b' '; 11];
+        for (idx, ch) in base.bytes().enumerate() {
+            encoded[idx] = ch.to_ascii_uppercase();
+        }
+        for (idx, ch) in ext.bytes().enumerate() {
+            encoded[8 + idx] = ch.to_ascii_uppercase();
+        }
+        Ok(encoded)
+    }
+
+    fn build_base_entry(short_name: [u8; 11]) -> FAT32ByteDirectoryEntry {
+        let entry = MaybeUninit::<FAT32ByteDirectoryEntry>::zeroed();
+        let mut entry = unsafe { entry.assume_init() };
+        entry.dir_name = short_name;
+        entry.dir_file_size.write(0);
+        entry.dir_fst_clus_lo.write(0);
+        entry.dir_fst_clus_hi.write(0);
+        entry
+    }
+
+    fn build_directory_entry(short_name: [u8; 11], cluster: u32) -> FAT32ByteDirectoryEntry {
+        let mut entry = Self::build_base_entry(short_name);
+        entry.dir_attr = FAT32DirectoryEntryAttribute::ATTR_DIRECTORY;
+        entry.dir_fst_clus_lo.write((cluster & 0xFFFF) as u16);
+        entry
+            .dir_fst_clus_hi
+            .write(((cluster >> 16) & 0xFFFF) as u16);
+        entry
+    }
+
+    fn build_file_entry(short_name: [u8; 11]) -> FAT32ByteDirectoryEntry {
+        let mut entry = Self::build_base_entry(short_name);
+        entry.dir_attr = FAT32DirectoryEntryAttribute::empty();
+        entry
+    }
+
+    fn write_directory_entry(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        entry_lba: u64,
+        entry_offset: u16,
+        entry: &FAT32ByteDirectoryEntry,
+    ) -> Result<(), FileSystemErr> {
+        let entry_bytes = unsafe {
+            core::slice::from_raw_parts(
+                entry as *const FAT32ByteDirectoryEntry as *const u8,
+                size_of::<FAT32ByteDirectoryEntry>(),
+            )
+        };
+        self.write_entry_data(block_device, entry_lba, entry_offset, entry_bytes)
+    }
+
+    fn write_long_directory_entry(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        entry_lba: u64,
+        entry_offset: u16,
+        entry: &FAT32LongDirectoryEntry,
+    ) -> Result<(), FileSystemErr> {
+        let entry_bytes = unsafe {
+            core::slice::from_raw_parts(
+                entry as *const FAT32LongDirectoryEntry as *const u8,
+                size_of::<FAT32LongDirectoryEntry>(),
+            )
+        };
+        self.write_entry_data(block_device, entry_lba, entry_offset, entry_bytes)
+    }
+
+    fn write_entry_data(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        entry_lba: u64,
+        entry_offset: u16,
+        entry_bytes: &[u8],
+    ) -> Result<(), FileSystemErr> {
+        let mut sector = vec![0u8; self.volume.bytes_per_sector as usize];
+        let mut uninit = slice_as_uninit(&mut sector);
+        block_device
+            .read_at(entry_lba, &mut uninit)
+            .map_err(from_io_err)?;
+        let offset = entry_offset as usize;
+        if offset + entry_bytes.len() > sector.len() {
+            return Err(FileSystemErr::Corrupted);
+        }
+        sector[offset..offset + entry_bytes.len()].copy_from_slice(entry_bytes);
+        block_device
+            .write_at(entry_lba, &sector)
+            .map_err(from_io_err)
+    }
+
+    fn read_directory_entry(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        meta: &DirMeta,
+    ) -> Result<FAT32ByteDirectoryEntry, FileSystemErr> {
+        if meta.entry_lba == 0 {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let mut sector = vec![0u8; self.volume.bytes_per_sector as usize];
+        let mut uninit = slice_as_uninit(&mut sector);
+        block_device
+            .read_at(meta.entry_lba, &mut uninit)
+            .map_err(from_io_err)?;
+        let offset = meta.entry_offset as usize;
+        if offset + size_of::<FAT32ByteDirectoryEntry>() > sector.len() {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let entry_ptr = unsafe { sector.as_ptr().add(offset) as *const FAT32ByteDirectoryEntry };
+        Ok(unsafe { core::ptr::read(entry_ptr) })
+    }
+
+    fn prepare_entry_names(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<([u8; 11], Vec<FAT32LongDirectoryEntry>), FileSystemErr> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        if let Some(_) = Self::is_encode_83(name)? {
+            let short = Self::encode_short_name_bytes(name)?;
+            return Ok((short, Vec::new()));
+        }
+        if !name.is_ascii() {
+            return Err(FileSystemErr::UnsupportedFileName);
+        }
+        let short = self.generate_short_name(block_device, dir_cluster, name)?;
+        let long = Self::build_long_entries(name, &short)?;
+        Ok((short, long))
+    }
+
+    fn insert_entry_with_builder<F>(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        name: &str,
+        build_entry: F,
+    ) -> Result<(u64, u16), FileSystemErr>
+    where
+        F: FnOnce([u8; 11]) -> FAT32ByteDirectoryEntry,
+    {
+        let (short_name, long_entries) =
+            self.prepare_entry_names(block_device, dir_cluster, name)?;
+        let entry = build_entry(short_name);
+        self.write_entry_sequence(block_device, dir_cluster, &long_entries, &entry)
+    }
+
+    fn write_entry_sequence(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        long_entries: &[FAT32LongDirectoryEntry],
+        entry: &FAT32ByteDirectoryEntry,
+    ) -> Result<(u64, u16), FileSystemErr> {
+        let span = self.find_free_dir_entries(block_device, dir_cluster, long_entries.len() + 1)?;
+        for (idx, long_entry) in long_entries.iter().enumerate().rev() {
+            let slot = long_entries.len() - 1 - idx;
+            let (lba, offset) = self.entry_location(block_device, &span, slot)?;
+            self.write_long_directory_entry(block_device, lba, offset, long_entry)?;
+        }
+        let (entry_lba, entry_offset) =
+            self.entry_location(block_device, &span, long_entries.len())?;
+        self.write_directory_entry(block_device, entry_lba, entry_offset, entry)?;
+        Ok((entry_lba, entry_offset))
+    }
+
+    fn entry_location(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        span: &DirEntrySpan,
+        index: usize,
+    ) -> Result<(u64, u16), FileSystemErr> {
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>() as u64;
+        let cluster_size = self.cluster_size_bytes() as u64;
+        let start_offset = span.start_offset as u64;
+        let total_offset = start_offset
+            .checked_add(
+                entry_size
+                    .checked_mul(index as u64)
+                    .ok_or(FileSystemErr::TooBigBuffer)?,
+            )
+            .ok_or(FileSystemErr::TooBigBuffer)?;
+        let clusters_to_skip = (total_offset / cluster_size) as usize;
+        let mut offset_in_cluster = (total_offset % cluster_size) as usize;
+        let mut iter = FAT32FATIter::new(block_device, self, span.start_cluster);
+        let mut info = None;
+        for _ in 0..=clusters_to_skip {
+            let Some(cluster_info) = iter.next() else {
+                return Err(FileSystemErr::Corrupted);
+            };
+            info = Some(cluster_info?);
+        }
+        let info = info.ok_or(FileSystemErr::Corrupted)?;
+        let sector_size = self.volume.bytes_per_sector as usize;
+        let entry_lba = info.lba + (offset_in_cluster / sector_size) as u64;
+        offset_in_cluster %= sector_size;
+        Ok((entry_lba, offset_in_cluster as u16))
+    }
+
+    fn find_free_dir_entries(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        count: usize,
+    ) -> Result<DirEntrySpan, FileSystemErr> {
+        if dir_cluster == 0 || count == 0 {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let cluster_size = self.cluster_size_bytes();
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        let mut buffer = vec![0u8; cluster_size];
+        let mut last_cluster = None;
+        let mut run_count = 0usize;
+        let mut run_start_cluster = dir_cluster;
+        let mut run_start_offset = 0usize;
+        for info in FAT32FATIter::new(block_device, self, dir_cluster) {
+            let info = info?;
+            last_cluster = Some(info.cluster);
+            let mut uninit = slice_as_uninit(&mut buffer);
+            block_device
+                .read_at(info.lba, &mut uninit)
+                .map_err(from_io_err)?;
+            for entry_off in (0..cluster_size).step_by(entry_size) {
+                let value = buffer[entry_off];
+                if value == 0x00 || value == 0xE5 {
+                    if run_count == 0 {
+                        run_start_cluster = info.cluster;
+                        run_start_offset = entry_off;
+                    }
+                    run_count += 1;
+                    if run_count >= count {
+                        return Ok(DirEntrySpan {
+                            start_cluster: run_start_cluster,
+                            start_offset: run_start_offset,
+                        });
+                    }
+                } else {
+                    run_count = 0;
+                }
+            }
+        }
+        let last_cluster = last_cluster.ok_or(FileSystemErr::Corrupted)?;
+        self.extend_directory_with_entries(block_device, last_cluster, count)
+    }
+
+    fn extend_directory_with_entries(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        mut last_cluster: u32,
+        count: usize,
+    ) -> Result<DirEntrySpan, FileSystemErr> {
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        let cluster_size = self.cluster_size_bytes();
+        let entries_per_cluster = cluster_size / entry_size;
+        if entries_per_cluster == 0 {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let clusters_needed = (count + entries_per_cluster - 1) / entries_per_cluster;
+        let mut first_new = None;
+        for _ in 0..clusters_needed {
+            let new_cluster = self.find_free_cluster(block_device)?;
+            self.write_fat_entry(block_device, new_cluster, FAT32FAT::END_OF_CHAIN)?;
+            self.write_fat_entry(block_device, last_cluster, new_cluster)?;
+            self.zero_cluster(block_device, new_cluster)?;
+            if first_new.is_none() {
+                first_new = Some(new_cluster);
+            }
+            last_cluster = new_cluster;
+        }
+        let start = first_new.ok_or(FileSystemErr::Corrupted)?;
+        Ok(DirEntrySpan {
+            start_cluster: start,
+            start_offset: 0,
+        })
+    }
+
+    fn short_name_exists(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        short_name: &[u8; 11],
+    ) -> Result<bool, FileSystemErr> {
+        let cluster_size = self.cluster_size_bytes();
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        let mut buffer = vec![0u8; cluster_size];
+        for info in FAT32FATIter::new(block_device, self, dir_cluster) {
+            let info = info?;
+            let mut uninit = slice_as_uninit(&mut buffer);
+            block_device
+                .read_at(info.lba, &mut uninit)
+                .map_err(from_io_err)?;
+            for entry_off in (0..cluster_size).step_by(entry_size) {
+                let name0 = buffer[entry_off];
+                if name0 == 0x00 {
+                    return Ok(false);
+                }
+                if name0 == 0xE5 {
+                    continue;
+                }
+                if !FAT32DirectoryEntryAttribute::is_sde(buffer.as_ptr() as usize + entry_off) {
+                    continue;
+                }
+                let entry = unsafe {
+                    &*((buffer.as_ptr().add(entry_off)) as *const FAT32ByteDirectoryEntry)
+                };
+                if entry.dir_attr & FAT32DirectoryEntryAttribute::ATTR_VOLUME_ID
+                    == FAT32DirectoryEntryAttribute::ATTR_VOLUME_ID
+                {
+                    continue;
+                }
+                if entry.dir_name == *short_name {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn generate_short_name(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<[u8; 11], FileSystemErr> {
+        let (base_part, ext_part) = Self::split_long_name(name);
+        let mut base = Self::sanitize_short_component(base_part);
+        if base.is_empty() {
+            base.push(b'_');
+        }
+        let mut extension = ext_part
+            .map(Self::sanitize_short_component)
+            .unwrap_or_default();
+        extension.truncate(3);
+        let mut counter = 1usize;
+        loop {
+            let mut base_candidate = base.clone();
+            let suffix = Self::format_short_suffix(counter);
+            while base_candidate.len() + suffix.len() > 8 {
+                if base_candidate.is_empty() {
+                    return Err(FileSystemErr::NoSpace);
+                }
+                base_candidate.pop();
+            }
+            base_candidate.extend_from_slice(&suffix);
+            let mut short = [b' '; 11];
+            for (idx, ch) in base_candidate.iter().take(8).enumerate() {
+                short[idx] = *ch;
+            }
+            for (idx, ch) in extension.iter().enumerate() {
+                short[8 + idx] = *ch;
+            }
+            if !self.short_name_exists(block_device, dir_cluster, &short)? {
+                return Ok(short);
+            }
+            counter += 1;
+            if counter > 999_999 {
+                return Err(FileSystemErr::NoSpace);
+            }
+        }
+    }
+
+    fn split_long_name(name: &str) -> (&str, Option<&str>) {
+        if let Some(idx) = name.rfind('.') {
+            if idx > 0 && idx < name.len() - 1 {
+                return (&name[..idx], Some(&name[idx + 1..]));
+            }
+        }
+        (name, None)
+    }
+
+    fn sanitize_short_component(component: &str) -> Vec<u8> {
+        let mut result = Vec::new();
+        for byte in component.bytes() {
+            let upper = byte.to_ascii_uppercase();
+            let valid = matches!(
+                upper,
+                b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'$'
+                    | b'%'
+                    | b'`'
+                    | b'-'
+                    | b'_'
+                    | b'@'
+                    | b'~'
+                    | b'!'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'^'
+                    | b'#'
+                    | b'&'
+            );
+            let ch = if valid { upper } else { b'_' };
+            if ch != b'.' {
+                result.push(ch);
+            }
+        }
+        result
+    }
+
+    fn format_short_suffix(counter: usize) -> Vec<u8> {
+        let mut suffix = Vec::new();
+        suffix.push(b'~');
+        let mut digits = Vec::new();
+        let mut value = counter;
+        while value > 0 {
+            digits.push(b'0' + (value % 10) as u8);
+            value /= 10;
+        }
+        if digits.is_empty() {
+            digits.push(b'0');
+        }
+        digits.reverse();
+        suffix.extend_from_slice(&digits);
+        suffix
+    }
+
+    fn build_long_entries(
+        name: &str,
+        short_name: &[u8; 11],
+    ) -> Result<Vec<FAT32LongDirectoryEntry>, FileSystemErr> {
+        let mut chars: Vec<u16> = name.bytes().map(|b| b as u16).collect();
+        chars.push(0);
+        let total_entries = (chars.len() + 12) / 13;
+        let checksum = Self::short_name_checksum(short_name);
+        let mut entries = Vec::with_capacity(total_entries);
+        for seq in 1..=total_entries {
+            let start = (seq - 1) * 13;
+            let end = core::cmp::min(start + 13, chars.len());
+            let slice = &chars[start..end];
+            let mut encoded = [0xFFFFu16; 13];
+            for (idx, ch) in slice.iter().enumerate() {
+                encoded[idx] = *ch;
+                if *ch == 0 {
+                    break;
+                }
+            }
+            let entry = MaybeUninit::<FAT32LongDirectoryEntry>::zeroed();
+            let mut entry = unsafe { entry.assume_init() };
+            entry.ldir_ord = seq as u8;
+            entry.ldir_attr = FAT32DirectoryEntryAttribute::ATTR_LONG_NAME;
+            entry.ldir_type = 0;
+            entry.ldir_chksum = checksum;
+            entry.ldir_fst_clus_lo = 0;
+            Self::fill_long_entry_name(&mut entry.ldir_name1, &encoded[0..5]);
+            Self::fill_long_entry_name(&mut entry.ldir_name2, &encoded[5..11]);
+            Self::fill_long_entry_name(&mut entry.ldir_name3, &encoded[11..13]);
+            entries.push(entry);
+        }
+        if let Some(last) = entries.last_mut() {
+            last.ldir_ord |= 0x40;
+        }
+        Ok(entries)
+    }
+
+    fn fill_long_entry_name(target: &mut [u8], values: &[u16]) {
+        for (idx, value) in values.iter().enumerate() {
+            let bytes = value.to_le_bytes();
+            let dst = idx * 2;
+            target[dst] = bytes[0];
+            target[dst + 1] = bytes[1];
+        }
+    }
+
+    fn short_name_checksum(short_name: &[u8; 11]) -> u8 {
+        let mut check_sum: u8 = 0;
+        for byte in short_name.iter() {
+            check_sum = check_sum.rotate_right(1).wrapping_add(*byte);
+        }
+        check_sum
+    }
+
+    fn dot_name(count: usize) -> [u8; 11] {
+        let mut name = [b' '; 11];
+        for i in 0..count {
+            name[i] = b'.';
+        }
+        name
+    }
+
+    fn initialize_directory_cluster(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        cluster: u32,
+        parent_cluster: u32,
+    ) -> Result<(), FileSystemErr> {
+        let mut cluster_buf = vec![0u8; self.cluster_size_bytes()];
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        let dot = Self::build_directory_entry(Self::dot_name(1), cluster);
+        let dotdot = Self::build_directory_entry(Self::dot_name(2), parent_cluster);
+        let dot_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &dot as *const FAT32ByteDirectoryEntry as *const u8,
+                entry_size,
+            )
+        };
+        cluster_buf[0..entry_size].copy_from_slice(dot_bytes);
+        let dotdot_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &dotdot as *const FAT32ByteDirectoryEntry as *const u8,
+                entry_size,
+            )
+        };
+        cluster_buf[entry_size..entry_size * 2].copy_from_slice(dotdot_bytes);
+        let lba = self.volume.cluster_to_lba(cluster)?;
+        block_device
+            .write_at(lba, &cluster_buf)
+            .map_err(from_io_err)
+    }
+
+    fn read_directory_parent_cluster(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+    ) -> Result<u32, FileSystemErr> {
+        if dir_cluster == 0 {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let mut buffer = vec![0u8; self.cluster_size_bytes()];
+        let mut uninit = slice_as_uninit(&mut buffer);
+        let lba = self.volume.cluster_to_lba(dir_cluster)?;
+        block_device
+            .read_at(lba, &mut uninit)
+            .map_err(from_io_err)?;
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        if entry_size * 2 > buffer.len() {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let parent_ptr =
+            unsafe { buffer.as_ptr().add(entry_size) as *const FAT32ByteDirectoryEntry };
+        let parent = unsafe { &*parent_ptr };
+        let parent_cluster =
+            ((parent.dir_fst_clus_hi.read() as u32) << 16) | parent.dir_fst_clus_lo.read() as u32;
+        Ok(parent_cluster)
+    }
+
+    fn update_directory_parent_cluster(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        parent_cluster: u32,
+    ) -> Result<(), FileSystemErr> {
+        if dir_cluster == 0 {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let mut buffer = vec![0u8; self.cluster_size_bytes()];
+        let mut uninit = slice_as_uninit(&mut buffer);
+        let lba = self.volume.cluster_to_lba(dir_cluster)?;
+        block_device
+            .read_at(lba, &mut uninit)
+            .map_err(from_io_err)?;
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        if entry_size * 2 > buffer.len() {
+            return Err(FileSystemErr::Corrupted);
+        }
+        let parent_ptr =
+            unsafe { buffer.as_mut_ptr().add(entry_size) as *mut FAT32ByteDirectoryEntry };
+        let parent = unsafe { &mut *parent_ptr };
+        if parent.dir_name[0] != b'.' || parent.dir_name[1] != b'.' {
+            return Err(FileSystemErr::Corrupted);
+        }
+        parent
+            .dir_fst_clus_lo
+            .write((parent_cluster & 0xFFFF) as u16);
+        parent
+            .dir_fst_clus_hi
+            .write(((parent_cluster >> 16) & 0xFFFF) as u16);
+        block_device.write_at(lba, &buffer).map_err(from_io_err)
+    }
+
+    fn directory_contains_cluster(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        ancestor: u32,
+        mut cluster: u32,
+    ) -> Result<bool, FileSystemErr> {
+        if ancestor == 0 || cluster == 0 {
+            return Ok(false);
+        }
+        if ancestor == cluster {
+            return Ok(true);
+        }
+        while cluster != self.root_dir_cluster {
+            cluster = self.read_directory_parent_cluster(block_device, cluster)?;
+            if cluster == ancestor {
+                return Ok(true);
+            }
+        }
+        Ok(cluster == ancestor)
+    }
+
+    fn delete_directory_entry(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+        meta: &DirMeta,
+    ) -> Result<(), FileSystemErr> {
+        let cluster_size = self.cluster_size_bytes();
+        let sector_size = self.volume.bytes_per_sector as usize;
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        let mut buffer = vec![0u8; cluster_size];
+        for info in FAT32FATIter::new(block_device, self, dir_cluster) {
+            let info = info?;
+            let start = info.lba;
+            let end = start + self.volume.sectors_per_cluster as u64;
+            if meta.entry_lba < start || meta.entry_lba >= end {
+                continue;
+            }
+            let mut uninit = slice_as_uninit(&mut buffer);
+            block_device
+                .read_at(info.lba, &mut uninit)
+                .map_err(from_io_err)?;
+            let sector_off = meta.entry_lba - start;
+            let mut entry_off = sector_off as usize * sector_size + meta.entry_offset as usize;
+            if entry_off + entry_size > buffer.len() {
+                return Err(FileSystemErr::Corrupted);
+            }
+            buffer[entry_off] = 0xE5;
+            while entry_off >= entry_size {
+                let prev = entry_off - entry_size;
+                let attr = buffer[prev + FAT32DirectoryEntryAttribute::OFFSET];
+                if attr != FAT32DirectoryEntryAttribute::ATTR_LONG_NAME.raw() {
+                    break;
+                }
+                buffer[prev] = 0xE5;
+                entry_off = prev;
+            }
+            block_device
+                .write_at(info.lba, &buffer)
+                .map_err(from_io_err)?;
+            return Ok(());
+        }
+        Err(FileSystemErr::Corrupted)
+    }
+
+    fn directory_is_empty(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        dir_cluster: u32,
+    ) -> Result<bool, FileSystemErr> {
+        let cluster_size = self.cluster_size_bytes();
+        let entry_size = size_of::<FAT32ByteDirectoryEntry>();
+        let mut buffer = vec![0u8; cluster_size];
+        for info in FAT32FATIter::new(block_device, self, dir_cluster) {
+            let info = info?;
+            let mut uninit = slice_as_uninit(&mut buffer);
+            block_device
+                .read_at(info.lba, &mut uninit)
+                .map_err(from_io_err)?;
+            for entry_off in (0..cluster_size).step_by(entry_size) {
+                let name0 = buffer[entry_off];
+                if name0 == 0x00 {
+                    return Ok(true);
+                }
+                if name0 == 0xE5 {
+                    continue;
+                }
+                let attr = buffer[entry_off + FAT32DirectoryEntryAttribute::OFFSET];
+                if attr == FAT32DirectoryEntryAttribute::ATTR_LONG_NAME.raw() {
+                    continue;
+                }
+                let entry = unsafe {
+                    &*((buffer.as_ptr().add(entry_off)) as *const FAT32ByteDirectoryEntry)
+                };
+                if entry.dir_attr & FAT32DirectoryEntryAttribute::ATTR_VOLUME_ID
+                    == FAT32DirectoryEntryAttribute::ATTR_VOLUME_ID
+                {
+                    continue;
+                }
+                if entry.dir_name[0] == b'.'
+                    && (entry.dir_name[1] == b' ' || entry.dir_name[1] == b'.')
+                {
+                    if entry.dir_name[1] == b' ' {
+                        continue;
+                    }
+                    if entry.dir_name[1] == b'.' && entry.dir_name[2] == b' ' {
+                        continue;
+                    }
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn free_cluster_chain(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        first_cluster: u32,
+    ) -> Result<(), FileSystemErr> {
+        if first_cluster == 0 {
+            return Ok(());
+        }
+        let chain = self.collect_cluster_chain(block_device, first_cluster)?;
+        for cluster in chain {
+            self.write_fat_entry(block_device, cluster, 0)?;
+        }
+        Ok(())
+    }
+
+    fn create_directory(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr> {
+        let components = Self::split_path_components(path)?;
+        let (parent_components, name) = components.split_at(components.len() - 1);
+        let dir_name = name[0];
+        if dir_name == "." || dir_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (parent_cluster, parent_meta) =
+            self.resolve_directory(block_device, parent_components)?;
+        self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
+        if self
+            .search_file_name_with_cluster_dir(block_device, parent_cluster, dir_name)?
+            .is_some()
+        {
+            return Err(FileSystemErr::AlreadyExists);
+        }
+        let new_cluster = self.find_free_cluster(block_device)?;
+        self.write_fat_entry(block_device, new_cluster, FAT32FAT::END_OF_CHAIN)?;
+        self.initialize_directory_cluster(block_device, new_cluster, parent_cluster)?;
+        self.insert_entry_with_builder(block_device, parent_cluster, dir_name, |short_name| {
+            Self::build_directory_entry(short_name, new_cluster)
+        })
+        .map(|_| ())
+    }
+
+    fn remove_directory(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr> {
+        let components = Self::split_path_components(path)?;
+        let (parent_components, name) = components.split_at(components.len() - 1);
+        let dir_name = name[0];
+        if dir_name == "." || dir_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (parent_cluster, parent_meta) =
+            self.resolve_directory(block_device, parent_components)?;
+        self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
+        let Some(meta) =
+            self.search_file_name_with_cluster_dir(block_device, parent_cluster, dir_name)?
+        else {
+            return Err(FileSystemErr::NotFound);
+        };
+        if !meta.is_dir {
+            return Err(FileSystemErr::NotDir);
+        }
+        if meta.is_readonly {
+            return Err(FileSystemErr::ReadOnly);
+        }
+        if !self.directory_is_empty(block_device, meta.first_cluster)? {
+            return Err(FileSystemErr::Busy);
+        }
+        self.free_cluster_chain(block_device, meta.first_cluster)?;
+        self.delete_directory_entry(block_device, parent_cluster, &meta)
+    }
 }
 
 fn slice_as_uninit(buf: &mut [u8]) -> &mut [MaybeUninit<u8>] {
@@ -507,24 +1338,290 @@ impl FileSystemTrait for FAT32FileSystem {
         })
     }
 
-    fn remove_file(&self, path: &str) -> Result<(), FileSystemErr> {
-        todo!()
+    fn create_file(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        file_system: &Arc<dyn FileSystemTrait>,
+        path: &str,
+    ) -> Result<FileHandle, FileSystemErr> {
+        let components = Self::split_path_components(path)?;
+        let (parent_components, name) = components.split_at(components.len() - 1);
+        let file_name = name[0];
+        if file_name == "." || file_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (parent_cluster, parent_meta) =
+            self.resolve_directory(block_device, parent_components)?;
+        self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
+        if self
+            .search_file_name_with_cluster_dir(block_device, parent_cluster, file_name)?
+            .is_some()
+        {
+            return Err(FileSystemErr::AlreadyExists);
+        }
+        let (entry_lba, entry_offset) = self.insert_entry_with_builder(
+            block_device,
+            parent_cluster,
+            file_name,
+            |short_name| Self::build_file_entry(short_name),
+        )?;
+        let meta = DirMeta {
+            is_dir: false,
+            is_readonly: false,
+            first_cluster: 0,
+            file_size: 0,
+            entry_lba,
+            entry_offset,
+        };
+        Ok(FileHandle {
+            dev_handle: Arc::downgrade(block_device),
+            file_handle: Arc::downgrade(file_system),
+            meta,
+            opts: OpenOptions::Write,
+        })
     }
 
-    fn copy(&self, from: &str, to: &str) -> Result<(), FileSystemErr> {
-        todo!()
+    fn remove_file(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr> {
+        let components = Self::split_path_components(path)?;
+        let (parent_components, name) = components.split_at(components.len() - 1);
+        let file_name = name[0];
+        if file_name == "." || file_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (parent_cluster, parent_meta) =
+            self.resolve_directory(block_device, parent_components)?;
+        self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
+        let Some(meta) =
+            self.search_file_name_with_cluster_dir(block_device, parent_cluster, file_name)?
+        else {
+            return Err(FileSystemErr::NotFound);
+        };
+        if meta.is_dir {
+            return Err(FileSystemErr::IsDir);
+        }
+        if meta.is_readonly {
+            return Err(FileSystemErr::ReadOnly);
+        }
+        self.free_cluster_chain(block_device, meta.first_cluster)?;
+        self.delete_directory_entry(block_device, parent_cluster, &meta)
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), FileSystemErr> {
-        todo!()
+    fn copy(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FileSystemErr> {
+        let src_components = Self::split_path_components(from)?;
+        let (src_parent_components, src_name) = src_components.split_at(src_components.len() - 1);
+        let src_file_name = src_name[0];
+        if src_file_name == "." || src_file_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (src_parent_cluster, _) =
+            self.resolve_directory(block_device, src_parent_components)?;
+        let Some(src_meta) = self.search_file_name_with_cluster_dir(
+            block_device,
+            src_parent_cluster,
+            src_file_name,
+        )?
+        else {
+            return Err(FileSystemErr::NotFound);
+        };
+        if src_meta.is_dir {
+            return Err(FileSystemErr::IsDir);
+        }
+
+        let dst_components = Self::split_path_components(to)?;
+        let (dst_parent_components, dst_name) = dst_components.split_at(dst_components.len() - 1);
+        let dst_file_name = dst_name[0];
+        if dst_file_name == "." || dst_file_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (dst_parent_cluster, dst_parent_meta) =
+            self.resolve_directory(block_device, dst_parent_components)?;
+        self.ensure_directory_writable(block_device, dst_parent_meta.as_ref())?;
+        if self
+            .search_file_name_with_cluster_dir(block_device, dst_parent_cluster, dst_file_name)?
+            .is_some()
+        {
+            return Err(FileSystemErr::AlreadyExists);
+        }
+
+        let (entry_lba, entry_offset) = self.insert_entry_with_builder(
+            block_device,
+            dst_parent_cluster,
+            dst_file_name,
+            |short_name| Self::build_file_entry(short_name),
+        )?;
+
+        let mut new_meta = DirMeta {
+            is_dir: false,
+            is_readonly: false,
+            first_cluster: 0,
+            file_size: 0,
+            entry_lba,
+            entry_offset,
+        };
+
+        let mut remaining = src_meta.file_size as u64;
+        if remaining == 0 {
+            return Ok(());
+        }
+        let chunk_size = cmp::max(1, self.cluster_size_bytes());
+        let mut buffer = vec![0u8; chunk_size];
+        let mut offset = 0u64;
+
+        while remaining > 0 {
+            let current = cmp::min(remaining, chunk_size as u64) as usize;
+            {
+                let chunk = &mut buffer[..current];
+                let mut uninit = slice_as_uninit(chunk);
+                self.read_at(block_device, offset, &mut uninit, &src_meta)?;
+            }
+            let chunk = &buffer[..current];
+            self.write_at(block_device, offset, chunk, &mut new_meta)?;
+            remaining -= current as u64;
+            offset += current as u64;
+        }
+        Ok(())
     }
 
-    fn create_dir(&self, path: &str) -> Result<(), FileSystemErr> {
-        todo!()
+    fn rename(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FileSystemErr> {
+        if from == to {
+            return Ok(());
+        }
+        let src_components = Self::split_path_components(from)?;
+        let (src_parent_components, src_name) = src_components.split_at(src_components.len() - 1);
+        let src_file_name = src_name[0];
+        if src_file_name == "." || src_file_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (src_parent_cluster, src_parent_meta) =
+            self.resolve_directory(block_device, src_parent_components)?;
+        self.ensure_directory_writable(block_device, src_parent_meta.as_ref())?;
+        let Some(src_meta) = self.search_file_name_with_cluster_dir(
+            block_device,
+            src_parent_cluster,
+            src_file_name,
+        )?
+        else {
+            return Err(FileSystemErr::NotFound);
+        };
+        if src_meta.is_readonly {
+            return Err(FileSystemErr::ReadOnly);
+        }
+
+        let dst_components = Self::split_path_components(to)?;
+        let (dst_parent_components, dst_name) = dst_components.split_at(dst_components.len() - 1);
+        let dst_file_name = dst_name[0];
+        if dst_file_name == "." || dst_file_name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (dst_parent_cluster, dst_parent_meta) =
+            self.resolve_directory(block_device, dst_parent_components)?;
+        self.ensure_directory_writable(block_device, dst_parent_meta.as_ref())?;
+
+        if src_meta.is_dir {
+            if src_meta.first_cluster == 0 {
+                return Err(FileSystemErr::Corrupted);
+            }
+            if dst_parent_cluster == src_meta.first_cluster
+                || self.directory_contains_cluster(
+                    block_device,
+                    src_meta.first_cluster,
+                    dst_parent_cluster,
+                )?
+            {
+                return Err(FileSystemErr::Busy);
+            }
+        }
+
+        if let Some(existing) =
+            self.search_file_name_with_cluster_dir(block_device, dst_parent_cluster, dst_file_name)?
+        {
+            if existing.entry_lba == src_meta.entry_lba
+                && existing.entry_offset == src_meta.entry_offset
+            {
+                return Ok(());
+            }
+            return Err(FileSystemErr::AlreadyExists);
+        }
+
+        let old_entry = self.read_directory_entry(block_device, &src_meta)?;
+        let same_parent = src_parent_cluster == dst_parent_cluster;
+        let entry_template = old_entry;
+        let (new_entry_lba, new_entry_offset) = self.insert_entry_with_builder(
+            block_device,
+            dst_parent_cluster,
+            dst_file_name,
+            |short_name| {
+                let mut entry = entry_template;
+                entry.dir_name = short_name;
+                entry
+            },
+        )?;
+        let new_entry_meta = DirMeta {
+            is_dir: src_meta.is_dir,
+            is_readonly: src_meta.is_readonly,
+            first_cluster: src_meta.first_cluster,
+            file_size: src_meta.file_size,
+            entry_lba: new_entry_lba,
+            entry_offset: new_entry_offset,
+        };
+
+        if let Err(err) = self.delete_directory_entry(block_device, src_parent_cluster, &src_meta) {
+            let _ = self.delete_directory_entry(block_device, dst_parent_cluster, &new_entry_meta);
+            return Err(err);
+        }
+
+        if !same_parent && src_meta.is_dir {
+            if let Err(err) = self.update_directory_parent_cluster(
+                block_device,
+                src_meta.first_cluster,
+                dst_parent_cluster,
+            ) {
+                let _ =
+                    self.delete_directory_entry(block_device, dst_parent_cluster, &new_entry_meta);
+                let _ = self.insert_entry_with_builder(
+                    block_device,
+                    src_parent_cluster,
+                    src_file_name,
+                    |short_name| {
+                        let mut entry = old_entry;
+                        entry.dir_name = short_name;
+                        entry
+                    },
+                );
+                return Err(err);
+            }
+        }
+        Ok(())
     }
 
-    fn remove_dir(&self, path: &str) -> Result<(), FileSystemErr> {
-        todo!()
+    fn create_dir(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr> {
+        self.create_directory(block_device, path)
+    }
+
+    fn remove_dir(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr> {
+        self.remove_directory(block_device, path)
     }
 
     fn read(
