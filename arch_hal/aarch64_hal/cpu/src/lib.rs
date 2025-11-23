@@ -85,6 +85,12 @@ pub fn get_elr_el2() -> u64 {
     elr_el2
 }
 
+pub fn get_hcr_el2() -> u64 {
+    let hcr_el2: u64;
+    unsafe { asm!("mrs {}, hcr_el2", out(reg) hcr_el2) };
+    hcr_el2
+}
+
 pub fn set_vtcr_el2(vtcr_el2: u64) {
     unsafe { asm!("msr vtcr_el2, {}", in(reg)vtcr_el2) };
 }
@@ -103,6 +109,22 @@ pub fn set_vbar_el2(vbar: u64) {
 
 pub fn set_elr_el2(elr_el2: u64) {
     unsafe { asm!("msr elr_el2, {}", in(reg) elr_el2) };
+}
+
+pub fn set_sctlr_el2(sctlr_el2: u64) {
+    unsafe { asm!("msr sctlr_el2, {}", in(reg) sctlr_el2) };
+}
+
+pub fn set_ttbr0_el2(ttbr0_el2: u64) {
+    unsafe { asm!("msr ttbr0_el2, {}", in(reg) ttbr0_el2) };
+}
+
+pub fn set_mair_el2(mair_el2: u64) {
+    unsafe { asm!("msr mair_el2, {}", in(reg) mair_el2) };
+}
+
+pub fn set_tcr_el2(tcr_el2: u64) {
+    unsafe { asm!("msr tcr_el2, {}", in(reg) tcr_el2) };
 }
 
 pub fn clean_dcache_poc(addr: usize, size: usize) {
