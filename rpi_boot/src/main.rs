@@ -37,22 +37,17 @@ use dtb::DtbParser;
 use file::AlignedSliceBox;
 use typestate::Le;
 
-#[unsafe(link_section = ".img")]
-static LINUX: [u8; include_bytes!("../../bin/Image").len()] = *include_bytes!("../../bin/Image");
-
 unsafe extern "C" {
     static mut _BSS_START: usize;
     static mut _BSS_END: usize;
     static mut _PROGRAM_START: usize;
     static mut _PROGRAM_END: usize;
     static mut _STACK_TOP: usize;
-    static __linux_image_start: u8;
-    static __linux_image_end: u8;
+    static mut _LINUX_IMAGE: usize;
 }
 
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
-pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
 static RP1_BASE: usize = 0x1c_0000_0000;
 static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
 static RP1_PAD: usize = RP1_BASE + 0xf_0000;
@@ -103,10 +98,12 @@ loop:
 
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
-    let program_start = unsafe { &raw mut _PROGRAM_START } as *const _ as usize;
-    let program_end = unsafe { &raw mut _PROGRAM_END } as *const _ as usize;
+    let program_start = &raw mut _PROGRAM_START as *const _ as usize;
+    let program_end = &raw mut _PROGRAM_END as *const _ as usize;
+    let linux_image = &raw mut _LINUX_IMAGE as *const _ as usize;
 
     debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000);
+    // debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000);
     cpu::isb();
     cpu::dsb_ish();
     debug_uart::write("HelloWorld!!!");
@@ -172,6 +169,18 @@ extern "C" fn main() -> ! {
         dtb.get_size()
     );
     allocator::add_reserved_region(DTB_PTR, dtb.get_size()).unwrap();
+    println!("get linux header");
+    let linux_header = unsafe { &*(linux_image as *const LinuxHeader) };
+    // check
+    if linux_header.magic != LinuxHeader::MAGIC {
+        panic!("invalid linux header");
+    }
+    let image_size = linux_header.image_size.read() as usize;
+    let text_offset = linux_header.text_offset.read() as usize;
+    let jump_addr = linux_image + text_offset;
+    unsafe { *LINUX_ADDR.get() = jump_addr };
+
+    allocator::add_reserved_region(linux_image, image_size).unwrap();
     println!("finalizing allocator...");
     allocator::finalize().unwrap();
     println!("allocator free regions after finalize:");
@@ -201,34 +210,36 @@ extern "C" fn main() -> ! {
     let ipa_space = 1usize << parange;
     const PAGE_SIZE: usize = 0x1000;
     let mut paging_data = [
+        // Stage2PagingSetting {
+        //     ipa: 0,
+        //     pa: 0,
+        //     size: 0xfff000,
+        // },
+        // Stage2PagingSetting {
+        //     ipa: 0xfff000 + 0x1000,
+        //     pa: 0xfff000 + 0x1000,
+        //     size: PL011_UART_ADDR - 0xfff000 - 0x1000,
+        // },
+        // Stage2PagingSetting {
+        //     ipa: PL011_UART_ADDR + 0x1000,
+        //     pa: PL011_UART_ADDR + 0x1000,
+        //     size: ipa_space - PL011_UART_ADDR - 0x1000,
+        // },
         Stage2PagingSetting {
             ipa: 0,
             pa: 0,
-            size: 0xfff000,
+            size: PL011_UART_ADDR,
         },
         Stage2PagingSetting {
-            ipa: 0xfff000 + 0x1000,
-            pa: 0xfff000 + 0x1000,
-            size: ipa_space - 0xfff000 - 0x1000,
+            ipa: PL011_UART_ADDR + 0x1000,
+            pa: PL011_UART_ADDR + 0x1000,
+            size: ipa_space - PL011_UART_ADDR - 0x1000,
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data).unwrap();
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");
 
-    println!("get linux header");
-    let linux_header = unsafe { &*(LINUX.as_ptr() as *const LinuxHeader) };
-    // check
-    if linux_header.magic != LinuxHeader::MAGIC {
-        panic!("invalid linux header");
-    }
-    let image_size = linux_header.image_size.read() as usize;
-    let text_offset = linux_header.text_offset.read() as usize;
-    let linux = AlignedSliceBox::new_uninit_with_align(image_size, 0x2 * 0x1000 * 0x1000).unwrap();
-    let mut linux = unsafe { linux.assume_init() };
-    linux[..LINUX.len()].copy_from_slice(&LINUX);
-    let jump_addr = linux.as_ptr() as usize + text_offset;
-    unsafe { *LINUX_ADDR.get() = jump_addr as usize };
     let mut modified: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(dtb.get_size());
     unsafe {
         core::ptr::copy_nonoverlapping(
