@@ -169,6 +169,18 @@ extern "C" fn main() -> ! {
         dtb.get_size()
     );
     allocator::add_reserved_region(DTB_PTR, dtb.get_size()).unwrap();
+    println!("get linux header");
+    let linux_header = unsafe { &*(linux_image as *const LinuxHeader) };
+    // check
+    if linux_header.magic != LinuxHeader::MAGIC {
+        panic!("invalid linux header");
+    }
+    let image_size = linux_header.image_size.read() as usize;
+    let text_offset = linux_header.text_offset.read() as usize;
+    let jump_addr = linux_image + text_offset;
+    unsafe { *LINUX_ADDR.get() = jump_addr };
+
+    allocator::add_reserved_region(linux_image, image_size).unwrap();
     println!("finalizing allocator...");
     allocator::finalize().unwrap();
     println!("allocator free regions after finalize:");
@@ -228,16 +240,6 @@ extern "C" fn main() -> ! {
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");
 
-    println!("get linux header");
-    let linux_header = unsafe { &*(linux_image as *const LinuxHeader) };
-    // check
-    if linux_header.magic != LinuxHeader::MAGIC {
-        panic!("invalid linux header");
-    }
-    let image_size = linux_header.image_size.read() as usize;
-    let text_offset = linux_header.text_offset.read() as usize;
-    let jump_addr = linux_image + text_offset;
-    unsafe { *LINUX_ADDR.get() = jump_addr };
     let mut modified: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(dtb.get_size());
     unsafe {
         core::ptr::copy_nonoverlapping(
