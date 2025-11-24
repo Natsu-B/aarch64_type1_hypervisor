@@ -155,6 +155,9 @@ impl Stage2Paging {
         let mut pa = data[0].pa;
         let mut ipa = data[0].ipa;
         let mut size = data[0].size;
+        if data[0].size == 0 {
+            return Err(PagingErr::ZeroSizedPage);
+        }
         if (data[0].pa | data[0].ipa | data[0].size) & (PAGE_TABLE_SIZE - 1) != 0 {
             return Err(PagingErr::UnalignedPage);
         }
@@ -296,6 +299,9 @@ impl Stage2Paging {
         *i += 1;
         if *i == data.len() {
             return Ok(());
+        }
+        if data[*i].size == 0 {
+            return Err(PagingErr::ZeroSizedPage);
         }
         if (data[*i].pa | data[*i].ipa | data[*i].size) & (PAGE_TABLE_SIZE - 1) != 0 {
             return Err(PagingErr::UnalignedPage);
