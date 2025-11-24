@@ -19,7 +19,7 @@ bitregs! {
         //   - 4KB granule:  [47:12] used
         //   - 16KB granule: [47:14] used
         //   - 64KB granule: [47:16] used
-        NLTA@[47:12],
+        pub(crate) ntla@[47:12],
 
         // For 48-bit OA (no FEAT_LPA2 / DS==0), these bits are RES0 in translation descriptors.
         reserved@[50:48] [res0],
@@ -42,7 +42,7 @@ impl Stage2_48bitTableDescriptor {
     #[inline]
     pub(crate) fn new_descriptor(next_table: u64) -> u64 {
         // Keep OA within [47:0] and zero below bit 12 (covers 4K superset; 16K/64K alignments are stricter).
-        Self::new().set_raw(Self::NLTA, next_table).bits()
+        Self::new().set_raw(Self::ntla, next_table).bits()
     }
 }
 
