@@ -258,14 +258,135 @@ bitregs! {
     ///       - Alignment checking and some exception-handling behaviors.
     ///
     /// Notes:
-    ///     This is a simplified model that exposes only the most commonly used
-    ///     fields for a hypervisor with VMSAv8-64 stage-1 translation at EL2.
-    ///     Newer architectural fields (TIDCP, LSMAOE, nTLSMD, BR, EPAN, etc.)
-    ///     are omitted here; consult the Arm ARM for full details.
+    ///     - This model exposes the commonly used fields for EL2 stage-1.
+    ///     - Architecturally mandated RES1 bits are preserved with `[res1]`
+    ///       so that constructing a value never writes them as 0.
+    ///     - Many upper fields are optional and RES0 when the corresponding
+    ///       FEAT is not implemented; they remain modeled but should be left
+    ///       at reset values unless explicitly needed.
     pub(crate) struct SCTLR_EL2: u64 {
-        // Bits [63:26]: Various optional architectural controls (e.g. TIDCP, LSMAOE,
-        // nTLSMD, EPAN, etc. on newer cores). Not modeled here.
-        reserved@[63:26] [res0],
+        // TIDCP — Trap ID/feature registers in host regime (FEAT_TIDCP1):
+        //   When implemented and EL2 is in Host/VHE view, this controls trapping
+        //   of certain ID/system registers to EL2.
+        //   Otherwise RES0.
+        pub(crate) tidcp@[63:63] as TrapIdRegs {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // SPINTMASK — Host interrupt masking control (optional):
+        //   When implemented in the EL2-in-Host view, controls masking behavior
+        //   for interrupts while executing at EL0/EL1 under VHE.
+        //   Otherwise RES0.
+        pub(crate) spintmask@[62:62] as SPIntMask {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // Bit [61]: reserved, RES0.
+        reserved@[61:61] [res0],
+
+        // EnTP2 — Enable EL0 access to TPIDR2_EL0 (optional, FEAT_TPIDR2 / SME):
+        //   0b0 = Accesses at EL0 are trapped/disabled per architecture.
+        //   0b1 = EL0 can access TPIDR2_EL0 when in Host/VHE regime.
+        //   Otherwise RES0.
+        pub(crate) entp2@[60:60] as EnableTpidr2 {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // Bits [59:58]: reserved, RES0.
+        reserved@[59:58] [res0],
+
+        // EPAN — Enhanced PAN in host regime (optional):
+        //   0b0 = Enhanced PAN disabled.
+        //   0b1 = Enhanced PAN enabled for EL2&0 host translation regime.
+        //   Otherwise RES0.
+        pub(crate) epan@[57:57] as EnhancedPAN {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // Bits [56:45]: various optional architectural controls (not modeled).
+        reserved@[56:45] [res0],
+
+        // DSSBS — Default state of SSBS for lower ELs (optional):
+        //   0b0 = Default SSBS = 0.
+        //   0b1 = Default SSBS = 1.
+        //   Otherwise RES0.
+        pub(crate) dssbs@[44:44] as DefaultSSBS {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // ATA — Allocation Tag Access (FEAT_MTE/ATA):
+        //   0b0 = Tag access checks follow normal rules.
+        //   0b1 = Enables tag access behavior for EL2/host regime.
+        //   Otherwise RES0.
+        pub(crate) ata@[43:43] as AllocationTagAccess {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // Bits [42:38]: reserved/optional, not modeled.
+        reserved@[42:38] [res0],
+
+        // ITFSB — Implicit TFSR Sync Barrier on exception entry (optional):
+        //   0b0 = No implicit barrier on exception entry/return.
+        //   0b1 = Insert implicit TFSR sync barrier.
+        //   Otherwise RES0.
+        pub(crate) itfsb@[37:37] as ITFSB {
+            Disabled = 0b0,
+            Enabled  = 0b1,
+        },
+
+        // BT — Branch Target Identification enable (optional, FEAT_BTI):
+        //   0b0 = BTI not enforced for EL2 regime.
+        //   0b1 = BTI enforced as configured by translation regime.
+        //   Otherwise RES0.
+        pub(crate) bt@[36:36] as BranchTargetId {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // Bits [35:32]: reserved/optional, not modeled.
+        reserved@[35:32] [res0],
+
+        // EnIA / EnIB — Pointer Authentication instruction enables (optional PAC):
+        //   When implemented:
+        //     0b0 = PAC instructions using key A/B are disabled/trapped.
+        //     0b1 = PAC instructions using key A/B are enabled.
+        //   Otherwise RES0.
+        pub(crate) enia@[31:31] as PAuthInstrA {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+        pub(crate) enib@[30:30] as PAuthInstrB {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
+
+        // Bits [29:28]: optional controls (e.g., LSMAOE / nTLSMD on some cores).
+        // Linux treats these as architecturally RES1 for SCTLR_EL2 reset safety.
+        reserved@[29:28] [res1],
+
+        // ENDA — Data endianness control A (optional):
+        //   0b0 = Little-endian data accesses at lower ELs (host view).
+        //   0b1 = Big-endian data accesses at lower ELs (host view).
+        //   Otherwise RES0.
+        pub(crate) enda@[27:27] as DataEndiannessA {
+            LittleEndian = 0b0,
+            BigEndian    = 0b1,
+        },
+
+        // UCI — User Cache Instruction trap control (host/VHE view):
+        //   0b0 = Trap EL0 cache maintenance instructions to EL2.
+        //   0b1 = Do not trap those instructions.
+        //   Otherwise RES0.
+        pub(crate) uci@[26:26] as UserCacheInstrTrap {
+            Trap   = 0b0,
+            NoTrap = 0b1,
+        },
 
         // EE — Exception endianness (EL2):
         //   0b0 = Little-endian.
@@ -277,29 +398,45 @@ bitregs! {
             BigEndian = 0b1,
         },
 
-        reserved@[24:23] [res0],
-
-        // EIS — Exception is context synchronizing:
-        //   When FEAT_ExS implemented:
-        //     0b0 = Exception entry to EL2 is not required to be context-synchronizing.
-        //     0b1 = Exception entry to EL2 is context-synchronizing.
+        // E0E — EL0 endianness in host regime (optional):
+        //   0b0 = Little-endian EL0 data accesses (host view).
+        //   0b1 = Big-endian EL0 data accesses (host view).
         //   Otherwise RES0.
+        pub(crate) e0e@[24:24] as EL0Endianness {
+            LittleEndian = 0b0,
+            BigEndian    = 0b1,
+        },
+
+        // Bit [23]: reserved, RES1 (must be 1).
+        reserved@[23:23] [res1],
+
+        // EIS — Exception entry is context synchronizing (FEAT_ExS):
+        //   0b0 = Exception entry to EL2 need not be context-synchronizing.
+        //   0b1 = Exception entry to EL2 is context-synchronizing.
+        //   Otherwise RES0. Many systems set this to 1 by default.
         pub(crate) eis@[22:22] as ExceptionIsSync {
             NotContextSync = 0b0,
-            ContextSync = 0b1,
+            ContextSync    = 0b1,
         },
 
         // IESB — Implicit Error Synchronization Barrier:
         //   When FEAT_IESB implemented:
         //     0b0 = No implicit ESB on exceptions/ERET at EL2.
-        //     0b1 = Implicit ESB on every exception entry to, and ERET from, EL2.
+        //     0b1 = Implicit ESB on every exception entry/ERET at EL2.
         //   Otherwise RES0.
         pub(crate) iesb@[21:21] as ImplicitESB {
             Disabled = 0b0,
-            Enabled = 0b1,
+            Enabled  = 0b1,
         },
 
-        reserved@[20:20] [res0],
+        // TSCXT — Trap SCXTNUM_EL0/context tracking access (optional):
+        //   0b0 = Do not trap.
+        //   0b1 = Trap relevant accesses to EL2.
+        //   Otherwise RES0.
+        pub(crate) tscxt@[20:20] as TrapSCXT {
+            Disable = 0b0,
+            Enable  = 0b1,
+        },
 
         // WXN — Write eXecute Never:
         //   0b0 = Writable regions are not forced XN.
@@ -308,12 +445,44 @@ bitregs! {
         // Only has effect when M == 1; may be cached in TLBs.
         pub(crate) wxn@[19:19] as WriteExecuteNever {
             Disable = 0b0,
-            Enable = 0b1,
+            Enable  = 0b1,
         },
 
-        // Bits [18:13]: In the full architecture these cover things like Background
-        // region control for the EL2 MPU on PMSAv8-64 implementations. Not modeled.
-        reserved@[18:13] [res0],
+        // Bit [18]: reserved, RES1 (architecturally nTWE in host view).
+        reserved@[18:18] [res1],
+
+        // Bit [17]: reserved, RES0.
+        reserved@[17:17] [res0],
+
+        // Bit [16]: reserved, RES1 (architecturally nTWI in host view).
+        reserved@[16:16] [res1],
+
+        // UCT — Trap CTR_EL0 access in host view (optional):
+        //   0b0 = Trap CTR_EL0 reads at EL0 to EL2.
+        //   0b1 = Do not trap.
+        //   Otherwise RES0.
+        pub(crate) uct@[15:15] as TrapCtrEl0 {
+            Trap   = 0b0,
+            NoTrap = 0b1,
+        },
+
+        // DZE — Trap DC ZVA at EL0 in host view (optional):
+        //   0b0 = Trap DC ZVA to EL2.
+        //   0b1 = Do not trap.
+        //   Otherwise RES0.
+        pub(crate) dze@[14:14] as TrapDCZVA {
+            Trap   = 0b0,
+            NoTrap = 0b1,
+        },
+
+        // ENDB — Data endianness control B (optional/common):
+        //   0b0 = Little-endian data accesses.
+        //   0b1 = Big-endian data accesses.
+        //   Otherwise RES0.
+        pub(crate) endb@[13:13] as DataEndiannessB {
+            LittleEndian = 0b0,
+            BigEndian    = 0b1,
+        },
 
         // I — Instruction cacheability control for EL2:
         //   0b0 = All instruction accesses to Normal memory from EL2 are treated
@@ -325,9 +494,14 @@ bitregs! {
             Cacheable    = 0b1,
         },
 
-        // Bits [11:4]: Other architectural controls (UCT, nTWI, nTWE, etc. on some
-        // cores). Not modeled here.
-        reserved@[11:4] [res0],
+        // Bit [11]: reserved, RES1 (architectural EOS bit).
+        reserved@[11:11] [res1],
+
+        // Bits [10:6]: reserved, RES0.
+        reserved@[10:6] [res0],
+
+        // Bits [5:4]: reserved, RES1 (must be 1).
+        reserved@[5:4] [res1],
 
         // SA — SP Alignment check enable:
         //   0b0 = No SP alignment fault for misaligned SP-based accesses at EL2.
