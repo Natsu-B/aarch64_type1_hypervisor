@@ -87,16 +87,25 @@ fn build_stage2_scenario()
             ipa: 0,
             pa: first_pa,
             size: first_size,
+            read: true,
+            write: true,
+            executable: true,
         },
         Stage2PagingSetting {
             ipa: first_size,
             pa: second_pa,
             size: second_size,
+            read: true,
+            write: true,
+            executable: true,
         },
         Stage2PagingSetting {
             ipa: first_size + second_size,
             pa: third_pa,
             size: third_size,
+            read: true,
+            write: true,
+            executable: true,
         },
     ];
 

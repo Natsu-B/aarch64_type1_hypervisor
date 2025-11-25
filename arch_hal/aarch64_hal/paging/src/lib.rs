@@ -1,5 +1,6 @@
 #![no_std]
 #![recursion_limit = "1024"]
+#![feature(sync_unsafe_cell)]
 
 extern crate alloc;
 

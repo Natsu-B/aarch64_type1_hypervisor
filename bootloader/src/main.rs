@@ -152,11 +152,17 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             ipa: 0x0000,
             pa: 0x0000,
             size: pl011_addr,
+            read: true,
+            write: true,
+            executable: true,
         },
         Stage2PagingSetting {
             ipa: pl011_addr + pl011_size,
             pa: pl011_addr + pl011_size,
             size: (1 << parange) - pl011_addr - pl011_size,
+            read: true,
+            write: true,
+            executable: true,
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data).unwrap();

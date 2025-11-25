@@ -229,11 +229,17 @@ extern "C" fn main() -> ! {
             ipa: 0,
             pa: 0,
             size: PL011_UART_ADDR,
+            read: true,
+            write: true,
+            executable: true,
         },
         Stage2PagingSetting {
             ipa: PL011_UART_ADDR + 0x1000,
             pa: PL011_UART_ADDR + 0x1000,
             size: ipa_space - PL011_UART_ADDR - 0x1000,
+            read: true,
+            write: true,
+            executable: true,
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data).unwrap();

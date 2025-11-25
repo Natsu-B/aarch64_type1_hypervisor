@@ -1,4 +1,7 @@
+use alloc::boxed::Box;
 use core::alloc::Layout;
+use core::cell::SyncUnsafeCell;
+use core::mem;
 use core::slice;
 
 use cpu::registers::PARange;
@@ -6,6 +9,7 @@ use cpu::registers::PARange;
 use crate::PAGE_TABLE_SIZE;
 use crate::PagingErr;
 use crate::registers::HCR_EL2;
+use crate::stage2::descriptor::AccessPermission;
 use crate::stage2::descriptor::Stage2_48bitLeafDescriptor;
 use crate::stage2::descriptor::Stage2_48bitTableDescriptor;
 use crate::stage2::registers::InnerCache;
@@ -19,13 +23,27 @@ use crate::stage2::registers::VTCR_EL2;
 mod descriptor;
 mod registers;
 
-pub struct Stage2Paging;
-
+#[derive(Clone, Copy)]
 pub struct Stage2PagingSetting {
     pub ipa: usize,
     pub pa: usize,
     pub size: usize,
+    pub read: bool,
+    pub write: bool,
+    pub executable: bool,
 }
+
+#[derive(Clone)]
+struct Stage2Context {
+    table_addr: usize,
+    top_table_level: i8,
+    num_of_tables: usize,
+    settings: Box<[Stage2PagingSetting]>,
+}
+
+static STAGE2_CONTEXT: SyncUnsafeCell<Option<Stage2Context>> = SyncUnsafeCell::new(None);
+
+pub struct Stage2Paging;
 
 impl Stage2Paging {
     /// initialize stage2 paging
@@ -115,6 +133,14 @@ impl Stage2Paging {
         // mapping page table
         let table = Self::setup_stage2_translation(data, initial_lookup_level_i8, num_of_tables)?;
         cpu::set_vttbr_el2(table as u64);
+        unsafe {
+            (*STAGE2_CONTEXT.get()) = Some(Stage2Context {
+                table_addr: table,
+                top_table_level: initial_lookup_level_i8,
+                num_of_tables,
+                settings: Box::from(data),
+            });
+        }
 
         let vtcr_el2 = VTCR_EL2::new()
             .set(VTCR_EL2::t0sz, t0sz)
@@ -171,7 +197,7 @@ impl Stage2Paging {
             if top_table_level != 0 && (pa | ipa) & (top_level - 1) == 0 && size >= top_level {
                 // block descriptor
                 debug_assert_eq!(table[idx], 0);
-                table[idx] = Stage2_48bitLeafDescriptor::new_block(pa as u64, top_table_level);
+                table[idx] = Self::build_leaf_descriptor(pa as u64, top_table_level, &data[i]);
                 pa += top_level;
                 ipa += top_level;
                 size -= top_level;
@@ -231,6 +257,7 @@ impl Stage2Paging {
         let table_limit = start_ipa + table_level_size * 512;
 
         while *i < data.len() && *ipa < table_limit {
+            let setting = &data[*i];
             // is block descriptor
             if table_level == 3
                 || ((*pa | *ipa) & (table_level_size - 1) == 0 && *size >= table_level_size)
@@ -240,11 +267,7 @@ impl Stage2Paging {
                 // block descriptor
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
-                table_addr[idx] = if table_level == 3 {
-                    Stage2_48bitLeafDescriptor::new_page(*pa as u64)
-                } else {
-                    Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level)
-                };
+                table_addr[idx] = Self::build_leaf_descriptor(*pa as u64, table_level, setting);
                 *pa += table_level_size;
                 *ipa += table_level_size;
                 *size -= table_level_size;
@@ -323,6 +346,58 @@ impl Stage2Paging {
             .set(HCR_EL2::rw, 0b1)
             .bits();
         cpu::set_hcr_el2(hcr);
+    }
+
+    /// Clear AF/DBM bits on every mapped leaf so subsequent accesses trap.
+    pub fn dirty_bit_remove_all() -> Result<(), PagingErr> {
+        let ctx = unsafe { &*STAGE2_CONTEXT.get() }
+            .as_ref()
+            .ok_or(PagingErr::Corrupted)?;
+        let mut table = unsafe {
+            slice::from_raw_parts_mut(ctx.table_addr as *mut u64, ctx.num_of_tables * 512)
+        };
+        Self::clear_dirty_bits_recursive(ctx.top_table_level, &mut table)?;
+        cpu::flush_tlb_el2_el1();
+        Ok(())
+    }
+
+    fn clear_dirty_bits_recursive(table_level: i8, table: &mut [u64]) -> Result<(), PagingErr> {
+        let table_bytes = table.len() * mem::size_of::<u64>();
+        for desc in table.iter_mut() {
+            match *desc & 0b11 {
+                0b01 => {
+                    *desc = Stage2_48bitLeafDescriptor::clear_access_and_dirty(*desc);
+                }
+                0b11 => {
+                    if table_level == 3 {
+                        *desc = Stage2_48bitLeafDescriptor::clear_access_and_dirty(*desc);
+                    } else {
+                        let next_table_addr = (*desc as usize) & !(PAGE_TABLE_SIZE - 1);
+                        let next_table =
+                            unsafe { slice::from_raw_parts_mut(next_table_addr as *mut u64, 512) };
+                        Self::clear_dirty_bits_recursive(table_level + 1, next_table)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        cpu::clean_dcache_poc(table.as_ptr() as usize, table_bytes);
+        Ok(())
+    }
+
+    fn build_leaf_descriptor(pa: u64, level: i8, setting: &Stage2PagingSetting) -> u64 {
+        let permission = match (setting.read, setting.write) {
+            (false, false) => AccessPermission::NoDataAccess,
+            (true, false) => AccessPermission::ReadOnly,
+            (false, true) => AccessPermission::WriteOnly,
+            (true, true) => AccessPermission::ReadWrite,
+        };
+
+        if level == 3 {
+            Stage2_48bitLeafDescriptor::new_page(pa, permission, setting.executable)
+        } else {
+            Stage2_48bitLeafDescriptor::new_block(pa, level, permission, setting.executable)
+        }
     }
 }
 
