@@ -8,9 +8,11 @@ mod systimer;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011;
@@ -208,34 +210,47 @@ extern "C" fn main() -> ! {
         cpu::registers::PARange::PA56bits64PB => 56,
     };
     let ipa_space = 1usize << parange;
-    const PAGE_SIZE: usize = 0x1000;
-    let mut paging_data = [
-        // Stage2PagingSetting {
-        //     ipa: 0,
-        //     pa: 0,
-        //     size: 0xfff000,
-        // },
-        // Stage2PagingSetting {
-        //     ipa: 0xfff000 + 0x1000,
-        //     pa: 0xfff000 + 0x1000,
-        //     size: PL011_UART_ADDR - 0xfff000 - 0x1000,
-        // },
-        // Stage2PagingSetting {
-        //     ipa: PL011_UART_ADDR + 0x1000,
-        //     pa: PL011_UART_ADDR + 0x1000,
-        //     size: ipa_space - PL011_UART_ADDR - 0x1000,
-        // },
-        Stage2PagingSetting {
-            ipa: 0,
-            pa: 0,
-            size: PL011_UART_ADDR,
-        },
-        Stage2PagingSetting {
-            ipa: PL011_UART_ADDR + 0x1000,
-            pa: PL011_UART_ADDR + 0x1000,
-            size: ipa_space - PL011_UART_ADDR - 0x1000,
-        },
-    ];
+    let mut paging_data: Vec<Stage2PagingSetting> = Vec::new();
+    dtb.find_node(Some("memory"), None, &mut |addr, size| {
+        let memory_last: Option<&Stage2PagingSetting> = paging_data.last();
+        let memory_last_addr = if let Some(memory_last) = memory_last {
+            memory_last.ipa + memory_last.size
+        } else {
+            0
+        };
+        assert!(memory_last_addr <= addr);
+        if memory_last_addr < addr {
+            paging_data.push(Stage2PagingSetting {
+                ipa: memory_last_addr,
+                pa: memory_last_addr,
+                size: addr - memory_last_addr,
+                types: Stage2PageTypes::Device,
+            });
+        }
+        paging_data.push(Stage2PagingSetting {
+            ipa: addr,
+            pa: addr,
+            size,
+            types: Stage2PageTypes::Normal,
+        });
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    let memory_last = paging_data.last().unwrap();
+    let memory_last_addr = memory_last.ipa + memory_last.size;
+    paging_data.push(Stage2PagingSetting {
+        ipa: memory_last_addr,
+        pa: memory_last_addr,
+        size: PL011_UART_ADDR - memory_last_addr,
+        types: Stage2PageTypes::Device,
+    });
+    paging_data.push(Stage2PagingSetting {
+        ipa: PL011_UART_ADDR + 0x1000,
+        pa: PL011_UART_ADDR + 0x1000,
+        size: ipa_space - PL011_UART_ADDR - 0x1000,
+        types: Stage2PageTypes::Device,
+    });
+    println!("Stage2Paging: {:#?}", paging_data);
     Stage2Paging::init_stage2paging(&paging_data).unwrap();
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");

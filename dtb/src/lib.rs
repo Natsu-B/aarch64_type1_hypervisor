@@ -925,11 +925,7 @@ mod dtb_parser {
             Ok(())
         }
 
-        fn strip_initrd(
-            &self,
-            struct_base: usize,
-            struct_size: usize,
-        ) -> Result<(), &'static str> {
+        fn strip_initrd(&self, struct_base: usize, struct_size: usize) -> Result<(), &'static str> {
             let mut cursor = struct_base;
             let end = struct_base + struct_size;
 

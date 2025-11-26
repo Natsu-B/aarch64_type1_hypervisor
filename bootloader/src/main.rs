@@ -12,6 +12,7 @@ use alloc::alloc::alloc;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011;
@@ -152,11 +153,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             ipa: 0x0000,
             pa: 0x0000,
             size: pl011_addr,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: pl011_addr + pl011_size,
             pa: pl011_addr + pl011_size,
             size: (1 << parange) - pl011_addr - pl011_size,
+            types: Stage2PageTypes::Normal,
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data).unwrap();
