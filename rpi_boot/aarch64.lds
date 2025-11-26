@@ -40,6 +40,6 @@ SECTIONS
 
     _STACK_TOP = .;
     _PROGRAM_END = .;
-    . = 0x100000;
+    . = 0x300000;
     _LINUX_IMAGE = .;
 }
