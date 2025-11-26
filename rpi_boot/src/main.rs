@@ -251,9 +251,7 @@ extern "C" fn main() -> ! {
     let modified = unsafe { modified.assume_init() };
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
     println!("set up linux data");
-    // workaround
-    let tmp = Box::new(1);
-    drop(tmp);
+
     let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, program_end));
@@ -267,7 +265,7 @@ extern "C" fn main() -> ! {
         )
     };
     new_dtb
-        .make_dtb(dtb_data, reserved_memory.as_ref())
+        .make_dtb(dtb_data, reserved_memory.as_ref(), true)
         .unwrap();
     unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
 

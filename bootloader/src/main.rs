@@ -239,7 +239,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         )
     };
     new_dtb
-        .make_dtb(dtb_data, reserved_memory.as_ref())
+        .make_dtb(dtb_data, reserved_memory.as_ref(), false)
         .unwrap();
     unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
     println!("jumping linux...");
