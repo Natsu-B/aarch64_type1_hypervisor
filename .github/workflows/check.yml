@@ -80,4 +80,4 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - run: nix develop --accept-flake-config --command cargo xbuild
+      - run: nix develop --accept-flake-config --command bash -c 'cargo xbuild && cargo xrun rpi5'

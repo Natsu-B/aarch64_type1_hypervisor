@@ -127,8 +127,10 @@ version = "0.1.0"
 name = "paging"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
  "allocator",
  "cpu",
+ "print",
  "typestate",
  "typestate_macro",
 ]
