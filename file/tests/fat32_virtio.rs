@@ -8,6 +8,7 @@ use arch_hal::debug_uart;
 use arch_hal::exit_failure;
 use arch_hal::exit_success;
 use arch_hal::println;
+use core::cmp;
 use core::str;
 use file::StorageDevice;
 use file::StorageDeviceErr;
@@ -112,6 +113,13 @@ fn run() -> Result<(), &'static str> {
     efi.read(1).unwrap();
 
     test_dir_and_file_ops(&device)?;
+
+    test_zero_length_write(&device)?;
+    test_invalid_offset_write(&device)?;
+    test_readonly_handle_write(&device)?;
+    test_partial_overwrite_middle(&device)?;
+    test_large_unaligned_multi_write(&device)?;
+    test_two_large_files_independent(&device)?;
 
     // Create a file and directory to check from host
     device.create_dir(0, "/testdir").unwrap();
@@ -245,6 +253,183 @@ fn test_dir_and_file_ops(device: &StorageDevice) -> Result<(), &'static str> {
     device.remove_file(0, copy_to).unwrap();
 
     println!("Directory and file operations test: PASS");
+    Ok(())
+}
+
+fn test_zero_length_write(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing zero-length write");
+    let path = "/zero_len.txt";
+    let handle = device.create_file(0, path).unwrap();
+    assert_eq!(handle.size().unwrap(), 0);
+
+    let mut writer = device.open(0, path, &file::OpenOptions::Write).unwrap();
+    assert_eq!(writer.write_at(0, &[]).unwrap(), 0);
+    writer.flush().unwrap();
+
+    let reader = device.open(0, path, &file::OpenOptions::Read).unwrap();
+    assert_eq!(reader.size().unwrap(), 0);
+
+    device.remove_file(0, path).unwrap();
+    println!("Zero-length write test: PASS");
+    Ok(())
+}
+
+fn test_invalid_offset_write(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing invalid offset write");
+    let path = "/invalid_offset.txt";
+    device.create_file(0, path).unwrap();
+
+    let mut writer = device.open(0, path, &file::OpenOptions::Write).unwrap();
+    assert_eq!(writer.size().unwrap(), 0);
+    let err = writer.write_at(1, b"x").unwrap_err();
+    assert_eq!(err, FileSystemErr::InvalidInput);
+    writer.flush().unwrap();
+    assert_eq!(writer.size().unwrap(), 0);
+
+    device.remove_file(0, path).unwrap();
+    println!("Invalid offset write test: PASS");
+    Ok(())
+}
+
+fn test_readonly_handle_write(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing write through readonly handle");
+    let path = "/readonly_handle.txt";
+    let initial = b"initial contents for readonly test";
+    let mut writer = device.create_file(0, path).unwrap();
+    writer.write_at(0, initial).unwrap();
+    writer.flush().unwrap();
+
+    let mut reader = device.open(0, path, &file::OpenOptions::Read).unwrap();
+    let err = reader.write_at(0, b"should fail").unwrap_err();
+    assert_eq!(err, FileSystemErr::ReadOnly);
+
+    let verify = device.open(0, path, &file::OpenOptions::Read).unwrap();
+    let content = verify.read(1).unwrap();
+    assert_eq!(&*content, initial);
+
+    device.remove_file(0, path).unwrap();
+    println!("Readonly handle write test: PASS");
+    Ok(())
+}
+
+fn test_partial_overwrite_middle(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing partial overwrite in the middle of a file");
+    let path = "/partial_overwrite.txt";
+    let initial = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let offset = 10usize;
+    let patch = b"12345";
+
+    let mut writer = device.create_file(0, path).unwrap();
+    writer.write_at(0, initial).unwrap();
+    writer.flush().unwrap();
+
+    let written = writer.write_at(offset as u64, patch).unwrap();
+    assert_eq!(written as usize, patch.len());
+    writer.flush().unwrap();
+
+    let reader = device.open(0, path, &file::OpenOptions::Read).unwrap();
+    let content = reader.read(1).unwrap();
+    assert_eq!(content.len(), initial.len());
+    assert_eq!(&content[..offset], &initial[..offset]);
+    assert_eq!(&content[offset..offset + patch.len()], patch);
+    assert_eq!(
+        &content[offset + patch.len()..initial.len()],
+        &initial[offset + patch.len()..]
+    );
+
+    device.remove_file(0, path).unwrap();
+    println!("Partial overwrite test: PASS");
+    Ok(())
+}
+
+fn test_large_unaligned_multi_write(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing large unaligned multi-chunk writes");
+    const TOTAL: usize = 128 * 1024;
+    const CHUNK: usize = 3000;
+    let path = "/large_unaligned.bin";
+    let mut writer = device.create_file(0, path).unwrap();
+    let mut offset = 0usize;
+    let mut buf = [0u8; CHUNK];
+    while offset < TOTAL {
+        let len = cmp::min(CHUNK, TOTAL - offset);
+        for i in 0..len {
+            let global_index = offset + i;
+            buf[i] = (global_index % 251) as u8;
+        }
+        let written = writer.write_at(offset as u64, &buf[..len]).unwrap();
+        assert_eq!(written as usize, len);
+        offset += len;
+    }
+    writer.flush().unwrap();
+    assert_eq!(writer.size().unwrap(), TOTAL as u64);
+
+    let reader = device.open(0, path, &file::OpenOptions::Read).unwrap();
+    let content = reader.read(1).unwrap();
+    assert_eq!(content.len(), TOTAL);
+    for (idx, byte) in content.iter().enumerate() {
+        assert_eq!(*byte, (idx % 251) as u8);
+    }
+
+    device.remove_file(0, path).unwrap();
+    println!("Large unaligned multi-chunk write test: PASS");
+    Ok(())
+}
+
+fn test_two_large_files_independent(device: &StorageDevice) -> Result<(), &'static str> {
+    println!("Testing two large files with independent data");
+    const TOTAL: usize = 64 * 1024;
+    const CHUNK: usize = 4096;
+    let mut buf = [0u8; CHUNK];
+
+    let path_a = "/large_a.bin";
+    let mut file_a = device.create_file(0, path_a).unwrap();
+    let mut offset = 0usize;
+    while offset < TOTAL {
+        let len = cmp::min(CHUNK, TOTAL - offset);
+        for i in 0..len {
+            let global_index = offset + i;
+            buf[i] = (global_index % 251) as u8;
+        }
+        let written = file_a.write_at(offset as u64, &buf[..len]).unwrap();
+        assert_eq!(written as usize, len);
+        offset += len;
+    }
+    file_a.flush().unwrap();
+    assert_eq!(file_a.size().unwrap(), TOTAL as u64);
+
+    let path_b = "/large_b.bin";
+    let mut file_b = device.create_file(0, path_b).unwrap();
+    offset = 0;
+    while offset < TOTAL {
+        let len = cmp::min(CHUNK, TOTAL - offset);
+        for i in 0..len {
+            let global_index = offset + i;
+            buf[i] = ((global_index + 7) % 251) as u8;
+        }
+        let written = file_b.write_at(offset as u64, &buf[..len]).unwrap();
+        assert_eq!(written as usize, len);
+        offset += len;
+    }
+    file_b.flush().unwrap();
+    assert_eq!(file_b.size().unwrap(), TOTAL as u64);
+
+    let reader_a = device.open(0, path_a, &file::OpenOptions::Read).unwrap();
+    let content_a = reader_a.read(1).unwrap();
+    assert_eq!(content_a.len(), TOTAL);
+    for (idx, byte) in content_a.iter().enumerate() {
+        assert_eq!(*byte, (idx % 251) as u8);
+    }
+
+    let reader_b = device.open(0, path_b, &file::OpenOptions::Read).unwrap();
+    let content_b = reader_b.read(1).unwrap();
+    assert_eq!(content_b.len(), TOTAL);
+    for (idx, byte) in content_b.iter().enumerate() {
+        assert_eq!(*byte, ((idx + 7) % 251) as u8);
+    }
+
+    device.remove_file(0, path_a).unwrap();
+    device.remove_file(0, path_b).unwrap();
+    println!("Two large independent files test: PASS");
     Ok(())
 }
 

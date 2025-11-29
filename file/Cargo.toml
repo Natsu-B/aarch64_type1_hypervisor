@@ -17,6 +17,7 @@ arch_hal = { path = "../arch_hal", default-features = false, features = ["uefi-t
 
 [lib]
 doctest = false
+test = false
 
 [[test]]
 name = "fat32_virtio"

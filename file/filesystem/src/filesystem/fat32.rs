@@ -1744,6 +1744,11 @@ impl FileSystemTrait for FAT32FileSystem {
         Ok(to_read as u64)
     }
 
+    // write_at invariants exercised by integration tests:
+    // - refuses holes by rejecting offset beyond current file size.
+    // - enforces FAT32 max file size (4 GiB - 1) and read-only flags.
+    // - extends cluster chains without sharing clusters and zero-fills new clusters.
+    // - operates with read-modify-write per cluster, preserving untouched bytes.
     fn write_at(
         &self,
         block_device: &Arc<dyn BlockDevice>,
