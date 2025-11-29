@@ -944,19 +944,28 @@ impl FAT32FileSystem {
         name: &str,
         short_name: &[u8; 11],
     ) -> Result<Vec<FAT32LongDirectoryEntry>, FileSystemErr> {
-        let mut chars: Vec<u16> = name.bytes().map(|b| b as u16).collect();
-        chars.push(0);
-        let total_entries = (chars.len() + 12) / 13;
+        if !name.is_ascii() {
+            return Err(FileSystemErr::UnsupportedFileName);
+        }
+        let bytes = name.as_bytes();
+        let chars_len = bytes.len() + 1;
+        let total_entries = (chars_len + 12) / 13;
         let checksum = Self::short_name_checksum(short_name);
         let mut entries = Vec::with_capacity(total_entries);
         for seq in 1..=total_entries {
-            let start = (seq - 1) * 13;
-            let end = core::cmp::min(start + 13, chars.len());
-            let slice = &chars[start..end];
             let mut encoded = [0xFFFFu16; 13];
-            for (idx, ch) in slice.iter().enumerate() {
-                encoded[idx] = *ch;
-                if *ch == 0 {
+            let start = (seq - 1) * 13;
+            for i in 0..13 {
+                let idx = start + i;
+                let ch = if idx < bytes.len() {
+                    bytes[idx] as u16
+                } else if idx == bytes.len() {
+                    0
+                } else {
+                    break;
+                };
+                encoded[i] = ch;
+                if ch == 0 {
                     break;
                 }
             }
