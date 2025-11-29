@@ -37,7 +37,10 @@ impl Stage2Paging {
     ///
     /// # safety
     ///     data must be ascending order
-    pub fn init_stage2paging(data: &[Stage2PagingSetting]) -> Result<(), PagingErr> {
+    pub fn init_stage2paging(
+        data: &[Stage2PagingSetting],
+        allocator: &'static allocator::DefaultAllocator,
+    ) -> Result<(), PagingErr> {
         if data.is_empty() {
             return Err(PagingErr::Corrupted);
         }
@@ -113,7 +116,12 @@ impl Stage2Paging {
             };
 
         // mapping page table
-        let table = Self::setup_stage2_translation(data, initial_lookup_level_i8, num_of_tables)?;
+        let table = Self::setup_stage2_translation(
+            data,
+            initial_lookup_level_i8,
+            num_of_tables,
+            allocator,
+        )?;
         cpu::set_vttbr_el2(table as u64);
 
         let vtcr_el2 = VTCR_EL2::new()
@@ -135,12 +143,14 @@ impl Stage2Paging {
         data: &[Stage2PagingSetting],
         top_table_level: i8,
         num_of_tables: usize,
+        allocator: &'static allocator::DefaultAllocator,
     ) -> Result<usize, PagingErr> {
-        let table_addr = allocator::allocate_with_size_and_align(
-            PAGE_TABLE_SIZE * num_of_tables,
-            PAGE_TABLE_SIZE * num_of_tables,
-        )
-        .map_err(|_| PagingErr::OutOfMemory)?;
+        let table_addr = allocator
+            .allocate_with_size_and_align(
+                PAGE_TABLE_SIZE * num_of_tables,
+                PAGE_TABLE_SIZE * num_of_tables,
+            )
+            .map_err(|_| PagingErr::OutOfMemory)?;
         let table =
             unsafe { slice::from_raw_parts_mut(table_addr as *mut u64, num_of_tables * 512) };
         // initialize page table
