@@ -1650,19 +1650,6 @@ impl FileSystemTrait for FAT32FileSystem {
         self.remove_directory(block_device, path)
     }
 
-    fn read(
-        &self,
-        block_device: &Arc<dyn BlockDevice>,
-        align: usize,
-        meta: &DirMeta,
-    ) -> Result<AlignedSliceBox<u8>, FileSystemErr> {
-        let mut data =
-            AlignedSliceBox::new_uninit_with_align(meta.file_size as usize, align).unwrap();
-        let len = self.read_at(block_device, 0, data.deref_uninit_u8_mut(), meta)?;
-        assert_eq!(data.len() as u64, len);
-        Ok(unsafe { data.assume_init() })
-    }
-
     fn read_at(
         &self,
         block_device: &Arc<dyn BlockDevice>,
