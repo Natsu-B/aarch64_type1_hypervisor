@@ -127,6 +127,10 @@ pub fn set_hcr_el2(hcr: u64) {
     unsafe { asm!("msr hcr_el2, {}", in(reg) hcr) };
 }
 
+pub fn set_vbar_el1(vbar: u64) {
+    unsafe { asm!("msr vbar_el1, {}", in(reg) vbar) };
+}
+
 pub fn set_vbar_el2(vbar: u64) {
     unsafe { asm!("msr vbar_el2, {}", in(reg) vbar) };
 }

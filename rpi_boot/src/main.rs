@@ -286,6 +286,9 @@ extern "C" fn main() -> ! {
 
     println!("jumping linux...\njump addr: 0x{:X}", jump_addr as usize);
 
+    // Install an EL1 vector table so that early guest faults are captured.
+    exceptions::setup_el1_exception();
+
     unsafe {
         core::arch::asm!("isb");
         core::arch::asm!("dsb sy");
