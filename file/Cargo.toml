@@ -10,6 +10,7 @@ filesystem = { path = "filesystem" }
 mutex = { path = "../mutex" }
 typestate = { path = "../typestate" }
 typestate_macro = { path = "../typestate_macro" }
+allocator = { path = "../allocator", features = ["no-alloc-error-handler"] }
 
 [dev-dependencies]
 arch_hal = { path = "../arch_hal", default-features = false, features = ["uefi-test"] }

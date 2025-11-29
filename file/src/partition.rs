@@ -2,9 +2,9 @@ use core::ptr::addr_of;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use allocator::AlignedSliceBox;
 use block_device_api::BlockDevice;
 use filesystem::FileSystemErr;
-use filesystem::aligned_box::AlignedSliceBox;
 use filesystem::filesystem::FileHandle;
 use filesystem::filesystem::FileSystemTrait;
 use filesystem::filesystem::OpenOptions;

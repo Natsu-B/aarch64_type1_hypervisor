@@ -7,11 +7,11 @@ use alloc::sync::Weak;
 use block_device_api::BlockDevice;
 
 use crate::FileSystemErr;
-use crate::aligned_box::AlignedSliceBox;
 use crate::filesystem::fat::FatType;
 use crate::filesystem::fat::FatVolume;
 use crate::filesystem::fat32::FAT32FileSystem;
 use crate::from_io_err;
+use allocator::AlignedSliceBox;
 
 pub(crate) mod fat;
 pub(crate) mod fat32;

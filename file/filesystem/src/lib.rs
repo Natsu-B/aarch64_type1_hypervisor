@@ -9,7 +9,6 @@ use alloc::sync::Arc;
 use block_device_api::BlockDevice;
 use block_device_api::IoError;
 
-pub mod aligned_box;
 pub mod filesystem;
 
 use crate::filesystem::FileSystemTrait;

@@ -41,12 +41,14 @@ impl<T> AlignedSliceBox<T> {
         let size = elem.checked_mul(len).ok_or("size overflow")?;
         let layout = Layout::from_size_align(size, a.get()).map_err(|_| "invalid layout")?;
 
+        // SAFETY: layout comes from validated size/align values.
         let raw = unsafe { alloc(layout) };
         if raw.is_null() {
             handle_alloc_error(layout);
         }
 
         Ok(AlignedSliceBox {
+            // SAFETY: allocation either panics or returns a valid pointer.
             ptr: unsafe { NonNull::new_unchecked(raw as *mut MaybeUninit<T>) },
             len,
             align: a,
@@ -61,12 +63,25 @@ impl<T> AlignedSliceBox<T> {
         core::mem::forget(this);
         (ptr, len, align)
     }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn align(&self) -> NonZeroUsize {
+        self.align
+    }
 }
 
 impl<T> AlignedSliceBox<MaybeUninit<T>> {
     pub unsafe fn assume_init(self) -> AlignedSliceBox<T> {
         let (ptr, len, align) = AlignedSliceBox::<MaybeUninit<T>>::into_raw_parts(self);
         AlignedSliceBox {
+            // SAFETY: caller guarantees the data is fully initialized.
             ptr: unsafe { NonNull::new_unchecked(ptr as *mut T) },
             len,
             align,
@@ -79,6 +94,7 @@ impl<T: BytePod> AlignedSliceBox<MaybeUninit<T>> {
     pub fn deref_uninit_u8_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         let byte_len = self.len * size_of::<T>();
         let p = self.ptr.as_ptr() as *mut MaybeUninit<u8>;
+        // SAFETY: pointer and length originate from the allocation for `len` elements of `T`.
         unsafe { slice::from_raw_parts_mut(p, byte_len) }
     }
 }
@@ -87,6 +103,7 @@ impl<T> Deref for AlignedSliceBox<T> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &Self::Target {
+        // SAFETY: `ptr` is valid for `len` elements by construction.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -94,6 +111,7 @@ impl<T> Deref for AlignedSliceBox<T> {
 impl<T> DerefMut for AlignedSliceBox<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `ptr` is valid for `len` elements by construction and we have &mut self.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -117,8 +135,10 @@ impl<T> Drop for AlignedSliceBox<T> {
             return;
         }
         unsafe {
+            // SAFETY: `ptr` points to `len` initialized elements when dropping `AlignedSliceBox<T>`.
             ptr::drop_in_place(core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
             let bytes = size_of::<T>() * self.len;
+            // SAFETY: layout matches the allocation in `new_uninit_with_align`.
             let layout = Layout::from_size_align(bytes, self.align.get()).unwrap();
             dealloc(self.ptr.as_ptr() as *mut u8, layout);
         }

@@ -3,8 +3,10 @@
 #![cfg_attr(not(test), feature(alloc_error_handler))]
 
 extern crate alloc;
+mod aligned_box;
 mod buddy_allocator;
 mod range_list_allocator;
+pub use aligned_box::AlignedSliceBox;
 use alloc::vec::Vec;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;

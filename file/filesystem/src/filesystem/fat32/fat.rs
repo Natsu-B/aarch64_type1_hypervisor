@@ -1,13 +1,13 @@
 // File Allocation Table
 
 use alloc::sync::Arc;
+use allocator::AlignedSliceBox;
 use block_device_api::BlockDevice;
 use core::mem::size_of;
 use typestate::Le;
 use typestate_macro::BytePod;
 
 use crate::FileSystemErr;
-use crate::aligned_box::AlignedSliceBox;
 use crate::filesystem::fat32::FAT32FileSystem;
 use crate::from_io_err;
 

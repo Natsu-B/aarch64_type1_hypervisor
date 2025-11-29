@@ -1,5 +1,4 @@
 use crate::FileSystemErr;
-use crate::aligned_box::AlignedSliceBox;
 use crate::filesystem::DirMeta;
 use crate::filesystem::FileHandle;
 use crate::filesystem::FileSystemTrait;
@@ -16,6 +15,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use allocator::AlignedSliceBox;
 use block_device_api::BlockDevice;
 use core::cmp;
 use core::convert::TryInto;

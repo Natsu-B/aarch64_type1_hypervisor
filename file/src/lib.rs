@@ -11,7 +11,7 @@ use filesystem::FileSystemErr;
 mod partition;
 use partition::PartitionIndex;
 
-pub use filesystem::aligned_box::AlignedSliceBox;
+pub use allocator::AlignedSliceBox;
 pub use filesystem::filesystem::FileHandle;
 pub use filesystem::filesystem::OpenOptions;
 
