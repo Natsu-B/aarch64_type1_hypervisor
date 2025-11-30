@@ -228,6 +228,41 @@ fn resolve_profile(args: &[String]) -> String {
 }
 
 fn test(args: &[String]) {
+    fn parse_test_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut forward_args = Vec::new();
+        let mut package_filters = Vec::new();
+        let mut i = 0;
+
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "--" {
+                forward_args.extend(args[i..].iter().cloned());
+                break;
+            } else if let Some(pkg) = arg.strip_prefix("--package=") {
+                package_filters.push(pkg.to_string());
+                i += 1;
+                continue;
+            } else if arg == "-p" || arg == "--package" {
+                if let Some(pkg) = args.get(i + 1) {
+                    package_filters.push(pkg.clone());
+                    i += 2;
+                    continue;
+                }
+            } else if arg.starts_with("-p") && arg.len() > 2 {
+                package_filters.push(arg[2..].to_string());
+                i += 1;
+                continue;
+            }
+
+            forward_args.push(arg.clone());
+            i += 1;
+        }
+
+        (forward_args, package_filters)
+    }
+
+    let (test_args, package_filters) = parse_test_args(args);
+
     // Detect host triple
     let host_output = Command::new("rustc")
         .arg("--print")
@@ -394,6 +429,26 @@ fn test(args: &[String]) {
         }
     }
 
+    if !package_filters.is_empty() {
+        std_crates.retain(|(pkg, _)| package_filters.contains(pkg));
+        uefi_tests.retain(|(pkg, _, _, _)| package_filters.contains(pkg));
+
+        if std_crates.is_empty() && uefi_tests.is_empty() {
+            eprintln!(
+                "No entries in xtest.txt match specified packages: {:?}",
+                package_filters
+            );
+            std::process::exit(1);
+        }
+
+        eprintln!(
+            "Filtered test plan to packages: {:?} ({} std, {} uefi)",
+            package_filters,
+            std_crates.len(),
+            uefi_tests.len()
+        );
+    }
+
     // Accumulate results across all tests
     let mut passed: Vec<String> = Vec::new();
     let mut failed: Vec<(String, i32)> = Vec::new();
@@ -424,7 +479,7 @@ fn test(args: &[String]) {
             .arg("-p")
             .arg(&pkg)
             .args(&extra)
-            .args(args)
+            .args(&test_args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -474,7 +529,7 @@ fn test(args: &[String]) {
             .arg("--test")
             .arg(&testname)
             .args(&extra)
-            .args(args)
+            .args(&test_args)
             .env("CARGO_TARGET_AARCH64_UNKNOWN_UEFI_RUNNER", runner)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
