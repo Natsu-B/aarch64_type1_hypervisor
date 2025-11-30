@@ -23,7 +23,7 @@ use paging::stage1::EL2Stage1PagingSetting;
 use print::debug_uart;
 use print::println;
 
-const UART_BASE: usize = 0x9000_0000;
+const UART_BASE: usize = 0x900_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
 
 static mut DUMMY: u64 = 0xDEAD_BEEF_CAFE_BABE;

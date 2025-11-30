@@ -1,0 +1,17 @@
+[package]
+name = "gdb_remote"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+byte_stream = { path = "../byte_stream" }
+
+[dev-dependencies]
+allocator = { path = "../allocator" }
+aarch64_test = { path = "../arch_hal/aarch64_hal/aarch64_test", default-features = false }
+print = { path = "../arch_hal/aarch64_hal/print" }
+
+[[test]]
+name = "uefi_basic_handshake"
+path = "tests/uefi_basic_handshake.rs"
+harness = false

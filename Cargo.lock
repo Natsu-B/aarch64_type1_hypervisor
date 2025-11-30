@@ -50,6 +50,10 @@ name = "block-device-api"
 version = "0.1.0"
 
 [[package]]
+name = "byte_stream"
+version = "0.1.0"
+
+[[package]]
 name = "cpu"
 version = "0.1.0"
 dependencies = [
@@ -113,6 +117,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdb_remote"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "allocator",
+ "byte_stream",
+ "print",
+]
+
+[[package]]
 name = "intrusive_linked_list"
 version = "0.1.0"
 
@@ -136,6 +150,7 @@ dependencies = [
 name = "print"
 version = "0.1.0"
 dependencies = [
+ "byte_stream",
  "mutex",
  "typestate",
  "typestate_macro",
