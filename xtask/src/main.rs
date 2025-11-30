@@ -307,9 +307,100 @@ fn test(args: &[String]) {
         None
     }
 
+    fn uefi_needs_sudo(
+        uefi_tests: &[(String, String, String, Vec<String>)],
+        repo_root: &PathBuf,
+    ) -> bool {
+        for (_, _, testscript, _) in uefi_tests {
+            let runner_path = repo_root.join(testscript);
+            match fs::read_to_string(&runner_path) {
+                Ok(content) => {
+                    if content.contains("sudo") {
+                        eprintln!(
+                            "Detected use of sudo in UEFI runner script: {}",
+                            runner_path.display()
+                        );
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to read UEFI runner script {}: {}",
+                        runner_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    fn sudo_warmup() {
+        let sudo_check = Command::new("sudo")
+            .arg("-V")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        match sudo_check {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!("Warning: 'sudo' not found; tests that require sudo may fail.");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to check availability of 'sudo': {}", e);
+                return;
+            }
+            Ok(_) => {}
+        }
+
+        match Command::new("sudo")
+            .arg("-n")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                eprintln!("Reusing existing sudo credential cache.");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Warning: failed to check sudo credential cache: {}", e);
+            }
+        }
+
+        eprintln!(
+            "Running 'sudo -v' to warm up credentials (you may be prompted for your password)..."
+        );
+        let status = Command::new("sudo")
+            .arg("-v")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap_or_else(|e| panic!("Failed to execute 'sudo -v': {}", e));
+
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            eprintln!(
+                "Error: 'sudo -v' failed (code {}); tests that require sudo cannot be run.",
+                code
+            );
+            std::process::exit(code);
+        }
+    }
+
     // Accumulate results across all tests
     let mut passed: Vec<String> = Vec::new();
     let mut failed: Vec<(String, i32)> = Vec::new();
+
+    if uefi_needs_sudo(&uefi_tests, &repo_root) {
+        sudo_warmup();
+    }
 
     // Run std tests (each with 30s timeout if available)
     for (pkg, extra) in std_crates {
