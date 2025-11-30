@@ -78,6 +78,7 @@ dependencies = [
  "dtb",
  "elf",
  "file",
+ "mutex",
  "typestate",
 ]
 

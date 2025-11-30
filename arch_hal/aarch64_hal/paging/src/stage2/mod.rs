@@ -348,6 +348,17 @@ impl Stage2Paging {
         cpu::set_hcr_el2(hcr);
     }
 
+    /// Translate a guest IPA to a physical address using the installed Stage-2 tables.
+    ///
+    /// Stage-2 translation must already be configured and enabled before calling this helper.
+    /// The returned physical address is expected to be directly accessible from EL2 (the current
+    /// boot flow installs an identity mapping for RAM).
+    pub fn ipa_to_pa(ipa: usize) -> Result<usize, PagingErr> {
+        cpu::ipa_to_pa_el2(ipa as u64)
+            .map(|pa| pa as usize)
+            .ok_or(PagingErr::Stage2Fault)
+    }
+
     /// Clear AF/DBM bits on every mapped leaf so subsequent accesses trap.
     pub fn dirty_bit_remove_all() -> Result<(), PagingErr> {
         let ctx = unsafe { &*STAGE2_CONTEXT.get() }

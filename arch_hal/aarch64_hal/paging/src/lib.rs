@@ -19,4 +19,5 @@ pub enum PagingErr {
     ZeroSizedPage,
     UnsupportedPARange,
     OutOfMemory,
+    Stage2Fault,
 }

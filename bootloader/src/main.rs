@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 extern crate alloc;
+mod gdb;
 mod handler;
 mod systimer;
 use crate::systimer::SystemTimer;
