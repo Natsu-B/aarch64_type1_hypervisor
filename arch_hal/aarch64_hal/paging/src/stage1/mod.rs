@@ -32,6 +32,7 @@ pub enum EL2Stage1PageTypes {
     Device = 0b1,
 }
 
+#[derive(Debug)]
 pub struct EL2Stage1PagingSetting {
     pub va: usize,
     pub pa: usize,
@@ -122,6 +123,9 @@ impl EL2Stage1Paging {
         let table = Self::setup_stage1_translation(data, top_table_level)?;
         debug_assert_eq!(table & 0xfff, 0);
         cpu::set_ttbr0_el2(table as u64);
+
+        cpu::isb();
+        cpu::dsb_ish();
 
         let sctlr_el2 = SCTLR_EL2::from_bits(get_sctlr_el2())
             .set(SCTLR_EL2::m, 0b1)

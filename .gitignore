@@ -17,7 +17,6 @@ Session.vim
 .cproject
 .idea
 *.iml
-.vscode
 .project
 .vim/
 .helix/

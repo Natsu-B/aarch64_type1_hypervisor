@@ -14,6 +14,7 @@ use core::ptr;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 use cpu::registers::PARange;
+use paging::stage2::Stage2PageTypes;
 use paging::stage2::Stage2Paging;
 use paging::stage2::Stage2PagingSetting;
 use print::debug_uart;
@@ -88,16 +89,19 @@ fn build_stage2_scenario()
             ipa: 0,
             pa: first_pa,
             size: first_size,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: first_size,
             pa: second_pa,
             size: second_size,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: first_size + second_size,
             pa: third_pa,
             size: third_size,
+            types: Stage2PageTypes::Normal,
         },
     ];
 

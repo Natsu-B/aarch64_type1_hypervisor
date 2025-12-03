@@ -21,10 +21,19 @@ mod registers;
 
 pub struct Stage2Paging;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+pub enum Stage2PageTypes {
+    Normal = 0b0,
+    Device = 0b1,
+}
+
+#[derive(Debug)]
 pub struct Stage2PagingSetting {
     pub ipa: usize,
     pub pa: usize,
     pub size: usize,
+    pub types: Stage2PageTypes,
 }
 
 impl Stage2Paging {
@@ -181,7 +190,11 @@ impl Stage2Paging {
             if top_table_level != 0 && (pa | ipa) & (top_level - 1) == 0 && size >= top_level {
                 // block descriptor
                 debug_assert_eq!(table[idx], 0);
-                table[idx] = Stage2_48bitLeafDescriptor::new_block(pa as u64, top_table_level);
+                table[idx] = Stage2_48bitLeafDescriptor::new_block(
+                    pa as u64,
+                    top_table_level,
+                    data[i].types,
+                );
                 pa += top_level;
                 ipa += top_level;
                 size -= top_level;
@@ -251,9 +264,9 @@ impl Stage2Paging {
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] = if table_level == 3 {
-                    Stage2_48bitLeafDescriptor::new_page(*pa as u64)
+                    Stage2_48bitLeafDescriptor::new_page(*pa as u64, data[*i].types)
                 } else {
-                    Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level)
+                    Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level, data[*i].types)
                 };
                 *pa += table_level_size;
                 *ipa += table_level_size;

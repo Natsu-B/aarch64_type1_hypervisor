@@ -10,6 +10,15 @@ bitregs! {
 }
 
 bitregs! {
+    /// Vector Base Address Register for EL1.
+    pub(crate) struct VBAR_EL1: u64 {
+        reserved@[10:0] [res0],
+        // Base address for the EL1 vector table; must be 2 KiB aligned.
+        pub(crate) vba@[63:11],
+    }
+}
+
+bitregs! {
     /// Exception Syndrome Register(EL2)
     pub(crate) struct ESR_EL2: u64 {
         union iss@[24:0] {

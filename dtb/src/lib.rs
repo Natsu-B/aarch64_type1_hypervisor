@@ -865,6 +865,7 @@ pub(crate) mod dtb_parser {
             &self,
             dtb: &mut [u8],
             reserved_memory: &[(usize /* addr */, usize /* size */)],
+            strip_initrd: bool,
         ) -> Result<(), &'static str> {
             if dtb.len() < self.get_required_size(reserved_memory.len()).0 {
                 return Err("dtb memory too short");
@@ -910,6 +911,7 @@ pub(crate) mod dtb_parser {
             }
 
             // copy struct
+            let struct_start = destination;
             unsafe {
                 ptr::copy(
                     self.parser.dtb_header.get_struct_start_address() as *const u8,
@@ -917,6 +919,11 @@ pub(crate) mod dtb_parser {
                     self.parser.dtb_header.get_struct_size(),
                 );
             }
+
+            if strip_initrd {
+                self.strip_initrd(struct_start, self.parser.dtb_header.get_struct_size())?;
+            }
+
             let struct_start_offset = destination - dtb.as_ptr() as usize;
 
             destination =
@@ -938,6 +945,95 @@ pub(crate) mod dtb_parser {
                 (string_start_offset + self.parser.dtb_header.get_string_size()) as u32,
             );
 
+            Ok(())
+        }
+
+        fn strip_initrd(&self, struct_base: usize, struct_size: usize) -> Result<(), &'static str> {
+            let mut cursor = struct_base;
+            let end = struct_base + struct_size;
+
+            let mut depth: usize = 0;
+            let mut in_chosen = false;
+
+            while cursor < end {
+                match DtbParser::get_types(&cursor) {
+                    t if t == DtbParser::FDT_NOP => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+                    }
+                    t if t == DtbParser::FDT_BEGIN_NODE => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+
+                        let name = big_endian::Dtb::read_char_str(cursor)?;
+                        let name_len = name.len() + 1;
+                        let padded_len = name_len.next_multiple_of(DtbParser::ALIGNMENT as usize);
+
+                        depth += 1;
+                        if depth == 2 && name == "chosen" {
+                            in_chosen = true;
+                        }
+
+                        cursor += padded_len;
+                    }
+                    t if t == DtbParser::FDT_PROP => {
+                        let prop_start = cursor;
+
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+
+                        let prop = unsafe { &*(cursor as *const big_endian::FdtProperty) };
+                        cursor += size_of::<big_endian::FdtProperty>();
+
+                        let name = big_endian::Dtb::read_char_str(
+                            self.parser.dtb_header.get_string_start_address()
+                                + prop.get_name_offset() as usize,
+                        )?;
+                        let len = prop.get_property_len();
+                        let padded_len = len.next_multiple_of(DtbParser::ALIGNMENT) as usize;
+
+                        let total_bytes = DtbParser::SIZEOF_FDT_TOKEN
+                            + size_of::<big_endian::FdtProperty>()
+                            + padded_len;
+
+                        if in_chosen && (name == "linux,initrd-start" || name == "linux,initrd-end")
+                        {
+                            let mut p = prop_start;
+                            let nop = DtbParser::FDT_NOP;
+
+                            while p < prop_start + total_bytes {
+                                unsafe {
+                                    ptr::copy_nonoverlapping(
+                                        nop.as_ptr(),
+                                        p as *mut u8,
+                                        DtbParser::SIZEOF_FDT_TOKEN,
+                                    );
+                                }
+                                p += DtbParser::SIZEOF_FDT_TOKEN;
+                            }
+                        }
+
+                        cursor += padded_len;
+                    }
+                    t if t == DtbParser::FDT_END_NODE => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+
+                        if in_chosen && depth == 2 {
+                            in_chosen = false;
+                        }
+                        depth = depth.saturating_sub(1);
+                    }
+                    t if t == DtbParser::FDT_END => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+                        break;
+                    }
+                    _ => {
+                        pr_debug!(
+                            "strip_initrd: unknown token {:?} at 0x{:x}",
+                            DtbParser::get_types(&cursor),
+                            cursor - struct_base
+                        );
+                        return Err("strip_initrd: unknown token");
+                    }
+                }
+            }
             Ok(())
         }
     }
