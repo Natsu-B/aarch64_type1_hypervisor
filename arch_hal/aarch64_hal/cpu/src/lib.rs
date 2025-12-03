@@ -192,6 +192,17 @@ pub fn flush_tlb_el2_el1() {
     };
 }
 
+pub fn invalidate_icache_all() {
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 pub fn get_parange() -> Option<PARange> {
     let id = ID_AA64MMFR0_EL1::from_bits(get_id_aa64mmfr0_el1());
     id.get_enum(ID_AA64MMFR0_EL1::parange)

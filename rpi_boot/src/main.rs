@@ -337,10 +337,10 @@ extern "C" fn main() -> ! {
     // Install an EL1 vector table so that early guest faults are captured.
     exceptions::setup_el1_exception();
 
-    unsafe {
-        core::arch::asm!("isb");
-        core::arch::asm!("dsb sy");
-    }
+    cpu::clean_dcache_poc(LINUX_ADDR.get() as usize, size_of::<usize>());
+    cpu::clean_dcache_poc(DTB_ADDR.get() as usize, size_of::<usize>());
+
+    cpu::invalidate_icache_all();
 
     let el1_main = el1_main as *const fn() as usize as u64;
     let stack_addr =
@@ -352,7 +352,7 @@ extern "C" fn main() -> ! {
     );
     const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
     unsafe {
-        core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
+        core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
         cpu::isb();
