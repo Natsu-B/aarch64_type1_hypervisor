@@ -7,20 +7,31 @@ use alloc::sync::Weak;
 use block_device_api::BlockDevice;
 
 use crate::FileSystemErr;
-use crate::PartitionIndex;
-use crate::aligned_box::AlignedSliceBox;
+use crate::filesystem::fat::FatType;
+use crate::filesystem::fat::FatVolume;
 use crate::filesystem::fat32::FAT32FileSystem;
-use crate::filesystem::fat32::sector::FAT32BootSector;
 use crate::from_io_err;
+use allocator::AlignedSliceBox;
 
+pub(crate) mod fat;
 pub(crate) mod fat32;
 
 pub(crate) mod file_system {
-    use typestate::Le;
-    use typestate::Unaligned;
-    use typestate::unalign_read;
-
     use super::*;
+
+    trait FileSystemDriver: Sync {
+        fn try_mount(
+            &self,
+            block_device: &Arc<dyn BlockDevice>,
+            start_sector: u64,
+            total_sector: u64,
+            boot_sector: &[u8],
+        ) -> Result<Option<Arc<dyn FileSystemTrait>>, FileSystemErr>;
+    }
+
+    struct FatDriver;
+    static FAT_DRIVER: FatDriver = FatDriver;
+    static FILE_SYSTEM_DRIVERS: &[&dyn FileSystemDriver] = &[&FAT_DRIVER];
 
     pub fn new(
         block_device: &Arc<dyn BlockDevice>,
@@ -34,43 +45,41 @@ pub(crate) mod file_system {
             .map_err(from_io_err)?;
         // The device promises the buffer is fully initialized on success
         let boot_sector_bytes: Box<[u8]> = unsafe { boot_sector.assume_init() };
-        let fat32_boot_sector = unsafe { &*(boot_sector_bytes.as_ptr() as *const FAT32BootSector) };
-        // check boot signature (using unaligned-safe wrapper)
-        if unalign_read!(fat32_boot_sector.bs_boot_sign =>Le<Unaligned<u16>>)
-            != PartitionIndex::BOOT_SIGNATURE
-        {
-            return Err(FileSystemErr::UnsupportedFileSystem);
+        for driver in FILE_SYSTEM_DRIVERS {
+            if let Some(fs) =
+                driver.try_mount(block_device, start_sector, total_sector, &boot_sector_bytes)?
+            {
+                return Ok(fs);
+            }
         }
-        // assume the partition is fat
-        if unalign_read!(fat32_boot_sector.bpb_fat_sz16 => Le<Unaligned<u16>>) != 0
-            || unalign_read!(fat32_boot_sector.bpb_tot_sec_16 => Le<Unaligned<u16>>) != 0
-        {
-            // partition is fat12 or fat16
-            return Err(FileSystemErr::UnsupportedFileSystem);
+        Err(FileSystemErr::UnsupportedFileSystem)
+    }
+
+    impl FileSystemDriver for FatDriver {
+        fn try_mount(
+            &self,
+            block_device: &Arc<dyn BlockDevice>,
+            start_sector: u64,
+            total_sector: u64,
+            boot_sector: &[u8],
+        ) -> Result<Option<Arc<dyn FileSystemTrait>>, FileSystemErr> {
+            let Some(volume) = FatVolume::from_boot_sector(
+                block_device.block_size(),
+                boot_sector,
+                start_sector,
+                total_sector,
+            )?
+            else {
+                return Ok(None);
+            };
+            match volume.kind {
+                FatType::Fat32 => {
+                    let fat32_filesystem = FAT32FileSystem::new(volume)?;
+                    Ok(Some(Arc::new(fat32_filesystem)))
+                }
+                FatType::Fat12 | FatType::Fat16 => Ok(None),
+            }
         }
-        let root_dir_sectors =
-            (unalign_read!(fat32_boot_sector.bpb_root_ent_cnt => Le<Unaligned<u16>>) as u32 * 32)
-                .div_ceil(
-                    unalign_read!(fat32_boot_sector.bpb_bytes_per_sec => Le<Unaligned<u16>>) as u32,
-                );
-        let data_sec = unalign_read!(fat32_boot_sector.bpb_tot_sec_32 => Le<Unaligned<u32>>)
-            - (unalign_read!(fat32_boot_sector.bpb_rsvd_sec_cnt => Le<Unaligned<u16>>) as u32
-                + (fat32_boot_sector.bpb_num_fats as u32
-                    * unalign_read!(fat32_boot_sector.bpb_fat_sz_32 => Le<Unaligned<u32>>))
-                + root_dir_sectors);
-        let count_of_clusters = data_sec / fat32_boot_sector.bpb_sec_per_clus as u32;
-        if count_of_clusters < 65525 {
-            // partition is fat12 or fat16
-            return Err(FileSystemErr::UnsupportedFileSystem);
-        }
-        // assume partition is fat32
-        let fat32_filesystem = FAT32FileSystem::new(
-            block_device.block_size(),
-            fat32_boot_sector,
-            count_of_clusters,
-            start_sector,
-        )?;
-        Ok(Arc::new(fat32_filesystem))
     }
 }
 
@@ -80,7 +89,8 @@ pub enum OpenOptions {
     Write,
 }
 
-pub(crate) trait FileSystemTrait {
+#[must_use]
+pub trait FileSystemTrait {
     // file
     fn open(
         &self,
@@ -89,20 +99,62 @@ pub(crate) trait FileSystemTrait {
         path: &str,
         opts: &OpenOptions,
     ) -> Result<FileHandle, FileSystemErr>;
-    fn remove_file(&self, path: &str) -> Result<(), FileSystemErr>;
-    fn copy(&self, from: &str, to: &str) -> Result<(), FileSystemErr>;
-    fn rename(&self, from: &str, to: &str) -> Result<(), FileSystemErr>;
+
+    fn create_file(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        file_system: &Arc<dyn FileSystemTrait>,
+        path: &str,
+    ) -> Result<FileHandle, FileSystemErr>;
+
+    fn remove_file(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr>;
+
+    fn copy(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FileSystemErr>;
+
+    fn rename(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FileSystemErr>;
 
     // dir
-    fn create_dir(&self, path: &str) -> Result<(), FileSystemErr>;
-    fn remove_dir(&self, path: &str) -> Result<(), FileSystemErr>;
+    fn create_dir(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr>;
+
+    fn remove_dir(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &str,
+    ) -> Result<(), FileSystemErr>;
 
     fn read(
         &self,
         block_device: &Arc<dyn BlockDevice>,
         align: usize,
         meta: &DirMeta,
-    ) -> Result<AlignedSliceBox<u8>, FileSystemErr>;
+    ) -> Result<AlignedSliceBox<u8>, FileSystemErr> {
+        // SAFETY: `read_at` is expected to fully initialize the provided buffer on success.
+        let mut data =
+            AlignedSliceBox::new_uninit_with_align(meta.file_size as usize, align).unwrap();
+
+        let len = self.read_at(block_device, 0, data.deref_uninit_u8_mut(), meta)?;
+        assert_eq!(data.len() as u64, len);
+
+        Ok(unsafe { data.assume_init() })
+    }
 
     fn read_at(
         &self,
@@ -110,6 +162,14 @@ pub(crate) trait FileSystemTrait {
         offset: u64,
         buf: &mut [MaybeUninit<u8>],
         meta: &DirMeta,
+    ) -> Result<u64, FileSystemErr>;
+
+    fn write_at(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        offset: u64,
+        buf: &[u8],
+        meta: &mut DirMeta,
     ) -> Result<u64, FileSystemErr>;
 }
 
@@ -119,6 +179,8 @@ pub struct DirMeta {
     is_readonly: bool,
     first_cluster: u32,
     file_size: u32,
+    entry_lba: u64,
+    entry_offset: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -130,28 +192,34 @@ pub struct FileHandle {
 }
 
 impl FileHandle {
+    fn upgrade_device(&self) -> Result<Arc<dyn BlockDevice>, FileSystemErr> {
+        self.dev_handle.upgrade().ok_or(FileSystemErr::Closed)
+    }
+
+    fn upgrade_handles(
+        &self,
+    ) -> Result<(Arc<dyn BlockDevice>, Arc<dyn FileSystemTrait>), FileSystemErr> {
+        let dev = self.upgrade_device()?;
+        let file = self.file_handle.upgrade().ok_or(FileSystemErr::Closed)?;
+        Ok((dev, file))
+    }
+
     pub fn read(&self, align: usize) -> Result<AlignedSliceBox<u8>, FileSystemErr> {
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
-        let Some(file) = self.file_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let (dev, file) = self.upgrade_handles()?;
         file.read(&dev, align, &self.meta)
     }
 
     pub fn read_at(&self, offset: u64, buf: &mut [MaybeUninit<u8>]) -> Result<u64, FileSystemErr> {
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
-        let Some(file) = self.file_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let (dev, file) = self.upgrade_handles()?;
         file.read_at(&dev, offset, buf, &self.meta)
     }
 
-    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<u64, FileSystemErr> {
-        todo!()
+    pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<u64, FileSystemErr> {
+        if self.opts != OpenOptions::Write {
+            return Err(FileSystemErr::ReadOnly);
+        }
+        let (dev, file) = self.upgrade_handles()?;
+        file.write_at(&dev, offset, buf, &mut self.meta)
     }
 
     pub fn size(&self) -> Result<u64, FileSystemErr> {
@@ -159,9 +227,7 @@ impl FileHandle {
     }
 
     pub fn flush(&self) -> Result<(), FileSystemErr> {
-        let Some(dev) = self.dev_handle.upgrade() else {
-            return Err(FileSystemErr::Closed);
-        };
+        let dev = self.upgrade_device()?;
         dev.flush().map_err(from_io_err)
     }
 }

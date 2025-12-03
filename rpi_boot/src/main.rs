@@ -9,6 +9,7 @@ use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
@@ -74,6 +75,8 @@ impl LinuxHeader {
     const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
 }
 
+define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
+
 global_asm!(
     r#"
 .global _start
@@ -122,16 +125,16 @@ extern "C" fn main() -> ! {
     let mut systimer = SystemTimer::new();
     systimer.init();
     println!("setup allocator");
-    allocator::init();
+    GLOBAL_ALLOCATOR.init();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
         println!("available region addr=0x{:X}, size=0x{:X}", addr, size);
-        allocator::add_available_region(addr, size).unwrap();
+        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
         ControlFlow::Continue(())
     })
     .unwrap();
     dtb.find_memory_reservation_block(&mut |addr, size| {
         println!("reserved (memreserve) addr=0x{:X}, size=0x{:X}", addr, size);
-        allocator::add_reserved_region(addr, size).unwrap();
+        GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
     dtb.find_reserved_memory_node(
@@ -140,7 +143,7 @@ extern "C" fn main() -> ! {
                 "reserved (node static) addr=0x{:X}, size=0x{:X}",
                 addr, size
             );
-            allocator::add_reserved_region(addr, size).unwrap();
+            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
             ControlFlow::Continue(())
         },
         &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
@@ -148,7 +151,8 @@ extern "C" fn main() -> ! {
                 "reserved (node dynamic) size=0x{:X}, align={:?}, range={:?}",
                 size, align, alloc_range
             );
-            if allocator::allocate_dynamic_reserved_region(size, align, alloc_range)
+            if GLOBAL_ALLOCATOR
+                .allocate_dynamic_reserved_region(size, align, alloc_range)
                 .unwrap()
                 .is_some()
             {
@@ -164,13 +168,17 @@ extern "C" fn main() -> ! {
         program_start,
         program_end - program_start
     );
-    allocator::add_reserved_region(program_start, program_end - program_start).unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(program_start, program_end - program_start)
+        .unwrap();
     println!(
         "reserved dtb addr=0x{:X}, size=0x{:X}",
         DTB_PTR,
         dtb.get_size()
     );
-    allocator::add_reserved_region(DTB_PTR, dtb.get_size()).unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(DTB_PTR, dtb.get_size())
+        .unwrap();
     println!("get linux header");
     let linux_header = unsafe { &*(linux_image as *const LinuxHeader) };
     // check
@@ -182,19 +190,23 @@ extern "C" fn main() -> ! {
     let jump_addr = linux_image + text_offset;
     unsafe { *LINUX_ADDR.get() = jump_addr };
 
-    allocator::add_reserved_region(linux_image, image_size).unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(linux_image, image_size)
+        .unwrap();
     println!("finalizing allocator...");
-    allocator::finalize().unwrap();
+    GLOBAL_ALLOCATOR.finalize().unwrap();
     println!("allocator free regions after finalize:");
-    allocator::for_each_free_region(|addr, size| {
-        println!("  free: addr=0x{:X}, size=0x{:X}", addr, size);
-    })
-    .unwrap();
+    GLOBAL_ALLOCATOR
+        .for_each_free_region(|addr, size| {
+            println!("  free: addr=0x{:X}, size=0x{:X}", addr, size);
+        })
+        .unwrap();
     println!("allocator reserved regions after finalize:");
-    allocator::for_each_reserved_region(|addr, size| {
-        println!("  reserved: addr=0x{:X}, size=0x{:X}", addr, size);
-    })
-    .unwrap();
+    GLOBAL_ALLOCATOR
+        .for_each_reserved_region(|addr, size| {
+            println!("  reserved: addr=0x{:X}, size=0x{:X}", addr, size);
+        })
+        .unwrap();
     println!("allocator setup success!!!");
 
     // setup paging
@@ -251,7 +263,7 @@ extern "C" fn main() -> ! {
         types: Stage2PageTypes::Device,
     });
     println!("Stage2Paging: {:#?}", paging_data);
-    Stage2Paging::init_stage2paging(&paging_data).unwrap();
+    Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");
 
@@ -267,7 +279,9 @@ extern "C" fn main() -> ! {
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
     println!("set up linux data");
 
-    let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
+    let mut reserved_memory = GLOBAL_ALLOCATOR
+        .trim_for_boot(0x1000 * 0x1000 * 128)
+        .unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, program_end));
 

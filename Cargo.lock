@@ -24,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "intrusive_linked_list",
  "mutex",
+ "typestate",
 ]
 
 [[package]]
@@ -60,6 +61,9 @@ dependencies = [
 [[package]]
 name = "dtb"
 version = "0.1.0"
+dependencies = [
+ "allocator",
+]
 
 [[package]]
 name = "elf"
@@ -96,16 +100,21 @@ dependencies = [
 name = "file"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "arch_hal",
  "block-device",
  "block-device-api",
  "filesystem",
+ "mutex",
+ "typestate",
+ "typestate_macro",
 ]
 
 [[package]]
 name = "filesystem"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "block-device-api",
  "mutex",
  "typestate",
