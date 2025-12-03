@@ -8,6 +8,8 @@ mod systimer;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use allocator::define_global_allocator;
 use arch_hal::cpu;
@@ -19,28 +21,31 @@ use arch_hal::paging::EL2Stage1PagingSetting;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
-use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use core::alloc::Layout;
 use core::arch::global_asm;
 use core::arch::naked_asm;
 use core::cell::SyncUnsafeCell;
-use core::ffi::CStr;
-use core::ffi::c_char;
+use core::convert::TryInto;
 use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
-use core::ptr::slice_from_raw_parts_mut;
 use core::ptr::write_volatile;
 use core::slice;
-use core::time::Duration;
 use core::usize;
-use dtb::DtbGenerator;
+use dtb::DeviceTree;
+use dtb::DeviceTreeEditExt;
+use dtb::DeviceTreeQueryExt;
 use dtb::DtbParser;
-use file::AlignedSliceBox;
+use dtb::MemReserve;
+use dtb::NameRef;
+use dtb::NodeEditExt;
+use dtb::NodeId;
+use dtb::NodeQueryExt;
+use dtb::ValueRef;
 use typestate::Le;
 
 unsafe extern "C" {
@@ -307,20 +312,25 @@ extern "C" fn main() -> ! {
         .trim_for_boot(0x1000 * 0x1000 * 128)
         .unwrap();
     println!("allocator closed");
-    reserved_memory.push((program_start, program_end));
-
-    let new_dtb = DtbGenerator::new(&dtb_modified);
-    let dtb_size = new_dtb.get_required_size(reserved_memory.len());
-    let dtb_data = unsafe {
-        &mut *slice_from_raw_parts_mut(
-            alloc::alloc::alloc(Layout::from_size_align_unchecked(dtb_size.0, dtb_size.1)),
-            dtb_size.0,
-        )
-    };
-    new_dtb
-        .make_dtb(dtb_data, reserved_memory.as_ref(), true)
+    let mut allocator_regions = Vec::new();
+    GLOBAL_ALLOCATOR
+        .for_each_free_region(|addr, size| allocator_regions.push((addr, size)))
         .unwrap();
-    unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
+    reserved_memory.extend_from_slice(&allocator_regions);
+    reserved_memory.push((program_start, program_end - program_start));
+    reserved_memory.push((DTB_PTR, dtb.get_size()));
+
+    let mut tree = DeviceTree::from_parser(&dtb_modified).unwrap();
+    let chosen_id = tree.get_or_create_node_by_path("/chosen").unwrap();
+    let initrd_range = remove_initrd(&mut tree, chosen_id);
+    remove_initrd_memreserve(&mut tree, initrd_range);
+    append_reserved_memory(&mut tree, &reserved_memory);
+    configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR).unwrap();
+
+    let dtb_box = tree.into_dtb_box().unwrap();
+    unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
+    cpu::clean_dcache_poc(dtb_box.as_ptr() as usize, dtb_box.len());
+    core::mem::forget(dtb_box);
 
     println!("jumping linux...\njump addr: 0x{:X}", jump_addr as usize);
 
@@ -345,7 +355,6 @@ extern "C" fn main() -> ! {
         core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
-        core::arch::asm!("msr sctlr_el2, {}", in(reg) 0);
         cpu::isb();
         core::arch::asm!("eret", options(noreturn));
     }
@@ -368,6 +377,145 @@ extern "C" fn el1_main() {
             0,
         );
     }
+}
+
+fn be_bytes_to_u64(bytes: &[u8]) -> Option<u64> {
+    match bytes.len() {
+        4 => Some(u32::from_be_bytes(bytes.try_into().ok()?) as u64),
+        8 => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+fn remove_initrd(tree: &mut DeviceTree<'_>, chosen: NodeId) -> Option<(u64, u64)> {
+    let start = tree
+        .node(chosen)
+        .and_then(|node| node.property("linux,initrd-start"))
+        .and_then(|p| be_bytes_to_u64(p.value.as_slice()));
+    let end = tree
+        .node(chosen)
+        .and_then(|node| node.property("linux,initrd-end"))
+        .and_then(|p| be_bytes_to_u64(p.value.as_slice()));
+
+    if let Some(node) = tree.node_mut(chosen) {
+        node.remove_property("linux,initrd-start");
+        node.remove_property("linux,initrd-end");
+    }
+
+    if let (Some(start), Some(end)) = (start, end) {
+        if end > start {
+            return Some((start, end - start));
+        }
+    }
+    None
+}
+
+fn remove_initrd_memreserve(tree: &mut DeviceTree<'_>, initrd: Option<(u64, u64)>) {
+    if let Some((addr, size)) = initrd {
+        tree.mem_reserve
+            .retain(|entry| !(entry.address == addr && entry.size == size));
+    }
+}
+
+fn append_reserved_memory(tree: &mut DeviceTree<'_>, reserved_memory: &[(usize, usize)]) {
+    for &(addr, size) in reserved_memory {
+        if size == 0 {
+            continue;
+        }
+        let entry = MemReserve {
+            address: addr as u64,
+            size: size as u64,
+        };
+        if tree
+            .mem_reserve
+            .iter()
+            .any(|r| r.address == entry.address && r.size == entry.size)
+        {
+            continue;
+        }
+        tree.mem_reserve.push(entry);
+    }
+}
+
+fn configure_uart_console(
+    tree: &mut DeviceTree<'_>,
+    chosen: NodeId,
+    pl011_uart_addr: usize,
+) -> Result<(), &'static str> {
+    let alias = pick_uart_alias(tree);
+    let stdout_value = format!("{alias}:115200\0").into_bytes();
+    let node = tree.node_mut(chosen).ok_or("chosen node missing")?;
+    node.set_property(
+        NameRef::Borrowed("stdout-path"),
+        ValueRef::Owned(stdout_value.clone()),
+    );
+    node.set_property(
+        NameRef::Borrowed("linux,stdout-path"),
+        ValueRef::Owned(stdout_value),
+    );
+
+    update_bootargs(tree, chosen, pl011_uart_addr)
+}
+
+fn pick_uart_alias(tree: &DeviceTree<'_>) -> &'static str {
+    if let Some(alias_id) = tree.find_node_by_path("/aliases") {
+        if let Some(node) = tree.node(alias_id) {
+            if node.property("uart0").is_some() {
+                return "uart0";
+            }
+            if node.property("serial0").is_some() {
+                return "serial0";
+            }
+        }
+    }
+    "uart0"
+}
+
+fn update_bootargs(
+    tree: &mut DeviceTree<'_>,
+    chosen: NodeId,
+    pl011_uart_addr: usize,
+) -> Result<(), &'static str> {
+    let mut args = String::new();
+
+    if let Some(existing) = tree
+        .node(chosen)
+        .and_then(|node| node.property("bootargs"))
+        .map(|p| p.value.as_slice())
+    {
+        if let Some(raw) = existing.split(|b| *b == 0).next() {
+            if let Ok(text) = core::str::from_utf8(raw) {
+                for token in text.split_whitespace() {
+                    if token.starts_with("console=") || token.starts_with("earlycon=") {
+                        continue;
+                    }
+                    if !args.is_empty() {
+                        args.push(' ');
+                    }
+                    args.push_str(token);
+                }
+            }
+        }
+    }
+
+    let earlycon = format!("earlycon=pl011,0x{pl011_uart_addr:x}");
+    let console = "console=ttyAMA0,115200";
+    for token in [earlycon.as_str(), console] {
+        if !args.is_empty() {
+            args.push(' ');
+        }
+        args.push_str(token);
+    }
+
+    let mut bytes = args.into_bytes();
+    if !bytes.ends_with(&[0]) {
+        bytes.push(0);
+    }
+
+    tree.node_mut(chosen)
+        .ok_or("chosen node missing")?
+        .set_property(NameRef::Borrowed("bootargs"), ValueRef::Owned(bytes));
+    Ok(())
 }
 
 #[panic_handler]
