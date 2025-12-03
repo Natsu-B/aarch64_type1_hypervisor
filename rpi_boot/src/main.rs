@@ -13,6 +13,9 @@ use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::paging::EL2Stage1PageTypes;
+use arch_hal::paging::EL2Stage1Paging;
+use arch_hal::paging::EL2Stage1PagingSetting;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
@@ -223,8 +226,9 @@ extern "C" fn main() -> ! {
     };
     let ipa_space = 1usize << parange;
     let mut paging_data: Vec<Stage2PagingSetting> = Vec::new();
+    let mut stage1_paging_data: Vec<EL2Stage1PagingSetting> = Vec::new();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
-        let memory_last: Option<&Stage2PagingSetting> = paging_data.last();
+        let memory_last = paging_data.last();
         let memory_last_addr = if let Some(memory_last) = memory_last {
             memory_last.ipa + memory_last.size
         } else {
@@ -238,12 +242,24 @@ extern "C" fn main() -> ! {
                 size: addr - memory_last_addr,
                 types: Stage2PageTypes::Device,
             });
+            stage1_paging_data.push(EL2Stage1PagingSetting {
+                va: memory_last_addr,
+                pa: memory_last_addr,
+                size: addr - memory_last_addr,
+                types: EL2Stage1PageTypes::Device,
+            });
         }
         paging_data.push(Stage2PagingSetting {
             ipa: addr,
             pa: addr,
             size,
             types: Stage2PageTypes::Normal,
+        });
+        stage1_paging_data.push(EL2Stage1PagingSetting {
+            va: addr,
+            pa: addr,
+            size,
+            types: EL2Stage1PageTypes::Normal,
         });
         ControlFlow::Continue(())
     })
@@ -262,9 +278,17 @@ extern "C" fn main() -> ! {
         size: ipa_space - PL011_UART_ADDR - 0x1000,
         types: Stage2PageTypes::Device,
     });
+    stage1_paging_data.push(EL2Stage1PagingSetting {
+        va: memory_last_addr,
+        pa: memory_last_addr,
+        size: ipa_space - memory_last_addr,
+        types: EL2Stage1PageTypes::Device,
+    });
     println!("Stage2Paging: {:#?}", paging_data);
+    println!("EL2Stage1Paging: {:#?}", stage1_paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation();
+    EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
 
     let mut modified: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(dtb.get_size());
