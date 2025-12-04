@@ -356,13 +356,20 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             }
         };
 
-        if binary.len() as u64 != len {
+        let mut decoded = [0u8; MAX_PKT];
+        let Ok(decoded_len) = decode_rsp_binary(binary, &mut decoded) else {
+            // Malformed escape or output buffer overflow.
+            send_packet::<_, T::Error>(&mut self.stream, b"E03")?;
+            return Ok(ProcessResult::None);
+        };
+
+        if decoded_len as u64 != len {
             send_packet::<_, T::Error>(&mut self.stream, b"E03")?;
             return Ok(ProcessResult::None);
         }
 
         target
-            .write_memory(addr, binary)
+            .write_memory(addr, &decoded[..decoded_len])
             .map_err(GdbError::Target)?;
         send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
         Ok(ProcessResult::None)
@@ -602,4 +609,33 @@ pub fn hex_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
         out += 1;
     }
     Ok(out)
+}
+
+/// Decode RSP binary data (with 0x7d escaping) into `dst`.
+/// Returns decoded length on success.
+fn decode_rsp_binary(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
+    let mut in_idx = 0usize;
+    let mut out_idx = 0usize;
+
+    while in_idx < src.len() {
+        if out_idx >= dst.len() {
+            return Err(());
+        }
+
+        let b = src[in_idx];
+        if b == b'}' {
+            in_idx += 1;
+            if in_idx >= src.len() {
+                return Err(());
+            }
+            dst[out_idx] = src[in_idx] ^ 0x20;
+        } else {
+            dst[out_idx] = b;
+        }
+
+        in_idx += 1;
+        out_idx += 1;
+    }
+
+    Ok(out_idx)
 }
