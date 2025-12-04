@@ -130,7 +130,6 @@ name = "gdb_remote"
 version = "0.1.0"
 dependencies = [
  "aarch64_test",
- "allocator",
  "byte_stream",
  "print",
 ]

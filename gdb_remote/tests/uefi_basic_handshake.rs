@@ -6,10 +6,7 @@ compile_error!("This test is intended to run on aarch64 targets only");
 
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
-use allocator;
 use core::convert::Infallible;
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::Ordering;
 use gdb_remote::GdbServer;
 use gdb_remote::Target;
 use print::debug_uart;
@@ -19,18 +16,9 @@ use print::stream::Pl011Stream;
 const UART_BASE: usize = 0x900_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
 
-const TEST_HEAP_SIZE: usize = 2 * 1024 * 1024;
-static mut TEST_HEAP: [u8; TEST_HEAP_SIZE] = [0; TEST_HEAP_SIZE];
-static HEAP_READY: AtomicBool = AtomicBool::new(false);
-
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
     debug_uart::init(UART_BASE, UART_CLOCK_HZ);
-
-    if let Err(err) = setup_allocator() {
-        let _ = err;
-        exit_failure();
-    }
 
     let uart = Pl011Uart::new(UART_BASE);
     uart.init(UART_CLOCK_HZ, 115200);
@@ -47,19 +35,6 @@ extern "C" fn efi_main() -> ! {
             exit_failure();
         }
     }
-}
-
-fn setup_allocator() -> Result<(), &'static str> {
-    if HEAP_READY.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    allocator::init();
-    let heap_start = unsafe { core::ptr::addr_of_mut!(TEST_HEAP) as usize };
-    allocator::add_available_region(heap_start, TEST_HEAP_SIZE)?;
-    allocator::finalize()?;
-    HEAP_READY.store(true, Ordering::SeqCst);
-    Ok(())
 }
 
 struct DummyTarget;
