@@ -267,6 +267,12 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
                 return Ok(ProcessResult::None);
             }
         };
+        if addr.checked_add(len).is_none() {
+            // Workaround for a GDB bug that can send wrapped "m" packets like "$mfffffffffffffffc,4#...".
+            // If the address+length overflows, treat it as EFAULT (14) and keep the session running.
+            send_packet::<_, T::Error>(&mut self.stream, b"E14")?;
+            return Ok(ProcessResult::None);
+        }
         let len_usize = match usize::try_from(len) {
             Ok(v) => v,
             Err(_) => {
