@@ -2,18 +2,20 @@
 resolver = "3"
 members = [
     "allocator",
-    "rpi_boot",
+    "arch_hal",
     "bootloader",
+    "byte_stream",
     "dtb",
+    "elf",
+    "file",
+    "gdb_remote",
+    "intrusive_linked_list",
     "mutex",
-    "xtask",
+    "rpi_boot",
     "typestate",
     "typestate_macro",
-    "intrusive_linked_list",
-    "file",
     "virtio",
-    "elf",
-    "arch_hal",
+    "xtask",
 ]
 
 [profile.release]

@@ -14,16 +14,18 @@ use core::ptr;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 use cpu::registers::PARange;
+use paging::stage2::Stage2PageTypes;
 use paging::stage2::Stage2Paging;
 use paging::stage2::Stage2PagingSetting;
 use print::debug_uart;
 use print::println;
 
-const UART_BASE: usize = 0x9000_0000;
+const UART_BASE: usize = 0x900_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
 static HEAP_READY: AtomicBool = AtomicBool::new(false);
 const TEST_HEAP_SIZE: usize = 8 * 1024 * 1024;
 static mut TEST_HEAP: [u8; TEST_HEAP_SIZE] = [0; TEST_HEAP_SIZE];
+static ALLOCATOR: allocator::DefaultAllocator = allocator::DefaultAllocator::new();
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
@@ -45,7 +47,7 @@ fn run() -> Result<(), &'static str> {
     let baseline = Stage2State::snapshot();
 
     let (settings, ipa_points, expected_pas) = build_stage2_scenario()?;
-    Stage2Paging::init_stage2paging(&settings).map_err(|_| {
+    Stage2Paging::init_stage2paging(&settings, &ALLOCATOR).map_err(|_| {
         baseline.restore();
         "stage2 init failed"
     })?;
@@ -93,25 +95,19 @@ fn build_stage2_scenario()
             ipa: 0,
             pa: first_pa,
             size: first_size,
-            read: true,
-            write: true,
-            executable: true,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: first_size,
             pa: second_pa,
             size: second_size,
-            read: true,
-            write: true,
-            executable: true,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: first_size + second_size,
             pa: third_pa,
             size: third_size,
-            read: true,
-            write: true,
-            executable: true,
+            types: Stage2PageTypes::Normal,
         },
     ];
 
@@ -186,11 +182,11 @@ fn setup_allocator() -> Result<(), &'static str> {
     if HEAP_READY.load(Ordering::SeqCst) {
         return Ok(());
     }
-    allocator::init();
+    ALLOCATOR.init();
     let heap_start = ptr::addr_of_mut!(TEST_HEAP) as *mut u8 as usize;
     let heap_size = TEST_HEAP_SIZE;
-    allocator::add_available_region(heap_start, heap_size)?;
-    allocator::finalize()?;
+    ALLOCATOR.add_available_region(heap_start, heap_size)?;
+    ALLOCATOR.finalize()?;
     HEAP_READY.store(true, Ordering::SeqCst);
     Ok(())
 }

@@ -45,7 +45,7 @@ enable_rp1_uart=1
 enable_jtag_gpio=1
 device_tree_address=0x20000000
 
-initramfs linux.img 0x100000
+initramfs linux.img 0x300000
 
 [cm4]
 # Enable host mode on the 2711 built-in XHCI USB controller.

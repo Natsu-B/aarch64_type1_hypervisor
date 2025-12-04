@@ -10,9 +10,11 @@ mod handler;
 mod systimer;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
+use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011;
@@ -70,6 +72,8 @@ impl LinuxHeader {
     const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
 }
 
+define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
+
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
@@ -102,23 +106,24 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let mut systimer = SystemTimer::new();
     systimer.init();
     println!("setup allocator");
-    allocator::init();
+    GLOBAL_ALLOCATOR.init();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
-        allocator::add_available_region(addr, size).unwrap();
+        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
         ControlFlow::Continue(())
     })
     .unwrap();
     dtb.find_memory_reservation_block(&mut |addr, size| {
-        allocator::add_reserved_region(addr, size).unwrap();
+        GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
     dtb.find_reserved_memory_node(
         &mut |addr, size| {
-            allocator::add_reserved_region(addr, size).unwrap();
+            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
             ControlFlow::Continue(())
         },
         &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
-            if allocator::allocate_dynamic_reserved_region(size, align, alloc_range)
+            if GLOBAL_ALLOCATOR
+                .allocate_dynamic_reserved_region(size, align, alloc_range)
                 .unwrap()
                 .is_some()
             {
@@ -129,9 +134,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         },
     )
     .unwrap();
-    allocator::add_reserved_region(program_start, stack_start - program_start).unwrap();
-    allocator::add_reserved_region(dtb_ptr, dtb.get_size()).unwrap();
-    allocator::finalize().unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(program_start, stack_start - program_start)
+        .unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(dtb_ptr, dtb.get_size())
+        .unwrap();
+    GLOBAL_ALLOCATOR.finalize().unwrap();
     println!("allocator setup success!!!");
     // setup paging
     println!("start paging...");
@@ -153,20 +162,16 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             ipa: 0x0000,
             pa: 0x0000,
             size: pl011_addr,
-            read: true,
-            write: true,
-            executable: true,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: pl011_addr + pl011_size,
             pa: pl011_addr + pl011_size,
             size: (1 << parange) - pl011_addr - pl011_size,
-            read: true,
-            write: true,
-            executable: true,
+            types: Stage2PageTypes::Normal,
         },
     ];
-    Stage2Paging::init_stage2paging(&paging_data).unwrap();
+    Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");
     println!("setup exception");
@@ -233,7 +238,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 
     drop(file_driver);
     println!("file system closed");
-    let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
+    let mut reserved_memory = GLOBAL_ALLOCATOR
+        .trim_for_boot(0x1000 * 0x1000 * 128)
+        .unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, stack_start));
 
@@ -246,7 +253,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         )
     };
     new_dtb
-        .make_dtb(dtb_data, reserved_memory.as_ref())
+        .make_dtb(dtb_data, reserved_memory.as_ref(), false)
         .unwrap();
     unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
     println!("jumping linux...");

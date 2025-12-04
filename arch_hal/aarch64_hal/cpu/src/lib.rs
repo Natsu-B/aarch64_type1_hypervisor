@@ -127,6 +127,10 @@ pub fn set_hcr_el2(hcr: u64) {
     unsafe { asm!("msr hcr_el2, {}", in(reg) hcr) };
 }
 
+pub fn set_vbar_el1(vbar: u64) {
+    unsafe { asm!("msr vbar_el1, {}", in(reg) vbar) };
+}
+
 pub fn set_vbar_el2(vbar: u64) {
     unsafe { asm!("msr vbar_el2, {}", in(reg) vbar) };
 }
@@ -186,6 +190,17 @@ pub fn flush_tlb_el2_el1() {
             isb"
         )
     };
+}
+
+pub fn invalidate_icache_all() {
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 pub fn get_parange() -> Option<PARange> {
