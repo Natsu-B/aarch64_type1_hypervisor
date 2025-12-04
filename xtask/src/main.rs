@@ -228,6 +228,41 @@ fn resolve_profile(args: &[String]) -> String {
 }
 
 fn test(args: &[String]) {
+    fn parse_test_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut forward_args = Vec::new();
+        let mut package_filters = Vec::new();
+        let mut i = 0;
+
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "--" {
+                forward_args.extend(args[i..].iter().cloned());
+                break;
+            } else if let Some(pkg) = arg.strip_prefix("--package=") {
+                package_filters.push(pkg.to_string());
+                i += 1;
+                continue;
+            } else if arg == "-p" || arg == "--package" {
+                if let Some(pkg) = args.get(i + 1) {
+                    package_filters.push(pkg.clone());
+                    i += 2;
+                    continue;
+                }
+            } else if arg.starts_with("-p") && arg.len() > 2 {
+                package_filters.push(arg[2..].to_string());
+                i += 1;
+                continue;
+            }
+
+            forward_args.push(arg.clone());
+            i += 1;
+        }
+
+        (forward_args, package_filters)
+    }
+
+    let (test_args, package_filters) = parse_test_args(args);
+
     // Detect host triple
     let host_output = Command::new("rustc")
         .arg("--print")
@@ -307,9 +342,120 @@ fn test(args: &[String]) {
         None
     }
 
+    fn uefi_needs_sudo(
+        uefi_tests: &[(String, String, String, Vec<String>)],
+        repo_root: &PathBuf,
+    ) -> bool {
+        for (_, _, testscript, _) in uefi_tests {
+            let runner_path = repo_root.join(testscript);
+            match fs::read_to_string(&runner_path) {
+                Ok(content) => {
+                    if content.contains("sudo") {
+                        eprintln!(
+                            "Detected use of sudo in UEFI runner script: {}",
+                            runner_path.display()
+                        );
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to read UEFI runner script {}: {}",
+                        runner_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    fn sudo_warmup() {
+        let sudo_check = Command::new("sudo")
+            .arg("-V")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        match sudo_check {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!("Warning: 'sudo' not found; tests that require sudo may fail.");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to check availability of 'sudo': {}", e);
+                return;
+            }
+            Ok(_) => {}
+        }
+
+        match Command::new("sudo")
+            .arg("-n")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                eprintln!("Reusing existing sudo credential cache.");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Warning: failed to check sudo credential cache: {}", e);
+            }
+        }
+
+        eprintln!(
+            "Running 'sudo -v' to warm up credentials (you may be prompted for your password)..."
+        );
+        let status = Command::new("sudo")
+            .arg("-v")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap_or_else(|e| panic!("Failed to execute 'sudo -v': {}", e));
+
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            eprintln!(
+                "Error: 'sudo -v' failed (code {}); tests that require sudo cannot be run.",
+                code
+            );
+            std::process::exit(code);
+        }
+    }
+
+    if !package_filters.is_empty() {
+        std_crates.retain(|(pkg, _)| package_filters.contains(pkg));
+        uefi_tests.retain(|(pkg, _, _, _)| package_filters.contains(pkg));
+
+        if std_crates.is_empty() && uefi_tests.is_empty() {
+            eprintln!(
+                "No entries in xtest.txt match specified packages: {:?}",
+                package_filters
+            );
+            std::process::exit(1);
+        }
+
+        eprintln!(
+            "Filtered test plan to packages: {:?} ({} std, {} uefi)",
+            package_filters,
+            std_crates.len(),
+            uefi_tests.len()
+        );
+    }
+
     // Accumulate results across all tests
     let mut passed: Vec<String> = Vec::new();
     let mut failed: Vec<(String, i32)> = Vec::new();
+
+    if uefi_needs_sudo(&uefi_tests, &repo_root) {
+        sudo_warmup();
+    }
 
     // Run std tests (each with 30s timeout if available)
     for (pkg, extra) in std_crates {
@@ -333,7 +479,7 @@ fn test(args: &[String]) {
             .arg("-p")
             .arg(&pkg)
             .args(&extra)
-            .args(args)
+            .args(&test_args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -383,7 +529,7 @@ fn test(args: &[String]) {
             .arg("--test")
             .arg(&testname)
             .args(&extra)
-            .args(args)
+            .args(&test_args)
             .env("CARGO_TARGET_AARCH64_UNKNOWN_UEFI_RUNNER", runner)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())

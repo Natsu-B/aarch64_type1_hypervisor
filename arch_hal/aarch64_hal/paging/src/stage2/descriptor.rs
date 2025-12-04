@@ -1,3 +1,4 @@
+use crate::stage2::Stage2PageTypes;
 use typestate::bitregs;
 
 bitregs! {
@@ -63,6 +64,14 @@ bitregs! {
         //   the combination rules for S1/S2 cacheability follow S2FWB semantics.
         //   currently only S2FWD is disabled is supported.
         pub(crate) mem_attr@[5:2] as MemAttr {
+            // Device-nGnRnE memory
+            Device_nGnRnE = 0b0000,
+            // Device-nGnRE memory
+            Device_nGnRE = 0b0001,
+            // Device-nGRE memory
+            Device_nGRE = 0b0010,
+            // Device-GRE memory
+            Device_GRE = 0b0011,
             // When FEAT_MTE_PERM is implemented, Outer/Inner Write-Back Cacheable
             Reserved = 0b0100,
             // Outer/Inner Non-cacheable
@@ -192,7 +201,7 @@ impl Stage2_48bitLeafDescriptor {
     /// Build a Stage-2 *block* descriptor (L1/L2). `level` is the translation level (1 or 2).
     /// We mask to the [47:21] superset and leave finer-grained alignment to the caller.
     #[inline]
-    pub(crate) fn new_block(pa: u64, level: i8) -> u64 {
+    pub(crate) fn new_block(pa: u64, level: i8, types: Stage2PageTypes) -> u64 {
         let _aligned_bits = match level {
             1 => 1 << 30, // 1GiB
             2 => 1 << 21, // 2MiB
@@ -200,10 +209,17 @@ impl Stage2_48bitLeafDescriptor {
         };
         debug_assert_eq!(pa & (_aligned_bits - 1), 0);
 
+        let (mem_attr, sh) = match types {
+            Stage2PageTypes::Normal => {
+                (MemAttr::BothWriteBackCacheable, Shareability::InnerSharable)
+            }
+            Stage2PageTypes::Device => (MemAttr::Device_nGnRnE, Shareability::NonSharable),
+        };
+
         Self::new()
-            .set_enum(Self::mem_attr, MemAttr::BothWriteBackCacheable)
+            .set_enum(Self::mem_attr, mem_attr)
             .set_enum(Self::s2ap, AccessPermission::ReadWrite)
-            .set_enum(Self::sh, Shareability::InnerSharable)
+            .set_enum(Self::sh, sh)
             .set_enum(Self::ty, DescriptorType::Block)
             .set_raw(Self::block_oab, pa)
             .set(Self::af, 0b1)
@@ -212,11 +228,18 @@ impl Stage2_48bitLeafDescriptor {
 
     /// Build a Stage-2 *page* descriptor (L3). We use the same [47:12] superset.
     #[inline]
-    pub(crate) fn new_page(pa: u64) -> u64 {
+    pub(crate) fn new_page(pa: u64, types: Stage2PageTypes) -> u64 {
+        let (mem_attr, sh) = match types {
+            Stage2PageTypes::Normal => {
+                (MemAttr::BothWriteBackCacheable, Shareability::InnerSharable)
+            }
+            Stage2PageTypes::Device => (MemAttr::Device_nGnRnE, Shareability::NonSharable),
+        };
+
         Self::new()
-            .set_enum(Self::mem_attr, MemAttr::BothWriteBackCacheable)
+            .set_enum(Self::mem_attr, mem_attr)
             .set_enum(Self::s2ap, AccessPermission::ReadWrite)
-            .set_enum(Self::sh, Shareability::InnerSharable)
+            .set_enum(Self::sh, sh)
             .set_enum(Self::ty, DescriptorType::Page)
             .set_raw(Self::page_oab, pa)
             .set(Self::af, 0b1)

@@ -21,10 +21,19 @@ mod registers;
 
 pub struct Stage2Paging;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+pub enum Stage2PageTypes {
+    Normal = 0b0,
+    Device = 0b1,
+}
+
+#[derive(Debug)]
 pub struct Stage2PagingSetting {
     pub ipa: usize,
     pub pa: usize,
     pub size: usize,
+    pub types: Stage2PageTypes,
 }
 
 impl Stage2Paging {
@@ -37,7 +46,10 @@ impl Stage2Paging {
     ///
     /// # safety
     ///     data must be ascending order
-    pub fn init_stage2paging(data: &[Stage2PagingSetting]) -> Result<(), PagingErr> {
+    pub fn init_stage2paging(
+        data: &[Stage2PagingSetting],
+        allocator: &'static allocator::DefaultAllocator,
+    ) -> Result<(), PagingErr> {
         if data.is_empty() {
             return Err(PagingErr::Corrupted);
         }
@@ -113,7 +125,12 @@ impl Stage2Paging {
             };
 
         // mapping page table
-        let table = Self::setup_stage2_translation(data, initial_lookup_level_i8, num_of_tables)?;
+        let table = Self::setup_stage2_translation(
+            data,
+            initial_lookup_level_i8,
+            num_of_tables,
+            allocator,
+        )?;
         cpu::set_vttbr_el2(table as u64);
 
         let vtcr_el2 = VTCR_EL2::new()
@@ -135,12 +152,14 @@ impl Stage2Paging {
         data: &[Stage2PagingSetting],
         top_table_level: i8,
         num_of_tables: usize,
+        allocator: &'static allocator::DefaultAllocator,
     ) -> Result<usize, PagingErr> {
-        let table_addr = allocator::allocate_with_size_and_align(
-            PAGE_TABLE_SIZE * num_of_tables,
-            PAGE_TABLE_SIZE * num_of_tables,
-        )
-        .map_err(|_| PagingErr::OutOfMemory)?;
+        let table_addr = allocator
+            .allocate_with_size_and_align(
+                PAGE_TABLE_SIZE * num_of_tables,
+                PAGE_TABLE_SIZE * num_of_tables,
+            )
+            .map_err(|_| PagingErr::OutOfMemory)?;
         let table =
             unsafe { slice::from_raw_parts_mut(table_addr as *mut u64, num_of_tables * 512) };
         // initialize page table
@@ -171,7 +190,11 @@ impl Stage2Paging {
             if top_table_level != 0 && (pa | ipa) & (top_level - 1) == 0 && size >= top_level {
                 // block descriptor
                 debug_assert_eq!(table[idx], 0);
-                table[idx] = Stage2_48bitLeafDescriptor::new_block(pa as u64, top_table_level);
+                table[idx] = Stage2_48bitLeafDescriptor::new_block(
+                    pa as u64,
+                    top_table_level,
+                    data[i].types,
+                );
                 pa += top_level;
                 ipa += top_level;
                 size -= top_level;
@@ -241,9 +264,9 @@ impl Stage2Paging {
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] = if table_level == 3 {
-                    Stage2_48bitLeafDescriptor::new_page(*pa as u64)
+                    Stage2_48bitLeafDescriptor::new_page(*pa as u64, data[*i].types)
                 } else {
-                    Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level)
+                    Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level, data[*i].types)
                 };
                 *pa += table_level_size;
                 *ipa += table_level_size;

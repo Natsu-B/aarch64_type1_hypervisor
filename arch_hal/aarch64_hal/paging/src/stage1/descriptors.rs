@@ -237,7 +237,7 @@ impl Stage1_48bitLeafDescriptor {
         debug_assert!(attr_indx < 8);
 
         Self::new()
-            .set_raw(Self::attr_indx, attr_indx as u64)
+            .set(Self::attr_indx, attr_indx as u64)
             .set_enum(Self::ap, ap)
             .set_enum(Self::sh, Shareability::InnerSharable) // Default: Inner Shareable
             .set_enum(Self::ty, DescriptorType::Block)
@@ -261,7 +261,7 @@ impl Stage1_48bitLeafDescriptor {
         debug_assert_eq!(pa & ((1 << 12) - 1), 0);
 
         Self::new()
-            .set_raw(Self::attr_indx, attr_indx as u64)
+            .set(Self::attr_indx, attr_indx as u64)
             .set_enum(Self::ap, ap)
             .set_enum(Self::sh, Shareability::InnerSharable)
             .set_enum(Self::ty, DescriptorType::Page)

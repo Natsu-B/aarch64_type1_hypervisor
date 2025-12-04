@@ -3,14 +3,17 @@
 #![feature(sync_unsafe_cell)]
 
 mod common_handler;
+mod el1;
 mod irq_handler;
 pub mod registers;
 pub mod synchronous_handler;
 
+use cpu::set_vbar_el1;
 use cpu::set_vbar_el2;
 
 use crate::common_handler::common_handler;
 use crate::irq_handler::irq_handler;
+use crate::registers::VBAR_EL1;
 use crate::registers::VBAR_EL2;
 use crate::synchronous_handler::synchronous_handler;
 use core::arch::global_asm;
@@ -194,6 +197,18 @@ pub fn setup_exception() {
     set_vbar_el2(
         VBAR_EL2::new()
             .set_raw(VBAR_EL2::vba, unsafe { &exception_table } as *const _
+                as u64)
+            .bits(),
+    );
+}
+
+pub fn setup_el1_exception() {
+    unsafe extern "C" {
+        static exception_table_el1: u8;
+    }
+    set_vbar_el1(
+        VBAR_EL1::new()
+            .set_raw(VBAR_EL1::vba, unsafe { &exception_table_el1 } as *const _
                 as u64)
             .bits(),
     );
