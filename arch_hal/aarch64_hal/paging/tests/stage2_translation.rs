@@ -20,7 +20,7 @@ use paging::stage2::Stage2PagingSetting;
 use print::debug_uart;
 use print::println;
 
-const UART_BASE: usize = 0x9000_0000;
+const UART_BASE: usize = 0x900_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
 static HEAP_READY: AtomicBool = AtomicBool::new(false);
 const TEST_HEAP_SIZE: usize = 8 * 1024 * 1024;
