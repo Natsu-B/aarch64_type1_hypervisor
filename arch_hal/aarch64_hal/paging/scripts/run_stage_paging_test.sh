@@ -15,6 +15,12 @@ rm -rf "$SCRIPT_DIR/../bin/EFI"
 mkdir -p "$BIN_DIR"
 cp "$PATH_TO_ELF" "$BIN_DIR/BOOTAA64.EFI"
 
+QEMU_GDB_ARGS=""
+if [ -n "$XTASK_QEMU_GDB_SOCKET" ]; then
+    rm -f "$XTASK_QEMU_GDB_SOCKET"
+    QEMU_GDB_ARGS="-gdb unix:path=$XTASK_QEMU_GDB_SOCKET,server=on,wait=off"
+fi
+
 qemu-system-aarch64 \
   -M virt,gic-version=3,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
@@ -24,7 +30,8 @@ qemu-system-aarch64 \
   -semihosting-config enable=on,target=native \
   -no-reboot -no-shutdown \
   -drive file=fat:rw:"$SCRIPT_DIR/../bin",format=raw,if=none,media=disk,id=disk \
-  -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0
+  -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0 \
+  $QEMU_GDB_ARGS
 
 RETCODE=$?
 

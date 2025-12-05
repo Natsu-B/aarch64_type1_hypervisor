@@ -7,6 +7,9 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 fn main() {
     // Skip the executable name (xtask)
@@ -225,6 +228,127 @@ fn resolve_profile(args: &[String]) -> String {
     }
 
     "debug".to_owned()
+}
+
+fn resolve_gdb_executable() -> Option<String> {
+    // Prefer gdb-multiarch if available, fall back to gdb.
+    for candidate in &["gdb-multiarch", "gdb"] {
+        let status = Command::new(candidate)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Ok(status) = status {
+            if status.success() {
+                return Some((*candidate).to_string());
+            }
+        }
+    }
+    None
+}
+
+fn run_uefi_test_with_backtrace(
+    mut cmd: Command,
+    label: &str,
+    gdb_socket: &str,
+    timeout_secs: u64,
+) -> i32 {
+    eprintln!("Running (UEFI, with gdb-on-timeout): {:?}", cmd);
+
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", label, e));
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    // Poll for completion with timeout.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    break Err(());
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error: failed to poll UEFI test process for {}: {}",
+                    label, e
+                );
+                break Err(());
+            }
+        }
+    };
+
+    match status {
+        Ok(status) => {
+            if status.success() {
+                0
+            } else {
+                status.code().unwrap_or(1)
+            }
+        }
+        Err(()) => {
+            eprintln!(
+                "Error: UEFI test '{}' did not finish within {}s; assuming hang.",
+                label, timeout_secs
+            );
+            eprintln!(
+                "Attempting to capture guest state via gdb (socket: {})...",
+                gdb_socket
+            );
+
+            if let Some(gdb) = resolve_gdb_executable() {
+                let mut gdb_cmd = Command::new(&gdb);
+                gdb_cmd
+                    .arg("-q")
+                    .arg("-ex")
+                    .arg("set pagination off")
+                    .arg("-ex")
+                    .arg(format!("target remote {}", gdb_socket))
+                    .arg("-ex")
+                    .arg("set confirm off")
+                    .arg("-ex")
+                    .arg("interrupt")
+                    .arg("-ex")
+                    .arg("info registers")
+                    .arg("-ex")
+                    .arg("bt")
+                    .arg("-ex")
+                    .arg("x/16i $pc")
+                    .arg("-ex")
+                    .arg("quit")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                eprintln!("Running gdb: {:?}", gdb_cmd);
+                match gdb_cmd.status() {
+                    Ok(s) => {
+                        eprintln!("gdb finished with status: {:?}", s);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to execute gdb for {}: {}", label, e);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Warning: no suitable gdb executable found in PATH; skip backtrace dump."
+                );
+            }
+
+            eprintln!("Killing hung UEFI test process for '{}'", label);
+            if let Err(e) = child.kill() {
+                eprintln!("Warning: failed to kill UEFI test process: {}", e);
+            }
+            let _ = child.wait();
+
+            // 124 = timeout and consistent with `timeout` command conventions.
+            124
+        }
+    }
 }
 
 fn test(args: &[String]) {
@@ -499,17 +623,43 @@ fn test(args: &[String]) {
         }
     }
 
-    // Run UEFI tests (rely on runner's internal timeout)
+    // Decide whether to enable gdb-on-timeout for UEFI tests.
+    let enable_uefi_backtrace = std::env::var("XTASK_UEFI_GDB_DUMP_ON_TIMEOUT")
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or_else(|_| std::env::var("CI").is_ok());
+
+    // Run UEFI tests
     for (pkg, testname, testscript, extra) in uefi_tests {
         let runner_path = repo_root.join(testscript);
         let runner = runner_path
             .to_str()
             .expect("runner path contains invalid UTF-8");
+
+        let label = format!("uefi:{}::{}", pkg, testname);
         eprintln!(
             "\n--- Running UEFI test for: {}::{}, runner: {} ---",
             pkg, testname, runner
         );
-        let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
+
+        // Prepare gdbstub socket path when backtrace dump is enabled.
+        let gdb_socket = if enable_uefi_backtrace {
+            Some(format!(
+                "/tmp/aarch64_hv_qemu_gdb_{}_{}.sock",
+                pkg.replace('/', "_"),
+                testname.replace('/', "_")
+            ))
+        } else {
+            None
+        };
+
+        let mut cmd = if enable_uefi_backtrace {
+            let mut c = Command::new("cargo");
+            c.arg("test");
+            c
+        } else if let Some(mut prefix) = timeout_prefix(30) {
             let mut c = Command::new(prefix.remove(0));
             for p in prefix {
                 c.arg(p);
@@ -535,17 +685,27 @@ fn test(args: &[String]) {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", pkg, e))
-            .wait()
-            .unwrap_or_else(|e| panic!("Failed to wait for cargo test (UEFI) for {}: {}", pkg, e));
-        let label = format!("uefi:{}::{}", pkg, testname);
-        if status.success() {
+        if let Some(ref socket) = gdb_socket {
+            cmd.env("XTASK_QEMU_GDB_SOCKET", socket);
+        }
+
+        let code = if let Some(ref socket) = gdb_socket {
+            run_uefi_test_with_backtrace(cmd, &label, socket, 60)
+        } else {
+            eprintln!("Running: {:?}", cmd);
+            let status = cmd
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", pkg, e))
+                .wait()
+                .unwrap_or_else(|e| {
+                    panic!("Failed to wait for cargo test (UEFI) for {}: {}", pkg, e)
+                });
+            status.code().unwrap_or(1)
+        };
+
+        if code == 0 {
             passed.push(label);
         } else {
-            let code = status.code().unwrap_or(1);
             eprintln!("Error: UEFI test failed for {} with code {}", pkg, code);
             failed.push((label, code));
         }
