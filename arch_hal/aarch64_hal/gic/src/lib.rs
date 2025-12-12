@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod gicv2;
 pub mod gicv3;
 
 pub use gicv3::GicDistributor;

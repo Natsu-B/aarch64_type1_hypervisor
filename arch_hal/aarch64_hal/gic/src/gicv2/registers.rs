@@ -1,0 +1,239 @@
+#![allow(non_camel_case_types)]
+
+use core::mem::size_of;
+use typestate::ReadOnly;
+use typestate::ReadWrite;
+use typestate::WriteOnly;
+use typestate::bitregs;
+
+// ARM IHI 0048B tables define the offsets; GIC-400 TRM sets the 4KB/8KB GICv2 frame sizes.
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(size_of::<GicV2Distributor>() == 0x1_000);
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(size_of::<GicV2CpuInterface>() == 0x2_000);
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(size_of::<GicV2VirtualInterfaceControl>() == 0x1_000);
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(size_of::<GicV2VirtualCpuInterface>() == 0x2_000);
+
+bitregs! {
+    /// GICv2 Distributor Control Register bits (ARM IHI 0048B Table 4-1).
+    pub(crate) struct GICD_CTLR_V2: u32 {
+        // Enable Group0 forwarding
+        pub(crate) enable_grp0@[0:0],
+        // Enable Group1 forwarding
+        pub(crate) enable_grp1@[1:1],
+        reserved@[31:2] [res0],
+    }
+}
+
+bitregs! {
+    /// GICv2 CPU Interface Control Register bits (ARM IHI 0048B Table 4-31).
+    pub(crate) struct GICC_CTLR_V2: u32 {
+        // Enable Group0 signaling to this CPU interface
+        pub(crate) enable_grp0@[0:0],
+        // Enable Group1 signaling to this CPU interface
+        pub(crate) enable_grp1@[1:1],
+        // Control use of IDs for acknowledgement
+        pub(crate) ack_ctl@[2:2],
+        // Route Group0 interrupts as FIQ when set
+        pub(crate) fiq_en@[3:3],
+        // Common Binary Point for both groups
+        pub(crate) cbpr@[4:4],
+        // Disable FIQ bypass for Group0
+        pub(crate) fiq_byp_dis_grp0@[5:5],
+        // Disable IRQ bypass for Group0
+        pub(crate) irq_byp_dis_grp0@[6:6],
+        // Disable FIQ bypass for Group1
+        pub(crate) fiq_byp_dis_grp1@[7:7],
+        // Disable IRQ bypass for Group1
+        pub(crate) irq_byp_dis_grp1@[8:8],
+        // Secure EOImode (EOI drops priority only when set)
+        pub(crate) eoi_mode_s@[9:9],
+        // Non-secure EOImode (alias behavior per Security Extensions)
+        pub(crate) eoi_mode_ns@[10:10],
+        reserved@[31:11] [res0],
+    }
+}
+
+bitregs! {
+    /// Virtual CPU Interface Control Register bits (ARM IHI 0048B Table 5-10).
+    pub(crate) struct GICV_CTLR: u32 {
+        // Enable Group0 virtual interrupts
+        pub(crate) enable_grp0@[0:0],
+        // Enable Group1 virtual interrupts
+        pub(crate) enable_grp1@[1:1],
+        // Control use of IDs for acknowledgement
+        pub(crate) ack_ctl@[2:2],
+        // Route Group0 virtual interrupts as FIQ when set
+        pub(crate) fiq_en@[3:3],
+        // Common Binary Point for both groups
+        pub(crate) cbpr@[4:4],
+        reserved@[8:5] [res0],
+        // EOImode: 0 drops priority and deactivates via EOI (DIR UNPREDICTABLE); 1 drops only (DIR deactivates)
+        pub(crate) eoi_mode@[9:9],
+        reserved@[31:10] [res0],
+    }
+}
+
+bitregs! {
+    /// GICv2 Hypervisor Control Register bits (ARM IHI 0048B Table 5-2).
+    pub(crate) struct GICH_HCR: u32 {
+        // Global enable for virtual/maintenance interrupt signalling
+        pub(crate) en@[0:0],
+        // Underflow Interrupt Enable
+        pub(crate) uie@[1:1],
+        // List Register Entry Not Present Interrupt Enable
+        pub(crate) lrenpie@[2:2],
+        // No Pending Interrupt Enable
+        pub(crate) npie@[3:3],
+        // Virtual Group0 Error Interrupt Enable
+        pub(crate) vgrp0eie@[4:4],
+        // Virtual Group0 Disable Interrupt Enable
+        pub(crate) vgrp0die@[5:5],
+        // Virtual Group1 Error Interrupt Enable
+        pub(crate) vgrp1eie@[6:6],
+        // Virtual Group1 Disable Interrupt Enable
+        pub(crate) vgrp1die@[7:7],
+        reserved@[26:8] [res0],
+        // EOICount (maintenance interrupt source)
+        pub(crate) eoicount@[31:27],
+    }
+}
+
+/// GICv2 Distributor register frame (0x1000 bytes) per ARM IHI 0048B Table 4-1;
+/// GIC-400 TRM maps this block at 0x1000-0x1FFF in the integrated memory map.
+#[repr(C)]
+pub(crate) struct GicV2Distributor {
+    /// Distributor Control Register; enables forwarding for Group0/Group1.
+    pub ctlr: ReadWrite<GICD_CTLR_V2>, // 0x000
+    pub typer: ReadOnly<u32>,   // 0x004
+    pub iidr: ReadOnly<u32>,    // 0x008
+    _rsvd_00c_007f: [u8; 0x74], // 0x00C-0x07F
+
+    /// Interrupt Group Registers; register n covers interrupts 32*n..32*n+31 (Group0 vs Group1 selection).
+    pub igroupr: [ReadWrite<u32>; 32], // 0x080-0x0FC
+    /// Interrupt Set-Enable Registers; register n covers interrupts 32*n..32*n+31.
+    pub isenabler: [ReadWrite<u32>; 32], // 0x100-0x17C
+    /// Interrupt Clear-Enable Registers; register n covers interrupts 32*n..32*n+31.
+    pub icenabler: [ReadWrite<u32>; 32], // 0x180-0x1FC
+    /// Interrupt Set-Pending Registers; register n covers interrupts 32*n..32*n+31.
+    pub ispendr: [ReadWrite<u32>; 32], // 0x200-0x27C
+    /// Interrupt Clear-Pending Registers; register n covers interrupts 32*n..32*n+31.
+    pub icpendr: [ReadWrite<u32>; 32], // 0x280-0x2FC
+    /// Interrupt Set-Active Registers; register n covers interrupts 32*n..32*n+31.
+    pub isactiver: [ReadWrite<u32>; 32], // 0x300-0x37C
+    /// Interrupt Clear-Active Registers; register n covers interrupts 32*n..32*n+31.
+    pub icactiver: [ReadWrite<u32>; 32], // 0x380-0x3FC
+
+    // Priority window: 0x0400..0x07FF (Table 4-1)
+    /// Interrupt Priority Registers; four 8-bit priority fields per word.
+    pub ipriorityr: [ReadWrite<u32>; 255],
+    _rsvd_07fc_07ff: [u8; 4],
+
+    // ITARGETSR window: 0x0800..0x0BFF
+    /// Interrupt Processor Targets Registers; word n covers interrupts 4*n..4*n+3.
+    /// 0x800-0x81C (interrupts 0-31, SGIs/PPIs) are RO/IMPLEMENTATION DEFINED targets.
+    /// 0x820-0xBF8 (SPIs) are RW, one byte per interrupt (byte accesses permitted); 0xBFC reserved.
+    pub itargetsr: [ReadWrite<u32>; 255],
+    _rsvd_0bfc_0bff: [u8; 4],
+
+    /// Interrupt Configuration Registers; register n covers interrupts 16*n..16*n+15.
+    /// For interrupt m, field F = m mod 16 uses bits [2F+1:2F] (edge vs level).
+    pub icfgr: [ReadWrite<u32>; 64], // 0x0C00-0x0CFC
+    _rsvd_0d00_0dff: [u8; 0x100], // 0x0D00-0x0DFF
+    /// Non-Secure Access Control Registers; register n covers interrupts 16*n..16*n+15.
+    pub nsacr: [ReadWrite<u32>; 64], // 0x0E00-0x0EFC
+
+    /// Software Generated Interrupt Register; issues SGIs (effect when Distributor forwarding disabled is IMPLEMENTATION DEFINED; NSATT depends on Security Extensions).
+    pub sgir: WriteOnly<u32>, // 0x0F00
+    _rsvd_0f04_0f0f: [u8; 0x0C],        // 0x0F04-0x0F0F
+    pub cpendsgir: [ReadWrite<u32>; 4], // 0x0F10-0x0F1C
+    pub spendsgir: [ReadWrite<u32>; 4], // 0x0F20-0x0F2C
+    _rsvd_0f30_0fcf: [u8; 0xA0],        // 0x0F30-0x0FCF
+
+    /// Peripheral ID registers (RO).
+    pub pidr: [ReadOnly<u32>; 8], // 0x0FD0-0x0FEC
+    /// Component ID registers (RO).
+    pub cidr: [ReadOnly<u32>; 4], // 0x0FF0-0x0FFC
+}
+
+/// GICv2 CPU interface register frame (0x2000 bytes including DIR at 0x1000) per ARM IHI 0048B Table 4-2;
+/// GIC-400 TRM maps CPU interfaces at 0x2000-0x3FFF.
+#[repr(C)]
+pub(crate) struct GicV2CpuInterface {
+    /// CPU Interface Control Register; enables signaling for Group0/Group1 (bit assignments vary with Security Extensions/Secure copy).
+    pub ctlr: ReadWrite<GICC_CTLR_V2>, // 0x0000
+    pub pmr: ReadWrite<u32>, // 0x0004
+    pub bpr: ReadWrite<u32>, // 0x0008
+    /// Interrupt Acknowledge Register; returns interrupt ID to be serviced.
+    pub iar: ReadOnly<u32>, // 0x000C
+    /// End of Interrupt Register; EOImode=0 drops priority and deactivates, EOImode=1 drops only.
+    pub eoir: WriteOnly<u32>, // 0x0010
+    pub rpr: ReadOnly<u32>,  // 0x0014
+    pub hppir: ReadOnly<u32>, // 0x0018
+    pub abpr: ReadWrite<u32>, // 0x001C
+    pub aiar: ReadOnly<u32>, // 0x0020
+    pub aeoir: WriteOnly<u32>, // 0x0024
+    pub ahppir: ReadOnly<u32>, // 0x0028
+    _rsvd_002c_00cf: [u8; 0xA4], // 0x002C-0x00CF
+    pub apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
+    pub nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC
+    _rsvd_00f0_00fb: [u8; 0x0C], // 0x00F0-0x00FB
+    pub iidr: ReadOnly<u32>, // 0x00FC
+    _rsvd_0100_0fff: [u8; 0xF00], // 0x0100-0x0FFF
+    /// Deactivate Interrupt Register; valid when priority drop/deactivate are split (EOImode=1), UNPREDICTABLE otherwise.
+    pub dir: WriteOnly<u32>, // 0x1000
+    _rsvd_1004_1fff: [u8; 0x0FFC], // 0x1004-0x1FFF
+}
+
+/// GICv2 Virtual Interface Control block (0x1000 bytes) per ARM IHI 0048B Table 5-1;
+/// GIC-400 TRM maps this block at 0x4000-0x5FFF.
+#[repr(C)]
+pub(crate) struct GicV2VirtualInterfaceControl {
+    /// Hypervisor Control Register; En must be set for virtual or maintenance interrupts to assert.
+    pub hcr: ReadWrite<GICH_HCR>, // 0x00
+    pub vtr: ReadOnly<u32>, // 0x04
+    /// VMCR alias; bundles virtual CPU view state for save/restore.
+    pub vmcr: ReadWrite<u32>, // 0x08
+    _rsvd_0c_0f: [u8; 0x04], // 0x0C-0x0F
+    pub misr: ReadOnly<u32>, // 0x10
+    _rsvd_14_1f: [u8; 0x0C], // 0x14-0x1F
+    pub eisr: [ReadOnly<u32>; 2], // 0x20-0x24
+    _rsvd_028_02f: [u8; 0x08], // 0x028-0x02F
+    pub elrsr: [ReadOnly<u32>; 2], // 0x30-0x34
+    _rsvd_038_0ef: [u8; 0xB8], // 0x038-0x0EF
+    pub apr: ReadWrite<u32>, // 0x0F0
+    _rsvd_0f4_0ff: [u8; 0x0C], // 0x0F4-0x0FF
+    pub lr: [ReadWrite<u32>; 64], // 0x100-0x1FC
+    _rsvd_200_fff: [u8; 0xE00], // 0x200-0xFFF
+}
+
+/// GICv2 Virtual CPU interface (0x2000 bytes including DIR) per ARM IHI 0048B Table 5-10;
+/// GIC-400 TRM maps virtual CPU interfaces at 0x6000-0x7FFF. Only Group 1 interrupts target the hypervisor in this path.
+#[repr(C)]
+pub(crate) struct GicV2VirtualCpuInterface {
+    /// Virtual CPU Control Register; EOImode controls whether EOI also deactivates (0) or only drops priority (1).
+    pub ctlr: ReadWrite<GICV_CTLR>, // 0x0000
+    pub pmr: ReadWrite<u32>, // 0x0004
+    pub bpr: ReadWrite<u32>, // 0x0008
+    /// Virtual Interrupt Acknowledge Register.
+    pub iar: ReadOnly<u32>, // 0x000C
+    /// Virtual End of Interrupt; EOImode=0 drops priority and deactivates, EOImode=1 drops only.
+    pub eoir: WriteOnly<u32>, // 0x0010
+    pub rpr: ReadOnly<u32>,  // 0x0014
+    pub hppir: ReadOnly<u32>, // 0x0018
+    pub abpr: ReadWrite<u32>, // 0x001C
+    pub aiar: ReadOnly<u32>, // 0x0020
+    pub aeoir: WriteOnly<u32>, // 0x0024
+    pub ahppir: ReadOnly<u32>, // 0x0028
+    _rsvd_002c_00cf: [u8; 0xA4], // 0x002C-0x00CF
+    pub apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
+    pub nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC
+    _rsvd_00f0_00fb: [u8; 0x0C], // 0x00F0-0x00FB
+    pub iidr: ReadOnly<u32>, // 0x00FC
+    _rsvd_0100_0fff: [u8; 0xF00], // 0x0100-0x0FFF
+    /// Virtual Deactivate Interrupt Register; valid when EOImode=1 (otherwise UNPREDICTABLE) to deactivate list register entry.
+    pub dir: WriteOnly<u32>, // 0x1000
+    _rsvd_1004_1fff: [u8; 0x0FFC], // 0x1004-0x1FFF
+}
