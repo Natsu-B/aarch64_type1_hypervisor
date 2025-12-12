@@ -67,6 +67,16 @@ fn run() -> Result<(), &'static str> {
     let text_addr = run as usize;
     let efi_addr = efi_main as usize;
     let dummy_addr = ptr::addr_of!(DUMMY) as usize;
+    let vbar_el2: usize;
+    unsafe {
+        asm!(
+            "mrs {vbar}, vbar_el2",
+            vbar = out(reg) vbar_el2,
+            options(nostack, preserves_flags),
+        );
+    }
+    let vbar_start = vbar_el2;
+    let vbar_end = vbar_start + 0x800 - 1;
 
     let mut tracked = Vec::new();
     tracked.push(buffer_ptr);
@@ -75,6 +85,8 @@ fn run() -> Result<(), &'static str> {
     tracked.push(text_addr);
     tracked.push(efi_addr);
     tracked.push(dummy_addr);
+    tracked.push(vbar_start);
+    tracked.push(vbar_end);
     tracked.push(UART_BASE);
     tracked.push(UART_BASE + 0x1000);
 
@@ -196,16 +208,35 @@ struct Stage1State {
     tcr: u64,
     ttbr0: u64,
     sctlr: u64,
+    daif: u64,
 }
 
 impl Stage1State {
     fn snapshot() -> Self {
+        let hcr = cpu::get_hcr_el2();
+        let mair = get_mair_el2();
+        let tcr = get_tcr_el2();
+        let ttbr0 = get_ttbr0_el2();
+        let sctlr = get_sctlr_el2();
+        let daif: u64;
+
+        unsafe {
+            asm!(
+                "mrs {daif}, daif",
+                // Set D, A, I, F mask bits (mask all exceptions).
+                "msr daifset, #0b1111",
+                daif = out(reg) daif,
+                options(nostack, preserves_flags),
+            );
+        }
+
         Self {
-            hcr: cpu::get_hcr_el2(),
-            mair: get_mair_el2(),
-            tcr: get_tcr_el2(),
-            ttbr0: get_ttbr0_el2(),
-            sctlr: get_sctlr_el2(),
+            hcr,
+            mair,
+            tcr,
+            ttbr0,
+            sctlr,
+            daif,
         }
     }
 
@@ -218,6 +249,15 @@ impl Stage1State {
         cpu::set_sctlr_el2(self.sctlr);
         cpu::flush_tlb_el2_el1();
         cpu::isb();
+
+        // Restore original interrupt mask state.
+        unsafe {
+            asm!(
+                "msr daif, {daif}",
+                daif = in(reg) self.daif,
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
