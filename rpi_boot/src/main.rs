@@ -4,6 +4,7 @@
 
 extern crate alloc;
 mod handler;
+mod multicore;
 mod systimer;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
@@ -12,6 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use allocator::define_global_allocator;
+use arch_hal::DEBUG_UART;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
@@ -57,6 +59,7 @@ unsafe extern "C" {
     static mut _LINUX_IMAGE: usize;
 }
 
+pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static RP1_BASE: usize = 0x1c_0000_0000;
@@ -114,6 +117,7 @@ extern "C" fn main() -> ! {
     let program_start = &raw mut _PROGRAM_START as *const _ as usize;
     let program_end = &raw mut _PROGRAM_END as *const _ as usize;
     let linux_image = &raw mut _LINUX_IMAGE as *const _ as usize;
+    let stack_top = &raw mut _STACK_TOP as *const _ as usize;
 
     debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000);
     // debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000);
@@ -296,6 +300,8 @@ extern "C" fn main() -> ! {
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
 
+    multicore::setup_multicore(stack_top);
+
     let mut modified: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(dtb.get_size());
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -350,7 +356,6 @@ extern "C" fn main() -> ! {
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
         el1_main, stack_addr
     );
-    const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
     unsafe {
         core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);

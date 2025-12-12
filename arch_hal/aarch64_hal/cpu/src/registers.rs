@@ -131,3 +131,17 @@ bitregs! {
         },
     }
 }
+
+bitregs! {
+    pub(crate) struct MPIDR_EL1: u64 {
+        reserved@[7:0] [res0],
+        pub(crate) aff1@[15:8],
+        pub(crate) aff2@[23:16],
+        pub(crate) mt@[24:24],
+        reserved@[29:25] [res0],
+        pub(crate) u@[30:30],
+        reserved@[31:31] [res1],
+        pub(crate) aff3@[39:32],
+        reserved@[63:40] [res0],
+    }
+}

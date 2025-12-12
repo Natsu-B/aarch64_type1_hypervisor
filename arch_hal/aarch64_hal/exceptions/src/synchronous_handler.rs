@@ -1,4 +1,5 @@
 use core::cell::SyncUnsafeCell;
+use core::u64;
 
 use crate::registers;
 use crate::registers::ESR_EL2;
@@ -11,6 +12,7 @@ use cpu::Registers;
 use cpu::get_elr_el2;
 use cpu::get_far_el2;
 use cpu::va_to_ipa_el2;
+use print::println;
 use psci::handle_secure_monitor_call;
 
 pub type DataAbortHandler =
@@ -70,7 +72,9 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                 ExceptionClass::SMCInstructionExecution => {
                     let imm16 = esr_el2.get(ESR_EL2::imm16);
                     if imm16 != 0 {
-                        panic!("unknown SMC imm value: 0x{:X}", imm16);
+                        // vender specific smc call
+                        println!("unknown SMC imm value: 0x{:X}", imm16);
+                        reg.x0 = u64::MAX; // SMCCC_RET_NOT_SUPPORTED(-1)
                     }
                     handle_secure_monitor_call(reg);
                 }
