@@ -9,6 +9,7 @@ dependencies = [
  "aarch64_test",
  "cpu",
  "exceptions",
+ "gic",
  "paging",
  "print",
  "psci",
@@ -108,6 +109,15 @@ version = "0.1.0"
 dependencies = [
  "block-device-api",
  "mutex",
+ "typestate",
+ "typestate_macro",
+]
+
+[[package]]
+name = "gic"
+version = "0.1.0"
+dependencies = [
+ "cpu",
  "typestate",
  "typestate_macro",
 ]

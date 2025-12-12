@@ -1,4 +1,5 @@
 #![allow(non_camel_case_types)]
+
 use core::mem::size_of;
 use typestate::ReadOnly;
 use typestate::ReadWrite;
@@ -102,29 +103,6 @@ pub(crate) struct GicV3Distributor {
     pub idregs_ro: [ReadOnly<u32>; 12],
 }
 
-bitregs! {
-    pub(crate) struct GICD_CTLR: u32 {
-        // Enable Group0 interrupts
-        pub(crate) enable_grp0@[0:0],
-        // Enable Group1 interrupts
-        pub(crate) enable_grp1@[1:1],
-        reserved@[3:2] [res0],
-        // Affinity Routing Enable
-        pub(crate) are@[4:4],
-        reserved@[5:5] [res0],
-        // Disable Security
-        pub(crate) ds@[6:6],
-        // Enable 1 of N Wakeup Functionality
-        pub(crate) e1nwf@[7:7],
-        reserved@[30:8] [res0],
-        // Register Write Pending. Read Only
-        pub(crate) rwp@[31:31] as RWP {
-            NoRegisterWriteInProgress = 0b0,
-            RegisterWriteInProgress = 0b1,
-        },
-    }
-}
-
 /// Redistributor control/LPI frame at RD_base (64KB)
 #[repr(C)]
 pub(crate) struct GicV3RedistributorCtrl {
@@ -176,4 +154,28 @@ pub(crate) struct GicV3RedistributorSgiPpi {
     _rsvd_0e04_0efc: [u8; 0xFC],
     // Pad remainder of 64KB SGI_base frame
     _rsvd_0f00_ffff: [u8; 0xF100], // 0x0F00-0xFFFF
+}
+
+bitregs! {
+    /// GIC Distributor Control Register bits (ARM IHI 0048B Table 4-1).
+    pub(crate) struct GICD_CTLR: u32 {
+        // Enable Group0 interrupts
+        pub(crate) enable_grp0@[0:0],
+        // Enable Group1 interrupts
+        pub(crate) enable_grp1@[1:1],
+        reserved@[3:2] [res0],
+        // Affinity Routing Enable
+        pub(crate) are@[4:4],
+        reserved@[5:5] [res0],
+        // Disable Security
+        pub(crate) ds@[6:6],
+        // Enable 1 of N Wakeup Functionality
+        pub(crate) e1nwf@[7:7],
+        reserved@[30:8] [res0],
+        // Register Write Pending. Read Only
+        pub(crate) rwp@[31:31] as RWP {
+            NoRegisterWriteInProgress = 0b0,
+            RegisterWriteInProgress = 0b1,
+        },
+    }
 }
