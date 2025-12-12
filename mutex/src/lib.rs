@@ -116,6 +116,7 @@ pub struct RawSpinLock<T: ?Sized> {
 
 pub struct RawSpinLockGuard<'a, T> {
     lock: &'a RawSpinLock<T>,
+    unlock_on_drop: bool,
 }
 
 unsafe impl<T: ?Sized + Send> Send for RawSpinLock<T> {}
@@ -133,7 +134,25 @@ impl<T> RawSpinLock<T> {
 
     pub fn lock(&self) -> RawSpinLockGuard<'_, T> {
         self.lock_fn.get()(&self.locked);
-        RawSpinLockGuard { lock: self }
+        RawSpinLockGuard {
+            lock: self,
+            unlock_on_drop: true,
+        }
+    }
+
+    /// Returns a guard without acquiring the lock or modifying lock state.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no other CPU/thread can access the protected
+    /// value concurrently (including via [`lock`](Self::lock)), and that no
+    /// other guard exists that could produce references to the same `T`.
+    /// Breaking these requirements can cause data races or aliasing UB.
+    pub unsafe fn no_lock(&self) -> RawSpinLockGuard<'_, T> {
+        RawSpinLockGuard {
+            lock: self,
+            unlock_on_drop: false,
+        }
     }
 
     /// Switches the lock into an atomic spin lock once multiple CPUs are active.
@@ -156,7 +175,9 @@ impl<T: ?Sized> RawSpinLock<T> {
 
 impl<T> Drop for RawSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.unlock_fn.get()(&self.lock.locked);
+        if self.unlock_on_drop {
+            self.lock.unlock_fn.get()(&self.lock.locked);
+        }
     }
 }
 
@@ -339,6 +360,33 @@ mod tests {
         let guard = lock.lock();
         assert!(lock.is_locked());
         drop(guard);
+        assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn raw_spinlock_no_lock_does_not_unlock_in_atomic_mode() {
+        let lock = RawSpinLock::new(0u32);
+        lock.enable_atomic();
+        lock.locked.store(true, Ordering::Relaxed);
+
+        {
+            let _guard = unsafe { lock.no_lock() };
+        }
+
+        assert!(lock.locked.load(Ordering::Relaxed));
+        lock.locked.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn raw_spinlock_lock_still_unlocks_in_atomic_mode() {
+        let lock = RawSpinLock::new(0u32);
+        lock.enable_atomic();
+
+        {
+            let _guard = lock.lock();
+            assert!(lock.is_locked());
+        }
+
         assert!(!lock.is_locked());
     }
 

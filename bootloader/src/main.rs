@@ -47,6 +47,7 @@ unsafe extern "C" {
     static mut _STACK_TOP: usize;
 }
 
+pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
@@ -270,9 +271,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
         el1_main, stack_addr
     );
-    const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
     unsafe {
-        core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
+        core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
         core::arch::asm!("msr sctlr_el2, {}", in(reg) 0);
