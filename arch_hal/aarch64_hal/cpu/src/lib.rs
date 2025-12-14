@@ -3,8 +3,36 @@
 use core::arch::asm;
 
 use crate::registers::ID_AA64MMFR0_EL1;
+use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
 pub mod registers;
+
+/// Core affinity encoded as MPIDR style fields (Aff3:Aff2:Aff1:Aff0).
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct CoreAffinity {
+    pub aff0: u8,
+    pub aff1: u8,
+    pub aff2: u8,
+    pub aff3: u8,
+}
+
+impl CoreAffinity {
+    pub const fn new(aff0: u8, aff1: u8, aff2: u8, aff3: u8) -> Self {
+        Self {
+            aff0,
+            aff1,
+            aff2,
+            aff3,
+        }
+    }
+
+    pub const fn to_bits(&self) -> u64 {
+        self.aff0 as u64
+            | (self.aff1 as u64) << 8
+            | (self.aff2 as u64) << 16
+            | (self.aff3 as u64) << 32
+    }
+}
 
 #[repr(C)]
 pub struct Registers {
@@ -85,6 +113,12 @@ pub fn get_elr_el2() -> u64 {
     elr_el2
 }
 
+pub fn get_mpidr_el1() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, mpidr_el1", val = out(reg) val) };
+    val
+}
+
 pub fn set_vtcr_el2(vtcr_el2: u64) {
     unsafe { asm!("msr vtcr_el2, {}", in(reg)vtcr_el2) };
 }
@@ -145,4 +179,16 @@ pub fn flush_tlb_el2_el1() {
 pub fn get_parange() -> Option<PARange> {
     let id = ID_AA64MMFR0_EL1::from_bits(get_id_aa64mmfr0_el1());
     id.get_enum(ID_AA64MMFR0_EL1::parange)
+}
+
+/// Return a CPU-specific ID composed from MPIDR_EL1.AFF{0..3}.
+/// The returned ID layout is compatible with the PSCI CPU_ON `target_cpu` argument.
+pub fn get_current_core_id() -> CoreAffinity {
+    let mpidr_el1 = MPIDR_EL1::from_bits(get_mpidr_el1());
+    let aff0 = 0;
+    let aff1 = mpidr_el1.get(MPIDR_EL1::aff1);
+    let aff2 = mpidr_el1.get(MPIDR_EL1::aff2);
+    let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
+
+    CoreAffinity::new(aff0, aff1 as u8, aff2 as u8, aff3 as u8)
 }
