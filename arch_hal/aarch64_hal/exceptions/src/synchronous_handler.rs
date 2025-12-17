@@ -75,6 +75,7 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                         // vender specific smc call
                         println!("unknown SMC imm value: 0x{:X}", imm16);
                         reg.x0 = u64::MAX; // SMCCC_RET_NOT_SUPPORTED(-1)
+                        return;
                     }
                     handle_secure_monitor_call(reg);
                 }
