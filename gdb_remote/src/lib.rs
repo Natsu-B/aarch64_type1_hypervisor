@@ -386,7 +386,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             return Ok(ProcessResult::None);
         }
         let mut body = &payload[2..];
-        if let Some(stripped) = body.strip_prefix(&[b',']) {
+        if let Some(stripped) = body.strip_prefix(b",") {
             body = stripped;
         }
         let Some(comma) = body.iter().position(|&b| b == b',') else {
@@ -595,7 +595,7 @@ fn hex_encode(src: &[u8], dst: &mut [u8]) -> Option<usize> {
 /// Decode ASCII hex in `src` into raw bytes in `dst`.
 /// Returns decoded length on success.
 pub fn hex_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
-    if src.len() % 2 != 0 {
+    if !src.len().is_multiple_of(2) {
         return Err(());
     }
     let mut out = 0usize;

@@ -40,6 +40,7 @@ macro_rules! pr_debug {
 
 pub const MINIMUM_ALLOCATABLE_BYTES: usize = range_list_allocator::MINIMUM_ALLOCATABLE_BYTES;
 
+#[must_use]
 pub const fn levels_value(max: usize) -> usize {
     max.trailing_zeros() as usize - MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize + 1
 }
@@ -63,9 +64,18 @@ unsafe impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> Sync
 {
 }
 
+impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> Default
+    for MemoryAllocator<MAX_ALLOCATABLE_BYTES, LEVELS>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     MemoryAllocator<MAX_ALLOCATABLE_BYTES, LEVELS>
 {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             range_list_allocator: RawSpinLock::new(OnceCell::new()),
@@ -254,7 +264,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         let Some(block) = guard.get() else {
             return Err("allocator not initialized");
         };
-        block.for_each_free_region(|addr, size| f(addr, size));
+        block.for_each_free_region(f);
         Ok(())
     }
 
@@ -267,7 +277,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         let Some(block) = guard.get() else {
             return Err("allocator not initialized");
         };
-        block.for_each_reserved_region(|addr, size| f(addr, size));
+        block.for_each_reserved_region(f);
         Ok(())
     }
 }
