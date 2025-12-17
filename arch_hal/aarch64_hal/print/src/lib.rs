@@ -67,7 +67,7 @@ pub mod debug_uart {
     pub fn write(s: &str) {
         let mut debug_uart = DEBUG_UART.lock();
         if let Some(uart) = debug_uart.get_mut() {
-            let _ = uart.write(s);
+            uart.write(s);
         }
     }
 

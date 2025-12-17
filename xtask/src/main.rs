@@ -216,10 +216,10 @@ fn resolve_profile(args: &[String]) -> String {
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--profile" {
-            if let Some(value) = iter.next() {
-                return value.clone();
-            }
+        if arg == "--profile"
+            && let Some(value) = iter.next()
+        {
+            return value.clone();
         }
     }
 
@@ -239,10 +239,10 @@ fn resolve_gdb_executable() -> Option<String> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if let Ok(status) = status {
-            if status.success() {
-                return Some((*candidate).to_string());
-            }
+        if let Ok(status) = status
+            && status.success()
+        {
+            return Some((*candidate).to_string());
         }
     }
     None

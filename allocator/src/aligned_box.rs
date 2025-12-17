@@ -49,13 +49,14 @@ impl<T> AlignedSliceBox<T> {
 
         Ok(AlignedSliceBox {
             // SAFETY: allocation either panics or returns a valid pointer.
-            ptr: unsafe { NonNull::new_unchecked(raw as *mut MaybeUninit<T>) },
+            ptr: unsafe { NonNull::new_unchecked(raw.cast::<MaybeUninit<T>>()) },
             len,
             align: a,
             _pd: PhantomData,
         })
     }
 
+    #[must_use]
     pub fn into_raw_parts(this: Self) -> (*mut T, usize, NonZeroUsize) {
         let ptr = this.ptr.as_ptr();
         let len = this.len;
@@ -64,25 +65,29 @@ impl<T> AlignedSliceBox<T> {
         (ptr, len, align)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[must_use]
     pub fn align(&self) -> NonZeroUsize {
         self.align
     }
 }
 
 impl<T> AlignedSliceBox<MaybeUninit<T>> {
+    #[must_use]
     pub unsafe fn assume_init(self) -> AlignedSliceBox<T> {
         let (ptr, len, align) = AlignedSliceBox::<MaybeUninit<T>>::into_raw_parts(self);
         AlignedSliceBox {
             // SAFETY: caller guarantees the data is fully initialized.
-            ptr: unsafe { NonNull::new_unchecked(ptr as *mut T) },
+            ptr: unsafe { NonNull::new_unchecked(ptr.cast::<T>()) },
             len,
             align,
             _pd: PhantomData,
@@ -93,7 +98,7 @@ impl<T> AlignedSliceBox<MaybeUninit<T>> {
 impl<T: BytePod> AlignedSliceBox<MaybeUninit<T>> {
     pub fn deref_uninit_u8_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         let byte_len = self.len * size_of::<T>();
-        let p = self.ptr.as_ptr() as *mut MaybeUninit<u8>;
+        let p = self.ptr.as_ptr().cast::<MaybeUninit<u8>>();
         // SAFETY: pointer and length originate from the allocation for `len` elements of `T`.
         unsafe { slice::from_raw_parts_mut(p, byte_len) }
     }
@@ -140,7 +145,7 @@ impl<T> Drop for AlignedSliceBox<T> {
             let bytes = size_of::<T>() * self.len;
             // SAFETY: layout matches the allocation in `new_uninit_with_align`.
             let layout = Layout::from_size_align(bytes, self.align.get()).unwrap();
-            dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            dealloc(self.ptr.as_ptr().cast::<u8>(), layout);
         }
     }
 }
