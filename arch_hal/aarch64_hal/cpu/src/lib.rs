@@ -314,11 +314,12 @@ pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
 /// The returned ID layout is compatible with the PSCI CPU_ON `target_cpu` argument.
 pub fn get_current_core_id() -> u64 {
     let mpidr_el1 = MPIDR_EL1::from_bits(get_mpidr_el1());
+    let aff0 = mpidr_el1.get(MPIDR_EL1::aff0);
     let aff1 = mpidr_el1.get(MPIDR_EL1::aff1);
     let aff2 = mpidr_el1.get(MPIDR_EL1::aff2);
     let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
 
-    0 /* aff0 */ | aff1 << 8 | aff2 << 16 | aff3 << 32
+    aff0 | (aff1 << 8) | (aff2 << 16) | (aff3 << 32)
 }
 
 pub fn clean_data_cache_all() {
