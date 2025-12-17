@@ -142,18 +142,15 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
     cpu::set_vbar_el2(register_context.vbar_el2);
 
     // Barriers before turning on MMU / stage-2
-    cpu::dsb_ish();
     cpu::isb();
+    cpu::flush_tlb_el2_el1();
+    cpu::flush_tlb_el2();
+    cpu::invalidate_icache_all();
 
     // Enable MMU & stage-2
     cpu::set_sctlr_el2(register_context.sctlr_el2);
     cpu::set_hcr_el2(register_context.hcr_el2);
 
-    // TLB / I-Cache sync
-    cpu::flush_tlb_el2_el1();
-    cpu::invalidate_icache_all();
-    cpu::flush_tlb_el2();
-    cpu::clean_data_cache_all();
     cpu::isb();
 
     println!("ap_main setup DONE!!!");
