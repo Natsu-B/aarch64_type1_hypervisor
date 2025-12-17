@@ -19,7 +19,7 @@ use crate::multicore::ap_on;
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
 
-    // deny guest PSCI CPU_ON.
+    // intercept guest PSCI CPU_ON for hypervisor-controlled AP bring-up.
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, ap_on);
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, ap_on);
     psci::set_psci_handler(PsciFunctionId::CpuSuspendSmc32, deny_handler);
