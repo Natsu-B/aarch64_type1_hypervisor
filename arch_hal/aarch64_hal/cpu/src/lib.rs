@@ -257,6 +257,18 @@ pub fn flush_tlb_el2_el1() {
     };
 }
 
+pub fn flush_tlb_el2() {
+    unsafe {
+        asm!(
+            "
+            dsb ishst
+            tlbi alle2is
+            dsb ish
+            isb"
+        )
+    };
+}
+
 pub fn invalidate_icache_all() {
     unsafe {
         core::arch::asm!(

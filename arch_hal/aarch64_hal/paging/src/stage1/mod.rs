@@ -134,7 +134,7 @@ impl EL2Stage1Paging {
             .bits();
 
         cpu::set_sctlr_el2(sctlr_el2);
-        cpu::flush_tlb_el2_el1();
+        cpu::flush_tlb_el2();
         Ok(())
     }
 
