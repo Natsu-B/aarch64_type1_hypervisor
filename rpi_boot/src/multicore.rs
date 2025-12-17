@@ -5,7 +5,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use arch_hal::DEBUG_UART;
 use arch_hal::cpu;
+use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+use arch_hal::println_force;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::secure_monitor_call;
 use core::arch::asm;
@@ -94,6 +96,11 @@ pub fn ap_on(regs: &mut cpu::Registers) {
     register_context.el1_entry_point = regs.x2;
     register_context.el1_context_id = regs.x3;
     cpu::clean_data_cache_all();
+    cpu::invalidate_icache_all();
+    cpu::clean_dcache_poc(
+        register_context as *const _ as usize,
+        size_of::<HypervisorRegisters>(),
+    );
     cpu::isb();
     cpu::dsb_ish();
 
@@ -115,11 +122,6 @@ extern "C" fn ap_start() {
 }
 
 extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
-    let hello = "hello world from application core\n";
-    for i in hello.as_bytes() {
-        unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
-    }
-
     let register_context = unsafe { &*register_context };
     // Stage-2 translation tables
     cpu::set_vtcr_el2(register_context.vtcr_el2);
@@ -150,6 +152,8 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
     // TLB / I-Cache sync
     cpu::flush_tlb_el2_el1();
     cpu::invalidate_icache_all();
+    cpu::flush_tlb_el2();
+    cpu::clean_data_cache_all();
     cpu::isb();
 
     println!("app_main setup DONE!!!");
