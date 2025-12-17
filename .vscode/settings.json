@@ -2,6 +2,6 @@
     "rust-analyzer.cargo.extraEnv": {
         "XTASK_BUILD": "1"
     },
-    "rust-analyzer.cargo.target": "aarch64-unknown-none",
+    "rust-analyzer.cargo.target": "aarch64-unknown-none-softfloat",
     "rust-analyzer.check.allTargets": false,
 }
