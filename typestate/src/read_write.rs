@@ -148,3 +148,56 @@ where
         self.write(current ^ mask);
     }
 }
+
+impl<S> ReadWrite<S>
+where
+    Self: Readable + Writable<T = <Self as Readable>::T>,
+    <Self as Readable>::T: Copy
+        + core::ops::BitAnd<Output = <Self as Readable>::T>
+        + core::ops::BitOr<Output = <Self as Readable>::T>
+        + core::ops::Not<Output = <Self as Readable>::T>,
+{
+    /// Updates the bits specified by `mask` to match `value` (read-modify-write).
+    ///
+    /// Equivalent to: `reg = (reg & !mask) | (value & mask)`.
+    /// Bits outside `mask` are preserved; bits outside `mask` in `value` are ignored.
+    /// Not suitable for clear-on-read registers.
+    #[inline]
+    pub fn update_bits(&self, mask: <Self as Readable>::T, value: <Self as Readable>::T) {
+        let current = self.read();
+        self.write((current & !mask) | (value & mask));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::endianness::Le;
+
+    #[test]
+    fn update_bits_preserves_unmasked_bits() {
+        let reg = ReadWrite(core::cell::UnsafeCell::new(0b1011u32));
+
+        reg.update_bits(0b0110, 0b0100);
+
+        assert_eq!(reg.read(), 0b1101);
+    }
+
+    #[test]
+    fn update_bits_ignores_unmasked_value_bits() {
+        let reg = ReadWrite(core::cell::UnsafeCell::new(0xFFFF_F0F0u32));
+
+        reg.update_bits(0x00F0, 0xABCD);
+
+        assert_eq!(reg.read(), 0xFFFF_F0C0);
+    }
+
+    #[test]
+    fn update_bits_supports_endianness_wrappers() {
+        let reg = ReadWrite(core::cell::UnsafeCell::new(Le::new(0x1234_5678u32)));
+
+        reg.update_bits(0x00FF_0000, 0xABCD_0000);
+
+        assert_eq!(reg.read(), 0x12CD_5678);
+    }
+}
