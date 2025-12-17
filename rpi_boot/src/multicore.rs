@@ -156,7 +156,7 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
     cpu::clean_data_cache_all();
     cpu::isb();
 
-    println!("app_main setup DONE!!!");
+    println!("ap_main setup DONE!!!");
 
     unsafe {
         asm!(
