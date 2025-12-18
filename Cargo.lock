@@ -12,6 +12,7 @@ dependencies = [
  "paging",
  "print",
  "psci",
+ "timer",
 ]
 
 [[package]]
@@ -212,6 +213,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "timer"
+version = "0.1.0"
+dependencies = [
+ "cpu",
 ]
 
 [[package]]

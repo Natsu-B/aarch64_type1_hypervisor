@@ -9,3 +9,4 @@ pub use exceptions;
 pub use paging;
 pub use print::*;
 pub use psci;
+pub use timer;

@@ -5,8 +5,6 @@
 extern crate alloc;
 mod handler;
 mod multicore;
-mod systimer;
-use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
 use alloc::format;
@@ -25,6 +23,7 @@ use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::global_asm;
 use core::arch::naked_asm;
@@ -136,6 +135,10 @@ extern "C" fn main() -> ! {
 
     let mut systimer = SystemTimer::new();
     systimer.init();
+    println!(
+        "system counter frequency: {}Hz",
+        systimer.counter_frequency_hz()
+    );
     println!("setup allocator");
     GLOBAL_ALLOCATOR.init();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
