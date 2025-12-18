@@ -221,9 +221,9 @@ All conflicts are **add/add** conflicts, meaning the same files exist in both br
 - **Addition in gic**: 56 new lines including:
   - New `update_bits()` method for masked bit updates
   - Three unit tests:
-    - `update_bits_preserves_unmasked_bits`
-    - `update_bits_ignores_unmasked_value_bits`
-    - `update_bits_supports_endianness_wrappers`
+  - `update_bits_preserves_unmasked_bits`
+  - `update_bits_ignores_unmasked_value_bits`
+  - `update_bits_supports_endianness_wrappers`
 
 ---
 
