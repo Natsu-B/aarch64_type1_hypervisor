@@ -14,7 +14,6 @@ use arch_hal::exceptions;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
-use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::timer::SystemTimer;
@@ -30,7 +29,6 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::ptr::slice_from_raw_parts_mut;
 use core::slice;
-use core::time::Duration;
 use core::usize;
 use dtb::DtbGenerator;
 use dtb::DtbParser;
@@ -81,8 +79,8 @@ extern "C" fn _start() {
 
 #[unsafe(no_mangle)]
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
-    let program_start = unsafe { &raw mut _PROGRAM_START } as *const _ as usize;
-    let stack_start = unsafe { &raw mut _STACK_TOP } as *const _ as usize;
+    let program_start = &raw mut _PROGRAM_START as *const _ as usize;
+    let stack_start = &raw mut _STACK_TOP as *const _ as usize;
 
     let args = unsafe { slice::from_raw_parts(argv, argc) };
     let dtb_ptr =
@@ -181,7 +179,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     exceptions::setup_exception();
     handler::setup_handler();
     let mut file_driver = None;
-    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, size| {
+    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, _size| {
         if let Ok(driver) = StorageDevice::new_virtio(addr) {
             file_driver = Some(driver);
         }
@@ -278,7 +276,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
-        core::arch::asm!("msr sctlr_el2, {}", in(reg) 0);
+        core::arch::asm!("msr sctlr_el2, {0:x}", in(reg) 0);
         cpu::isb();
         core::arch::asm!("eret", options(noreturn));
     }
@@ -329,6 +327,6 @@ fn panic(info: &PanicInfo) -> ! {
     let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
     debug_uart.init(4400_0000, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
-    debug_uart.write_fmt(format_args!("PANIC: {}", info));
+    let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}
 }

@@ -1,22 +1,16 @@
 use crate::GLOBAL_ALLOCATOR;
-use crate::PL011_UART_ADDR;
 use crate::SPSR_EL2_M_EL1H;
 use alloc::vec;
 use alloc::vec::Vec;
 use arch_hal::DEBUG_UART;
 use arch_hal::cpu;
-use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
-use arch_hal::println_force;
-use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::secure_monitor_call;
 use core::arch::asm;
-use core::arch::global_asm;
 use core::arch::naked_asm;
 use core::cell::OnceCell;
 use core::mem::size_of;
 use core::ops::ControlFlow;
-use core::ptr;
 use mutex::SpinLock;
 
 static AP_STACK_SIZE: usize = 0x1000;

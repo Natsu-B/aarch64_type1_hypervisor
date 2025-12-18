@@ -9,8 +9,3 @@ alloc = []
 
 [dependencies]
 allocator = { path = "../allocator", features = ["no-alloc-error-handler"] }
-
-[profile.release]
-panic = 'abort'
-[profile.dev]
-panic = 'abort'

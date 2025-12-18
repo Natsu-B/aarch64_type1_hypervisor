@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types)]
+
 use crate::stage2::Stage2PageTypes;
 use typestate::bitregs;
 

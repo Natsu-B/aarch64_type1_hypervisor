@@ -5,7 +5,6 @@ use arch_hal::println;
 use arch_hal::psci;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
-use core::arch::asm;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use exceptions::registers::InstructionRegisterSize;

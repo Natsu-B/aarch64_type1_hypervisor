@@ -5,13 +5,11 @@
 extern crate alloc;
 mod handler;
 mod multicore;
-use alloc::alloc::alloc;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use allocator::define_global_allocator;
-use arch_hal::DEBUG_UART;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
@@ -26,7 +24,6 @@ use arch_hal::println;
 use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::global_asm;
-use core::arch::naked_asm;
 use core::cell::SyncUnsafeCell;
 use core::convert::TryInto;
 use core::fmt::Write;
@@ -34,8 +31,6 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
-use core::ptr::write_volatile;
-use core::slice;
 use core::usize;
 use dtb::DeviceTree;
 use dtb::DeviceTreeEditExt;
@@ -531,6 +526,6 @@ fn panic(info: &PanicInfo) -> ! {
     let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
     debug_uart.init(4800_0000, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
-    debug_uart.write_fmt(format_args!("PANIC: {}", info));
+    let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}
 }

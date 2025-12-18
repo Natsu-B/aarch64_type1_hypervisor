@@ -1,12 +1,10 @@
 use arch_hal::cpu;
-use arch_hal::cpu::Registers;
 use arch_hal::exceptions;
 use arch_hal::println;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
-use core::arch::asm;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use exceptions::registers::InstructionRegisterSize;

@@ -11,8 +11,3 @@ file = { path = "../file" }
 elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
 mutex = { path = "../mutex" }
-
-[profile.release]
-panic = 'abort'
-[profile.dev]
-panic = 'abort'
