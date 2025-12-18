@@ -32,7 +32,7 @@ pub(crate) struct FAT32BootSector {
     bpb_ext_flags: Le<Unaligned<u16>>,
     bpb_fs_ver: Le<Unaligned<u16>>,
     pub(crate) bpb_root_clus: Le<Unaligned<u32>>,
-    bpb_fs_info: Le<Unaligned<u16>>,
+    pub(crate) bpb_fs_info: Le<Unaligned<u16>>,
     bpb_bk_boot_sec: Le<Unaligned<u16>>,
     bpb_reserved: [u8; 12],
     bs_drv_num: u8,
@@ -59,6 +59,7 @@ struct FAT32FSInfoSector {
 /// # Safety
 /// require 2byte alignment
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct FAT32ByteDirectoryEntry {
     pub(crate) dir_name: [u8; 11],
     pub(crate) dir_attr: FAT32DirectoryEntryAttribute,
@@ -77,11 +78,12 @@ pub(crate) struct FAT32ByteDirectoryEntry {
 /// # Safety
 /// require 2byte alignment
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct FAT32LongDirectoryEntry {
     pub(crate) ldir_ord: u8,
     pub(crate) ldir_name1: [u8; 10],
-    ldir_attr: FAT32DirectoryEntryAttribute,
-    ldir_type: u8,
+    pub(crate) ldir_attr: FAT32DirectoryEntryAttribute,
+    pub(crate) ldir_type: u8,
     pub(crate) ldir_chksum: u8,
     pub(crate) ldir_name2: [u8; 12],
     pub(crate) ldir_fst_clus_lo: u16,
@@ -93,18 +95,28 @@ pub(crate) struct FAT32LongDirectoryEntry {
 pub(crate) struct FAT32DirectoryEntryAttribute(u8);
 
 impl FAT32DirectoryEntryAttribute {
-    const OFFSET: usize = 11;
+    pub(crate) const OFFSET: usize = 11;
     pub(crate) const ATTR_READ_ONLY: Self = Self(0x01);
     const ATTR_HIDDEN: Self = Self(0x02);
     const ATTR_SYSTEM: Self = Self(0x04);
     pub(crate) const ATTR_VOLUME_ID: Self = Self(0x08);
     pub(crate) const ATTR_DIRECTORY: Self = Self(0x10);
     const ATTR_ARCHIVE: Self = Self(0x20);
-    const ATTR_LONG_NAME: Self = Self(0x0F);
+    pub(crate) const ATTR_LONG_NAME: Self = Self(0x0F);
 
     #[inline]
     pub(crate) fn is_sde(ptr: usize) -> bool {
         let ptr = (ptr + Self::OFFSET) as *const FAT32DirectoryEntryAttribute;
         unsafe { *ptr != Self::ATTR_LONG_NAME }
+    }
+
+    #[inline]
+    pub(crate) const fn raw(self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) const fn empty() -> Self {
+        Self(0)
     }
 }

@@ -11,3 +11,6 @@ std typestate
 
 uefi block-device virtio_blk_modern file/block-device/scripts/run_qemu.sh
 uefi file fat32_virtio file/scripts/run_fat32_virtio_test.sh
+uefi paging stage1_translation arch_hal/aarch64_hal/paging/scripts/run_stage_paging_test.sh
+uefi paging stage2_translation arch_hal/aarch64_hal/paging/scripts/run_stage_paging_test.sh
+uefi gdb_remote uefi_basic_handshake gdb_remote/scripts/run_uefi_gdb_remote_test.sh

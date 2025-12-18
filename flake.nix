@@ -33,6 +33,7 @@
             pkgs.qemu
             pkgs.dtc
             pkgs.cargo-binutils
+            pkgs.gdb
           ];
         };
       }

@@ -3,9 +3,9 @@ name = "dtb"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[features]
+default = ["alloc"]
+alloc = []
 
-[profile.release]
-panic = 'abort'
-[profile.dev]
-panic = 'abort'
+[dependencies]
+allocator = { path = "../allocator", features = ["no-alloc-error-handler"] }

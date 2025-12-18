@@ -29,9 +29,6 @@
 //! device registers. It is **your** responsibility to place these wrappers at
 //! the correct, valid MMIO address and to follow the device's access rules.
 
-#[cfg(test)]
-extern crate self as typestate;
-
 pub mod bitflags;
 mod endianness;
 mod read_write;

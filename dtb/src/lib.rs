@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 use core::ffi::CStr;
 use core::ffi::c_char;
 use core::ops::ControlFlow;
@@ -7,7 +9,21 @@ use core::ops::ControlFlow;
 pub use dtb_parser::DtbGenerator;
 pub use dtb_parser::DtbParser;
 
-mod dtb_parser {
+pub mod ast;
+
+pub use ast::DeviceTree;
+pub use ast::DeviceTreeEditExt;
+pub use ast::DeviceTreeQueryExt;
+pub use ast::Header;
+pub use ast::MemReserve;
+pub use ast::MmioCollectExt;
+pub use ast::NameRef;
+pub use ast::NodeEditExt;
+pub use ast::NodeId;
+pub use ast::NodeQueryExt;
+pub use ast::ValueRef;
+
+pub(crate) mod dtb_parser {
     use super::*;
     use big_endian::CharStringIter;
     use big_endian::Dtb;
@@ -114,6 +130,8 @@ mod dtb_parser {
             compatible_name: Option<&str>,
         ) -> Result<bool, &'static str> {
             *address += DtbParser::SIZEOF_FDT_TOKEN;
+            // SAFETY: FDT requires 4-byte alignment for structure tokens. `address` always points
+            // to a property header boundary, so dereferencing as `FdtProperty` is aligned.
             let property = unsafe { &*(*address as *const FdtProperty) };
             *address += size_of::<FdtProperty>();
             let name = Dtb::read_char_str(
@@ -325,6 +343,9 @@ mod dtb_parser {
             let parser = Self { dtb_header: dtb };
             Ok(parser)
         }
+        pub fn dtb_header(&self) -> &Dtb {
+            &self.dtb_header
+        }
         pub fn get_size(&self) -> usize {
             self.dtb_header.get_total_size() as usize
         }
@@ -445,6 +466,8 @@ mod dtb_parser {
                     }
                     Self::FDT_PROP => {
                         *pointer += Self::SIZEOF_FDT_TOKEN;
+                        // SAFETY: Structure tokens are 4-byte aligned; `pointer` is advanced in
+                        // aligned increments, so this dereference is aligned.
                         let property = unsafe { &*(*pointer as *const FdtProperty) };
                         *pointer += size_of::<FdtProperty>()
                             + property
@@ -842,6 +865,7 @@ mod dtb_parser {
             &self,
             dtb: &mut [u8],
             reserved_memory: &[(usize /* addr */, usize /* size */)],
+            strip_initrd: bool,
         ) -> Result<(), &'static str> {
             if dtb.len() < self.get_required_size(reserved_memory.len()).0 {
                 return Err("dtb memory too short");
@@ -887,6 +911,7 @@ mod dtb_parser {
             }
 
             // copy struct
+            let struct_start = destination;
             unsafe {
                 ptr::copy(
                     self.parser.dtb_header.get_struct_start_address() as *const u8,
@@ -894,6 +919,11 @@ mod dtb_parser {
                     self.parser.dtb_header.get_struct_size(),
                 );
             }
+
+            if strip_initrd {
+                self.strip_initrd(struct_start, self.parser.dtb_header.get_struct_size())?;
+            }
+
             let struct_start_offset = destination - dtb.as_ptr() as usize;
 
             destination =
@@ -917,9 +947,97 @@ mod dtb_parser {
 
             Ok(())
         }
+
+        fn strip_initrd(&self, struct_base: usize, struct_size: usize) -> Result<(), &'static str> {
+            let mut cursor = struct_base;
+            let end = struct_base + struct_size;
+
+            let mut depth: usize = 0;
+            let mut in_chosen = false;
+
+            while cursor < end {
+                match DtbParser::get_types(&cursor) {
+                    t if t == DtbParser::FDT_NOP => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+                    }
+                    t if t == DtbParser::FDT_BEGIN_NODE => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+
+                        let name = big_endian::Dtb::read_char_str(cursor)?;
+                        let name_len = name.len() + 1;
+                        let padded_len = name_len.next_multiple_of(DtbParser::ALIGNMENT as usize);
+
+                        depth += 1;
+                        if depth == 2 && name == "chosen" {
+                            in_chosen = true;
+                        }
+
+                        cursor += padded_len;
+                    }
+                    t if t == DtbParser::FDT_PROP => {
+                        let prop_start = cursor;
+
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+
+                        let prop = unsafe { &*(cursor as *const big_endian::FdtProperty) };
+                        cursor += size_of::<big_endian::FdtProperty>();
+
+                        let name = big_endian::Dtb::read_char_str(
+                            self.parser.dtb_header.get_string_start_address()
+                                + prop.get_name_offset() as usize,
+                        )?;
+                        let len = prop.get_property_len();
+                        let padded_len = len.next_multiple_of(DtbParser::ALIGNMENT) as usize;
+
+                        let total_bytes = DtbParser::SIZEOF_FDT_TOKEN
+                            + size_of::<big_endian::FdtProperty>()
+                            + padded_len;
+
+                        if in_chosen && (name == "linux,initrd-start" || name == "linux,initrd-end")
+                        {
+                            let mut p = prop_start;
+                            let nop = DtbParser::FDT_NOP;
+
+                            while p < prop_start + total_bytes {
+                                unsafe {
+                                    ptr::copy_nonoverlapping(
+                                        nop.as_ptr(),
+                                        p as *mut u8,
+                                        DtbParser::SIZEOF_FDT_TOKEN,
+                                    );
+                                }
+                                p += DtbParser::SIZEOF_FDT_TOKEN;
+                            }
+                        }
+
+                        cursor += padded_len;
+                    }
+                    t if t == DtbParser::FDT_END_NODE => {
+                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
+
+                        if in_chosen && depth == 2 {
+                            in_chosen = false;
+                        }
+                        depth = depth.saturating_sub(1);
+                    }
+                    t if t == DtbParser::FDT_END => {
+                        break;
+                    }
+                    _ => {
+                        pr_debug!(
+                            "strip_initrd: unknown token {:?} at 0x{:x}",
+                            DtbParser::get_types(&cursor),
+                            cursor - struct_base
+                        );
+                        return Err("strip_initrd: unknown token");
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
-    mod big_endian {
+    pub(crate) mod big_endian {
 
         #[allow(clippy::assertions_on_constants)]
         const _: () = assert!(size_of::<FdtProperty>() == 8);
@@ -929,6 +1047,7 @@ mod dtb_parser {
         use super::*;
         use crate::pr_debug;
         #[repr(C)]
+        #[derive(Clone, Copy)]
         pub struct FtdHeader {
             magic: u32,             // should contain 0xd00dfeed (big-endian)
             total_size: u32,        // total size of the DTB in bytes
@@ -993,17 +1112,18 @@ mod dtb_parser {
         }
 
         pub struct Dtb {
-            address: &'static FtdHeader,
+            fdt_base: usize,
+            header: FtdHeader,
         }
 
         impl Dtb {
             const DTB_VERSION: u32 = 17;
             const DTB_HEADER_MAGIC: u32 = 0xd00d_feed;
             pub fn new(address: usize) -> Result<Dtb, &'static str> {
-                let ftb = Self {
-                    address: unsafe { &*(address as *const FtdHeader) },
-                };
-                let header = ftb.address;
+                if address % core::mem::align_of::<FtdHeader>() != 0 {
+                    return Err("dtb: unaligned fdt address");
+                }
+                let header = unsafe { *(address as *const FtdHeader) };
                 pr_debug!("dtb version: {}", u32::from_be(header.last_comp_version));
                 if u32::from_be(header.magic) != Self::DTB_HEADER_MAGIC {
                     return Err("invalid magic");
@@ -1011,41 +1131,49 @@ mod dtb_parser {
                 if u32::from_be(header.last_comp_version) > Self::DTB_VERSION {
                     return Err("this dtb is not compatible with the version 17");
                 }
-                Ok(ftb)
+                Ok(Self {
+                    fdt_base: address,
+                    header,
+                })
             }
             pub fn get_fdt_address(&self) -> usize {
-                self.address as *const _ as usize
+                self.fdt_base
             }
             pub fn get_memory_reservation_offset(&self) -> usize {
-                u32::from_be(self.address.off_mem_rsvmap) as usize
+                u32::from_be(self.header.off_mem_rsvmap) as usize
             }
             pub fn get_total_size(&self) -> u32 {
-                u32::from_be(self.address.total_size)
+                u32::from_be(self.header.total_size)
+            }
+            pub fn get_version(&self) -> u32 {
+                u32::from_be(self.header.version)
+            }
+            pub fn get_last_comp_version(&self) -> u32 {
+                u32::from_be(self.header.last_comp_version)
+            }
+            pub fn get_boot_cpuid_phys(&self) -> u32 {
+                u32::from_be(self.header.boot_cpuid_phys)
             }
             pub fn get_struct_start_address(&self) -> usize {
-                self.address as *const _ as usize
-                    + u32::from_be(self.address.off_dt_struct) as usize
+                self.fdt_base + u32::from_be(self.header.off_dt_struct) as usize
             }
             pub fn get_struct_end_address(&self) -> usize {
-                self.get_struct_start_address() + u32::from_be(self.address.size_dt_struct) as usize
+                self.get_struct_start_address() + u32::from_be(self.header.size_dt_struct) as usize
             }
             pub fn get_struct_size(&self) -> usize {
-                u32::from_be(self.address.size_dt_struct) as usize
+                u32::from_be(self.header.size_dt_struct) as usize
             }
             pub fn get_string_start_address(&self) -> usize {
-                self.address as *const _ as usize
-                    + u32::from_be(self.address.off_dt_strings) as usize
+                self.fdt_base + u32::from_be(self.header.off_dt_strings) as usize
             }
             pub fn get_string_end_address(&self) -> usize {
-                self.get_string_start_address()
-                    + u32::from_be(self.address.size_dt_strings) as usize
+                self.get_string_start_address() + u32::from_be(self.header.size_dt_strings) as usize
             }
             pub fn get_string_size(&self) -> usize {
-                u32::from_be(self.address.size_dt_strings) as usize
+                u32::from_be(self.header.size_dt_strings) as usize
             }
             pub fn get_memory_reservation_start_address(&self) -> usize {
-                self.address as *const _ as usize
-                    + u32::from_be(self.address.off_mem_rsvmap) as usize
+                self.fdt_base + u32::from_be(self.header.off_mem_rsvmap) as usize
             }
             pub fn read_u32_from_ptr(address: usize) -> u32 {
                 u32::from_be(unsafe { *(address as *const u32) })
@@ -1110,7 +1238,19 @@ mod dtb_parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use allocator::AlignedSliceBox;
+    use core::mem::MaybeUninit;
+    use core::mem::align_of;
     use std::path::PathBuf;
+
+    fn align_dtb(bytes: &[u8]) -> AlignedSliceBox<u8> {
+        let mut buf = AlignedSliceBox::<u8>::new_uninit_with_align(bytes.len(), align_of::<u64>())
+            .expect("failed to allocate aligned dtb buffer");
+        for (dst, &src) in buf.iter_mut().zip(bytes.iter()) {
+            *dst = MaybeUninit::new(src);
+        }
+        unsafe { buf.assume_init() }
+    }
 
     const PL011_DEBUG_UART_ADDRESS: usize = 0x10_7D00_1000;
     const PL011_DEBUG_UART_SIZE: usize = 0x200;
@@ -1119,7 +1259,8 @@ mod tests {
     #[test]
     fn it_works() {
         let test_data = std::fs::read("test/test.dtb").expect("failed to load dtb files");
-        let test_data_addr = test_data.as_ptr() as usize;
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
         let parser = DtbParser::init(test_data_addr).unwrap();
 
         let mut counter = 0;
@@ -1168,7 +1309,8 @@ mod tests {
             path.display()
         );
         let test_data = std::fs::read(&path).expect("failed to load generated dtb file");
-        let test_data_addr = test_data.as_ptr() as usize;
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
         let parser = DtbParser::init(test_data_addr).unwrap();
 
         let mut captured: Option<(usize, usize)> = None;
@@ -1199,7 +1341,8 @@ mod tests {
         );
 
         let test_data = std::fs::read(&path).expect("failed to load generated dtb file");
-        let test_data_addr = test_data.as_ptr() as usize;
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
         let parser = DtbParser::init(test_data_addr).unwrap();
 
         // Static regions should not be called in this DTS

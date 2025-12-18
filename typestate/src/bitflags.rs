@@ -85,7 +85,7 @@ macro_rules! bitregs {
     ( $(#[$m:meta])* $vis:vis struct $Name:ident : $ty:ty { $($body:tt)* } ) => {
         $(#[$m])*
         #[repr(transparent)]
-        #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, ::typestate_macro::RawReg)]
+        #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash /*, ::typestate_macro::RawReg*/)]
         $vis struct $Name($ty);
 
         const _: () = {
@@ -1227,7 +1227,6 @@ macro_rules! __bitregs_internal_view_overlap_fold {
 
 #[cfg(test)]
 mod tests {
-    use crate::RawReg;
     bitregs! {
         /// nested union test
         pub(super) struct PacketNested: u16 {
@@ -1279,33 +1278,6 @@ mod tests {
         }
     }
 
-    bitregs! {
-        pub(super) struct Packet: u16 {
-            union hdr@[7:0] {
-                view split {
-                    pub lo@[3:0],
-                    pub hi@[7:4],
-                }
-                view kind {
-                    pub kind@[7:0] as Kind {
-                        A = 0b0000_0001,
-                        B = 0b0000_0010,
-                        C = 0b0001_0000,
-                        D = 0b0010_0000,
-                    }
-                }
-                view flags {
-                    pub enabled@[0:0],
-                    reserved@[2:1] [res0],
-                    pub err@[3:3],
-                    reserved@[7:4] [ignore],
-                }
-            }
-
-            reserved@[15:8] [res1],
-        }
-    }
-
     #[test]
     fn nested_union_basic() {
         let reg = PacketNested::new()
@@ -1334,6 +1306,61 @@ mod tests {
         assert_eq!(status.get_enum(Status::state), Some(State::Busy));
         assert_eq!(status.get(Status::error), 1);
         assert_eq!(status.bits() & 0xC000, 0xC000); // res1 bits forced high
+    }
+}
+
+#[cfg(test)]
+mod test {
+    bitregs! {
+        pub(super) struct Timer: u32 {
+            pub period@[7:0],
+            reserved@[15:8] [res0],
+            pub enable@[16:16],
+            reserved@[23:17] [ignore],
+            reserved@[31:24] [res1],
+        }
+    }
+
+    bitregs! {
+        pub(super) struct Status: u16 {
+            pub state@[2:0] as State {
+                Idle = 0b000,
+                Busy = 0b001,
+                Done = 0b010,
+                Fault = 0b011,
+            },
+            reserved@[7:3] [res0],
+            pub error@[8:8],
+            reserved@[13:9] [ignore],
+            reserved@[15:14] [res1],
+        }
+    }
+
+    bitregs! {
+        pub(super) struct Packet: u16 {
+            union hdr@[7:0] {
+                view split {
+                    pub lo@[3:0],
+                    pub hi@[7:4],
+                }
+                view kind {
+                    pub kind@[7:0] as Kind {
+                        A = 0b0000_0001,
+                        B = 0b0000_0010,
+                        C = 0b0001_0000,
+                        D = 0b0010_0000,
+                    }
+                }
+                view flags {
+                    pub enabled@[0:0],
+                    reserved@[2:1] [res0],
+                    pub err@[3:3],
+                    reserved@[7:4] [ignore],
+                }
+            }
+
+            reserved@[15:8] [res1],
+        }
     }
 
     #[test]

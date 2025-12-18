@@ -1,0 +1,43 @@
+#!/bin/sh
+
+PATH_TO_ELF="$1"
+
+if [ -z "$PATH_TO_ELF" ]; then
+    echo "usage: $0 <path-to-uefi-test-elf>"
+    exit 1
+fi
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../../../.." && pwd)
+BIN_DIR="$SCRIPT_DIR/../bin/EFI/BOOT"
+
+rm -rf "$SCRIPT_DIR/../bin/EFI"
+mkdir -p "$BIN_DIR"
+cp "$PATH_TO_ELF" "$BIN_DIR/BOOTAA64.EFI"
+
+QEMU_GDB_ARGS=""
+if [ -n "$XTASK_QEMU_GDB_SOCKET" ]; then
+    rm -f "$XTASK_QEMU_GDB_SOCKET"
+    QEMU_GDB_ARGS="-gdb unix:path=$XTASK_QEMU_GDB_SOCKET,server=on,wait=off"
+fi
+
+qemu-system-aarch64 \
+  -M virt,gic-version=3,secure=off,virtualization=on \
+  -global virtio-mmio.force-legacy=off \
+  -cpu cortex-a53 -smp 4 -m 2G \
+  -bios "$REPO_ROOT/test/RELEASEAARCH64_QEMU_EFI.fd" \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -no-reboot -no-shutdown \
+  -drive file=fat:rw:"$SCRIPT_DIR/../bin",format=raw,if=none,media=disk,id=disk \
+  -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0 \
+  $QEMU_GDB_ARGS
+
+RETCODE=$?
+
+if [ $RETCODE -eq 0 ]; then
+    exit 0
+elif [ $RETCODE -eq 1 ]; then
+    printf "\nFailed\n"
+    exit 1
+fi

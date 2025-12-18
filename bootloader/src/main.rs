@@ -6,17 +6,17 @@
 
 extern crate alloc;
 mod handler;
-mod systimer;
-use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
+use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
-use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::naked_asm;
 use core::cell::SyncUnsafeCell;
@@ -29,7 +29,6 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::ptr::slice_from_raw_parts_mut;
 use core::slice;
-use core::time::Duration;
 use core::usize;
 use dtb::DtbGenerator;
 use dtb::DtbParser;
@@ -45,6 +44,7 @@ unsafe extern "C" {
     static mut _STACK_TOP: usize;
 }
 
+pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
@@ -69,6 +69,8 @@ impl LinuxHeader {
     const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
 }
 
+define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
+
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
@@ -77,8 +79,8 @@ extern "C" fn _start() {
 
 #[unsafe(no_mangle)]
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
-    let program_start = unsafe { &raw mut _PROGRAM_START } as *const _ as usize;
-    let stack_start = unsafe { &raw mut _STACK_TOP } as *const _ as usize;
+    let program_start = &raw mut _PROGRAM_START as *const _ as usize;
+    let stack_start = &raw mut _STACK_TOP as *const _ as usize;
 
     let args = unsafe { slice::from_raw_parts(argv, argc) };
     let dtb_ptr =
@@ -100,24 +102,29 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 
     let mut systimer = SystemTimer::new();
     systimer.init();
+    println!(
+        "system counter frequency: {}Hz",
+        systimer.counter_frequency_hz()
+    );
     println!("setup allocator");
-    allocator::init();
+    GLOBAL_ALLOCATOR.init();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
-        allocator::add_available_region(addr, size).unwrap();
+        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
         ControlFlow::Continue(())
     })
     .unwrap();
     dtb.find_memory_reservation_block(&mut |addr, size| {
-        allocator::add_reserved_region(addr, size).unwrap();
+        GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
     dtb.find_reserved_memory_node(
         &mut |addr, size| {
-            allocator::add_reserved_region(addr, size).unwrap();
+            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
             ControlFlow::Continue(())
         },
         &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
-            if allocator::allocate_dynamic_reserved_region(size, align, alloc_range)
+            if GLOBAL_ALLOCATOR
+                .allocate_dynamic_reserved_region(size, align, alloc_range)
                 .unwrap()
                 .is_some()
             {
@@ -128,9 +135,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         },
     )
     .unwrap();
-    allocator::add_reserved_region(program_start, stack_start - program_start).unwrap();
-    allocator::add_reserved_region(dtb_ptr, dtb.get_size()).unwrap();
-    allocator::finalize().unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(program_start, stack_start - program_start)
+        .unwrap();
+    GLOBAL_ALLOCATOR
+        .add_reserved_region(dtb_ptr, dtb.get_size())
+        .unwrap();
+    GLOBAL_ALLOCATOR.finalize().unwrap();
     println!("allocator setup success!!!");
     // setup paging
     println!("start paging...");
@@ -152,21 +163,23 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             ipa: 0x0000,
             pa: 0x0000,
             size: pl011_addr,
+            types: Stage2PageTypes::Normal,
         },
         Stage2PagingSetting {
             ipa: pl011_addr + pl011_size,
             pa: pl011_addr + pl011_size,
             size: (1 << parange) - pl011_addr - pl011_size,
+            types: Stage2PageTypes::Normal,
         },
     ];
-    Stage2Paging::init_stage2paging(&paging_data).unwrap();
+    Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation();
     println!("paging success!!!");
     println!("setup exception");
     exceptions::setup_exception();
     handler::setup_handler();
     let mut file_driver = None;
-    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, size| {
+    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, _size| {
         if let Ok(driver) = StorageDevice::new_virtio(addr) {
             file_driver = Some(driver);
         }
@@ -226,7 +239,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 
     drop(file_driver);
     println!("file system closed");
-    let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
+    let mut reserved_memory = GLOBAL_ALLOCATOR
+        .trim_for_boot(0x1000 * 0x1000 * 128)
+        .unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, stack_start));
 
@@ -239,7 +254,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         )
     };
     new_dtb
-        .make_dtb(dtb_data, reserved_memory.as_ref())
+        .make_dtb(dtb_data, reserved_memory.as_ref(), false)
         .unwrap();
     unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
     println!("jumping linux...");
@@ -257,12 +272,11 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
         el1_main, stack_addr
     );
-    const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
     unsafe {
-        core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
+        core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
-        core::arch::asm!("msr sctlr_el2, {}", in(reg) 0);
+        core::arch::asm!("msr sctlr_el2, {0:x}", in(reg) 0);
         cpu::isb();
         core::arch::asm!("eret", options(noreturn));
     }
@@ -313,6 +327,6 @@ fn panic(info: &PanicInfo) -> ! {
     let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
     debug_uart.init(4400_0000, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
-    debug_uart.write_fmt(format_args!("PANIC: {}", info));
+    let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}
 }

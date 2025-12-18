@@ -9,10 +9,10 @@ dependencies = [
  "aarch64_test",
  "cpu",
  "exceptions",
- "gic",
  "paging",
  "print",
  "psci",
+ "timer",
 ]
 
 [[package]]
@@ -25,6 +25,7 @@ version = "0.1.0"
 dependencies = [
  "intrusive_linked_list",
  "mutex",
+ "typestate",
 ]
 
 [[package]]
@@ -51,6 +52,10 @@ name = "block-device-api"
 version = "0.1.0"
 
 [[package]]
+name = "byte_stream"
+version = "0.1.0"
+
+[[package]]
 name = "cpu"
 version = "0.1.0"
 dependencies = [
@@ -61,6 +66,9 @@ dependencies = [
 [[package]]
 name = "dtb"
 version = "0.1.0"
+dependencies = [
+ "allocator",
+]
 
 [[package]]
 name = "elf"
@@ -97,16 +105,21 @@ dependencies = [
 name = "file"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "arch_hal",
  "block-device",
  "block-device-api",
  "filesystem",
+ "mutex",
+ "typestate",
+ "typestate_macro",
 ]
 
 [[package]]
 name = "filesystem"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "block-device-api",
  "mutex",
  "typestate",
@@ -114,12 +127,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "gic"
+name = "gdb_remote"
 version = "0.1.0"
 dependencies = [
- "cpu",
- "typestate",
- "typestate_macro",
+ "aarch64_test",
+ "byte_stream",
+ "print",
 ]
 
 [[package]]
@@ -134,8 +147,10 @@ version = "0.1.0"
 name = "paging"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
  "allocator",
  "cpu",
+ "print",
  "typestate",
  "typestate_macro",
 ]
@@ -144,6 +159,7 @@ dependencies = [
 name = "print"
 version = "0.1.0"
 dependencies = [
+ "byte_stream",
  "mutex",
  "typestate",
  "typestate_macro",
@@ -184,6 +200,7 @@ dependencies = [
  "dtb",
  "elf",
  "file",
+ "mutex",
  "typestate",
 ]
 
@@ -196,6 +213,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "timer"
+version = "0.1.0"
+dependencies = [
+ "cpu",
 ]
 
 [[package]]
