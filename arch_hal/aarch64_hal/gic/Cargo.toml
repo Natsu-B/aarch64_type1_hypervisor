@@ -7,3 +7,4 @@ edition = "2024"
 typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
 cpu = { path = "../cpu" }
+mutex = { path = "../../../mutex" }

@@ -17,42 +17,164 @@ const _: () = assert!(size_of::<GicV2VirtualInterfaceControl>() == 0x1_000);
 const _: () = assert!(size_of::<GicV2VirtualCpuInterface>() == 0x2_000);
 
 bitregs! {
-    /// GICv2 Distributor Control Register bits (ARM IHI 0048B Table 4-1).
-    pub(crate) struct GICD_CTLR_V2: u32 {
-        // Enable Group0 forwarding
-        pub(crate) enable_grp0@[0:0],
-        // Enable Group1 forwarding
-        pub(crate) enable_grp1@[1:1],
+    /// Distributor Control Register, GICD_CTLR.
+    ///
+    /// Bit assignments depend on:
+    /// - whether Security Extensions are implemented (GICD_TYPER.SecurityExtn),
+    /// - and if so, whether the visible bank is the Secure copy or the Non-secure copy.
+    pub(crate) struct GICD_CTLR: u32 {
+        union sec@[1:0] {
+            // Security Extensions are NOT implemented (single copy).
+            view NoSecurityExt {
+                pub(crate) enable_grp0@[0:0],
+                pub(crate) enable_grp1@[1:1],
+            },
+
+            // Security Extensions ARE implemented: Secure copy.
+            view SecureCopy {
+                pub(crate) enable_grp0_secure@[0:0],
+                pub(crate) enable_grp1_secure@[1:1],
+            },
+
+            // Security Extensions ARE implemented: Non-secure copy.
+            //
+            // Bit[0] is the global enable that controls *only Group 1* forwarding.
+            view NonSecureCopy {
+                pub(crate) enable_grp1_non_secure@[0:0],
+                reserved@[1:1] [res0],
+            },
+        },
+
         reserved@[31:2] [res0],
     }
 }
 
 bitregs! {
-    /// GICv2 CPU Interface Control Register bits (ARM IHI 0048B Table 4-31).
-    pub(crate) struct GICC_CTLR_V2: u32 {
-        // Enable Group0 signaling to this CPU interface
-        pub(crate) enable_grp0@[0:0],
-        // Enable Group1 signaling to this CPU interface
-        pub(crate) enable_grp1@[1:1],
-        // Control use of IDs for acknowledgement
-        pub(crate) ack_ctl@[2:2],
-        // Route Group0 interrupts as FIQ when set
-        pub(crate) fiq_en@[3:3],
-        // Common Binary Point for both groups
-        pub(crate) cbpr@[4:4],
-        // Disable FIQ bypass for Group0
-        pub(crate) fiq_byp_dis_grp0@[5:5],
-        // Disable IRQ bypass for Group0
-        pub(crate) irq_byp_dis_grp0@[6:6],
-        // Disable FIQ bypass for Group1
-        pub(crate) fiq_byp_dis_grp1@[7:7],
-        // Disable IRQ bypass for Group1
-        pub(crate) irq_byp_dis_grp1@[8:8],
-        // Secure EOImode (EOI drops priority only when set)
-        pub(crate) eoi_mode_s@[9:9],
-        // Non-secure EOImode (alias behavior per Security Extensions)
-        pub(crate) eoi_mode_ns@[10:10],
+    /// Interrupt Controller Type Register, GICD_TYPER (ARM IHI 0048B Table 4-6).
+    pub(crate) struct GICD_TYPER: u32 {
+        // ITLinesNumber[4:0].
+        //
+        // Indicates the maximum number of interrupts that the GIC supports. :contentReference[oaicite:1]{index=1}
+        pub(crate) it_lines_number@[4:0],
+
+        // CPUNumber[7:5].
+        //
+        // Indicates the number of implemented CPU interfaces (value + 1). :contentReference[oaicite:2]{index=2}
+        pub(crate) cpu_number@[7:5],
+
+        reserved@[9:8] [res0],
+
+        // SecurityExtn[10].
+        //
+        // Indicates whether the GIC implements the Security Extensions. :contentReference[oaicite:3]{index=3}
+        pub(crate) security_extn@[10:10],
+
+        // LSPI[15:11].
+        //
+        // If Security Extensions are implemented, maximum number of implemented lockable SPIs;
+        // otherwise reserved. :contentReference[oaicite:4]{index=4}
+        pub(crate) lspi@[15:11],
+
+        reserved@[31:16] [res0],
+    }
+}
+
+bitregs! {
+    /// GICC_CTLR (CPU Interface Control Register)
+    ///
+    /// - Table 4-30: GICv2 + Security Extensions, Non-secure copy
+    /// - Table 4-31: No Security Extensions, or Secure copy
+    pub(crate) struct GICC_CTLR: u32 {
+        union ctlr_bits@[10:0] {
+            // Security Extensions not implemented, or Secure copy (Table 4-31).
+            view SecureOrNoSecurityExtn {
+                pub(crate) enable_grp0@[0:0],
+                pub(crate) enable_grp1@[1:1],
+                pub(crate) ack_ctl@[2:2],
+                pub(crate) fiq_en@[3:3],
+                pub(crate) cbpr@[4:4],
+                pub(crate) fiq_byp_dis_grp0@[5:5],
+                pub(crate) irq_byp_dis_grp0@[6:6],
+                pub(crate) fiq_byp_dis_grp1@[7:7],
+                pub(crate) irq_byp_dis_grp1@[8:8],
+                pub(crate) eoi_mode_s@[9:9],
+                pub(crate) eoi_mode_ns@[10:10],
+            },
+
+            // Security Extensions implemented, Non-secure copy (Table 4-30).
+            view NonSecureCopy {
+                pub(crate) enable_grp1_non_secure@[0:0],
+                reserved@[4:1] [res0],
+                pub(crate) fiq_byp_dis_grp1_non_secure@[5:5],
+                pub(crate) irq_byp_dis_grp1_non_secure@[6:6],
+                reserved@[8:7] [res0],
+                pub(crate) eoi_mode_ns_non_secure@[9:9],
+                reserved@[10:10] [res0],
+            },
+        }
+
         reserved@[31:11] [res0],
+    }
+}
+
+bitregs! {
+    /// Interrupt Priority Mask Register, GICC_PMR
+    pub(crate) struct GICC_PMR: u32 {
+        pub(crate) priority@[7:0],
+        reserved@[31:8],
+    }
+}
+
+bitregs! {
+    /// Binary Point Register, GICC_BPR
+    pub(crate) struct GICC_BPR: u32 {
+        // The minimum binary point value is IMPLEMENTATION DEFINED in the range:
+        // - 0-3 if the implementation does not include the GIC Security Extensions, and for the
+        //  Secure copy of the register if the implementation includes the Security Extensions
+        // - 1-4 for the Non-secure copy of the register.
+        // An attempt to program the binary point field to a value less than the minimum value sets the
+        // field to the minimum value. On a reset, the binary point field is set to the minimum
+        // supported value.
+        pub(crate) binary_point@[2:0],
+        reserved@[31:3],
+    }
+}
+
+bitregs! {
+    /// Aliased Binary Point Register, GICC_ABPR
+    pub(crate) struct GICC_ABPR: u32 {
+        // A Binary Point Register for handling Group 1 interrupts.
+        // The reset value of this register is defined as (minimum GICC_BPR.Binary point + 1),
+        // resulting in a permitted range of 0x1-0x4 .
+        pub(crate) binary_point@[2:0],
+        reserved@[31:3],
+    }
+}
+
+bitregs! {
+    /// End of Interrupt Register, GICC_EOIR
+    pub(crate) struct GICC_EOIR: u32 {
+        pub(crate) eoi_int_id@[9:0],
+        pub(crate) cpu_id@[12:10],
+        reserved@[31:13],
+    }
+}
+
+bitregs! {
+    /// Interrupt Acknowledge Register, GICC_IAR
+    pub(crate) struct GICC_IAR: u32 {
+        pub(crate) interrupt_id@[9:0],
+        pub(crate) cpu_id@[12:10],
+        reserved@[31:13],
+    }
+}
+
+bitregs! {
+    /// Deactivate Interrupt Register, GICC_DIR
+    pub(crate) struct GICC_DIR: u32 {
+        pub(crate) interrupt_id@[9:0],
+        pub(crate) cpu_id@[12:10],
+        reserved@[31:13],
     }
 }
 
@@ -73,6 +195,14 @@ bitregs! {
         // EOImode: 0 drops priority and deactivates via EOI (DIR UNPREDICTABLE); 1 drops only (DIR deactivates)
         pub(crate) eoi_mode@[9:9],
         reserved@[31:10] [res0],
+    }
+}
+
+bitregs! {
+    pub(crate) struct GICD_ICPIDR2: u32 {
+        reserved@[3:0] [ignore], // Implementation defined
+        pub(crate) arch_rev@[7:4], // Architecture Revision
+        reserved@[31:8] [ignore], // Implementation defined
     }
 }
 
@@ -106,12 +236,19 @@ bitregs! {
 #[repr(C)]
 pub(crate) struct GicV2Distributor {
     /// Distributor Control Register; enables forwarding for Group0/Group1.
-    pub ctlr: ReadWrite<GICD_CTLR_V2>, // 0x000
-    pub typer: ReadOnly<u32>,   // 0x004
-    pub iidr: ReadOnly<u32>,    // 0x008
-    _rsvd_00c_007f: [u8; 0x74], // 0x00C-0x07F
+    pub ctlr: ReadWrite<GICD_CTLR>, // 0x000
+    pub typer: ReadOnly<GICD_TYPER>, // 0x004
+    pub iidr: ReadOnly<u32>,         // 0x008
+    _rsvd_00c_007f: [u8; 0x74],      // 0x00C-0x07F
 
     /// Interrupt Group Registers; register n covers interrupts 32*n..32*n+31 (Group0 vs Group1 selection).
+    ///
+    /// Bit value meaning:
+    /// - `0` => Group0
+    /// - `1` => Group1
+    ///
+    /// Group interpretation depends on whether Security Extensions are implemented and which copy
+    /// of the register bank is visible (Secure vs Non-secure).
     pub igroupr: [ReadWrite<u32>; 32], // 0x080-0x0FC
     /// Interrupt Set-Enable Registers; register n covers interrupts 32*n..32*n+31.
     pub isenabler: [ReadWrite<u32>; 32], // 0x100-0x17C
@@ -128,14 +265,18 @@ pub(crate) struct GicV2Distributor {
 
     // Priority window: 0x0400..0x07FF (Table 4-1)
     /// Interrupt Priority Registers; four 8-bit priority fields per word.
-    pub ipriorityr: [ReadWrite<u32>; 255],
+    pub ipriorityr: [[ReadWrite<u8>; 4]; 255],
     _rsvd_07fc_07ff: [u8; 4],
 
     // ITARGETSR window: 0x0800..0x0BFF
     /// Interrupt Processor Targets Registers; word n covers interrupts 4*n..4*n+3.
-    /// 0x800-0x81C (interrupts 0-31, SGIs/PPIs) are RO/IMPLEMENTATION DEFINED targets.
+    /// 0x800-0x81C (interrupts 0-31, SGIs/PPIs) are RO and can be banked.
+    ///
+    /// In particular, ITARGETSR0-7 readback is banked/RO and returns a value corresponding only
+    /// to the reading CPU interface (commonly a one-hot CPU target mask).
     /// 0x820-0xBF8 (SPIs) are RW, one byte per interrupt (byte accesses permitted); 0xBFC reserved.
-    pub itargetsr: [ReadWrite<u32>; 255],
+    pub itargetsr0_7: [[ReadOnly<u8>; 4]; 8],
+    pub itargetsr: [[ReadWrite<u8>; 4]; 247],
     _rsvd_0bfc_0bff: [u8; 4],
 
     /// Interrupt Configuration Registers; register n covers interrupts 16*n..16*n+15.
@@ -163,27 +304,27 @@ pub(crate) struct GicV2Distributor {
 #[repr(C)]
 pub(crate) struct GicV2CpuInterface {
     /// CPU Interface Control Register; enables signaling for Group0/Group1 (bit assignments vary with Security Extensions/Secure copy).
-    pub ctlr: ReadWrite<GICC_CTLR_V2>, // 0x0000
-    pub pmr: ReadWrite<u32>, // 0x0004
-    pub bpr: ReadWrite<u32>, // 0x0008
+    pub ctlr: ReadWrite<GICC_CTLR>, // 0x0000
+    pub pmr: ReadWrite<GICC_PMR>, // 0x0004
+    pub bpr: ReadWrite<GICC_BPR>, // 0x0008
     /// Interrupt Acknowledge Register; returns interrupt ID to be serviced.
-    pub iar: ReadOnly<u32>, // 0x000C
+    pub iar: ReadOnly<GICC_IAR>, // 0x000C
     /// End of Interrupt Register; EOImode=0 drops priority and deactivates, EOImode=1 drops only.
-    pub eoir: WriteOnly<u32>, // 0x0010
-    pub rpr: ReadOnly<u32>,  // 0x0014
-    pub hppir: ReadOnly<u32>, // 0x0018
-    pub abpr: ReadWrite<u32>, // 0x001C
-    pub aiar: ReadOnly<u32>, // 0x0020
-    pub aeoir: WriteOnly<u32>, // 0x0024
-    pub ahppir: ReadOnly<u32>, // 0x0028
-    _rsvd_002c_00cf: [u8; 0xA4], // 0x002C-0x00CF
+    pub eoir: WriteOnly<GICC_EOIR>, // 0x0010
+    pub rpr: ReadOnly<u32>,       // 0x0014
+    pub hppir: ReadOnly<u32>,     // 0x0018
+    pub abpr: ReadWrite<GICC_ABPR>, // 0x001C
+    pub aiar: ReadOnly<u32>,      // 0x0020
+    pub aeoir: WriteOnly<u32>,    // 0x0024
+    pub ahppir: ReadOnly<u32>,    // 0x0028
+    _rsvd_002c_00cf: [u8; 0xA4],  // 0x002C-0x00CF
     pub apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
     pub nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC
-    _rsvd_00f0_00fb: [u8; 0x0C], // 0x00F0-0x00FB
-    pub iidr: ReadOnly<u32>, // 0x00FC
+    _rsvd_00f0_00fb: [u8; 0x0C],  // 0x00F0-0x00FB
+    pub iidr: ReadOnly<u32>,      // 0x00FC
     _rsvd_0100_0fff: [u8; 0xF00], // 0x0100-0x0FFF
     /// Deactivate Interrupt Register; valid when priority drop/deactivate are split (EOImode=1), UNPREDICTABLE otherwise.
-    pub dir: WriteOnly<u32>, // 0x1000
+    pub dir: WriteOnly<GICC_DIR>, // 0x1000
     _rsvd_1004_1fff: [u8; 0x0FFC], // 0x1004-0x1FFF
 }
 
@@ -193,20 +334,23 @@ pub(crate) struct GicV2CpuInterface {
 pub(crate) struct GicV2VirtualInterfaceControl {
     /// Hypervisor Control Register; En must be set for virtual or maintenance interrupts to assert.
     pub hcr: ReadWrite<GICH_HCR>, // 0x00
+    /// Virtualization Type Register.
+    ///
+    /// `ListRegs` is encoded as `VTR[5:0] + 1` (number of implemented list registers).
     pub vtr: ReadOnly<u32>, // 0x04
     /// VMCR alias; bundles virtual CPU view state for save/restore.
     pub vmcr: ReadWrite<u32>, // 0x08
-    _rsvd_0c_0f: [u8; 0x04], // 0x0C-0x0F
-    pub misr: ReadOnly<u32>, // 0x10
-    _rsvd_14_1f: [u8; 0x0C], // 0x14-0x1F
-    pub eisr: [ReadOnly<u32>; 2], // 0x20-0x24
-    _rsvd_028_02f: [u8; 0x08], // 0x028-0x02F
+    _rsvd_0c_0f: [u8; 0x04],       // 0x0C-0x0F
+    pub misr: ReadOnly<u32>,       // 0x10
+    _rsvd_14_1f: [u8; 0x0C],       // 0x14-0x1F
+    pub eisr: [ReadOnly<u32>; 2],  // 0x20-0x24
+    _rsvd_028_02f: [u8; 0x08],     // 0x028-0x02F
     pub elrsr: [ReadOnly<u32>; 2], // 0x30-0x34
-    _rsvd_038_0ef: [u8; 0xB8], // 0x038-0x0EF
-    pub apr: ReadWrite<u32>, // 0x0F0
-    _rsvd_0f4_0ff: [u8; 0x0C], // 0x0F4-0x0FF
-    pub lr: [ReadWrite<u32>; 64], // 0x100-0x1FC
-    _rsvd_200_fff: [u8; 0xE00], // 0x200-0xFFF
+    _rsvd_038_0ef: [u8; 0xB8],     // 0x038-0x0EF
+    pub apr: ReadWrite<u32>,       // 0x0F0
+    _rsvd_0f4_0ff: [u8; 0x0C],     // 0x0F4-0x0FF
+    pub lr: [ReadWrite<u32>; 64],  // 0x100-0x1FC
+    _rsvd_200_fff: [u8; 0xE00],    // 0x200-0xFFF
 }
 
 /// GICv2 Virtual CPU interface (0x2000 bytes including DIR) per ARM IHI 0048B Table 5-10;

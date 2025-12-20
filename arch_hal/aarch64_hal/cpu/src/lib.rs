@@ -160,6 +160,10 @@ pub fn dsb_ish() {
     unsafe { asm!("dsb ish") };
 }
 
+pub fn dsb_sy() {
+    unsafe { asm!("dsb sy") };
+}
+
 pub fn isb() {
     unsafe { asm!("isb") };
 }

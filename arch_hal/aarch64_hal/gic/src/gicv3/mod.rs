@@ -7,16 +7,16 @@ use registers::GICD_CTLR;
 use registers::GicV3Distributor;
 use registers::RWP;
 
-pub struct GicDistributor {
+pub struct Gicv3Distributor {
     distributer: &'static GicV3Distributor,
 }
 
-impl GicDistributor {
-    pub fn new(addr: usize, size: usize) -> Result<Self, GicErr> {
+impl Gicv3Distributor {
+    pub fn new(addr: usize, size: usize) -> Result<Self, GicError> {
         if size != size_of::<GicV3Distributor>() {
-            return Err(GicErr::InvalidSize);
+            return Err(GicError::InvalidSize);
         }
-        Ok(GicDistributor {
+        Ok(Gicv3Distributor {
             distributer: unsafe { &*(addr as *mut GicV3Distributor) },
         })
     }
@@ -60,9 +60,9 @@ impl GicDistributor {
         trigger_mode: GicTriggerMode,
         pending: bool,
         enable: bool,
-    ) -> Result<(), GicErr> {
+    ) -> Result<(), GicError> {
         if int_id < 32 {
-            return Err(GicErr::UnsupportedINTID);
+            return Err(GicError::UnsupportedINTID);
         }
         // set group
         let reg_idx = int_id >> 5; // int_id / u32::BITS
@@ -80,7 +80,7 @@ impl GicDistributor {
             .write((ipriorityr & !mask) | (priority as u32) << reg_offset);
 
         // set routing (non rooting mode)
-        self.distributer.irouter[int_id as usize].write(todo!() /* core affinity */);
+        self.distributer.irouter[int_id as usize].write(cpu::get_current_core_id().to_bits());
 
         // set trigger mode
         let reg_idx = int_id >> 4; // int_id / (u32::BITS / 2)
@@ -119,7 +119,7 @@ pub enum GicTriggerMode {
     EdgeTriggered,
 }
 
-pub enum GicErr {
+pub enum GicError {
     InvalidSize,
     UnsupportedINTID,
 }
