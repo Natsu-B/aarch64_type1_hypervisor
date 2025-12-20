@@ -5,6 +5,7 @@ use core::panic;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::thread;
@@ -248,6 +249,123 @@ fn resolve_gdb_executable() -> Option<String> {
     None
 }
 
+#[cfg(unix)]
+fn spawn_in_own_pgrp(cmd: &mut Command) -> io::Result<Child> {
+    use core::ffi::c_int;
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: This runs in the child just before exec; setpgid is async-signal-safe and
+    // we only touch state local to the child process to move it into a new process group.
+    unsafe {
+        cmd.pre_exec(|| {
+            unsafe extern "C" {
+                fn setpgid(pid: c_int, pgid: c_int) -> c_int;
+            }
+
+            if setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_in_own_pgrp(cmd: &mut Command) -> io::Result<Child> {
+    cmd.spawn()
+}
+
+#[cfg(unix)]
+fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
+    use core::ffi::c_int;
+
+    const SIGTERM: c_int = 15;
+    const SIGKILL: c_int = 9;
+
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    let pgid = match i32::try_from(child.id()) {
+        Ok(pid) => pid,
+        Err(_) => {
+            eprintln!(
+                "Warning: PID {} for {} does not fit into i32; falling back to child.kill()",
+                child.id(),
+                label
+            );
+            if let Err(e) = child.kill() {
+                eprintln!("Warning: failed to kill {}: {}", label, e);
+            }
+            let _ = child.wait();
+            return;
+        }
+    };
+
+    let mut wait_for_exit = |deadline: Instant| -> bool {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to poll {} while terminating process group: {}",
+                        label, e
+                    );
+                    return false;
+                }
+            }
+        }
+    };
+
+    let send_signal = |sig: c_int| {
+        let res = unsafe { kill(-(pgid as c_int), sig) };
+        if res != 0 {
+            let e = io::Error::last_os_error();
+            eprintln!(
+                "Warning: failed to send signal {} to process group {} for {}: {}",
+                sig, pgid, label, e
+            );
+        }
+    };
+
+    send_signal(SIGTERM);
+    let mut exited = wait_for_exit(Instant::now() + Duration::from_secs(2));
+
+    if !exited {
+        send_signal(SIGKILL);
+        exited = wait_for_exit(Instant::now() + Duration::from_secs(2));
+    }
+
+    if !exited {
+        if let Ok(Some(_)) = child.try_wait() {
+            exited = true;
+        }
+    }
+
+    if !exited {
+        eprintln!(
+            "Warning: process group {} for {} may still be running after SIGKILL",
+            pgid, label
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
+    if let Err(e) = child.kill() {
+        eprintln!("Warning: failed to kill {}: {}", label, e);
+    }
+    let _ = child.wait();
+}
+
 fn run_uefi_test_with_backtrace(
     mut cmd: Command,
     label: &str,
@@ -256,8 +374,7 @@ fn run_uefi_test_with_backtrace(
 ) -> i32 {
     eprintln!("Running (UEFI, with gdb-on-timeout): {:?}", cmd);
 
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_in_own_pgrp(&mut cmd)
         .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", label, e));
 
     let start = Instant::now();
@@ -340,12 +457,57 @@ fn run_uefi_test_with_backtrace(
             }
 
             eprintln!("Killing hung UEFI test process for '{}'", label);
-            if let Err(e) = child.kill() {
-                eprintln!("Warning: failed to kill UEFI test process: {}", e);
-            }
-            let _ = child.wait();
+            kill_process_tree_best_effort(label, &mut child);
 
             // 124 = timeout and consistent with `timeout` command conventions.
+            124
+        }
+    }
+}
+
+fn run_uefi_test_with_timeout(mut cmd: Command, label: &str, timeout_secs: u64) -> i32 {
+    eprintln!("Running (UEFI, with internal timeout): {:?}", cmd);
+
+    let mut child = spawn_in_own_pgrp(&mut cmd)
+        .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", label, e));
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    break Err(());
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error: failed to poll UEFI test process for {}: {}",
+                    label, e
+                );
+                break Err(());
+            }
+        }
+    };
+
+    match status {
+        Ok(status) => {
+            if status.success() {
+                0
+            } else {
+                status.code().unwrap_or(1)
+            }
+        }
+        Err(()) => {
+            eprintln!(
+                "Error: UEFI test '{}' did not finish within {}s; assuming hang.",
+                label, timeout_secs
+            );
+            eprintln!("Killing hung UEFI test process for '{}'", label);
+            kill_process_tree_best_effort(label, &mut child);
             124
         }
     }
@@ -655,19 +817,7 @@ fn test(args: &[String]) {
             None
         };
 
-        let mut cmd = if enable_uefi_backtrace {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            c
-        } else if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(prefix.remove(0));
-            for p in prefix {
-                c.arg(p);
-            }
-            c.arg("cargo");
-            c.arg("test");
-            c
-        } else {
+        let mut cmd = {
             let mut c = Command::new("cargo");
             c.arg("test");
             c
@@ -692,15 +842,7 @@ fn test(args: &[String]) {
         let code = if let Some(ref socket) = gdb_socket {
             run_uefi_test_with_backtrace(cmd, &label, socket, 60)
         } else {
-            eprintln!("Running: {:?}", cmd);
-            let status = cmd
-                .spawn()
-                .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", pkg, e))
-                .wait()
-                .unwrap_or_else(|e| {
-                    panic!("Failed to wait for cargo test (UEFI) for {}: {}", pkg, e)
-                });
-            status.code().unwrap_or(1)
+            run_uefi_test_with_timeout(cmd, &label, 30)
         };
 
         if code == 0 {
