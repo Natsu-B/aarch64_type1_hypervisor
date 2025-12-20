@@ -156,8 +156,6 @@ mod tests {
     use super::*;
     use crate::levels;
     use core::alloc::Layout;
-    use core::ptr;
-    use std::cell::RefCell;
 
     const MAX_ALLOC: usize = 4096; // 4KB
     const HEAP_SIZE: usize = MAX_ALLOC * 4; // 16KB
@@ -181,7 +179,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; HEAP_SIZE]);
         let mut heap = AlignedHeap([0; HEAP_SIZE]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_ALLOC>::new();
         allocator.set_memory(heap_addr, HEAP_SIZE);
@@ -204,7 +202,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; HEAP_SIZE]);
         let mut heap = AlignedHeap([0; HEAP_SIZE]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_ALLOC>::new();
         allocator.set_memory(heap_addr, HEAP_SIZE);
@@ -230,7 +228,7 @@ mod tests {
         #[repr(align(128))]
         struct AlignedHeap([u8; SMALL_HEAP_SIZE]);
         let mut heap = AlignedHeap([0; SMALL_HEAP_SIZE]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_SMALL_ALLOC>::new();
         allocator.set_memory(heap_addr, SMALL_HEAP_SIZE);
@@ -266,7 +264,7 @@ mod tests {
         #[repr(align(128))]
         struct AlignedHeap([u8; SMALL_HEAP_SIZE]);
         let mut heap = AlignedHeap([0; SMALL_HEAP_SIZE]);
-        let heap_start = &mut heap.0 as *mut _ as usize;
+        let heap_start = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_SMALL_ALLOC>::new();
         allocator.set_memory(heap_start, SMALL_HEAP_SIZE);
@@ -313,7 +311,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; MAX_ALLOC]);
         let mut heap = AlignedHeap([0; MAX_ALLOC]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_ALLOC>::new();
         pr_debug!("heap address: 0x{:x}", heap_addr);
@@ -363,7 +361,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; MAX_ALLOC]);
         let mut heap = AlignedHeap([0; MAX_ALLOC]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
         allocator.set_memory(heap_addr, MAX_ALLOC);
 
         // The first allocation should succeed.
@@ -385,7 +383,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; HEAP_SIZE]);
         let mut heap = AlignedHeap([0; HEAP_SIZE]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_ALLOC>::new();
         allocator.set_memory(heap_addr, HEAP_SIZE);
@@ -401,7 +399,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; HEAP_SIZE]);
         let mut heap = AlignedHeap([0; HEAP_SIZE]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_ALLOC>::new();
         allocator.set_memory(heap_addr, HEAP_SIZE);
@@ -420,7 +418,7 @@ mod tests {
         #[repr(align(4096))]
         struct AlignedHeap([u8; HEAP_SIZE]);
         let mut heap = AlignedHeap([0; HEAP_SIZE]);
-        let heap_addr = &mut heap.0 as *mut _ as usize;
+        let heap_addr = &raw mut heap.0 as usize;
 
         let mut allocator = TestAlloc::<MAX_ALLOC>::new();
         allocator.set_memory(heap_addr, HEAP_SIZE);

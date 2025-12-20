@@ -1021,7 +1021,6 @@ pub(crate) mod dtb_parser {
                         depth = depth.saturating_sub(1);
                     }
                     t if t == DtbParser::FDT_END => {
-                        cursor += DtbParser::SIZEOF_FDT_TOKEN;
                         break;
                     }
                     _ => {

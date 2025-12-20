@@ -25,6 +25,24 @@ macro_rules! println {
 }
 
 #[macro_export]
+macro_rules! print_force {
+    ($($arg:tt)*) => {
+        ($crate::_print_force(format_args!($($arg)*)));
+    };
+}
+
+#[macro_export]
+macro_rules! println_force {
+    () => {$crate::print_force!("\n");};
+    ($fmt:expr, $($arg:tt)+) => {
+        $crate::print_force!(concat!($fmt, "\n"), $($arg)*);
+    };
+    ($fmt:expr) => {
+        $crate::print_force!(concat!($fmt, "\n"));
+    };
+}
+
+#[macro_export]
 macro_rules! pr_trace {
     () => {
         $crate::print!("{}:{}\n", file!(), line!())
@@ -49,7 +67,7 @@ pub mod debug_uart {
     pub fn write(s: &str) {
         let mut debug_uart = DEBUG_UART.lock();
         if let Some(uart) = debug_uart.get_mut() {
-            let _ = uart.write(s);
+            uart.write(s);
         }
     }
 
@@ -60,6 +78,13 @@ pub mod debug_uart {
 
 pub fn _print(args: fmt::Arguments) {
     let mut debug_uart = DEBUG_UART.lock();
+    if let Some(uart) = debug_uart.get_mut() {
+        let _ = uart.write_fmt(args);
+    }
+}
+
+pub fn _print_force(args: fmt::Arguments) {
+    let mut debug_uart = unsafe { DEBUG_UART.no_lock() };
     if let Some(uart) = debug_uart.get_mut() {
         let _ = uart.write_fmt(args);
     }

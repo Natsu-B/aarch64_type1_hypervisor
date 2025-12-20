@@ -158,14 +158,30 @@ struct Stage2State {
     vtcr: u64,
     vttbr: u64,
     hcr: u64,
+    daif: u64,
 }
 
 impl Stage2State {
     fn snapshot() -> Self {
+        let vtcr = read_vtcr_el2();
+        let vttbr = read_vttbr_el2();
+        let hcr = cpu::get_hcr_el2();
+        let daif: u64;
+
+        unsafe {
+            asm!(
+                "mrs {daif}, daif",
+                "msr daifset, #0b1111",
+                daif = out(reg) daif,
+                options(nostack, preserves_flags),
+            );
+        }
+
         Self {
-            vtcr: read_vtcr_el2(),
-            vttbr: read_vttbr_el2(),
-            hcr: cpu::get_hcr_el2(),
+            vtcr,
+            vttbr,
+            hcr,
+            daif,
         }
     }
 
@@ -179,6 +195,14 @@ impl Stage2State {
         cpu::flush_tlb_el2_el1();
         cpu::set_hcr_el2(self.hcr);
         cpu::isb();
+
+        unsafe {
+            asm!(
+                "msr daif, {daif}",
+                daif = in(reg) self.daif,
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 

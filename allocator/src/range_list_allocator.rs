@@ -770,13 +770,13 @@ impl MemoryBlock {
     }
 
     pub fn for_each_free_region<F: FnMut(usize, usize)>(&self, mut f: F) {
-        for region in self.regions[..self.region_size as usize].iter() {
+        for region in &self.regions[..self.region_size as usize] {
             f(region.address, region.size);
         }
     }
 
     pub fn for_each_reserved_region<F: FnMut(usize, usize)>(&self, mut f: F) {
-        for region in self.reserved_regions[..self.reserved_region_size as usize].iter() {
+        for region in &self.reserved_regions[..self.reserved_region_size as usize] {
             f(region.address, region.size);
         }
     }
@@ -815,10 +815,8 @@ macro_rules! debug_assert {
 
 #[cfg(test)]
 mod tests {
-    use core::panic;
-    use std::alloc::alloc;
 
-    use crate::pr_debug;
+    use std::alloc::alloc;
 
     use super::*;
 

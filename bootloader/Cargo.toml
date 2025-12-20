@@ -10,8 +10,3 @@ typestate = { path = "../typestate" }
 file = { path = "../file" }
 elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
-
-[profile.release]
-panic = 'abort'
-[profile.dev]
-panic = 'abort'

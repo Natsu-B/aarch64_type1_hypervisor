@@ -2,7 +2,9 @@ use crate::UART_ADDR;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::println;
-use core::arch::asm;
+use arch_hal::psci;
+use arch_hal::psci::PsciFunctionId;
+use arch_hal::psci::PsciReturnCode;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use exceptions::registers::InstructionRegisterSize;
@@ -11,6 +13,10 @@ use exceptions::registers::WriteNotRead;
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
+
+    // deny guest PSCI CPU_ON.
+    psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, deny_cpu_on_handler);
+    psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, deny_cpu_on_handler);
 }
 
 fn data_abort_handler(
@@ -69,4 +75,8 @@ fn data_abort_handler(
     }
     // advance elr_el2
     cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+}
+
+fn deny_cpu_on_handler(regs: &mut cpu::Registers) {
+    regs.x0 = PsciReturnCode::Denied.to_x0();
 }

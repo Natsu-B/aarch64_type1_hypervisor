@@ -9,3 +9,5 @@ pub use gic;
 #[cfg(feature = "paging")]
 pub use paging;
 pub use print::*;
+pub use psci;
+pub use timer;

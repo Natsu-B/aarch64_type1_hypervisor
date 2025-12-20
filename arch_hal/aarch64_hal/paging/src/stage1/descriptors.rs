@@ -1,3 +1,4 @@
+#![allow(non_camel_case_types)]
 use typestate::bitregs;
 
 bitregs! {
@@ -48,13 +49,12 @@ bitregs! {
 
         // APTable: Access Permission limit for subsequent levels.
         //
-        // (2-EL translation regimeの典型的な意味)
         //   00: No effect.
         //   01: EL0 access not permitted (EL1/EL2/EL3 access follows leaf AP).
         //   10: Writes not permitted at any EL (reads follow leaf AP).
         //   11: Both: EL0 access not permitted, and writes not permitted at any EL.
         //
-        // Actual effect is regime-dependent butこの4パターンの制限と考えて良い。
+        // Actual effect is regime-dependent
         pub(crate) ap_table@[62:61],
 
         // NSTable: Security state for subsequent levels (when in Secure state).

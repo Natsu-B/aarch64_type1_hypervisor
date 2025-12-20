@@ -30,10 +30,10 @@ fn main() {
             );
 
             let download_dir = Path::new("test/.download");
-            if download_dir.exists() {
-                if let Err(err) = fs::remove_dir_all(download_dir) {
-                    panic!("failed to clear temporary download dir: {}", err);
-                }
+            if download_dir.exists()
+                && let Err(err) = fs::remove_dir_all(download_dir)
+            {
+                panic!("failed to clear temporary download dir: {}", err);
             }
 
             let status = Command::new("git")
