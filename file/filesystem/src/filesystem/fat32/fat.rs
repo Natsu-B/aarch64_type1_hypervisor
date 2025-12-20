@@ -1,12 +1,13 @@
 // File Allocation Table
 
 use alloc::sync::Arc;
+use allocator::AlignedSliceBox;
 use block_device_api::BlockDevice;
+use core::mem::size_of;
 use typestate::Le;
 use typestate_macro::BytePod;
 
 use crate::FileSystemErr;
-use crate::aligned_box::AlignedSliceBox;
 use crate::filesystem::fat32::FAT32FileSystem;
 use crate::from_io_err;
 
@@ -15,7 +16,13 @@ use crate::from_io_err;
 pub(crate) struct FAT32FAT(Le<u32>);
 
 impl FAT32FAT {
-    const MASK: u32 = 0x0FFF_FFFF;
+    pub(crate) const MASK: u32 = 0x0FFF_FFFF;
+    pub(crate) const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
+}
+
+pub(crate) struct FatClusterInfo {
+    pub(crate) cluster: u32,
+    pub(crate) lba: u64,
 }
 
 pub(crate) struct FAT32FATIter<'a> {
@@ -50,13 +57,13 @@ impl<'a> FAT32FATIter<'a> {
 }
 
 impl<'a> Iterator for FAT32FATIter<'a> {
-    type Item = Result<u64, FileSystemErr>;
+    type Item = Result<FatClusterInfo, FileSystemErr>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // TODO BPB_ExtFlags
         let cluster = self.next_cluster?;
-        let spf = self.file_system.sectors_per_fat as u64;
-        let bps = self.file_system.bytes_per_sector as u64;
+        let spf = self.file_system.volume.sectors_per_fat as u64;
+        let bps = self.file_system.volume.bytes_per_sector as u64;
 
         let entry_byte = cluster as u64 * size_of::<FAT32FAT>() as u64;
         let entry_sector = entry_byte / bps;
@@ -76,8 +83,8 @@ impl<'a> Iterator for FAT32FATIter<'a> {
             }
         }
 
-        let fat_lba = self.file_system.hidden_sector as u64
-            + self.file_system.reserved_sectors as u64
+        let fat_lba = self.file_system.volume.hidden_sectors as u64
+            + self.file_system.volume.reserved_sectors as u64
             + fat_relative;
 
         let allocate_size = (read_sectors * bps) as usize;
@@ -120,7 +127,7 @@ impl<'a> Iterator for FAT32FATIter<'a> {
                 return Some(Err(FileSystemErr::Corrupted));
             }
             x if x >= 0x0FFF_FFF8 => self.next_cluster = None,
-            x if x > self.file_system.count_of_clusters + 1 => {
+            x if x > self.file_system.volume.count_of_clusters + 1 => {
                 return Some(Err(FileSystemErr::Corrupted));
             }
             x => {
@@ -134,11 +141,9 @@ impl<'a> Iterator for FAT32FATIter<'a> {
                 }
             }
         }
-        Some(Ok(self.file_system.hidden_sector as u64
-            + self.file_system.reserved_sectors as u64
-            + self.file_system.num_fats as u64
-                * self.file_system.sectors_per_fat as u64
-            + (cluster as u64 - 2)
-                * self.file_system.sectors_per_cluster as u64))
+        match self.file_system.volume.cluster_to_lba(cluster) {
+            Ok(lba) => Some(Ok(FatClusterInfo { cluster, lba })),
+            Err(e) => Some(Err(e)),
+        }
     }
 }

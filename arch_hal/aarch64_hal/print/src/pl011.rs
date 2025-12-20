@@ -295,6 +295,10 @@ impl Pl011Uart {
         }
     }
 
+    pub fn write_byte(&self, byte: u8) {
+        self.pushb(byte as u32);
+    }
+
     pub fn read_char(&self) -> u8 {
         while self.registers.flags.read() & UARTFR::RXFE_MASK != UARTFR(0) {
             core::hint::spin_loop();
@@ -306,6 +310,13 @@ impl Pl011Uart {
             self.registers.error_status.write(0);
         }
         (read & UARTDR::DATA_MASK).0 as u8
+    }
+
+    /// Drain any pending RX characters without returning them.
+    pub fn drain_rx(&self) {
+        while self.registers.flags.read() & UARTFR::RXFE_MASK == UARTFR(0) {
+            let _ = self.registers.data.read();
+        }
     }
 }
 

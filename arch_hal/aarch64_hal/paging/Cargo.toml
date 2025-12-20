@@ -8,3 +8,18 @@ cpu = { path = "../cpu" }
 allocator = { path = "../../../allocator" }
 typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
+
+[dev-dependencies]
+print = { path = "../print" }
+allocator = { path = "../../../allocator", features = ["no-alloc-error-handler"] }
+aarch64_test = { path = "../aarch64_test" }
+
+[[test]]
+name = "stage1_translation"
+path = "tests/stage1_translation.rs"
+harness = false
+
+[[test]]
+name = "stage2_translation"
+path = "tests/stage2_translation.rs"
+harness = false

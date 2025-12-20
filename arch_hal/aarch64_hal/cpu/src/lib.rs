@@ -119,6 +119,36 @@ pub fn get_mpidr_el1() -> u64 {
     val
 }
 
+pub fn get_hcr_el2() -> u64 {
+    let hcr_el2: u64;
+    unsafe { asm!("mrs {}, hcr_el2", out(reg) hcr_el2) };
+    hcr_el2
+}
+
+pub fn get_mair_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, mair_el2", val = out(reg) val) };
+    val
+}
+
+pub fn get_tcr_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, tcr_el2", val = out(reg) val) };
+    val
+}
+
+pub fn get_ttbr0_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, ttbr0_el2", val = out(reg) val) };
+    val
+}
+
+pub fn get_sctlr_el2() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, sctlr_el2", val = out(reg) val) };
+    val
+}
+
 pub fn set_vtcr_el2(vtcr_el2: u64) {
     unsafe { asm!("msr vtcr_el2, {}", in(reg)vtcr_el2) };
 }
@@ -131,12 +161,32 @@ pub fn set_hcr_el2(hcr: u64) {
     unsafe { asm!("msr hcr_el2, {}", in(reg) hcr) };
 }
 
+pub fn set_vbar_el1(vbar: u64) {
+    unsafe { asm!("msr vbar_el1, {}", in(reg) vbar) };
+}
+
 pub fn set_vbar_el2(vbar: u64) {
     unsafe { asm!("msr vbar_el2, {}", in(reg) vbar) };
 }
 
 pub fn set_elr_el2(elr_el2: u64) {
     unsafe { asm!("msr elr_el2, {}", in(reg) elr_el2) };
+}
+
+pub fn set_sctlr_el2(sctlr_el2: u64) {
+    unsafe { asm!("msr sctlr_el2, {}", in(reg) sctlr_el2) };
+}
+
+pub fn set_ttbr0_el2(ttbr0_el2: u64) {
+    unsafe { asm!("msr ttbr0_el2, {}", in(reg) ttbr0_el2) };
+}
+
+pub fn set_mair_el2(mair_el2: u64) {
+    unsafe { asm!("msr mair_el2, {}", in(reg) mair_el2) };
+}
+
+pub fn set_tcr_el2(tcr_el2: u64) {
+    unsafe { asm!("msr tcr_el2, {}", in(reg) tcr_el2) };
 }
 
 pub fn clean_dcache_poc(addr: usize, size: usize) {
@@ -180,6 +230,17 @@ pub fn flush_tlb_el2_el1() {
     };
 }
 
+pub fn invalidate_icache_all() {
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 pub fn get_parange() -> Option<PARange> {
     let id = ID_AA64MMFR0_EL1::from_bits(get_id_aa64mmfr0_el1());
     id.get_enum(ID_AA64MMFR0_EL1::parange)
@@ -195,4 +256,29 @@ pub fn get_current_core_id() -> CoreAffinity {
     let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
 
     CoreAffinity::new(aff0, aff1 as u8, aff2 as u8, aff3 as u8)
+}
+
+pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
+    let par_after: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, par_el1",
+            "at S1E1R, {va}",
+            "isb",
+            "mrs {par_after}, par_el1",
+            "msr par_el1, {tmp}",
+            tmp        = lateout(reg) _,
+            par_after  = out(reg) par_after,
+            va         = in(reg) va,
+            options(nostack)
+        );
+    }
+
+    if (par_after & 1) != 0 {
+        return None;
+    }
+
+    let ipa = par_after & 0x0000_FFFF_FFFF_F000;
+    Some(ipa | (va & 0xFFF))
 }

@@ -28,6 +28,12 @@ sudo cp "$SCRIPT_DIR/very_long_long_example_text.TXT" $DISK_MOUNT_DIR
 sync
 sudo umount $DISK_MOUNT_DIR
 
+QEMU_GDB_ARGS=""
+if [ -n "$XTASK_QEMU_GDB_SOCKET" ]; then
+    rm -f "$XTASK_QEMU_GDB_SOCKET"
+    QEMU_GDB_ARGS="-gdb unix:path=$XTASK_QEMU_GDB_SOCKET,server=on,wait=off"
+fi
+
 qemu-system-aarch64 \
   -M virt,gic-version=3,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
@@ -37,11 +43,32 @@ qemu-system-aarch64 \
   -semihosting-config enable=on,target=native \
   -no-reboot -no-shutdown \
   -drive file=$DISK_IMG,format=raw,if=none,media=disk,id=disk \
-  -device virtio-blk-device,bus=virtio-mmio-bus.0,drive=disk
+  -device virtio-blk-device,bus=virtio-mmio-bus.0,drive=disk \
+  $QEMU_GDB_ARGS
 
 RETCODE=$?
 
 if [ $RETCODE -eq 0 ]; then
+    # Mount the disk image again to check the created file
+    sudo mount -o loop,offset=$((2048 * 512)) $DISK_IMG $DISK_MOUNT_DIR
+    if [ ! -d "$DISK_MOUNT_DIR/testdir" ]; then
+        echo "FAIL: testdir not found"
+        sudo umount $DISK_MOUNT_DIR
+        exit 1
+    fi
+    if [ ! -f "$DISK_MOUNT_DIR/testdir/testfile.txt" ]; then
+        echo "FAIL: testfile.txt not found"
+        sudo umount $DISK_MOUNT_DIR
+        exit 1
+    fi
+    if [ "$(sudo cat $DISK_MOUNT_DIR/testdir/testfile.txt)" != "test content" ]; then
+        echo "FAIL: testfile.txt content mismatch"
+        sudo umount $DISK_MOUNT_DIR
+        exit 1
+    fi
+    echo "Host check: PASS"
+    sudo rm -rf "$DISK_MOUNT_DIR/testdir"
+    sudo umount $DISK_MOUNT_DIR
     exit 0
 elif [ $RETCODE -eq 1 ]; then
     printf "\nFailed\n"

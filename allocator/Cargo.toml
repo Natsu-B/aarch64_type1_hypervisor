@@ -16,6 +16,7 @@ pedantic = "warn"
 [dependencies]
 mutex = { path = "../mutex" }
 intrusive_linked_list = { path = "../intrusive_linked_list" }
+typestate = { path = "../typestate" }
 
 [profile.release]
 panic = 'abort'
@@ -24,3 +25,5 @@ panic = 'abort'
 
 [features]
 debug-assertions = []
+no-alloc-error-handler = []
+no-allocator = []
