@@ -57,6 +57,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - run: git submodule update --init --recursive
+      - run: cd u-boot && nix develop --accept-flake-config --command ./init.sh && cd ..
       - run: nix develop --accept-flake-config --command cargo xtest
 
   build:
