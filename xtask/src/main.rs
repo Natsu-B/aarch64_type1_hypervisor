@@ -422,7 +422,7 @@ impl AnsiQueryFilter {
                 FilterState::Csi => {
                     self.pending.push(b);
                     if Self::is_csi_final(b) {
-                        if b == b'n' || b == b'c' {
+                        if Self::should_drop_csi(&self.pending, b) {
                             self.pending.clear();
                         } else {
                             self.flush_pending(output);
@@ -459,6 +459,65 @@ impl AnsiQueryFilter {
             self.pending.clear();
         }
         self.state = FilterState::Normal;
+    }
+
+    fn should_drop_csi(pending: &[u8], final_byte: u8) -> bool {
+        match final_byte {
+            b'c' => true,
+            b'n' => Self::is_dsr_or_cpr_query(pending),
+            _ => false,
+        }
+    }
+
+    fn is_dsr_or_cpr_query(pending: &[u8]) -> bool {
+        // Drop CSI Ps n where the last numeric parameter is 5 (status) or 6 (cursor position),
+        // with an optional private marker ('?') after CSI.
+        if pending.len() < 3 || pending[0] != 0x1b || pending[1] != b'[' {
+            return false;
+        }
+        if *pending.last().unwrap_or(&0) != b'n' {
+            return false;
+        }
+
+        let mut params = &pending[2..pending.len() - 1];
+        if let Some(b'?') = params.first() {
+            params = &params[1..];
+        }
+
+        if params.is_empty() {
+            return false;
+        }
+
+        let mut last_param: Option<u32> = None;
+        let mut current: u32 = 0;
+        let mut has_digits = false;
+
+        for &b in params {
+            match b {
+                b'0'..=b'9' => {
+                    current = current
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(b - b'0'));
+                    has_digits = true;
+                }
+                b';' => {
+                    if has_digits {
+                        last_param = Some(current);
+                    } else {
+                        last_param = None;
+                    }
+                    current = 0;
+                    has_digits = false;
+                }
+                _ => return false,
+            }
+        }
+
+        if has_digits {
+            last_param = Some(current);
+        }
+
+        matches!(last_param, Some(5) | Some(6))
     }
 
     fn is_csi_final(b: u8) -> bool {
@@ -1042,6 +1101,7 @@ fn test(args: &[String]) {
             .args(&extra)
             .args(&test_args)
             .env("CARGO_TARGET_AARCH64_UNKNOWN_UEFI_RUNNER", runner)
+            .env("CARGO_TERM_COLOR", "always")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1122,6 +1182,7 @@ fn test(args: &[String]) {
             .env("CARGO_PROFILE_DEV_PANIC", "abort")
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", &target_dir)
+            .env("CARGO_TERM_COLOR", "always")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1177,6 +1238,12 @@ mod tests {
     }
 
     #[test]
+    fn strips_status_report_query() {
+        let out = filter_chunks(&[b"\x1b[5n"]);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
     fn strips_device_attributes_query() {
         let out = filter_chunks(&[b"\x1b[0c"]);
         assert_eq!(out, b"");
@@ -1189,8 +1256,28 @@ mod tests {
     }
 
     #[test]
+    fn strips_private_cpr_sequence() {
+        let out = filter_chunks(&[b"before\x1b[?6nafter"]);
+        assert_eq!(out, b"beforeafter");
+    }
+
+    #[test]
     fn preserves_sgr_sequences() {
         let payload = b"\x1b[31mred\x1b[0m";
+        let out = filter_chunks(&[payload]);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn preserves_cursor_positioning_sequences() {
+        let payload = b"\x1b[10;20Hmove";
+        let out = filter_chunks(&[payload]);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn preserves_non_query_csi_n_sequences() {
+        let payload = b"\x1b[42n";
         let out = filter_chunks(&[payload]);
         assert_eq!(out, payload);
     }
