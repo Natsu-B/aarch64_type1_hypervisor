@@ -3,7 +3,9 @@
 
 use core::panic;
 use std::fs;
-use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::io::{self};
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
@@ -366,6 +368,172 @@ fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
     let _ = child.wait();
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FilterState {
+    Normal,
+    AfterEsc,
+    Csi,
+}
+
+#[derive(Debug)]
+struct AnsiQueryFilter {
+    state: FilterState,
+    pending: Vec<u8>,
+}
+
+impl AnsiQueryFilter {
+    const MAX_PENDING: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            state: FilterState::Normal,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push_filtered(&mut self, input: &[u8], output: &mut Vec<u8>) {
+        for &b in input {
+            match self.state {
+                FilterState::Normal => {
+                    if b == 0x1b {
+                        self.pending.clear();
+                        self.pending.push(b);
+                        self.state = FilterState::AfterEsc;
+                    } else {
+                        output.push(b);
+                    }
+                }
+                FilterState::AfterEsc => {
+                    self.pending.push(b);
+                    match b {
+                        b'[' => {
+                            self.state = FilterState::Csi;
+                        }
+                        b'Z' => {
+                            self.pending.clear();
+                            self.state = FilterState::Normal;
+                        }
+                        _ => {
+                            self.flush_pending(output);
+                            self.state = FilterState::Normal;
+                        }
+                    }
+                }
+                FilterState::Csi => {
+                    self.pending.push(b);
+                    if Self::is_csi_final(b) {
+                        if b == b'n' || b == b'c' {
+                            self.pending.clear();
+                        } else {
+                            self.flush_pending(output);
+                        }
+                        self.state = FilterState::Normal;
+                    } else if Self::is_csi_param_or_intermediate(b) {
+                        // Keep buffering until we see a final byte.
+                    } else {
+                        // Not a valid CSI continuation; flush what we saw.
+                        self.flush_pending(output);
+                        self.state = FilterState::Normal;
+                    }
+                }
+            }
+
+            if self.pending.len() > Self::MAX_PENDING {
+                self.flush_pending(output);
+                self.state = FilterState::Normal;
+            }
+        }
+    }
+
+    fn finish_into(&mut self, output: &mut Vec<u8>) {
+        if !self.pending.is_empty() {
+            output.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        self.state = FilterState::Normal;
+    }
+
+    fn flush_pending(&mut self, output: &mut Vec<u8>) {
+        if !self.pending.is_empty() {
+            output.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        self.state = FilterState::Normal;
+    }
+
+    fn is_csi_final(b: u8) -> bool {
+        (0x40..=0x7e).contains(&b)
+    }
+
+    fn is_csi_param_or_intermediate(b: u8) -> bool {
+        (0x30..=0x3f).contains(&b) || (0x20..=0x2f).contains(&b)
+    }
+}
+
+fn pump_filtered_output<R, W>(mut reader: R, mut writer: W)
+where
+    R: Read,
+    W: Write,
+{
+    let mut buf = [0u8; 4096];
+    let mut filtered = Vec::with_capacity(buf.len());
+    let mut filter = AnsiQueryFilter::new();
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                filtered.clear();
+                filter.push_filtered(&buf[..n], &mut filtered);
+                if !filtered.is_empty() {
+                    if let Err(e) = writer.write_all(&filtered) {
+                        eprintln!("Warning: failed to write child output: {}", e);
+                        break;
+                    }
+                }
+                let _ = writer.flush();
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("Warning: failed to read child output: {}", e);
+                break;
+            }
+        }
+    }
+
+    filtered.clear();
+    filter.finish_into(&mut filtered);
+    if !filtered.is_empty() {
+        let _ = writer.write_all(&filtered);
+    }
+    let _ = writer.flush();
+}
+
+fn spawn_output_pumps(child: &mut Child) -> (thread::JoinHandle<()>, thread::JoinHandle<()>) {
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout should be piped for output forwarding");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr should be piped for output forwarding");
+
+    let stdout_handle = thread::spawn(move || {
+        let stdout_handle = io::stdout();
+        let mut stdout_lock = stdout_handle.lock();
+        pump_filtered_output(stdout, &mut stdout_lock);
+    });
+
+    let stderr_handle = thread::spawn(move || {
+        let stderr_handle = io::stderr();
+        let mut stderr_lock = stderr_handle.lock();
+        pump_filtered_output(stderr, &mut stderr_lock);
+    });
+
+    (stdout_handle, stderr_handle)
+}
+
 fn run_uefi_test_with_backtrace(
     mut cmd: Command,
     label: &str,
@@ -376,6 +544,7 @@ fn run_uefi_test_with_backtrace(
 
     let mut child = spawn_in_own_pgrp(&mut cmd)
         .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", label, e));
+    let (stdout_pump, stderr_pump) = spawn_output_pumps(&mut child);
 
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -400,7 +569,7 @@ fn run_uefi_test_with_backtrace(
         }
     };
 
-    match status {
+    let exit_code = match status {
         Ok(status) => {
             if status.success() {
                 0
@@ -462,7 +631,11 @@ fn run_uefi_test_with_backtrace(
             // 124 = timeout and consistent with `timeout` command conventions.
             124
         }
-    }
+    };
+    let _ = stdout_pump.join();
+    let _ = stderr_pump.join();
+
+    exit_code
 }
 
 fn run_guest_test_with_timeout(
@@ -475,6 +648,7 @@ fn run_guest_test_with_timeout(
 
     let mut child = spawn_in_own_pgrp(&mut cmd)
         .unwrap_or_else(|e| panic!("Failed to spawn cargo test ({}) for {}: {}", kind, label, e));
+    let (stdout_pump, stderr_pump) = spawn_output_pumps(&mut child);
 
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -498,7 +672,7 @@ fn run_guest_test_with_timeout(
         }
     };
 
-    match status {
+    let exit_code = match status {
         Ok(status) => {
             if status.success() {
                 0
@@ -515,7 +689,11 @@ fn run_guest_test_with_timeout(
             kill_process_tree_best_effort(label, &mut child);
             124
         }
-    }
+    };
+    let _ = stdout_pump.join();
+    let _ = stderr_pump.join();
+
+    exit_code
 }
 
 fn run_uefi_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> i32 {
@@ -864,7 +1042,7 @@ fn test(args: &[String]) {
             .args(&extra)
             .args(&test_args)
             .env("CARGO_TARGET_AARCH64_UNKNOWN_UEFI_RUNNER", runner)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -944,7 +1122,7 @@ fn test(args: &[String]) {
             .env("CARGO_PROFILE_DEV_PANIC", "abort")
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", &target_dir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -975,5 +1153,51 @@ fn test(args: &[String]) {
         std::process::exit(1);
     } else {
         eprintln!("All tests passed (host + UEFI + U-Boot)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnsiQueryFilter;
+
+    fn filter_chunks(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut filter = AnsiQueryFilter::new();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            filter.push_filtered(chunk, &mut out);
+        }
+        filter.finish_into(&mut out);
+        out
+    }
+
+    #[test]
+    fn strips_cpr_sequence() {
+        let out = filter_chunks(&[b"abc\x1b[6nxyz"]);
+        assert_eq!(out, b"abcxyz");
+    }
+
+    #[test]
+    fn strips_device_attributes_query() {
+        let out = filter_chunks(&[b"\x1b[0c"]);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn strips_decid_sequence() {
+        let out = filter_chunks(&[b"\x1bZ"]);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn preserves_sgr_sequences() {
+        let payload = b"\x1b[31mred\x1b[0m";
+        let out = filter_chunks(&[payload]);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn handles_chunk_boundaries() {
+        let out = filter_chunks(&[b"abc\x1b[", b"6nxyz"]);
+        assert_eq!(out, b"abcxyz");
     }
 }
