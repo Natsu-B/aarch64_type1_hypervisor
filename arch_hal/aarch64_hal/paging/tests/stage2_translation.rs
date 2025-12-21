@@ -10,10 +10,12 @@ use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
 use allocator;
 use core::arch::asm;
+use core::arch::naked_asm;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 use cpu::registers::PARange;
+use exceptions;
 use paging::stage2::Stage2PageTypes;
 use paging::stage2::Stage2Paging;
 use paging::stage2::Stage2PagingSetting;
@@ -27,9 +29,15 @@ const TEST_HEAP_SIZE: usize = 8 * 1024 * 1024;
 static mut TEST_HEAP: [u8; TEST_HEAP_SIZE] = [0; TEST_HEAP_SIZE];
 static ALLOCATOR: allocator::DefaultAllocator = allocator::DefaultAllocator::new();
 
-#[unsafe(no_mangle)]
-extern "C" fn efi_main() -> ! {
+unsafe extern "C" {
+    static __bss_start: u8;
+    static __bss_end: u8;
+    static __stack_top: u8;
+}
+
+fn entry() -> ! {
     debug_uart::init(UART_BASE, UART_CLOCK_HZ);
+    println!("Starting stage2 translation test...");
     match run() {
         Ok(()) => {
             println!("stage2 translation test: PASS");
@@ -40,6 +48,19 @@ extern "C" fn efi_main() -> ! {
             exit_failure();
         }
     }
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+extern "C" fn _start() -> ! {
+    naked_asm!("ldr x0, =__stack_top", "mov sp, x0", "bl rust_entry", "b .",);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn rust_entry() -> ! {
+    unsafe { clear_bss() };
+    exceptions::setup_exception();
+    entry()
 }
 
 fn run() -> Result<(), &'static str> {
@@ -216,6 +237,16 @@ fn read_vttbr_el2() -> u64 {
     let val: u64;
     unsafe { asm!("mrs {val}, vttbr_el2", val = out(reg) val) };
     val
+}
+
+unsafe fn clear_bss() {
+    unsafe {
+        let start = &__bss_start as *const u8 as usize;
+        let end = &__bss_end as *const u8 as usize;
+        if end > start {
+            ptr::write_bytes(start as *mut u8, 0, end - start);
+        }
+    }
 }
 
 fn setup_allocator() -> Result<(), &'static str> {

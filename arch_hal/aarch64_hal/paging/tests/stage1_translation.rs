@@ -11,11 +11,13 @@ use aarch64_test::exit_success;
 use alloc::vec::Vec;
 use allocator;
 use core::arch::asm;
+use core::arch::naked_asm;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 use cpu::registers::PARange;
 use cpu::*;
+use exceptions;
 use paging::PagingErr;
 use paging::stage1::EL2Stage1PageTypes;
 use paging::stage1::EL2Stage1Paging;
@@ -32,9 +34,15 @@ const TEST_HEAP_SIZE: usize = 8 * 1024 * 1024;
 static mut TEST_HEAP: [u8; TEST_HEAP_SIZE] = [0; TEST_HEAP_SIZE];
 static ALLOCATOR: allocator::DefaultAllocator = allocator::DefaultAllocator::new();
 
-#[unsafe(no_mangle)]
-extern "C" fn efi_main() -> ! {
+unsafe extern "C" {
+    static __bss_start: u8;
+    static __bss_end: u8;
+    static __stack_top: u8;
+}
+
+fn entry() -> ! {
     debug_uart::init(UART_BASE, UART_CLOCK_HZ);
+    println!("Starting stage1 translation test...");
     match run() {
         Ok(()) => {
             println!("stage1 translation test: PASS");
@@ -45,6 +53,20 @@ extern "C" fn efi_main() -> ! {
             exit_failure();
         }
     }
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+extern "C" fn _start() -> ! {
+    naked_asm!("ldr x0, =__stack_top", "mov sp, x0", "bl rust_entry", "b .",);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn rust_entry() -> ! {
+    unsafe { clear_bss() };
+    unsafe { ptr::write_volatile(UART_BASE as *mut u8, b'!') };
+    exceptions::setup_exception();
+    entry()
 }
 
 fn run() -> Result<(), &'static str> {
@@ -65,7 +87,7 @@ fn run() -> Result<(), &'static str> {
 
     let stack_addr = current_sp();
     let text_addr = run as usize;
-    let efi_addr = efi_main as usize;
+    let entry_addr = entry as usize;
     let dummy_addr = ptr::addr_of!(DUMMY) as usize;
     let vbar_el2: usize;
     unsafe {
@@ -83,7 +105,7 @@ fn run() -> Result<(), &'static str> {
     tracked.push(buffer_end - 1);
     tracked.push(stack_addr);
     tracked.push(text_addr);
-    tracked.push(efi_addr);
+    tracked.push(entry_addr);
     tracked.push(dummy_addr);
     tracked.push(vbar_start);
     tracked.push(vbar_end);
@@ -200,6 +222,16 @@ fn current_sp() -> usize {
     let sp: usize;
     unsafe { asm!("mov {}, sp", out(reg) sp) };
     sp
+}
+
+unsafe fn clear_bss() {
+    unsafe {
+        let start = &__bss_start as *const u8 as usize;
+        let end = &__bss_end as *const u8 as usize;
+        if end > start {
+            ptr::write_bytes(start as *mut u8, 0, end - start);
+        }
+    }
 }
 
 struct Stage1State {

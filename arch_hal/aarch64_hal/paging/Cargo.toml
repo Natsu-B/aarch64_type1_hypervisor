@@ -13,6 +13,7 @@ typestate_macro = { path = "../../../typestate_macro" }
 print = { path = "../print" }
 allocator = { path = "../../../allocator", features = ["no-alloc-error-handler"] }
 aarch64_test = { path = "../aarch64_test" }
+exceptions = { path = "../exceptions" }
 
 [[test]]
 name = "stage1_translation"

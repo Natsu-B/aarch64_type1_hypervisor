@@ -161,6 +161,7 @@ dependencies = [
  "aarch64_test",
  "allocator",
  "cpu",
+ "exceptions",
  "print",
  "typestate",
  "typestate_macro",

@@ -5,6 +5,7 @@ use core::panic;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::thread;
@@ -248,6 +249,123 @@ fn resolve_gdb_executable() -> Option<String> {
     None
 }
 
+#[cfg(unix)]
+fn spawn_in_own_pgrp(cmd: &mut Command) -> io::Result<Child> {
+    use core::ffi::c_int;
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: This runs in the child just before exec; setpgid is async-signal-safe and
+    // we only touch state local to the child process to move it into a new process group.
+    unsafe {
+        cmd.pre_exec(|| {
+            unsafe extern "C" {
+                fn setpgid(pid: c_int, pgid: c_int) -> c_int;
+            }
+
+            if setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_in_own_pgrp(cmd: &mut Command) -> io::Result<Child> {
+    cmd.spawn()
+}
+
+#[cfg(unix)]
+fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
+    use core::ffi::c_int;
+
+    const SIGTERM: c_int = 15;
+    const SIGKILL: c_int = 9;
+
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    let pgid = match i32::try_from(child.id()) {
+        Ok(pid) => pid,
+        Err(_) => {
+            eprintln!(
+                "Warning: PID {} for {} does not fit into i32; falling back to child.kill()",
+                child.id(),
+                label
+            );
+            if let Err(e) = child.kill() {
+                eprintln!("Warning: failed to kill {}: {}", label, e);
+            }
+            let _ = child.wait();
+            return;
+        }
+    };
+
+    let mut wait_for_exit = |deadline: Instant| -> bool {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to poll {} while terminating process group: {}",
+                        label, e
+                    );
+                    return false;
+                }
+            }
+        }
+    };
+
+    let send_signal = |sig: c_int| {
+        let res = unsafe { kill(-(pgid as c_int), sig) };
+        if res != 0 {
+            let e = io::Error::last_os_error();
+            eprintln!(
+                "Warning: failed to send signal {} to process group {} for {}: {}",
+                sig, pgid, label, e
+            );
+        }
+    };
+
+    send_signal(SIGTERM);
+    let mut exited = wait_for_exit(Instant::now() + Duration::from_secs(2));
+
+    if !exited {
+        send_signal(SIGKILL);
+        exited = wait_for_exit(Instant::now() + Duration::from_secs(2));
+    }
+
+    if !exited {
+        if let Ok(Some(_)) = child.try_wait() {
+            exited = true;
+        }
+    }
+
+    if !exited {
+        eprintln!(
+            "Warning: process group {} for {} may still be running after SIGKILL",
+            pgid, label
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
+    if let Err(e) = child.kill() {
+        eprintln!("Warning: failed to kill {}: {}", label, e);
+    }
+    let _ = child.wait();
+}
+
 fn run_uefi_test_with_backtrace(
     mut cmd: Command,
     label: &str,
@@ -256,8 +374,7 @@ fn run_uefi_test_with_backtrace(
 ) -> i32 {
     eprintln!("Running (UEFI, with gdb-on-timeout): {:?}", cmd);
 
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_in_own_pgrp(&mut cmd)
         .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", label, e));
 
     let start = Instant::now();
@@ -340,15 +457,73 @@ fn run_uefi_test_with_backtrace(
             }
 
             eprintln!("Killing hung UEFI test process for '{}'", label);
-            if let Err(e) = child.kill() {
-                eprintln!("Warning: failed to kill UEFI test process: {}", e);
-            }
-            let _ = child.wait();
+            kill_process_tree_best_effort(label, &mut child);
 
             // 124 = timeout and consistent with `timeout` command conventions.
             124
         }
     }
+}
+
+fn run_guest_test_with_timeout(
+    mut cmd: Command,
+    label: &str,
+    timeout_secs: u64,
+    kind: &str,
+) -> i32 {
+    eprintln!("Running ({} with internal timeout): {:?}", kind, cmd);
+
+    let mut child = spawn_in_own_pgrp(&mut cmd)
+        .unwrap_or_else(|e| panic!("Failed to spawn cargo test ({}) for {}: {}", kind, label, e));
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    break Err(());
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error: failed to poll {} process for {}: {}",
+                    kind, label, e
+                );
+                break Err(());
+            }
+        }
+    };
+
+    match status {
+        Ok(status) => {
+            if status.success() {
+                0
+            } else {
+                status.code().unwrap_or(1)
+            }
+        }
+        Err(()) => {
+            eprintln!(
+                "Error: {} '{}' did not finish within {}s; assuming hang.",
+                kind, label, timeout_secs
+            );
+            eprintln!("Killing hung {} process for '{}'", kind, label);
+            kill_process_tree_best_effort(label, &mut child);
+            124
+        }
+    }
+}
+
+fn run_uefi_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> i32 {
+    run_guest_test_with_timeout(cmd, label, timeout_secs, "UEFI test")
+}
+
+fn run_uboot_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> i32 {
+    run_guest_test_with_timeout(cmd, label, timeout_secs, "U-Boot test")
 }
 
 fn test(args: &[String]) {
@@ -406,6 +581,7 @@ fn test(args: &[String]) {
 
     let mut std_crates: Vec<(String, Vec<String>)> = Vec::new();
     let mut uefi_tests: Vec<(String, String, String, Vec<String>)> = Vec::new();
+    let mut uboot_tests: Vec<(String, String, String, Vec<String>)> = Vec::new();
 
     let plan_text = plan.expect("require xtest.txt");
     for (lineno, line) in plan_text.lines().enumerate() {
@@ -434,9 +610,21 @@ fn test(args: &[String]) {
                     ),
                 }
             }
+            Some("uboot") | Some("u-boot") => {
+                let (pkg, testname, testscript) = (parts.next(), parts.next(), parts.next());
+                match (pkg, testname, testscript) {
+                    (Some(p), Some(t), Some(s)) => {
+                        uboot_tests.push((p.to_string(), t.to_string(), s.to_string(), Vec::new()))
+                    }
+                    _ => eprintln!(
+                        "xtest.txt:{}: expected: uboot <package> <testname> <testscript>",
+                        lineno + 1
+                    ),
+                }
+            }
             Some(other) => {
                 eprintln!(
-                    "xtest.txt:{}: unknown kind '{}'; expected 'std' or 'uefi'",
+                    "xtest.txt:{}: unknown kind '{}'; expected 'std', 'uefi', or 'uboot'",
                     lineno + 1,
                     other
                 );
@@ -466,17 +654,19 @@ fn test(args: &[String]) {
         None
     }
 
-    fn uefi_needs_sudo(
-        uefi_tests: &[(String, String, String, Vec<String>)],
+    fn scripts_need_sudo(
+        tests: &[(String, String, String, Vec<String>)],
         repo_root: &PathBuf,
+        kind: &str,
     ) -> bool {
-        for (_, _, testscript, _) in uefi_tests {
+        for (_, _, testscript, _) in tests {
             let runner_path = repo_root.join(testscript);
             match fs::read_to_string(&runner_path) {
                 Ok(content) => {
                     if content.contains("sudo") {
                         eprintln!(
-                            "Detected use of sudo in UEFI runner script: {}",
+                            "Detected use of sudo in {} runner script: {}",
+                            kind,
                             runner_path.display()
                         );
                         return true;
@@ -484,7 +674,8 @@ fn test(args: &[String]) {
                 }
                 Err(e) => {
                     eprintln!(
-                        "Warning: failed to read UEFI runner script {}: {}",
+                        "Warning: failed to read {} runner script {}: {}",
+                        kind,
                         runner_path.display(),
                         e
                     );
@@ -556,8 +747,9 @@ fn test(args: &[String]) {
     if !package_filters.is_empty() {
         std_crates.retain(|(pkg, _)| package_filters.contains(pkg));
         uefi_tests.retain(|(pkg, _, _, _)| package_filters.contains(pkg));
+        uboot_tests.retain(|(pkg, _, _, _)| package_filters.contains(pkg));
 
-        if std_crates.is_empty() && uefi_tests.is_empty() {
+        if std_crates.is_empty() && uefi_tests.is_empty() && uboot_tests.is_empty() {
             eprintln!(
                 "No entries in xtest.txt match specified packages: {:?}",
                 package_filters
@@ -566,10 +758,11 @@ fn test(args: &[String]) {
         }
 
         eprintln!(
-            "Filtered test plan to packages: {:?} ({} std, {} uefi)",
+            "Filtered test plan to packages: {:?} ({} std, {} uefi, {} uboot)",
             package_filters,
             std_crates.len(),
-            uefi_tests.len()
+            uefi_tests.len(),
+            uboot_tests.len()
         );
     }
 
@@ -577,7 +770,9 @@ fn test(args: &[String]) {
     let mut passed: Vec<String> = Vec::new();
     let mut failed: Vec<(String, i32)> = Vec::new();
 
-    if uefi_needs_sudo(&uefi_tests, &repo_root) {
+    if scripts_need_sudo(&uefi_tests, &repo_root, "UEFI")
+        || scripts_need_sudo(&uboot_tests, &repo_root, "U-Boot")
+    {
         sudo_warmup();
     }
 
@@ -655,19 +850,7 @@ fn test(args: &[String]) {
             None
         };
 
-        let mut cmd = if enable_uefi_backtrace {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            c
-        } else if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(prefix.remove(0));
-            for p in prefix {
-                c.arg(p);
-            }
-            c.arg("cargo");
-            c.arg("test");
-            c
-        } else {
+        let mut cmd = {
             let mut c = Command::new("cargo");
             c.arg("test");
             c
@@ -682,8 +865,8 @@ fn test(args: &[String]) {
             .args(&test_args)
             .env("CARGO_TARGET_AARCH64_UNKNOWN_UEFI_RUNNER", runner)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         if let Some(ref socket) = gdb_socket {
             cmd.env("XTASK_QEMU_GDB_SOCKET", socket);
@@ -692,21 +875,84 @@ fn test(args: &[String]) {
         let code = if let Some(ref socket) = gdb_socket {
             run_uefi_test_with_backtrace(cmd, &label, socket, 60)
         } else {
-            eprintln!("Running: {:?}", cmd);
-            let status = cmd
-                .spawn()
-                .unwrap_or_else(|e| panic!("Failed to spawn cargo test (UEFI) for {}: {}", pkg, e))
-                .wait()
-                .unwrap_or_else(|e| {
-                    panic!("Failed to wait for cargo test (UEFI) for {}: {}", pkg, e)
-                });
-            status.code().unwrap_or(1)
+            run_uefi_test_with_timeout(cmd, &label, 30)
         };
 
         if code == 0 {
             passed.push(label);
         } else {
             eprintln!("Error: UEFI test failed for {} with code {}", pkg, code);
+            failed.push((label, code));
+        }
+    }
+
+    // Run U-Boot tests
+    for (pkg, testname, testscript, extra) in uboot_tests {
+        let runner_path = repo_root.join(testscript);
+        let runner = runner_path
+            .to_str()
+            .expect("runner path contains invalid UTF-8");
+
+        let test_lds_path = repo_root.join("test.lds");
+        let test_lds = test_lds_path
+            .to_str()
+            .expect("test linker path contains invalid UTF-8")
+            .to_string();
+
+        let label = format!("uboot:{}::{}", pkg, testname);
+        eprintln!(
+            "\n--- Running U-Boot test for: {}::{}, runner: {} ---",
+            pkg, testname, runner
+        );
+
+        let mut cmd = Command::new("cargo");
+
+        // Give each U-Boot test its own fresh target dir to avoid mixing build-std
+        // artifacts (duplicate core lang items).
+        let sanitized_label = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let target_dir = std::env::temp_dir()
+            .join("aarch64_hv_uboot_tests")
+            .join(format!("{}_{}", sanitized_label, std::process::id()));
+        let _ = fs::remove_dir_all(&target_dir);
+
+        let rustflags = {
+            let mut parts = Vec::new();
+            if let Ok(existing) = std::env::var("RUSTFLAGS") {
+                parts.push(existing);
+            }
+            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
+            parts.push("-C relocation-model=static".to_string());
+            parts.push(format!("-C link-arg=-T{}", test_lds));
+            parts.join(" ")
+        };
+
+        cmd.arg("test")
+            .arg("--target")
+            .arg("aarch64-unknown-none-softfloat")
+            .arg("-p")
+            .arg(&pkg)
+            .arg("--test")
+            .arg(&testname)
+            .args(&extra)
+            .args(&test_args)
+            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
+            .env("RUSTFLAGS", rustflags)
+            .env("CARGO_PROFILE_TEST_PANIC", "abort")
+            .env("CARGO_PROFILE_DEV_PANIC", "abort")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let code = run_uboot_test_with_timeout(cmd, &label, 300);
+        if code == 0 {
+            passed.push(label);
+        } else {
+            eprintln!("Error: U-Boot test failed for {} with code {}", pkg, code);
             failed.push((label, code));
         }
     }
@@ -728,6 +974,6 @@ fn test(args: &[String]) {
         }
         std::process::exit(1);
     } else {
-        eprintln!("All tests passed (host + UEFI)");
+        eprintln!("All tests passed (host + UEFI + U-Boot)");
     }
 }

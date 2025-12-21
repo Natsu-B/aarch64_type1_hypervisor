@@ -22,3 +22,7 @@ members = [
 panic = 'abort'
 [profile.dev]
 panic = 'abort'
+[profile.test]
+panic = 'abort'
+[profile.bench]
+panic = 'abort'
