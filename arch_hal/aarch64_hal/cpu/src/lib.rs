@@ -3,6 +3,7 @@
 use core::arch::asm;
 
 use crate::registers::ID_AA64MMFR0_EL1;
+use crate::registers::ID_AA64PFR0_EL1;
 use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
 pub mod registers;
@@ -96,6 +97,13 @@ pub fn get_current_el() -> u64 {
 pub fn get_id_aa64mmfr0_el1() -> u64 {
     let id: u64;
     unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) id) };
+    id
+}
+
+pub fn get_id_aa64pfr0_el1() -> u64 {
+    let id: u64;
+    // SAFETY: Reads the read-only ID_AA64PFR0_EL1 system register.
+    unsafe { asm!("mrs {}, id_aa64pfr0_el1", out(reg) id) };
     id
 }
 
@@ -324,6 +332,11 @@ pub fn invalidate_icache_all() {
 pub fn get_parange() -> Option<PARange> {
     let id = ID_AA64MMFR0_EL1::from_bits(get_id_aa64mmfr0_el1());
     id.get_enum(ID_AA64MMFR0_EL1::parange)
+}
+
+pub fn el3_is_implemented() -> bool {
+    let id = ID_AA64PFR0_EL1::from_bits(get_id_aa64pfr0_el1());
+    id.get(ID_AA64PFR0_EL1::el3) != 0
 }
 
 /// Return a CPU-specific ID composed from MPIDR_EL1.AFF{0..3}.
