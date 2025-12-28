@@ -17,10 +17,6 @@ pub mod gicv2;
 /// GICv3 implementation (Distributor/Redistributor; CPU interface via system registers; optional ITS/MSI).
 pub mod gicv3;
 
-/// Re-export of a GICv3-specific trigger encoding/type, if a v3 backend exposes richer options than
-/// the version-independent `TriggerMode` below (e.g. limitations for certain interrupt classes).
-pub use gicv3::GicTriggerMode;
-
 use cpu::CoreAffinity;
 
 /// An MMIO region describing a device register frame.
@@ -68,6 +64,9 @@ pub enum GicError {
     IndexOutOfRange,
     /// Backend GIC revision is not supported (e.g. GICv2 backend found non-v2 hardware).
     UnsupportedRevision,
+    /// Current security state/configuration (Secure vs Non-secure, GIC security settings)
+    /// makes the operation architecturally inaccessible (e.g. Secure-only register, NS RAZ/WI).
+    InvalidSecurityState,
 }
 
 /// Decoded acknowledgement token returned by `acknowledge()`.
@@ -81,8 +80,11 @@ pub enum GicError {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct AckedIrq {
     raw: u32,
+    ack_kind: AckKind,
     pub intid: u32,
     pub source: Option<CoreAffinity>,
+    /// Group determined at acknowledge time (drives EOIR vs AEOIR selection on GICv2).
+    pub group: IrqGroup,
 }
 
 /// Interrupt group selection.
@@ -96,6 +98,13 @@ pub struct AckedIrq {
 pub enum IrqGroup {
     Group0,
     Group1,
+}
+
+/// Gic v2 specific acknowledge kind
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum AckKind {
+    Iar,
+    Aiar,
 }
 
 /// Trigger configuration for an interrupt (where configurable).

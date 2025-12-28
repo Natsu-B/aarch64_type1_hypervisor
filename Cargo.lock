@@ -140,8 +140,10 @@ dependencies = [
 name = "gic"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
  "cpu",
  "mutex",
+ "print",
  "typestate",
  "typestate_macro",
 ]

@@ -80,6 +80,22 @@ bitregs! {
 }
 
 bitregs! {
+    /// Software Generated Interrupt Register, GICD_SGIR
+    pub(crate) struct GICD_SGIR: u32 {
+        pub(crate) sgi_int_id@[3:0],
+        reserved@[14:4] [ignore],
+        pub(crate) ns_att@[15:14],
+        pub(crate) cpu_target_list@[23:16],
+        pub(crate) target_list_filter@[25:24] as TargetListFilter {
+            CpuTargetListFieldSpecified = 0b00,
+            InterruptAllCpuExceptRequestedCpu = 0b01,
+            InterruptAllCpu = 0b10,
+        },
+        reserved@[31:26] [ignore],
+    }
+}
+
+bitregs! {
     /// GICC_CTLR (CPU Interface Control Register)
     ///
     /// - Table 4-30: GICv2 + Security Extensions, Non-secure copy
@@ -155,6 +171,24 @@ bitregs! {
     /// End of Interrupt Register, GICC_EOIR
     pub(crate) struct GICC_EOIR: u32 {
         pub(crate) eoi_int_id@[9:0],
+        pub(crate) cpu_id@[12:10],
+        reserved@[31:13],
+    }
+}
+
+bitregs! {
+    /// Highest Priority Pending Interrupt Register, GICC_HPPIR.
+    pub(crate) struct GICC_HPPIR: u32 {
+        pub(crate) interrupt_id@[9:0],
+        pub(crate) cpu_id@[12:10],
+        reserved@[31:13],
+    }
+}
+
+bitregs! {
+    /// Aliased Highest Priority Pending Interrupt Register, GICC_AHPPIR.
+    pub(crate) struct GICC_AHPPIR: u32 {
+        pub(crate) interrupt_id@[9:0],
         pub(crate) cpu_id@[12:10],
         reserved@[31:13],
     }
@@ -287,7 +321,7 @@ pub(crate) struct GicV2Distributor {
     pub nsacr: [ReadWrite<u32>; 64], // 0x0E00-0x0EFC
 
     /// Software Generated Interrupt Register; issues SGIs (effect when Distributor forwarding disabled is IMPLEMENTATION DEFINED; NSATT depends on Security Extensions).
-    pub sgir: WriteOnly<u32>, // 0x0F00
+    pub sgir: WriteOnly<GICD_SGIR>, // 0x0F00
     _rsvd_0f04_0f0f: [u8; 0x0C],        // 0x0F04-0x0F0F
     pub cpendsgir: [ReadWrite<u32>; 4], // 0x0F10-0x0F1C
     pub spendsgir: [ReadWrite<u32>; 4], // 0x0F20-0x0F2C
@@ -312,11 +346,11 @@ pub(crate) struct GicV2CpuInterface {
     /// End of Interrupt Register; EOImode=0 drops priority and deactivates, EOImode=1 drops only.
     pub eoir: WriteOnly<GICC_EOIR>, // 0x0010
     pub rpr: ReadOnly<u32>,       // 0x0014
-    pub hppir: ReadOnly<u32>,     // 0x0018
+    pub hppir: ReadOnly<GICC_HPPIR>, // 0x0018
     pub abpr: ReadWrite<GICC_ABPR>, // 0x001C
-    pub aiar: ReadOnly<u32>,      // 0x0020
+    pub aiar: ReadOnly<GICC_IAR>, // 0x0020
     pub aeoir: WriteOnly<u32>,    // 0x0024
-    pub ahppir: ReadOnly<u32>,    // 0x0028
+    pub ahppir: ReadOnly<GICC_AHPPIR>, // 0x0028
     _rsvd_002c_00cf: [u8; 0xA4],  // 0x002C-0x00CF
     pub apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
     pub nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC
@@ -366,11 +400,11 @@ pub(crate) struct GicV2VirtualCpuInterface {
     /// Virtual End of Interrupt; EOImode=0 drops priority and deactivates, EOImode=1 drops only.
     pub eoir: WriteOnly<u32>, // 0x0010
     pub rpr: ReadOnly<u32>,  // 0x0014
-    pub hppir: ReadOnly<u32>, // 0x0018
+    pub hppir: ReadOnly<GICC_HPPIR>, // 0x0018
     pub abpr: ReadWrite<u32>, // 0x001C
     pub aiar: ReadOnly<u32>, // 0x0020
     pub aeoir: WriteOnly<u32>, // 0x0024
-    pub ahppir: ReadOnly<u32>, // 0x0028
+    pub ahppir: ReadOnly<GICC_AHPPIR>, // 0x0028
     _rsvd_002c_00cf: [u8; 0xA4], // 0x002C-0x00CF
     pub apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
     pub nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC

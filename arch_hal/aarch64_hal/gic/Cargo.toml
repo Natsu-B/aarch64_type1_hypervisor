@@ -8,3 +8,12 @@ typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
 cpu = { path = "../cpu" }
 mutex = { path = "../../../mutex" }
+
+[dev-dependencies]
+aarch64_test = { path = "../aarch64_test" }
+print = { path = "../print" }
+
+[[test]]
+name = "gicv2_pending"
+path = "tests/gicv2_pending.rs"
+harness = false

@@ -1,30 +1,43 @@
-use typestate::Readable;
-use typestate::Writable;
-
 use crate::EnableOp;
 use crate::GicDistributor;
 use crate::GicError;
+use crate::GicSgi;
 use crate::IrqGroup;
+use crate::SgiTarget;
 use crate::TriggerMode;
 use crate::gicv2::Gicv2;
 use crate::gicv2::registers::GICD_CTLR;
+use crate::gicv2::registers::GICD_SGIR;
+use crate::gicv2::registers::TargetListFilter;
+use core::cmp;
+use typestate::Readable;
+use typestate::Writable;
 
 impl Gicv2 {
     pub(crate) fn init_banked_sgi_ppi_state(&self) -> Result<(), GicError> {
         // disable PPIs
         const PPI_MASK: u32 = 0xffff_0000;
+        let security_ext = self.is_security_extension_implemented();
 
         self.gicd.icenabler[0].write(PPI_MASK);
+        // Clear any stale SGI/PPI pending/active state before re-enabling.
         self.gicd.icpendr[0].write(PPI_MASK);
-        self.gicd.icactiver[0].write(PPI_MASK);
+        self.gicd.icactiver[0].write(0xffff_ffff);
 
         for v in self.gicd.ipriorityr.iter().take(8).flatten() {
-            v.write(0xff);
+            // Give SGIs/PPIs the highest priority (numerically lowest) so they are not masked.
+            v.write(0x00);
         }
 
-        if !self.is_security_extension_implemented() {
-            self.gicd.igroupr[0].write(0xffff_ffff);
-        }
+        // Default SGI/PPI group selection: Group0 when Security Extensions are absent, Group1
+        // otherwise (to keep Non-secure SGIs usable when EL3 firmware programs security state).
+        self.gicd.igroupr[0].write(if security_ext {
+            0xffff_ffff
+        } else {
+            0x0000_0000
+        });
+        // Enable SGIs for this CPU interface; leave PPIs disabled (masked above).
+        self.gicd.isenabler[0].write(!PPI_MASK);
 
         cpu::dsb_sy();
         cpu::isb();
@@ -33,11 +46,56 @@ impl Gicv2 {
     }
 }
 
+impl GicSgi for Gicv2 {
+    fn send_sgi(&self, sgi_id: u8, target: crate::SgiTarget<'_>) -> Result<(), crate::GicError> {
+        if sgi_id >= 16 {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let value = GICD_SGIR::new().set(GICD_SGIR::sgi_int_id, sgi_id as u32);
+        let value = match target {
+            SgiTarget::Specific(affinities) => {
+                if affinities.is_empty() {
+                    return Ok(());
+                }
+                let mut mask: u8 = 0;
+                for affinity in affinities {
+                    mask |= self.cpu_targets_mask_from_affinity(*affinity)?;
+                }
+                if mask == 0 {
+                    return Ok(());
+                }
+                value
+                    .set_enum(
+                        GICD_SGIR::target_list_filter,
+                        TargetListFilter::CpuTargetListFieldSpecified,
+                    )
+                    .set(GICD_SGIR::cpu_target_list, mask as u32)
+            }
+            SgiTarget::AllButSelf => value.set_enum(
+                GICD_SGIR::target_list_filter,
+                TargetListFilter::InterruptAllCpuExceptRequestedCpu,
+            ),
+            // TargetListFilter = 0b10 selects the current CPU interface only.
+            SgiTarget::SelfOnly => value.set_enum(
+                GICD_SGIR::target_list_filter,
+                TargetListFilter::InterruptAllCpu,
+            ),
+        };
+
+        self.gicd.sgir.write(value);
+        cpu::dsb_sy();
+        cpu::isb();
+        Ok(())
+    }
+}
+
 impl GicDistributor for Gicv2 {
     fn init(&self) -> Result<(), crate::GicError> {
         // disable distributor
+        let security_ext = self.is_security_extension_implemented();
         let mutex = self.mutex.lock();
-        if self.is_security_extension_implemented() {
+        if security_ext {
             self.gicd
                 .ctlr
                 .write(GICD_CTLR::new().set(GICD_CTLR::enable_grp1_non_secure, 0));
@@ -55,22 +113,31 @@ impl GicDistributor for Gicv2 {
         let max_intid = self.max_intid();
         let num_words = ((max_intid as usize) + 31) / 32;
 
-        // Program interrupt groups only when Security Extensions are not implemented.
-        // On implementations with Security Extensions (e.g. GIC-400), GICD_IGROUPRn is Secure-only;
-        // Non-secure accesses are RAZ/WI. Firmware must configure interrupt groups.
-        if !self.is_security_extension_implemented() {
-            let words = core::cmp::min(num_words, self.gicd.igroupr.len());
-            for n in 0..words {
-                let mask = Self::word_mask(max_intid, n);
-                if mask == 0 {
-                    break;
-                }
+        // Program interrupt groups so SGIs/PPIs/SPIs are visible to the Non-secure interface.
+        // If IGROUPR is Secure-only, these writes are RAZ/WI and firmware must configure groups.
+        let words = core::cmp::min(num_words, self.gicd.igroupr.len());
+        for n in 0..words {
+            let mask = Self::word_mask(max_intid, n);
+            if mask == 0 {
+                break;
+            }
+            if security_ext {
+                // On systems with Security Extensions, IGROUPR can be Secure-only (RAZ/WI here).
                 self.gicd.igroupr[n].write(mask);
+            } else {
+                // Default to Group0 when Security Extensions are absent; AckCtl=0 expects Group1
+                // interrupts to use AIAR/AEOIR, which this driver does not enable by default.
+                self.gicd.igroupr[n].write(0);
             }
         }
 
+        if !security_ext {
+            // Track all interrupts as Group0 logically when Security Extensions are absent.
+            self.reset_shadow_groups();
+        }
+
         // disable all interrupts
-        let words = core::cmp::min(num_words, self.gicd.icenabler.len());
+        let words = cmp::min(num_words, self.gicd.icenabler.len());
         for n in 0..words {
             let mask = Self::word_mask(max_intid, n);
             if mask == 0 {
@@ -117,6 +184,10 @@ impl GicDistributor for Gicv2 {
             self.gicd.icenabler[intid as usize / 32].write(1 << intid as usize % 32);
         }
 
+        // Ensure the enable change is visible before callers proceed (tests may wait immediately).
+        cpu::dsb_sy();
+        cpu::isb();
+
         Ok(())
     }
 
@@ -129,7 +200,9 @@ impl GicDistributor for Gicv2 {
         route: crate::SpiRoute,
         enable: EnableOp,
     ) -> Result<(), crate::GicError> {
-        if group == IrqGroup::Group0 {
+        let security_ext = self.is_security_extension_implemented();
+
+        if security_ext && group == IrqGroup::Group0 {
             // this crate does not support secure state
             return Err(GicError::UnsupportedFeature);
         }
@@ -154,21 +227,28 @@ impl GicDistributor for Gicv2 {
         self.gicd.icactiver[word].write(bit);
 
         let mutex = self.mutex.lock();
-        // Non-secure Group 1: set IGROUPR bit (RMW; do not overwrite other interrupts' group bits).
-        // On implementations with Security Extensions (e.g. GIC-400), GICD_IGROUPRn is Secure-only;
-        // Non-secure accesses are RAZ/WI. Firmware must configure interrupt groups.
-        if !self.is_security_extension_implemented() {
-            let igroupr = self.gicd.igroupr[word].read();
-            self.gicd.igroupr[word].write(igroupr | bit);
+        if security_ext {
+            // Non-secure Group 1: set IGROUPR bit (RMW; do not overwrite other interrupts' group
+            // bits). On implementations with Security Extensions (e.g. GIC-400) and EL3 firmware,
+            // GICD_IGROUPRn is Secure-only; Non-secure accesses are RAZ/WI. Firmware must
+            // configure interrupt groups.
+            if group == IrqGroup::Group1 {
+                let igroupr = self.gicd.igroupr[word].read();
+                self.gicd.igroupr[word].write(igroupr | bit);
+            }
+        } else {
+            // Security Extensions absent: remember the requested logical group in software and
+            // force hardware IGROUPR to Group0 to keep AckCtl=0 usable without AIAR.
+            self.set_shadow_group(intid, group)?;
+            let igroupr = self.gicd.igroupr[word].read() & !bit;
+            self.gicd.igroupr[word].write(igroupr);
         }
 
-        self.gicd.ipriorityr[intid as usize / 4][intid as usize % 4]
-            .update_bits(0b1111_1111, priority);
+        self.gicd.ipriorityr[intid as usize / 4][intid as usize % 4].write(priority);
 
         match route {
             crate::SpiRoute::Specific(core_affinity) => {
-                let cpu_id = self.cpu_id_from_affinity(core_affinity)?;
-                let cpu_targets = Self::cpu_targets_mask_from_cpu_id(cpu_id)?;
+                let cpu_targets = self.cpu_targets_mask_from_affinity(core_affinity)?;
                 let spi = (intid as usize)
                     .checked_sub(32)
                     .ok_or(GicError::UnsupportedIntId)?;
@@ -189,8 +269,16 @@ impl GicDistributor for Gicv2 {
         );
         drop(mutex);
 
+        // Ensure route/priority/group programming is observed before (re-)enabling the SPI.
+        cpu::dsb_sy();
+        cpu::isb();
+
         if enable_after {
             self.gicd.isenabler[word].write(bit);
+
+            // Make the enable visible before callers proceed (tests may poll immediately).
+            cpu::dsb_sy();
+            cpu::isb();
         }
 
         Ok(())
@@ -208,6 +296,9 @@ impl GicDistributor for Gicv2 {
         } else {
             self.gicd.icpendr[word].write(bit);
         }
+
+        cpu::dsb_sy();
+        cpu::isb();
         Ok(())
     }
 }

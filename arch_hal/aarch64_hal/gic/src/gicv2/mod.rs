@@ -18,6 +18,9 @@ mod distributor;
 mod registers;
 mod virtualization;
 
+pub const GICV2_GICD_FRAME_SIZE: usize = size_of::<GicV2Distributor>();
+pub const GICV2_GICC_FRAME_SIZE: usize = size_of::<GicV2CpuInterface>();
+
 #[derive(Copy, Clone, Debug)]
 pub struct Gicv2mFrameArgs {
     pub reg: MmioRegion,
@@ -47,8 +50,18 @@ pub struct Gicv2 {
     gicd: &'static GicV2Distributor,
     gicc: &'static GicV2CpuInterface,
     virtualization_extension: Option<GicV2VirtualizationExtension>,
-    affinity_table: RawRwLock<[Option<CoreAffinity>; 8]>,
+    /// Shadow logical group bitmap used when Security Extensions are absent.
+    logical_groups: RawRwLock<[u32; 32]>,
+    affinity_table: RawRwLock<
+        [Option<(
+            CoreAffinity,
+            bool, /* enable_group0 */
+            bool, /* enable_group1 */
+        )>; 8],
+    >,
 }
+
+unsafe impl Sync for Gicv2 {}
 
 impl Gicv2 {
     pub fn new(
@@ -109,12 +122,14 @@ impl Gicv2 {
                 gicv: unsafe { &*(v.gicv.base as *const GicV2VirtualCpuInterface) },
                 maintenance_interrupt: v.maintenance_interrupt_id,
             }),
+            logical_groups: RawRwLock::new([0; 32]),
             affinity_table: RawRwLock::new([None; 8]),
         })
     }
 
     pub fn enable_atomic(&self) {
         self.mutex.enable_atomic();
+        self.logical_groups.enable_atomic();
         self.affinity_table.enable_atomic();
     }
 
@@ -130,7 +145,7 @@ impl Gicv2 {
         let table = self.affinity_table.read();
         let cpu_if = table
             .iter()
-            .position(|x| x.is_some_and(|a| a == affinity))
+            .position(|x| x.is_some_and(|a| a.0 == affinity))
             .ok_or(GicError::UnsupportedAffinity)?;
         Ok(cpu_if as u8)
     }
@@ -142,47 +157,91 @@ impl Gicv2 {
         }
         let table = self.affinity_table.read();
         let affinity = table[cpu_if as usize].ok_or(GicError::InvalidCpuId)?;
-        Ok(affinity)
+        Ok(affinity.0)
     }
 
     #[inline]
-    fn cpu_id_from_itargetsr0_7(&self, value: u8) -> Result<u8, GicError> {
-        // read GICD_TYPER to determine number of CPU interfaces
+    fn get_enable_group_from_affinity(
+        &self,
+        affinity: CoreAffinity,
+    ) -> Result<(bool, bool), GicError> {
+        let table = self.affinity_table.read();
+        let cpu_if = table
+            .iter()
+            .position(|x| x.is_some_and(|a| a.0 == affinity))
+            .ok_or(GicError::UnsupportedAffinity)?;
+        let entry = table[cpu_if].ok_or(GicError::InvalidCpuId)?;
+        Ok((entry.1, entry.2))
+    }
+
+    #[inline]
+    fn cpu_if_and_targets_mask_from_itargetsr0_7(&self, value: u8) -> Result<u8, GicError> {
         let ncpu = self.gicd.typer.read().get(GICD_TYPER::cpu_number) as u8 + 1;
 
         // ITARGETSR0-7 are banked/RO; treat returned value as one-hot mask.
         // On UP systems, these registers can be RAZ/WI and read back as 0.
-        if value == 0 {
-            if ncpu == 1 {
-                return Ok(0);
-            }
-            return Err(GicError::InvalidCpuId);
+        if ncpu == 1 {
+            return Ok(0);
         }
 
         // Require one-hot encoding (a single bit set).
-        if (value & (value - 1)) != 0 {
+        if value == 0 || (value & (value - 1)) != 0 {
             return Err(GicError::InvalidCpuId);
         }
 
-        let cpu_id = value.trailing_zeros() as u8;
-        // Reject out-of-range values and values beyond implemented CPU interfaces.
-        if cpu_id >= ncpu {
+        let cpu_if = value.trailing_zeros() as u8;
+        if cpu_if >= ncpu {
             return Err(GicError::InvalidCpuId);
         }
-        Ok(cpu_id)
+
+        Ok(cpu_if)
     }
 
     #[inline]
-    fn cpu_targets_mask_from_cpu_id(cpu_id: u8) -> Result<u8, GicError> {
-        if cpu_id >= 8 {
-            return Err(GicError::InvalidCpuId);
-        }
-        Ok(1u8 << cpu_id)
+    fn cpu_targets_mask_from_affinity(&self, affinity: CoreAffinity) -> Result<u8, GicError> {
+        let cpu_if = self.cpu_id_from_affinity(affinity)?;
+        Ok(1 << cpu_if)
     }
 
     #[inline]
     fn is_security_extension_implemented(&self) -> bool {
         self.security_extension_implemented
+    }
+
+    fn set_shadow_group(&self, intid: u32, group: crate::IrqGroup) -> Result<(), GicError> {
+        if intid >= self.max_intid() {
+            return Err(GicError::UnsupportedIntId);
+        }
+        let word = (intid / 32) as usize;
+        let bit = 1u32 << (intid % 32);
+        let mut bitmap = self.logical_groups.write();
+        match group {
+            crate::IrqGroup::Group0 => bitmap[word] &= !bit,
+            crate::IrqGroup::Group1 => bitmap[word] |= bit,
+        }
+        Ok(())
+    }
+
+    fn shadow_group(&self, intid: u32) -> Result<crate::IrqGroup, GicError> {
+        if intid >= self.max_intid() {
+            return Err(GicError::UnsupportedIntId);
+        }
+        let word = (intid / 32) as usize;
+        let bit = 1u32 << (intid % 32);
+        let bitmap = self.logical_groups.read();
+        let is_group1 = (bitmap[word] & bit) != 0;
+        Ok(if is_group1 {
+            crate::IrqGroup::Group1
+        } else {
+            crate::IrqGroup::Group0
+        })
+    }
+
+    fn reset_shadow_groups(&self) {
+        let mut bitmap = self.logical_groups.write();
+        for word in bitmap.iter_mut() {
+            *word = 0;
+        }
     }
 
     #[inline]
