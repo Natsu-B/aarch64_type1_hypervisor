@@ -10,6 +10,7 @@ pub use dtb_parser::DtbGenerator;
 pub use dtb_parser::DtbParser;
 
 pub mod ast;
+pub mod overlay;
 
 pub use ast::DeviceTree;
 pub use ast::DeviceTreeEditExt;
@@ -22,6 +23,9 @@ pub use ast::NodeEditExt;
 pub use ast::NodeId;
 pub use ast::NodeQueryExt;
 pub use ast::ValueRef;
+pub use overlay::OverlayApplyOptions;
+pub use overlay::OverlayApplyReport;
+pub use overlay::OverlayError;
 
 pub(crate) mod dtb_parser {
     use super::*;
