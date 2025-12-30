@@ -101,6 +101,9 @@ impl GicCpuInterface for Gicv2 {
             (true, true)
         };
 
+        cpu::dsb_sy();
+        cpu::isb();
+
         Ok(GicCpuCaps {
             priority_bits: priority.count_ones() as u8,
             binary_points_min: binary_point as u8,
