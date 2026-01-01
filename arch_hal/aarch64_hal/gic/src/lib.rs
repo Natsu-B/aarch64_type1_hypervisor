@@ -17,6 +17,8 @@ pub mod gicv2;
 /// GICv3 implementation (Distributor/Redistributor; CPU interface via system registers; optional ITS/MSI).
 pub mod gicv3;
 
+extern crate alloc;
+
 use cpu::CoreAffinity;
 
 /// An MMIO region describing a device register frame.
@@ -67,6 +69,16 @@ pub enum GicError {
     /// Current security state/configuration (Secure vs Non-secure, GIC security settings)
     /// makes the operation architecturally inaccessible (e.g. Secure-only register, NS RAZ/WI).
     InvalidSecurityState,
+    /// The provided VCPU identifier is invalid.
+    InvalidVcpuId,
+    /// The provided LR index is invalid.
+    InvalidLrIndex,
+    /// The access size is invalid for the requested operation.
+    InvalidAccessSize,
+    /// The provided offset is invalid for the requested operation.
+    InvalidOffset,
+    /// Attempted write to a read-only register.
+    ReadOnlyRegister,
 }
 
 /// Decoded acknowledgement token returned by `acknowledge()`.
@@ -307,7 +319,7 @@ pub trait GicDistributor {
     ///
     /// Implementations may temporarily disable the interrupt while reprogramming attributes.
     /// In particular, changing a programmable `Int_config` field without disabling the interrupt
-    /// first is UNPREDICTABLE on GICv2. :contentReference[oaicite:2]{index=2}
+    /// first is UNPREDICTABLE on GICv2.
     ///
     /// `enable` specifies the *final* enable state:
     /// - `Keep`    : restore the entry state (even if temporarily disabled internally).
@@ -384,6 +396,8 @@ pub struct VirtualInterrupt {
     pub vintid: u32,
     /// Optional physical interrupt ID for hardware-backed injection.
     pub pintid: Option<u32>,
+    /// Whether guest deactivation should raise an EOI maintenance interrupt (HW=0 only).
+    pub eoi_maintenance: bool,
     /// Virtual priority.
     pub priority: u8,
     /// Virtual interrupt group.
@@ -392,6 +406,7 @@ pub struct VirtualInterrupt {
     pub state: IrqState,
     /// Whether this entry represents a hardware-backed interrupt (backend-specific meaning).
     pub hw: bool,
+    pub source: Option<VcpuId>,
 }
 
 /// Version-independent maintenance reasons encoded as a bitset.
@@ -406,64 +421,471 @@ pub struct VirtualInterrupt {
 pub struct MaintenanceReasons(pub u32);
 
 impl MaintenanceReasons {
-    /// No maintenance reason.
     pub const NONE: Self = Self(0);
 
-    pub const UNDERFLOW: u32 = 1 << 0;
-    pub const LR_ENTRY_NOT_PRESENT: u32 = 1 << 1;
-    pub const NO_PENDING: u32 = 1 << 2;
-    pub const EOI_COUNT_ZERO: u32 = 1 << 3;
-    pub const VGRP0_DISABLED: u32 = 1 << 4;
-    pub const VGRP1_DISABLED: u32 = 1 << 5;
-    pub const VGRP0_ERROR: u32 = 1 << 6;
-    pub const VGRP1_ERROR: u32 = 1 << 7;
+    // Bits match GICv2 GICH_MISR and GICv3 ICH_MISR_EL2.
+    pub const EOI: u32 = 1 << 0;
+    pub const UNDERFLOW: u32 = 1 << 1;
+    pub const LR_ENTRY_NOT_PRESENT: u32 = 1 << 2; // LRENP
+    pub const NO_PENDING: u32 = 1 << 3; // NP
+    pub const VGRP0_ENABLED: u32 = 1 << 4; // VGrp0E
+    pub const VGRP0_DISABLED: u32 = 1 << 5; // VGrp0D
+    pub const VGRP1_ENABLED: u32 = 1 << 6; // VGrp1E
+    pub const VGRP1_DISABLED: u32 = 1 << 7; // VGrp1D
+
+    pub const SUPPORTED: u32 = Self::EOI
+        | Self::UNDERFLOW
+        | Self::LR_ENTRY_NOT_PRESENT
+        | Self::NO_PENDING
+        | Self::VGRP0_ENABLED
+        | Self::VGRP0_DISABLED
+        | Self::VGRP1_ENABLED
+        | Self::VGRP1_DISABLED;
 
     #[inline]
-    pub const fn is_empty(self) -> bool {
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
         self.0 == 0
     }
 
     #[inline]
-    pub const fn contains(self, bit: u32) -> bool {
-        (self.0 & bit) != 0
+    pub fn contains(self, bits: u32) -> bool {
+        (self.0 & bits) == bits
     }
 }
 
-/// vGIC interface (EL2-only).
+/// Work requested by vGIC software model after a state update.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VgicWork {
+    /// Caller should attempt to refill LRs for affected vCPU(s) when possible.
+    pub refill: bool,
+    /// Caller should request a "kick" (IPI/resched) for affected vCPU(s) that may be running.
+    pub kick: bool,
+}
+
+impl VgicWork {
+    pub const NONE: Self = Self {
+        refill: false,
+        kick: false,
+    };
+    pub const REFILL: Self = Self {
+        refill: true,
+        kick: false,
+    };
+    pub const REFILL_KICK: Self = Self {
+        refill: true,
+        kick: true,
+    };
+}
+
+/// Guest-visible CPU identity within a VM.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VcpuId(pub u16);
+
+/// Physical interrupt identifier on the host GIC.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PIntId(pub u32);
+
+/// Virtual interrupt identifier as seen by the guest.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VIntId(pub u32);
+
+/// Edge/level semantics for injection bookkeeping (esp. mapped pIRQs).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IrqSense {
+    Edge,
+    Level,
+}
+
+/// Host-side vGIC HW backend (GICv2: GICH_* / GICv3: ICH_*).
 ///
-/// This is intentionally separated from the OS-visible traits:
-/// - OS code should only depend on `GicCpuInterface`/`GicDistributor`/`GicSgi`.
-/// - hypervisor code can additionally depend on `GicVgic`.
-///
-/// Implementations must provide a `SavedState` that contains all state necessary for vCPU
-/// context switching (e.g. list registers, control/VMCR state, and any priority state).
-pub trait GicVgic {
-    /// Backend-defined saved vGIC state used for vCPU context switching.
-    ///
-    /// Implementations should keep this as a compact, copy-friendly representation (often arrays
-    /// of raw LR values plus a small set of control registers).
+/// This is *per-PE* hardware state and must be context-switched per vCPU.
+pub trait VgicHw {
+    /// Backend-defined saved state for a vCPU (LRs + VMCR/APR/etc).
     type SavedState;
 
-    /// Initialize virtualization support (enable vGIC interface, configure maintenance IRQ sources, etc.).
-    fn vgic_init(&self) -> Result<(), GicError>;
+    /// Enable/initialize the HW virtualization interface on this PE (EL2).
+    fn hw_init(&self) -> Result<(), GicError>;
 
-    /// Number of implemented list registers (LRs) used for virtual interrupt injection.
-    fn num_list_registers(&self) -> Result<usize, GicError>;
+    /// Enable or disable the virtualization interface for the current vCPU context.
+    fn set_enabled(&self, enabled: bool) -> Result<(), GicError>;
 
-    /// Read a virtual list register entry and decode it into `VirtualInterrupt`.
+    /// Toggle Underflow maintenance interrupt (UIE).
+    fn set_underflow_irq(&self, enable: bool) -> Result<(), GicError>;
+
+    /// Implemented LR count on this PE.
+    fn num_lrs(&self) -> Result<usize, GicError>;
+
+    /// Bitmap of empty LRs (bit i == 1 => LR[i] is empty).
+    fn empty_lr_bitmap(&self) -> Result<u64, GicError>;
+
+    /// Bitmap of LRs that caused an EOI maintenance event (bit i == 1).
+    fn eoi_lr_bitmap(&self) -> Result<u64, GicError>;
+
+    /// Read/Write an LR decoded as a version-independent descriptor.
     fn read_lr(&self, index: usize) -> Result<VirtualInterrupt, GicError>;
-
-    /// Encode `VirtualInterrupt` into a list register entry and write it to the given LR index.
     fn write_lr(&self, index: usize, irq: VirtualInterrupt) -> Result<(), GicError>;
 
-    /// Read and decode maintenance reasons (a snapshot bitset).
-    ///
-    /// Callers typically use this to drive refill of LRs or error handling on maintenance IRQ.
+    /// Read and clear EOICount (LRENP accounting).
+    fn take_eoi_count(&self) -> Result<u8, GicError>;
+
+    /// Accessor for APR (active priority register).
+    fn read_apr(&self) -> Result<u32, GicError>;
+    fn write_apr(&self, value: u32) -> Result<(), GicError>;
+
+    /// Snapshot maintenance reasons (MISR / ICH_MISR_EL2).
     fn maintenance_reasons(&self) -> Result<MaintenanceReasons, GicError>;
 
-    /// Save backend-specific vGIC state for a vCPU switch-out.
+    /// Save/restore HW state for vCPU context switching on this PE.
     fn save_state(&self) -> Result<Self::SavedState, GicError>;
-
-    /// Restore backend-specific vGIC state for a vCPU switch-in.
     fn restore_state(&self, state: &Self::SavedState) -> Result<(), GicError>;
+}
+
+/// Dense vCPU bitmask: bit i => vCPU i.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VcpuMask(pub u16);
+
+impl VcpuMask {
+    pub const EMPTY: Self = Self(0);
+    pub const fn contains(self, id: VcpuId) -> bool {
+        (self.0 & (1u16 << id.0)) != 0
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Where an IRQ's state lives (GICv2 banked vs GICv3 redistributor).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VgicIrqScope {
+    /// Per-vCPU local IRQ state (SGI/PPI).
+    Local(VcpuId),
+    /// VM-global IRQ state (SPI).
+    Global,
+}
+
+/// More precise targeting for update aggregation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VgicTargets {
+    One(VcpuId),
+    Mask(VcpuMask),
+    All,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VgicUpdate {
+    None,
+    Some {
+        targets: VgicTargets,
+        work: VgicWork,
+    },
+}
+impl VgicUpdate {
+    fn combine(&mut self, other: &VgicUpdate) {
+        *self = match (*self, *other) {
+            (VgicUpdate::None, u) | (u, VgicUpdate::None) => u,
+
+            (
+                VgicUpdate::Some {
+                    targets: t1,
+                    work: w1,
+                },
+                VgicUpdate::Some {
+                    targets: t2,
+                    work: w2,
+                },
+            ) => {
+                let combined_targets = match (t1, t2) {
+                    (VgicTargets::All, _) | (_, VgicTargets::All) => VgicTargets::All,
+
+                    (VgicTargets::Mask(m1), VgicTargets::Mask(m2)) => {
+                        VgicTargets::Mask(VcpuMask(m1.0 | m2.0))
+                    }
+
+                    (VgicTargets::Mask(m), VgicTargets::One(id))
+                    | (VgicTargets::One(id), VgicTargets::Mask(m)) => {
+                        VgicTargets::Mask(VcpuMask(m.0 | (1u16 << id.0)))
+                    }
+
+                    (VgicTargets::One(id1), VgicTargets::One(id2)) if id1 == id2 => {
+                        VgicTargets::One(id1)
+                    }
+
+                    (VgicTargets::One(id1), VgicTargets::One(id2)) => {
+                        VgicTargets::Mask(VcpuMask((1 << id1.0) | (1 << id2.0)))
+                    }
+                };
+
+                let combined_work = VgicWork {
+                    refill: w1.refill || w2.refill,
+                    kick: w1.kick || w2.kick,
+                };
+
+                VgicUpdate::Some {
+                    targets: combined_targets,
+                    work: combined_work,
+                }
+            }
+        };
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VSpiRouting {
+    Targets(u8),
+    Specific(CoreAffinity),
+    AnyParticipating,
+}
+
+/// VM identity helpers shared by vGIC traits.
+pub trait VgicVmInfo {
+    type VcpuModel: VgicVcpuModel;
+
+    fn vcpu_count(&self) -> u16;
+    fn vcpu(&self, id: VcpuId) -> Result<&Self::VcpuModel, GicError>;
+}
+
+/// Guest-visible virtual register file (Distributor/Redistributor) backed by a VM model.
+pub trait VgicGuestRegs: VgicVmInfo {
+    fn set_dist_enable(
+        &mut self,
+        enable_grp0: bool,
+        enable_grp1: bool,
+    ) -> Result<VgicUpdate, GicError>;
+    fn dist_enable(&self) -> Result<(bool, bool), GicError>;
+
+    fn set_group(
+        &mut self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+        group: IrqGroup,
+    ) -> Result<VgicUpdate, GicError>;
+    fn set_priority(
+        &mut self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+        priority: u8,
+    ) -> Result<VgicUpdate, GicError>;
+    fn set_trigger(
+        &mut self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+        trigger: TriggerMode,
+    ) -> Result<VgicUpdate, GicError>;
+    fn set_enable(
+        &mut self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+        enable: bool,
+    ) -> Result<VgicUpdate, GicError>;
+    fn set_pending(
+        &mut self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+        pending: bool,
+    ) -> Result<VgicUpdate, GicError>;
+    fn set_active(
+        &mut self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+        active: bool,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn read_group_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_group_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        value: u32,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn read_enable_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_set_enable_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        set_bits: u32,
+    ) -> Result<VgicUpdate, GicError>;
+    fn write_clear_enable_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        clear_bits: u32,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn read_pending_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_set_pending_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        set_bits: u32,
+    ) -> Result<VgicUpdate, GicError>;
+    fn write_clear_pending_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        clear_bits: u32,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn read_active_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_set_active_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        set_bits: u32,
+    ) -> Result<VgicUpdate, GicError>;
+    fn write_clear_active_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        clear_bits: u32,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn read_priority_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_priority_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        value: u32,
+    ) -> Result<VgicUpdate, GicError>;
+    fn read_trigger_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_trigger_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        value: u32,
+    ) -> Result<VgicUpdate, GicError>;
+    fn read_nsacr_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    fn write_nsacr_word(
+        &mut self,
+        scope: VgicIrqScope,
+        base: VIntId,
+        value: u32,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn set_spi_route(
+        &mut self,
+        vintid: VIntId,
+        targets: VSpiRouting,
+    ) -> Result<VgicUpdate, GicError>;
+    fn get_spi_route(&self, vintid: VIntId) -> Result<VSpiRouting, GicError>;
+}
+
+/// SGI pending source register helpers (CPENDSGIR/SPENDSGIR/SGIR).
+pub trait VgicSgiRegs: VgicVmInfo {
+    fn read_sgi_pending_sources_word(&self, target: VcpuId, sgi: u8) -> Result<u32, GicError>;
+    fn write_set_sgi_pending_sources_word(
+        &mut self,
+        target: VcpuId,
+        sgi: u8,
+        sources: u32,
+    ) -> Result<VgicUpdate, GicError>;
+    fn write_clear_sgi_pending_sources_word(
+        &mut self,
+        target: VcpuId,
+        sgi: u8,
+        sources: u32,
+    ) -> Result<VgicUpdate, GicError>;
+
+    fn write_set_sgi_pending_sources(
+        &mut self,
+        target: VcpuId,
+        sgi: u8,
+        sources: VcpuMask,
+    ) -> Result<VgicUpdate, GicError> {
+        self.write_set_sgi_pending_sources_word(target, sgi, sources.0 as u32)
+    }
+
+    fn write_clear_sgi_pending_sources(
+        &mut self,
+        target: VcpuId,
+        sgi: u8,
+        sources: VcpuMask,
+    ) -> Result<VgicUpdate, GicError> {
+        self.write_clear_sgi_pending_sources_word(target, sgi, sources.0 as u32)
+    }
+
+    fn inject_sgi(
+        &mut self,
+        sender: VcpuId,
+        targets: VcpuMask,
+        sgi: u8,
+    ) -> Result<VgicUpdate, GicError> {
+        if sender.0 >= 16 {
+            return Err(GicError::InvalidVcpuId);
+        }
+        if targets.is_empty() {
+            return Ok(VgicUpdate::None);
+        }
+
+        let mut update = VgicUpdate::None;
+        for bit in 0..16 {
+            if (targets.0 & (1 << bit)) == 0 {
+                continue;
+            }
+            let target = VcpuId(bit);
+            let res = self.write_set_sgi_pending_sources_word(target, sgi, 1u32 << sender.0)?;
+            update.combine(&res);
+        }
+        Ok(update)
+    }
+}
+
+/// Host-side physical IRQ mapping and ingress hooks.
+pub trait VgicPirqModel: VgicVmInfo {
+    fn map_pirq(
+        &mut self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        sense: IrqSense,
+        group: IrqGroup,
+        priority: u8,
+    ) -> Result<VgicUpdate, GicError>;
+    fn unmap_pirq(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError>;
+    fn on_physical_irq(&mut self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError>;
+}
+
+/// VM logical state model marker (version-independent core).
+///
+/// Implementers should provide:
+/// - `VgicGuestRegs` for guest-visible register emulation (groups/enables/pending/priority/routing).
+/// - `VgicSgiRegs` for SGI pending-source helpers and SGIR injection.
+/// - `VgicPirqModel` for host-side pIRQ mapping and physical interrupt ingress.
+pub trait VgicVmModel: VgicGuestRegs + VgicSgiRegs + VgicPirqModel {}
+
+impl<T> VgicVmModel for T where T: VgicGuestRegs + VgicSgiRegs + VgicPirqModel {}
+
+/// Per-vCPU model API: LR refill policy + kick decision.
+///
+/// This API never touches guest-facing MMIO/sysregs directly.
+/// It only decides "what to put into HW LRs" and "whether we must kick a running vCPU".
+pub trait VgicVcpuModel {
+    /// Refill HW LRs from the software model for this vCPU.
+    ///
+    /// Returns `true` if the caller should request a "kick" (IPI) because the vCPU
+    /// is currently running elsewhere and needs to exit to EL2 for refill.
+    fn refill_lrs<H: VgicHw>(&self, hw: &H) -> Result<bool, GicError>;
+
+    /// Handle a maintenance interrupt for this vCPU on this PE.
+    ///
+    /// Typical actions:
+    /// - Read MISR reasons
+    /// - Drain completed EOIs / update software state
+    /// - Refill LRs on UNDERFLOW
+    fn handle_maintenance<H: VgicHw>(
+        &self,
+        hw: &H,
+        on_pirq_eoi: &mut impl FnMut(PIntId),
+        on_pirq_deactivate: &mut impl FnMut(PIntId),
+        on_pirq_resample: &mut impl FnMut(PIntId),
+    ) -> Result<VgicUpdate, GicError>;
+
+    /// Switch in this vCPU's HW state on this PE.
+    fn switch_out_sync<H: VgicHw>(&self, hw: &H) -> Result<(), GicError>;
 }
