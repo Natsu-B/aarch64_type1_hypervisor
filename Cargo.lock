@@ -21,6 +21,14 @@ name = "aarch64_test"
 version = "0.1.0"
 
 [[package]]
+name = "aarch64_unit_test"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "print",
+]
+
+[[package]]
 name = "allocator"
 version = "0.1.0"
 dependencies = [
@@ -95,6 +103,8 @@ dependencies = [
 name = "exceptions"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
+ "aarch64_unit_test",
  "cpu",
  "print",
  "psci",

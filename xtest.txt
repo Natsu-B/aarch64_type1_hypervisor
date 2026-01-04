@@ -1,7 +1,10 @@
 # Test plan for cargo xtask xtest
-# Format:
-#   std    <package>
-#   uboot  <package> <testname> <testscript>
+# Format (extra cargo args allowed after required fields):
+#   std         <package> [extra...]                    # host: cargo test (lib + integration)
+#   unit        <package> [extra...]                    # host: cargo test --lib (lib-only)
+#   uboot-unit  <package> <testscript> [extra...]       # bare-metal lib tests with custom runner
+#   uefi        <package> <testname> <testscript> [extra...]
+#   uboot       <package> <testname> <testscript> [extra...]
 
 std allocator
 std dtb

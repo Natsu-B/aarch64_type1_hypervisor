@@ -817,6 +817,7 @@ fn test(args: &[String]) {
     let plan = std::fs::read_to_string(&plan_path).ok();
 
     let mut std_crates: Vec<(String, Vec<String>)> = Vec::new();
+    let mut unit_crates: Vec<(String, Vec<String>)> = Vec::new();
     let mut uefi_tests: Vec<(String, String, String, Vec<String>)> = Vec::new();
     let mut uboot_tests: Vec<(String, String, String, Vec<String>)> = Vec::new();
 
@@ -830,16 +831,26 @@ fn test(args: &[String]) {
         match parts.next() {
             Some("std") => {
                 if let Some(pkg) = parts.next() {
-                    std_crates.push((pkg.to_string(), Vec::new()));
+                    let extra: Vec<String> = parts.map(|s| s.to_string()).collect();
+                    std_crates.push((pkg.to_string(), extra));
                 } else {
                     eprintln!("xtest.txt:{}: missing package after 'std'", lineno + 1);
+                }
+            }
+            Some("unit") => {
+                if let Some(pkg) = parts.next() {
+                    let extra: Vec<String> = parts.map(|s| s.to_string()).collect();
+                    unit_crates.push((pkg.to_string(), extra));
+                } else {
+                    eprintln!("xtest.txt:{}: missing package after 'unit'", lineno + 1);
                 }
             }
             Some("uefi") => {
                 let (pkg, testname, testscript) = (parts.next(), parts.next(), parts.next());
                 match (pkg, testname, testscript) {
                     (Some(p), Some(t), Some(s)) => {
-                        uefi_tests.push((p.to_string(), t.to_string(), s.to_string(), Vec::new()))
+                        let extra: Vec<String> = parts.map(|s| s.to_string()).collect();
+                        uefi_tests.push((p.to_string(), t.to_string(), s.to_string(), extra))
                     }
                     _ => eprintln!(
                         "xtest.txt:{}: expected: uefi <package> <testname> <testscript>",
@@ -851,17 +862,31 @@ fn test(args: &[String]) {
                 let (pkg, testname, testscript) = (parts.next(), parts.next(), parts.next());
                 match (pkg, testname, testscript) {
                     (Some(p), Some(t), Some(s)) => {
-                        uboot_tests.push((p.to_string(), t.to_string(), s.to_string(), Vec::new()))
+                        let extra: Vec<String> = parts.map(|s| s.to_string()).collect();
+                        uboot_tests.push((p.to_string(), t.to_string(), s.to_string(), extra))
                     }
                     _ => eprintln!(
-                        "xtest.txt:{}: expected: uboot <package> <testname> <testscript>",
+                        "xtest.txt:{}: expected: uboot <package> <testname> <testscript> [extra...]",
+                        lineno + 1
+                    ),
+                }
+            }
+            Some("uboot-unit") | Some("u-boot-unit") | Some("uboot_unit") | Some("u_boot_unit") => {
+                let (pkg, testscript) = (parts.next(), parts.next());
+                match (pkg, testscript) {
+                    (Some(p), Some(s)) => {
+                        let extra: Vec<String> = parts.map(|s| s.to_string()).collect();
+                        uboot_tests.push((p.to_string(), String::new(), s.to_string(), extra))
+                    }
+                    _ => eprintln!(
+                        "xtest.txt:{}: expected: uboot-unit <package> <testscript> [extra...]",
                         lineno + 1
                     ),
                 }
             }
             Some(other) => {
                 eprintln!(
-                    "xtest.txt:{}: unknown kind '{}'; expected 'std', 'uefi', or 'uboot'",
+                    "xtest.txt:{}: unknown kind '{}'; expected 'std', 'unit', 'uefi', 'uboot', or 'uboot-unit'",
                     lineno + 1,
                     other
                 );
@@ -983,10 +1008,15 @@ fn test(args: &[String]) {
 
     if !package_filters.is_empty() {
         std_crates.retain(|(pkg, _)| package_filters.contains(pkg));
+        unit_crates.retain(|(pkg, _)| package_filters.contains(pkg));
         uefi_tests.retain(|(pkg, _, _, _)| package_filters.contains(pkg));
         uboot_tests.retain(|(pkg, _, _, _)| package_filters.contains(pkg));
 
-        if std_crates.is_empty() && uefi_tests.is_empty() && uboot_tests.is_empty() {
+        if std_crates.is_empty()
+            && unit_crates.is_empty()
+            && uefi_tests.is_empty()
+            && uboot_tests.is_empty()
+        {
             eprintln!(
                 "No entries in xtest.txt match specified packages: {:?}",
                 package_filters
@@ -995,9 +1025,10 @@ fn test(args: &[String]) {
         }
 
         eprintln!(
-            "Filtered test plan to packages: {:?} ({} std, {} uefi, {} uboot)",
+            "Filtered test plan to packages: {:?} ({} std, {} unit, {} uefi, {} uboot/uboot-unit)",
             package_filters,
             std_crates.len(),
+            unit_crates.len(),
             uefi_tests.len(),
             uboot_tests.len()
         );
@@ -1052,6 +1083,52 @@ fn test(args: &[String]) {
             let code = status.code().unwrap_or(1);
             eprintln!("Error: Tests failed for package: {} (code {})", pkg, code);
             failed.push((format!("std:{}", pkg), code));
+        }
+    }
+
+    // Run host unit tests explicitly (lib-only) with 30s timeout if available.
+    for (pkg, extra) in unit_crates {
+        eprintln!("\n--- Running host unit tests for: {} ---", pkg);
+        let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
+            let mut c = Command::new(prefix.remove(0));
+            for p in prefix {
+                c.arg(p);
+            }
+            c.arg("cargo");
+            c.arg("test");
+            c
+        } else {
+            let mut c = Command::new("cargo");
+            c.arg("test");
+            c
+        };
+
+        cmd.arg("--target")
+            .arg(&host_tuple)
+            .arg("-p")
+            .arg(&pkg)
+            .arg("--lib")
+            .args(&extra)
+            .args(&test_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        eprintln!("Running: {:?}", cmd);
+        let status = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
+            .wait()
+            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e));
+        if status.success() {
+            passed.push(format!("unit:{}", pkg));
+        } else {
+            let code = status.code().unwrap_or(1);
+            eprintln!(
+                "Error: Unit tests failed for package: {} (code {})",
+                pkg, code
+            );
+            failed.push((format!("unit:{}", pkg), code));
         }
     }
 
@@ -1137,10 +1214,14 @@ fn test(args: &[String]) {
             .expect("test linker path contains invalid UTF-8")
             .to_string();
 
-        let label = format!("uboot:{}::{}", pkg, testname);
+        let label = if testname.is_empty() {
+            format!("uboot-unit:{}", pkg)
+        } else {
+            format!("uboot:{}::{}", pkg, testname)
+        };
         eprintln!(
-            "\n--- Running U-Boot test for: {}::{}, runner: {} ---",
-            pkg, testname, runner
+            "\n--- Running U-Boot test for: {} (runner: {}) ---",
+            label, runner
         );
 
         let mut cmd = Command::new("cargo");
@@ -1171,10 +1252,15 @@ fn test(args: &[String]) {
             .arg("--target")
             .arg("aarch64-unknown-none-softfloat")
             .arg("-p")
-            .arg(&pkg)
-            .arg("--test")
-            .arg(&testname)
-            .args(&extra)
+            .arg(&pkg);
+
+        if !testname.is_empty() {
+            cmd.arg("--test").arg(&testname);
+        } else {
+            cmd.arg("--lib");
+        }
+
+        cmd.args(&extra)
             .args(&test_args)
             .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
             .env("RUSTFLAGS", rustflags)
@@ -1213,7 +1299,7 @@ fn test(args: &[String]) {
         }
         std::process::exit(1);
     } else {
-        eprintln!("All tests passed (host + UEFI + U-Boot)");
+        eprintln!("All tests passed (host std + host unit + UEFI + U-Boot)");
     }
 }
 

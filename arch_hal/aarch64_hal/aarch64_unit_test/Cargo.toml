@@ -1,0 +1,8 @@
+[package]
+name = "aarch64_unit_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aarch64_test = { path = "../aarch64_test" }
+print = { path = "../print" }
