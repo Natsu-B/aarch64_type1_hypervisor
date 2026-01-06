@@ -84,12 +84,13 @@ bitregs! {
     pub(crate) struct GICD_SGIR: u32 {
         pub(crate) sgi_int_id@[3:0],
         reserved@[14:4] [ignore],
-        pub(crate) ns_att@[15:14],
+        pub(crate) ns_att@[15:15],
         pub(crate) cpu_target_list@[23:16],
         pub(crate) target_list_filter@[25:24] as TargetListFilter {
             CpuTargetListFieldSpecified = 0b00,
             InterruptAllCpuExceptRequestedCpu = 0b01,
-            InterruptAllCpu = 0b10,
+            // 0b10 targets only the requesting CPU interface (self).
+            InterruptSelfOnly = 0b10,
         },
         reserved@[31:26] [ignore],
     }
@@ -265,6 +266,138 @@ bitregs! {
     }
 }
 
+bitregs! {
+    /// Virtualization Type Register, GICH_VTR (ARM IHI 0048B Table 5-3).
+    pub(crate) struct GICH_VTR: u32 {
+        // ListRegs[5:0] (number of implemented List registers is ListRegs + 1).
+        pub(crate) list_regs@[5:0],
+        reserved@[22:6] [res0],
+
+        // Pribits[24:23] (actual number of priority bits is Pribits + 1).
+        pub(crate) pribits@[24:23],
+        reserved@[25:25] [res0],
+
+        // PreBits[28:26] (actual number of preemption bits is PreBits + 1).
+        pub(crate) prebits@[28:26],
+        reserved@[31:29] [res0],
+    }
+}
+
+bitregs! {
+    /// Virtual Machine Control Register, GICH_VMCR (ARM IHI 0048B Table 5-4).
+    pub(crate) struct GICH_VMCR: u32 {
+        // VMGrp0En[0]
+        pub(crate) vm_grp0_en@[0:0],
+        // VMGrp1En[1]
+        pub(crate) vm_grp1_en@[1:1],
+        // AckCtl[2]
+        pub(crate) ack_ctl@[2:2],
+        // FIQEn[3]
+        pub(crate) fiq_en@[3:3],
+        // CBPR[4]
+        pub(crate) cbpr@[4:4],
+        reserved@[8:5] [res0],
+        // EOImode[9]
+        pub(crate) eoi_mode@[9:9],
+        reserved@[17:10] [res0],
+        // BPR[20:18]
+        pub(crate) bpr@[20:18],
+        // ABPR[23:21]
+        pub(crate) abpr@[23:21],
+        reserved@[31:24] [res0],
+    }
+}
+
+bitregs! {
+    /// Maintenance Interrupt Status Register, GICH_MISR (ARM IHI 0048B Table 5-5).
+    pub(crate) struct GICH_MISR: u32 {
+        // EOI[0]
+        pub(crate) eoi@[0:0],
+        // U[1]
+        pub(crate) u@[1:1],
+        // LRENP[2]
+        pub(crate) lrenp@[2:2],
+        // NP[3]
+        pub(crate) np@[3:3],
+        // VGrp0E[4]
+        pub(crate) vgrp0e@[4:4],
+        // VGrp0D[5]
+        pub(crate) vgrp0d@[5:5],
+        // VGrp1E[6]
+        pub(crate) vgrp1e@[6:6],
+        // VGrp1D[7]
+        pub(crate) vgrp1d@[7:7],
+        reserved@[31:8] [res0],
+    }
+}
+
+bitregs! {
+    /// End of Interrupt Status Register, GICH_EISR0/1 (ARM IHI 0048B Table 5-6).
+    pub(crate) struct GICH_EISR: u32 {
+        // EOI status bits [31:0]
+        pub(crate) eoi_status@[31:0],
+    }
+}
+
+bitregs! {
+    /// Empty List Register Status Register, GICH_ELRSR0/1 (ARM IHI 0048B Table 5-7).
+    pub(crate) struct GICH_ELRSR: u32 {
+        // List register status bits [31:0]
+        pub(crate) lr_status@[31:0],
+    }
+}
+
+bitregs! {
+    /// Active Priorities Register, GICH_APR (ARM IHI 0048B Table 5-8).
+    pub(crate) struct GICH_APR: u32 {
+        pub(crate) active_prio@[31:0],
+    }
+}
+
+bitregs! {
+    /// List Register n, GICH_LRn (ARM IHI 0048B Table 5-9).
+    pub(crate) struct GICH_LR: u32 {
+        // Virtual interrupt ID [9:0]
+        pub(crate) virtual_id@[9:0],
+
+        // PhysID / CPUID+EOI overlay [19:10]
+        union phys@[19:10] {
+            // HW == 0 interpretation.
+            view Sw {
+                // CPUID[12:10] (source CPU for virtual SGI)
+                pub(crate) cpuid@[12:10],
+                reserved@[18:13] [res0],
+                // EOI[19]
+                pub(crate) eoi@[19:19],
+            },
+            // HW == 1 interpretation.
+            view Hw {
+                // Physical interrupt ID [19:10]
+                pub(crate) physical_id@[19:10],
+            },
+        }
+
+        reserved@[22:20] [res0],
+
+        // Priority[27:23] (uses implemented priority bits; see GICH_VTR.Pribits)
+        pub(crate) priority@[27:23],
+
+        // State[29:28]
+        pub(crate) state@[29:28] as LrState {
+            Invalid = 0b00,
+            Pending = 0b01,
+            Active = 0b10,
+            PendingAndActive = 0b11,
+        },
+
+        // Grp1[30]
+        pub(crate) grp1@[30:30],
+
+        // HW[31]
+        pub(crate) hw@[31:31],
+    }
+}
+
 /// GICv2 Distributor register frame (0x1000 bytes) per ARM IHI 0048B Table 4-1;
 /// GIC-400 TRM maps this block at 0x1000-0x1FFF in the integrated memory map.
 #[repr(C)]
@@ -371,20 +504,20 @@ pub(crate) struct GicV2VirtualInterfaceControl {
     /// Virtualization Type Register.
     ///
     /// `ListRegs` is encoded as `VTR[5:0] + 1` (number of implemented list registers).
-    pub vtr: ReadOnly<u32>, // 0x04
+    pub vtr: ReadOnly<GICH_VTR>, // 0x04
     /// VMCR alias; bundles virtual CPU view state for save/restore.
-    pub vmcr: ReadWrite<u32>, // 0x08
-    _rsvd_0c_0f: [u8; 0x04],       // 0x0C-0x0F
-    pub misr: ReadOnly<u32>,       // 0x10
-    _rsvd_14_1f: [u8; 0x0C],       // 0x14-0x1F
-    pub eisr: [ReadOnly<u32>; 2],  // 0x20-0x24
-    _rsvd_028_02f: [u8; 0x08],     // 0x028-0x02F
-    pub elrsr: [ReadOnly<u32>; 2], // 0x30-0x34
-    _rsvd_038_0ef: [u8; 0xB8],     // 0x038-0x0EF
-    pub apr: ReadWrite<u32>,       // 0x0F0
-    _rsvd_0f4_0ff: [u8; 0x0C],     // 0x0F4-0x0FF
-    pub lr: [ReadWrite<u32>; 64],  // 0x100-0x1FC
-    _rsvd_200_fff: [u8; 0xE00],    // 0x200-0xFFF
+    pub vmcr: ReadWrite<GICH_VMCR>, // 0x08
+    _rsvd_0c_0f: [u8; 0x04],              // 0x0C-0x0F
+    pub misr: ReadOnly<GICH_MISR>,        // 0x10
+    _rsvd_14_1f: [u8; 0x0C],              // 0x14-0x1F
+    pub eisr: [ReadOnly<GICH_EISR>; 2],   // 0x20-0x24
+    _rsvd_028_02f: [u8; 0x08],            // 0x028-0x02F
+    pub elrsr: [ReadOnly<GICH_ELRSR>; 2], // 0x30-0x34
+    _rsvd_038_0ef: [u8; 0xB8],            // 0x038-0x0EF
+    pub apr: ReadWrite<GICH_APR>,         // 0x0F0
+    _rsvd_0f4_0ff: [u8; 0x0C],            // 0x0F4-0x0FF
+    pub lr: [ReadWrite<GICH_LR>; 64],     // 0x100-0x1FC
+    _rsvd_200_fff: [u8; 0xE00],           // 0x200-0xFFF
 }
 
 /// GICv2 Virtual CPU interface (0x2000 bytes including DIR) per ARM IHI 0048B Table 5-10;

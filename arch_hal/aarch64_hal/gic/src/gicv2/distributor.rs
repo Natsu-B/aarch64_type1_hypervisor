@@ -79,7 +79,7 @@ impl GicSgi for Gicv2 {
             // TargetListFilter = 0b10 selects the current CPU interface only.
             SgiTarget::SelfOnly => value.set_enum(
                 GICD_SGIR::target_list_filter,
-                TargetListFilter::InterruptAllCpu,
+                TargetListFilter::InterruptSelfOnly,
             ),
         };
 
