@@ -173,7 +173,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         },
     ];
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation();
+    Stage2Paging::enable_stage2_translation(false);
     println!("paging success!!!");
     println!("setup exception");
     exceptions::setup_exception();

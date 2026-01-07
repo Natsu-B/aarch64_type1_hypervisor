@@ -72,7 +72,7 @@ fn run() -> Result<(), &'static str> {
         baseline.restore();
         "stage2 init failed"
     })?;
-    Stage2Paging::enable_stage2_translation();
+    Stage2Paging::enable_stage2_translation(false);
 
     for (ipa, expected) in ipa_points.iter().zip(expected_pas.iter()) {
         let translated = translate_stage2(*ipa)?;
