@@ -113,8 +113,8 @@ extern "C" fn main() -> ! {
     let linux_image = &raw mut _LINUX_IMAGE as *const _ as usize;
     let stack_top = &raw mut _STACK_TOP as *const _ as usize;
 
-    debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000);
-    // debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000);
+    debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000, 115200);
+    // debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000, 115200);
     cpu::isb();
     cpu::dsb_ish();
     debug_uart::write("HelloWorld!!!");
@@ -523,8 +523,9 @@ fn update_bootargs(
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
-    debug_uart.init(4800_0000, 115200);
+    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 48_000_000);
+    // let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 44_000_000);
+    debug_uart.init(115200);
     debug_uart.write("core 0 panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}

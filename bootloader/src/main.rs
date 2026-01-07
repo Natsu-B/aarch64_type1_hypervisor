@@ -90,7 +90,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let mut pl011_addr = None;
     let mut pl011_size = None;
     dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
-        debug_uart::init(addr, 48 * 1000 * 1000);
+        debug_uart::init(addr, 48 * 1000 * 1000, 115200);
         pl011_addr = Some(addr);
         pl011_size = Some(size);
         ControlFlow::Break(())
@@ -324,8 +324,8 @@ fn str_to_usize(s: &str) -> Option<usize> {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
-    debug_uart.init(4400_0000, 115200);
+    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 48_000_000);
+    debug_uart.init(115200);
     debug_uart.write("core 0 panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}

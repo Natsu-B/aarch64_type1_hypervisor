@@ -50,7 +50,7 @@ struct Case {
 }
 
 fn entry() -> ! {
-    debug_uart::init(UART_BASE, UART_CLOCK_HZ);
+    debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
 
     match run() {
         Ok(()) => {
