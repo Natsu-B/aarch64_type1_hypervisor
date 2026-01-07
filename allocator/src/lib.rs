@@ -239,6 +239,12 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// # Safety
     /// - Do not call this after `enable_atomic` has been invoked.
     /// - This function does not support atomic access and may cause a deadlock.
+    /// - Internally calls `MemoryBlock::trim_for_boot`, which allocates a `Vec`
+    ///   while the range-list allocator guard is held and can re-enter the
+    ///   global allocator.
+    /// - Only valid before `enable_atomic()` when `RawSpinLock::lock()` is a
+    ///   no-op and during single-threaded bring-up; after atomic locking is
+    ///   enabled this path can deadlock or spin indefinitely.
     pub fn trim_for_boot(&self, reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
         let mut guard = self.range_list_allocator.lock();
         let Some(block) = guard.get_mut() else {
