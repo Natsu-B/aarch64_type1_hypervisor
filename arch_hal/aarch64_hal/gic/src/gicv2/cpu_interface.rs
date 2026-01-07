@@ -294,12 +294,15 @@ impl GicCpuInterface for Gicv2 {
     }
 
     fn deactivate(&self, ack: crate::AckedIrq) -> Result<(), crate::GicError> {
+        let ctlr = self.gicc.ctlr.read();
         if self.is_security_extension_implemented() {
+            if ctlr.get(GICC_CTLR::eoi_mode_ns_non_secure) == 0 {
+                return Ok(());
+            }
             self.gicc.dir.write(GICC_DIR::from_bits(ack.raw));
             return Ok(());
         }
 
-        let ctlr = self.gicc.ctlr.read();
         let separate = match ack.group {
             IrqGroup::Group0 => ctlr.get(GICC_CTLR::eoi_mode_s) != 0,
             IrqGroup::Group1 => ctlr.get(GICC_CTLR::eoi_mode_ns) != 0,
