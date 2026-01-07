@@ -304,6 +304,9 @@ impl Pl011Uart {
 
     pub fn write(&mut self, string: &str) {
         for ch in string.bytes() {
+            if ch == b'\n' {
+                self.pushb(b'\r');
+            }
             self.pushb(ch);
         }
     }
