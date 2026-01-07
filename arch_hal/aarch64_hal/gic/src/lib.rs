@@ -289,6 +289,35 @@ pub enum EnableOp {
     Disable,
 }
 
+/// Per-PE local interrupt configuration (PPIs only).
+///
+/// This trait programs banked PPI state for the *current* processing element:
+/// - On GICv2, SGI/PPI registers are banked per CPU interface.
+/// - On GICv3, equivalent state lives in the Redistributor and is per-PE.
+///
+/// Scope and error handling:
+/// - Only INTIDs 16..31 are supported; SGIs/SPIs or out-of-range INTIDs must return
+///   `GicError::UnsupportedIntId`.
+/// - If Security Extensions are implemented, requests for `IrqGroup::Group0` must return
+///   `GicError::UnsupportedFeature` (matching the SPI security policy in this crate).
+pub trait GicPpi {
+    /// Enable or disable a PPI for the current PE.
+    fn set_ppi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError>;
+
+    /// Configure a PPI for the current PE.
+    ///
+    /// Implementations may temporarily disable the interrupt while reprogramming its attributes,
+    /// and then apply the requested final enable state.
+    fn configure_ppi(
+        &self,
+        intid: u32,
+        group: IrqGroup,
+        priority: u8,
+        trigger: TriggerMode,
+        enable: EnableOp,
+    ) -> Result<(), GicError>;
+}
+
 /// Global distributor configuration (primarily SPIs).
 ///
 /// This trait models *global* interrupt source configuration that is shared across PEs

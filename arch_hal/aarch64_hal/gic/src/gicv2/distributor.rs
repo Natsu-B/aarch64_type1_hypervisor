@@ -1,6 +1,7 @@
 use crate::EnableOp;
 use crate::GicDistributor;
 use crate::GicError;
+use crate::GicPpi;
 use crate::GicSgi;
 use crate::IrqGroup;
 use crate::SgiTarget;
@@ -36,11 +37,95 @@ impl Gicv2 {
         } else {
             0x0000_0000
         });
-        // Enable SGIs for this CPU interface; leave PPIs disabled (masked above).
+        // Enable SGIs for this CPU interface; PPIs remain disabled and should be configured via
+        // `GicPpi::configure_ppi` per-PE after CPU interface initialization.
         self.gicd.isenabler[0].write(!PPI_MASK);
 
         cpu::dsb_sy();
         cpu::isb();
+
+        Ok(())
+    }
+}
+
+impl GicPpi for Gicv2 {
+    fn set_ppi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError> {
+        if intid < 16 || intid >= 32 {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let bit = 1u32 << (intid % 32);
+        if enable {
+            self.gicd.isenabler[0].write(bit);
+        } else {
+            self.gicd.icenabler[0].write(bit);
+        }
+
+        cpu::dsb_sy();
+        cpu::isb();
+        Ok(())
+    }
+
+    fn configure_ppi(
+        &self,
+        intid: u32,
+        group: IrqGroup,
+        priority: u8,
+        trigger: TriggerMode,
+        enable: EnableOp,
+    ) -> Result<(), GicError> {
+        let security_ext = self.is_security_extension_implemented();
+
+        if intid < 16 || intid >= 32 {
+            return Err(GicError::UnsupportedIntId);
+        }
+        if security_ext && group == IrqGroup::Group0 {
+            return Err(GicError::UnsupportedFeature);
+        }
+
+        let bit = 1u32 << (intid % 32);
+        let enable_after = match enable {
+            EnableOp::Keep => (self.gicd.isenabler[0].read() >> (intid as usize % 32)) & 0b1 != 0,
+            EnableOp::Enable => true,
+            EnableOp::Disable => false,
+        };
+
+        self.gicd.icenabler[0].write(bit);
+
+        self.gicd.icpendr[0].write(bit);
+        self.gicd.icactiver[0].write(bit);
+
+        if security_ext {
+            if group == IrqGroup::Group1 {
+                let igroupr = self.gicd.igroupr[0].read();
+                self.gicd.igroupr[0].write(igroupr | bit);
+            }
+        } else {
+            self.set_shadow_group(intid, group)?;
+            let igroupr = self.gicd.igroupr[0].read() & !bit;
+            self.gicd.igroupr[0].write(igroupr);
+        }
+
+        self.gicd.ipriorityr[intid as usize / 4][intid as usize % 4].write(priority);
+
+        let reg = intid as usize / 16;
+        let shift = (intid as usize % 16) * 2;
+        self.gicd.icfgr[reg].clear_bits(0b11 << shift);
+        self.gicd.icfgr[reg].set_bits(
+            match trigger {
+                TriggerMode::Edge => 0b10,
+                TriggerMode::Level => 0b00,
+            } << shift,
+        );
+
+        cpu::dsb_sy();
+        cpu::isb();
+
+        if enable_after {
+            self.gicd.isenabler[0].write(bit);
+            cpu::dsb_sy();
+            cpu::isb();
+        }
 
         Ok(())
     }
