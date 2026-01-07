@@ -104,8 +104,11 @@ fn run() -> Result<(), &'static str> {
     .map_err(|err| map_err("gic_new", err))?;
 
     gic.enable_atomic();
-    GicDistributor::init(&gic).map_err(|err| map_err("gicd_init", err))?;
-    let caps = GicCpuInterface::init(&gic).map_err(|err| map_err("gicc_init", err))?;
+    gic.init_distributor()
+        .map_err(|err| map_err("gicd_init", err))?;
+    let caps = gic
+        .init_cpu_interface()
+        .map_err(|err| map_err("gicc_init", err))?;
     if security_extension_implemented {
         if !caps.supports_group1 {
             return Err("group1_not_supported");

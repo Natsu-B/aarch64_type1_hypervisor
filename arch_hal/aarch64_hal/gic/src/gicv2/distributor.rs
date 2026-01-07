@@ -91,7 +91,7 @@ impl GicSgi for Gicv2 {
 }
 
 impl GicDistributor for Gicv2 {
-    fn init(&self) -> Result<(), crate::GicError> {
+    fn init_distributor(&self) -> Result<(), crate::GicError> {
         // disable distributor
         let security_ext = self.is_security_extension_implemented();
         let mutex = self.mutex.lock();

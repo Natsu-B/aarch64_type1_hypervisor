@@ -20,7 +20,7 @@ use crate::gicv2::registers::GICC_IAR;
 use crate::gicv2::registers::GICC_PMR;
 
 impl GicCpuInterface for Gicv2 {
-    fn init(&self) -> Result<GicCpuCaps, GicError> {
+    fn init_cpu_interface(&self) -> Result<GicCpuCaps, GicError> {
         let security_ext = self.is_security_extension_implemented();
         // disable cpu interface
         if security_ext {

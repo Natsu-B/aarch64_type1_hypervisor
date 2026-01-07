@@ -149,7 +149,7 @@ pub enum SpiRoute {
 
 /// Capability snapshot for a per-CPU GIC interface.
 ///
-/// Returned by `GicCpuInterface::init()`.
+/// Returned by `GicCpuInterface::init_cpu_interface()`.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct GicCpuCaps {
     /// Number of implemented priority bits (PRIbits).
@@ -200,7 +200,7 @@ pub enum BinaryPoint {
 /// Caller-provided CPU interface configuration.
 ///
 /// Typical flow:
-/// 1) `let caps = cpu_if.init()?;`
+/// 1) `let caps = cpu_if.init_cpu_interface()?;`
 /// 2) Build `GicCpuConfig` that matches policy and `caps`.
 /// 3) `cpu_if.configure(&cfg)?;`
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -236,7 +236,7 @@ pub trait GicCpuInterface {
     /// or masked) suitable for early boot, and then report what can be configured.
     ///
     /// Concrete configuration (PMR/BPR/group enables/EOI mode) should be applied via `configure()`.
-    fn init(&self) -> Result<GicCpuCaps, GicError>;
+    fn init_cpu_interface(&self) -> Result<GicCpuCaps, GicError>;
 
     /// Apply caller-provided configuration (PMR/BPR/group enables/EOI mode).
     ///
@@ -310,7 +310,7 @@ pub trait GicDistributor {
     /// - clearing enable/pending/active state for implemented interrupts,
     /// - setting default group/priority/route/trigger where appropriate,
     /// - re-enabling forwarding for the intended interrupt group(s).
-    fn init(&self) -> Result<(), GicError>;
+    fn init_distributor(&self) -> Result<(), GicError>;
 
     /// Toggle forwarding of a single SPI only (no attribute changes).
     fn set_spi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError>;
