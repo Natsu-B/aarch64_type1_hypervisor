@@ -8,7 +8,7 @@ use registers::GicV3Distributor;
 use registers::RWP;
 
 pub struct Gicv3Distributor {
-    distributer: &'static GicV3Distributor,
+    distributor: &'static GicV3Distributor,
 }
 
 impl Gicv3Distributor {
@@ -17,13 +17,13 @@ impl Gicv3Distributor {
             return Err(GicError::InvalidSize);
         }
         Ok(Gicv3Distributor {
-            distributer: unsafe { &*(addr as *mut GicV3Distributor) },
+            distributor: unsafe { &*(addr as *mut GicV3Distributor) },
         })
     }
 
     fn spin_rwp(&self) {
         while self
-            .distributer
+            .distributor
             .ctlr
             .read()
             .get_enum::<_, RWP>(GICD_CTLR::rwp)
@@ -35,17 +35,17 @@ impl Gicv3Distributor {
     }
 
     pub fn init(&self) {
-        self.distributer.ctlr.write(
+        self.distributor.ctlr.write(
             GICD_CTLR::new()
                 .set(GICD_CTLR::enable_grp0, 0b0)
                 .set(GICD_CTLR::enable_grp1, 0b0),
         );
         self.spin_rwp();
-        self.distributer
+        self.distributor
             .ctlr
             .write(GICD_CTLR::new().set(GICD_CTLR::are, 0b1));
         self.spin_rwp();
-        self.distributer
+        self.distributor
             .ctlr
             .set_bits(GICD_CTLR::new().set(GICD_CTLR::enable_grp1, 0b1));
         self.spin_rwp();
@@ -68,19 +68,19 @@ impl Gicv3Distributor {
         let reg_idx = int_id >> 5; // int_id / u32::BITS
         let reg_offset = int_id & (u32::BITS - 1);
         // non secure group 1
-        self.distributer.igroupr[reg_idx as usize].set_bits(1 << reg_offset);
-        self.distributer.igrpmodr[reg_idx as usize].clear_bits(1 << reg_offset);
+        self.distributor.igroupr[reg_idx as usize].set_bits(1 << reg_offset);
+        self.distributor.igrpmodr[reg_idx as usize].clear_bits(1 << reg_offset);
 
         // set priority
         let reg_idx = int_id >> 2; // int_id / 4
         let reg_offset = (int_id & 0b11) << 3; // (int_id % 4) * 8
         let mask = 0xff << reg_offset;
-        let ipriorityr = self.distributer.ipriorityr[reg_idx as usize].read();
-        self.distributer.ipriorityr[reg_idx as usize]
+        let ipriorityr = self.distributor.ipriorityr[reg_idx as usize].read();
+        self.distributor.ipriorityr[reg_idx as usize]
             .write((ipriorityr & !mask) | (priority as u32) << reg_offset);
 
         // set routing (non rooting mode)
-        self.distributer.irouter[int_id as usize].write(cpu::get_current_core_id().to_bits());
+        self.distributor.irouter[int_id as usize].write(cpu::get_current_core_id().to_bits());
 
         // set trigger mode
         let reg_idx = int_id >> 4; // int_id / (u32::BITS / 2)
@@ -90,23 +90,23 @@ impl Gicv3Distributor {
             GicTriggerMode::LevelSensitive => 0b00,
             GicTriggerMode::EdgeTriggered => 0b10,
         };
-        let icfgr = self.distributer.icfgr[reg_idx as usize].read();
-        self.distributer.icfgr[reg_idx as usize].write((icfgr & !mask) | config << reg_offset);
+        let icfgr = self.distributor.icfgr[reg_idx as usize].read();
+        self.distributor.icfgr[reg_idx as usize].write((icfgr & !mask) | config << reg_offset);
 
         // set pending
         let reg_idx = int_id >> 5; // int_id / u32::BITS
         let reg_offset = int_id & (u32::BITS - 1);
         if pending {
-            self.distributer.ispendr[reg_idx as usize].write(1 << reg_offset);
+            self.distributor.ispendr[reg_idx as usize].write(1 << reg_offset);
         } else {
-            self.distributer.icpendr[reg_idx as usize].write(1 << reg_offset);
+            self.distributor.icpendr[reg_idx as usize].write(1 << reg_offset);
         }
 
         // set enable
         if enable {
-            self.distributer.isenabler[reg_idx as usize].write(1 << reg_offset);
+            self.distributor.isenabler[reg_idx as usize].write(1 << reg_offset);
         } else {
-            self.distributer.icenabler[reg_idx as usize].write(1 << reg_offset);
+            self.distributor.icenabler[reg_idx as usize].write(1 << reg_offset);
         }
         cpu::dsb_ish();
         cpu::isb();

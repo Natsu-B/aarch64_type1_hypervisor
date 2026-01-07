@@ -380,12 +380,12 @@ pub fn el3_is_implemented() -> bool {
 /// The returned ID layout is compatible with the PSCI CPU_ON `target_cpu` argument.
 pub fn get_current_core_id() -> CoreAffinity {
     let mpidr_el1 = MPIDR_EL1::from_bits(get_mpidr_el1());
-    let aff0 = 0;
+    let aff0 = mpidr_el1.get(MPIDR_EL1::aff0);
     let aff1 = mpidr_el1.get(MPIDR_EL1::aff1);
     let aff2 = mpidr_el1.get(MPIDR_EL1::aff2);
     let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
 
-    CoreAffinity::new(aff0, aff1 as u8, aff2 as u8, aff3 as u8)
+    CoreAffinity::new(aff0 as u8, aff1 as u8, aff2 as u8, aff3 as u8)
 }
 
 pub fn va_to_ipa_el2(va: u64) -> Option<u64> {

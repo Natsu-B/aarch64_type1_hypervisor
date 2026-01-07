@@ -323,7 +323,7 @@ impl Gicv2 {
         }
     }
 
-    fn ack_via_iar<F>(&self, sprious_action: F) -> Result<Option<AckedIrq>, GicError>
+    fn ack_via_iar<F>(&self, spurious_action: F) -> Result<Option<AckedIrq>, GicError>
     where
         F: FnOnce() -> Result<Option<AckedIrq>, GicError>,
     {
@@ -341,13 +341,13 @@ impl Gicv2 {
                 }))
             }
             x if x == 1022 || x == 1023 => {
-                return sprious_action();
+                return spurious_action();
             }
             _ => return Err(GicError::UnsupportedIntId),
         }
     }
 
-    fn ack_via_aiar<F>(&self, sprious_action: F) -> Result<Option<AckedIrq>, GicError>
+    fn ack_via_aiar<F>(&self, spurious_action: F) -> Result<Option<AckedIrq>, GicError>
     where
         F: FnOnce() -> Result<Option<AckedIrq>, GicError>,
     {
@@ -365,7 +365,7 @@ impl Gicv2 {
                 }))
             }
             x if x == 1022 || x == 1023 => {
-                return sprious_action();
+                return spurious_action();
             }
             _ => return Err(GicError::UnsupportedIntId),
         }
