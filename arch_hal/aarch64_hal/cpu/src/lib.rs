@@ -1,6 +1,8 @@
 #![no_std]
 
 use core::arch::asm;
+use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
 
 use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::ID_AA64PFR0_EL1;
@@ -117,6 +119,41 @@ pub fn get_far_el2() -> u64 {
     let far_el2: u64;
     unsafe { asm!("mrs {}, far_el2", out(reg) far_el2) };
     far_el2
+}
+
+pub fn read_daif() -> u64 {
+    let daif: u64;
+    // SAFETY: Reads the DAIF mask bits; does not modify processor state.
+    unsafe { asm!("mrs {0}, daif", out(reg) daif, options(nostack)) };
+    daif
+}
+
+pub unsafe fn write_daif(daif: u64) {
+    // SAFETY: Caller must ensure restoring DAIF is appropriate for the current context.
+    unsafe {
+        asm!("msr daif, {0}", in(reg) daif, options(nostack));
+    }
+}
+
+pub fn irq_save() -> u64 {
+    let flags = read_daif();
+    // Mask IRQs.
+    unsafe {
+        asm!("msr daifset, #2", options(nostack));
+    }
+    // Prevent compiler/CPU reordering across the mask boundary.
+    isb();
+    compiler_fence(Ordering::SeqCst);
+    flags
+}
+
+pub fn irq_restore(saved: u64) {
+    compiler_fence(Ordering::SeqCst);
+    // Restore full DAIF state.
+    unsafe {
+        write_daif(saved);
+    }
+    isb();
 }
 
 pub fn get_hpfar_el2() -> u64 {
