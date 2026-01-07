@@ -133,6 +133,21 @@ bitregs! {
 }
 
 bitregs! {
+    /// ID_AA64PFR0_EL1 — AArch64 Processor Feature Register 0
+    /// Purpose:
+    ///     Provides information about the implemented Exception levels in AArch64 state.
+    /// # Safety
+    ///     all field is ReadOnly
+    pub(crate) struct ID_AA64PFR0_EL1: u64 {
+        pub(crate) el0@[3:0],
+        pub(crate) el1@[7:4],
+        pub(crate) el2@[11:8],
+        pub(crate) el3@[15:12],
+        reserved@[63:16] [res0],
+    }
+}
+
+bitregs! {
     pub(crate) struct MPIDR_EL1: u64 {
         pub(crate) aff0@[7:0],
         pub(crate) aff1@[15:8],

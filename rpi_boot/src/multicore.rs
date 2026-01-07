@@ -4,6 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use arch_hal::DEBUG_UART;
 use arch_hal::cpu;
+use arch_hal::cpu::CoreAffinity;
 use arch_hal::println;
 use arch_hal::psci::secure_monitor_call;
 use core::arch::asm;
@@ -15,7 +16,7 @@ use mutex::SpinLock;
 
 static AP_STACK_SIZE: usize = 0x1000;
 
-static STACK_MEM_FOR_EACH_CPU: SpinLock<OnceCell<Vec<(u64, usize)>>> =
+static STACK_MEM_FOR_EACH_CPU: SpinLock<OnceCell<Vec<(CoreAffinity, usize)>>> =
     SpinLock::new(OnceCell::new());
 
 #[repr(C, align(16))]
@@ -47,7 +48,7 @@ pub fn setup_multicore(stack: usize) {
 // psci application processor on handler
 pub fn ap_on(regs: &mut cpu::Registers) {
     println!("application processor on");
-    let cpu_id = regs.x1;
+    let cpu_id = CoreAffinity::from_bits(regs.x1);
     let mut stack_list = STACK_MEM_FOR_EACH_CPU.lock();
     let stack_list = stack_list.get_mut().unwrap();
     let already_allocated_cpu_stack =

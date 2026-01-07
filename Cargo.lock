@@ -9,6 +9,7 @@ dependencies = [
  "aarch64_test",
  "cpu",
  "exceptions",
+ "gic",
  "paging",
  "print",
  "psci",
@@ -18,6 +19,14 @@ dependencies = [
 [[package]]
 name = "aarch64_test"
 version = "0.1.0"
+
+[[package]]
+name = "aarch64_unit_test"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "print",
+]
 
 [[package]]
 name = "allocator"
@@ -94,6 +103,8 @@ dependencies = [
 name = "exceptions"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
+ "aarch64_unit_test",
  "cpu",
  "print",
  "psci",
@@ -133,6 +144,18 @@ dependencies = [
  "aarch64_test",
  "byte_stream",
  "print",
+]
+
+[[package]]
+name = "gic"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "cpu",
+ "mutex",
+ "print",
+ "typestate",
+ "typestate_macro",
 ]
 
 [[package]]

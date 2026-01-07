@@ -1,11 +1,51 @@
 #![no_std]
 
 use core::arch::asm;
+use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
 
 use crate::registers::ID_AA64MMFR0_EL1;
+use crate::registers::ID_AA64PFR0_EL1;
 use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
 pub mod registers;
+
+/// Core affinity encoded as MPIDR style fields (Aff3:Aff2:Aff1:Aff0).
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct CoreAffinity {
+    pub aff0: u8,
+    pub aff1: u8,
+    pub aff2: u8,
+    pub aff3: u8,
+}
+
+impl CoreAffinity {
+    pub const fn new(aff0: u8, aff1: u8, aff2: u8, aff3: u8) -> Self {
+        Self {
+            aff0,
+            aff1,
+            aff2,
+            aff3,
+        }
+    }
+
+    pub const fn to_bits(&self) -> u64 {
+        self.aff0 as u64
+            | (self.aff1 as u64) << 8
+            | (self.aff2 as u64) << 16
+            | (self.aff3 as u64) << 32
+    }
+
+    pub fn from_bits(bits: u64) -> Self {
+        let mpidr = MPIDR_EL1::from_bits(bits);
+        Self {
+            aff0: mpidr.get(MPIDR_EL1::aff0) as u8,
+            aff1: mpidr.get(MPIDR_EL1::aff1) as u8,
+            aff2: mpidr.get(MPIDR_EL1::aff2) as u8,
+            aff3: mpidr.get(MPIDR_EL1::aff3) as u8,
+        }
+    }
+}
 
 #[repr(C)]
 pub struct Registers {
@@ -62,6 +102,13 @@ pub fn get_id_aa64mmfr0_el1() -> u64 {
     id
 }
 
+pub fn get_id_aa64pfr0_el1() -> u64 {
+    let id: u64;
+    // SAFETY: Reads the read-only ID_AA64PFR0_EL1 system register.
+    unsafe { asm!("mrs {}, id_aa64pfr0_el1", out(reg) id) };
+    id
+}
+
 pub fn get_esr_el2() -> u64 {
     let esr_el2: u64;
     unsafe { asm!("mrs {}, esr_el2", out(reg) esr_el2) };
@@ -74,6 +121,41 @@ pub fn get_far_el2() -> u64 {
     far_el2
 }
 
+pub fn read_daif() -> u64 {
+    let daif: u64;
+    // SAFETY: Reads the DAIF mask bits; does not modify processor state.
+    unsafe { asm!("mrs {0}, daif", out(reg) daif, options(nostack)) };
+    daif
+}
+
+pub unsafe fn write_daif(daif: u64) {
+    // SAFETY: Caller must ensure restoring DAIF is appropriate for the current context.
+    unsafe {
+        asm!("msr daif, {0}", in(reg) daif, options(nostack));
+    }
+}
+
+pub fn irq_save() -> u64 {
+    let flags = read_daif();
+    // Mask IRQs.
+    unsafe {
+        asm!("msr daifset, #2", options(nostack));
+    }
+    // Prevent compiler/CPU reordering across the mask boundary.
+    isb();
+    compiler_fence(Ordering::SeqCst);
+    flags
+}
+
+pub fn irq_restore(saved: u64) {
+    compiler_fence(Ordering::SeqCst);
+    // Restore full DAIF state.
+    unsafe {
+        write_daif(saved);
+    }
+    isb();
+}
+
 pub fn get_hpfar_el2() -> u64 {
     let hpfar_el2: u64;
     unsafe { asm!("mrs {}, hpfar_el2", out(reg) hpfar_el2) };
@@ -84,6 +166,12 @@ pub fn get_elr_el2() -> u64 {
     let elr_el2: u64;
     unsafe { asm!("mrs {}, elr_el2", out(reg) elr_el2) };
     elr_el2
+}
+
+pub fn get_mpidr_el1() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, mpidr_el1", val = out(reg) val) };
+    val
 }
 
 pub fn get_hcr_el2() -> u64 {
@@ -155,12 +243,6 @@ pub fn get_cptr_el2() -> u64 {
 pub fn get_mdcr_el2() -> u64 {
     let val: u64;
     unsafe { asm!("mrs {val}, mdcr_el2", val = out(reg) val) };
-    val
-}
-
-pub fn get_mpidr_el1() -> u64 {
-    let val: u64;
-    unsafe { asm!("mrs {val}, mpidr_el1", val = out(reg) val) };
     val
 }
 
@@ -241,6 +323,10 @@ pub fn dsb_ish() {
     unsafe { asm!("dsb ish") };
 }
 
+pub fn dsb_sy() {
+    unsafe { asm!("dsb sy") };
+}
+
 pub fn isb() {
     unsafe { asm!("isb") };
 }
@@ -285,6 +371,23 @@ pub fn get_parange() -> Option<PARange> {
     id.get_enum(ID_AA64MMFR0_EL1::parange)
 }
 
+pub fn el3_is_implemented() -> bool {
+    let id = ID_AA64PFR0_EL1::from_bits(get_id_aa64pfr0_el1());
+    id.get(ID_AA64PFR0_EL1::el3) != 0
+}
+
+/// Return a CPU-specific ID composed from MPIDR_EL1.AFF{0..3}.
+/// The returned ID layout is compatible with the PSCI CPU_ON `target_cpu` argument.
+pub fn get_current_core_id() -> CoreAffinity {
+    let mpidr_el1 = MPIDR_EL1::from_bits(get_mpidr_el1());
+    let aff0 = mpidr_el1.get(MPIDR_EL1::aff0);
+    let aff1 = mpidr_el1.get(MPIDR_EL1::aff1);
+    let aff2 = mpidr_el1.get(MPIDR_EL1::aff2);
+    let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
+
+    CoreAffinity::new(aff0 as u8, aff1 as u8, aff2 as u8, aff3 as u8)
+}
+
 pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
     let par_after: u64;
 
@@ -308,18 +411,6 @@ pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
 
     let ipa = par_after & 0x0000_FFFF_FFFF_F000;
     Some(ipa | (va & 0xFFF))
-}
-
-/// Return a CPU-specific ID composed from MPIDR_EL1.AFF{0..3}.
-/// The returned ID layout is compatible with the PSCI CPU_ON `target_cpu` argument.
-pub fn get_current_core_id() -> u64 {
-    let mpidr_el1 = MPIDR_EL1::from_bits(get_mpidr_el1());
-    let aff0 = mpidr_el1.get(MPIDR_EL1::aff0);
-    let aff1 = mpidr_el1.get(MPIDR_EL1::aff1);
-    let aff2 = mpidr_el1.get(MPIDR_EL1::aff2);
-    let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
-
-    aff0 | (aff1 << 8) | (aff2 << 16) | (aff3 << 32)
 }
 
 pub fn clean_data_cache_all() {
