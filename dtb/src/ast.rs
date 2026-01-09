@@ -391,7 +391,7 @@ impl<'dtb> DeviceTree<'dtb, Borrowed> {
                     }
 
                     let prop_ptr = struct_slice[cursor..].as_ptr() as *const FdtProperty;
-                    // Safety: bounds checked above; DTB structure is 4-byte aligned.
+                    // Safety: bounds checked above; validated struct offset keeps this aligned.
                     let property = unsafe { &*prop_ptr };
                     let len = property.get_property_len() as usize;
                     let nameoff = property.get_name_offset() as usize;

@@ -1,6 +1,7 @@
 use core::ffi::CStr;
 use core::ffi::c_char;
 use core::marker::PhantomData;
+use core::mem::align_of;
 use core::mem::size_of;
 
 use typestate::Be;
@@ -167,6 +168,15 @@ impl Dtb<Unchecked> {
         pr_debug!("dtb last_comp_version: {}", self.header.last_comp_version());
         if self.header.last_comp_version() > DTB_VERSION {
             return Err("dtb: incompatible version");
+        }
+        if self.header.struct_offset() as usize % align_of::<FdtProperty>() != 0 {
+            return Err("dtb: unaligned struct offset");
+        }
+        if self.header.strings_offset() as usize % align_of::<u32>() != 0 {
+            return Err("dtb: unaligned strings offset");
+        }
+        if self.header.mem_rsvmap_offset() as usize % align_of::<FdtReserveEntry>() != 0 {
+            return Err("dtb: unaligned memreserve offset");
         }
         Ok(Dtb {
             fdt_base: self.fdt_base,
