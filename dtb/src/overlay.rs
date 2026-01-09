@@ -234,7 +234,7 @@ fn read_node_phandle_pair(node: &Node<'_>) -> Result<(Option<u32>, Option<u32>),
                 return Err(OverlayError::InvalidPhandle);
             }
             let parsed = read_be_u32(&value[..4]);
-            if parsed == 0 || parsed == core::u32::MAX {
+            if parsed == 0 || parsed == u32::MAX {
                 return Err(OverlayError::InvalidPhandle);
             }
             if name == "phandle" {
@@ -298,7 +298,7 @@ fn adjust_overlay_phandles(overlay: &mut DeviceTree<'_>, delta: u32) -> Result<(
         let new_val = old
             .checked_add(delta)
             .ok_or(OverlayError::PhandleOverflow)?;
-        if new_val == core::u32::MAX {
+        if new_val == u32::MAX {
             return Err(OverlayError::PhandleOverflow);
         }
         if phandle.is_some() {
@@ -364,7 +364,7 @@ fn apply_local_fixups_recursive(
             let patched = current
                 .checked_add(delta)
                 .ok_or(OverlayError::PhandleOverflow)?;
-            if patched == core::u32::MAX {
+            if patched == u32::MAX {
                 return Err(OverlayError::PhandleOverflow);
             }
             value[start..end].copy_from_slice(&patched.to_be_bytes());
