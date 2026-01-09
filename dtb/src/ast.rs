@@ -9,11 +9,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 use allocator::AlignedSliceBox;
 use core::convert::TryFrom;
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::mem::align_of;
 use core::mem::size_of;
+use typestate::Be;
 
 use crate::dtb_parser::DtbParser;
+use crate::dtb_parser::Validated;
 use crate::dtb_parser::big_endian::Dtb;
 use crate::dtb_parser::big_endian::FdtProperty;
 use crate::dtb_parser::big_endian::FdtReserveEntry;
@@ -37,7 +40,8 @@ fn read_be_u32(buf: &[u8], offset: usize) -> Result<u32, &'static str> {
     let bytes = buf
         .get(offset..end)
         .ok_or("dtb: out of bounds in read_be_u32")?;
-    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    let be = unsafe { &*(bytes.as_ptr() as *const Be<u32>) };
+    Ok(be.read())
 }
 
 fn read_cstr<'dtb>(buf: &'dtb [u8], offset: usize) -> Result<&'dtb str, &'static str> {
@@ -76,6 +80,14 @@ fn write_be_u64(buf: &mut [u8], offset: usize, v: u64) -> Result<(), &'static st
 
 /// Dense identifier used to index into the `nodes` array of a `DeviceTree`.
 pub type NodeId = usize;
+
+/// Marker for DTB AST that borrows names/values from an external buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct Borrowed;
+
+/// Marker for DTB AST that owns its names/values.
+#[derive(Clone, Copy, Debug)]
+pub struct Owned;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Header {
@@ -182,15 +194,20 @@ impl<'dtb> Node<'dtb> {
     }
 }
 
+/// Device tree AST with a typestate marker for storage/ownership.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeviceTree<'dtb> {
+pub struct DeviceTree<'dtb, State = Owned> {
     pub header: Header,
     pub mem_reserve: Vec<MemReserve>,
     pub nodes: Vec<Node<'dtb>>,
     pub root: NodeId,
+    _state: PhantomData<State>,
 }
 
-impl<'dtb> DeviceTree<'dtb> {
+pub type DeviceTreeBorrowed<'dtb> = DeviceTree<'dtb, Borrowed>;
+pub type DeviceTreeOwned<'dtb> = DeviceTree<'dtb, Owned>;
+
+impl<'dtb> DeviceTree<'dtb, Owned> {
     pub fn with_root(root_name: NameRef<'dtb>) -> Self {
         let root = Node::new(root_name);
         Self {
@@ -198,9 +215,12 @@ impl<'dtb> DeviceTree<'dtb> {
             mem_reserve: Vec::new(),
             root: 0,
             nodes: vec![root],
+            _state: PhantomData,
         }
     }
+}
 
+impl<'dtb> DeviceTree<'dtb, Borrowed> {
     /// Parse a flattened device tree (DTB/FDT) blob into an AST.
     ///
     /// All names and property values are borrowed from `dtb`
@@ -222,7 +242,7 @@ impl<'dtb> DeviceTree<'dtb> {
     /// Build AST using an existing low-level parser.
     ///
     /// Reuses the underlying DTB buffer referenced by `parser`.
-    pub fn from_parser(parser: &'dtb DtbParser) -> Result<Self, &'static str> {
+    pub fn from_parser(parser: &'dtb DtbParser<Validated>) -> Result<Self, &'static str> {
         let header = parser.dtb_header();
         let totalsize = header.get_total_size() as usize;
         if totalsize == 0 {
@@ -234,7 +254,10 @@ impl<'dtb> DeviceTree<'dtb> {
         Self::parse_with_header(dtb, header)
     }
 
-    fn parse_with_header(dtb: &'dtb [u8], dtb_header: &Dtb) -> Result<Self, &'static str> {
+    fn parse_with_header(
+        dtb: &'dtb [u8],
+        dtb_header: &Dtb<Validated>,
+    ) -> Result<Self, &'static str> {
         let base = dtb.as_ptr() as usize;
         if base != dtb_header.get_fdt_address() {
             return Err("dtb: parser/base mismatch");
@@ -368,8 +391,8 @@ impl<'dtb> DeviceTree<'dtb> {
                     }
 
                     let prop_ptr = struct_slice[cursor..].as_ptr() as *const FdtProperty;
-                    // Safety: bounds checked above; read_unaligned handles potential unaligned base.
-                    let property = unsafe { core::ptr::read_unaligned(prop_ptr) };
+                    // Safety: bounds checked above; DTB structure is 4-byte aligned.
+                    let property = unsafe { &*prop_ptr };
                     let len = property.get_property_len() as usize;
                     let nameoff = property.get_name_offset() as usize;
                     cursor += size_of::<FdtProperty>();
@@ -415,9 +438,58 @@ impl<'dtb> DeviceTree<'dtb> {
             mem_reserve,
             nodes,
             root,
+            _state: PhantomData,
         })
     }
 
+    pub fn into_owned(self) -> DeviceTree<'static, Owned> {
+        fn name_to_owned<'dtb>(name: NameRef<'dtb>) -> NameRef<'static> {
+            match name {
+                NameRef::Borrowed(s) => NameRef::Owned(s.to_string()),
+                NameRef::Owned(s) => NameRef::Owned(s),
+            }
+        }
+
+        fn value_to_owned<'dtb>(value: ValueRef<'dtb>) -> ValueRef<'static> {
+            match value {
+                ValueRef::Borrowed(v) => ValueRef::Owned(v.to_vec()),
+                ValueRef::Owned(v) => ValueRef::Owned(v),
+            }
+        }
+
+        fn prop_to_owned<'dtb>(prop: Property<'dtb>) -> Property<'static> {
+            Property {
+                name: name_to_owned(prop.name),
+                value: value_to_owned(prop.value),
+            }
+        }
+
+        fn node_to_owned<'dtb>(node: Node<'dtb>) -> Node<'static> {
+            Node {
+                name: name_to_owned(node.name),
+                properties: node.properties.into_iter().map(prop_to_owned).collect(),
+                children: node.children,
+                parent: node.parent,
+            }
+        }
+
+        let nodes = self.nodes.into_iter().map(node_to_owned).collect();
+
+        DeviceTree {
+            header: self.header,
+            mem_reserve: self.mem_reserve,
+            nodes,
+            root: self.root,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn to_owned(&self) -> DeviceTree<'static, Owned> {
+        self.clone().into_owned()
+    }
+}
+
+impl<'dtb, State> DeviceTree<'dtb, State> {
     /// Serialize this AST into a newly allocated DTB blob.
     ///
     /// The returned `AlignedSliceBox<u8>` owns the DTB bytes with alignment suitable for FDT access.
@@ -439,8 +511,8 @@ impl<'dtb> DeviceTree<'dtb> {
             }
         }
 
-        fn estimate_node_size<'dtb>(
-            tree: &DeviceTree<'dtb>,
+        fn estimate_node_size<'dtb, State>(
+            tree: &DeviceTree<'dtb, State>,
             node_id: NodeId,
         ) -> Result<usize, &'static str> {
             let node = tree
@@ -547,8 +619,8 @@ impl<'dtb> DeviceTree<'dtb> {
             buf[pos + name.len()] = 0;
         }
 
-        fn emit_node<'dtb>(
-            tree: &DeviceTree<'dtb>,
+        fn emit_node<'dtb, State>(
+            tree: &DeviceTree<'dtb, State>,
             buf: &mut [u8],
             struct_base: usize,
             cursor: &mut usize,
@@ -635,19 +707,14 @@ impl<'dtb> DeviceTree<'dtb> {
     }
 }
 
-pub trait DeviceTreeQueryExt<'dtb> {
+pub trait DeviceTreeQueryExt<'dtb, State = Owned> {
     fn node(&self, id: NodeId) -> Option<&Node<'dtb>>;
-    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node<'dtb>>;
     fn find_node_by_path(&self, path: &str) -> Option<NodeId>;
 }
 
-impl<'dtb> DeviceTreeQueryExt<'dtb> for DeviceTree<'dtb> {
+impl<'dtb, State> DeviceTreeQueryExt<'dtb, State> for DeviceTree<'dtb, State> {
     fn node(&self, id: NodeId) -> Option<&Node<'dtb>> {
         self.nodes.get(id)
-    }
-
-    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node<'dtb>> {
-        self.nodes.get_mut(id)
     }
 
     fn find_node_by_path(&self, path: &str) -> Option<NodeId> {
@@ -676,6 +743,8 @@ impl<'dtb> DeviceTreeQueryExt<'dtb> for DeviceTree<'dtb> {
 }
 
 pub trait DeviceTreeEditExt<'dtb> {
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node<'dtb>>;
+
     fn get_or_create_node_by_path(&mut self, path: &str) -> Result<NodeId, &'static str>;
 
     fn add_child(&mut self, parent: NodeId, name: NameRef<'dtb>) -> Result<NodeId, &'static str>;
@@ -685,7 +754,11 @@ pub trait DeviceTreeEditExt<'dtb> {
     fn detach_node(&mut self, node: NodeId) -> Result<(), &'static str>;
 }
 
-impl<'dtb> DeviceTreeEditExt<'dtb> for DeviceTree<'dtb> {
+impl<'dtb> DeviceTreeEditExt<'dtb> for DeviceTree<'dtb, Owned> {
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node<'dtb>> {
+        self.nodes.get_mut(id)
+    }
+
     fn get_or_create_node_by_path(&mut self, path: &str) -> Result<NodeId, &'static str> {
         if path == "/" {
             return Ok(self.root);
@@ -835,7 +908,7 @@ impl<'dtb> NodeEditExt<'dtb> for Node<'dtb> {
 
 pub trait MmioCollectExt<'dtb> {}
 
-impl<'dtb> MmioCollectExt<'dtb> for DeviceTree<'dtb> {}
+impl<'dtb, State> MmioCollectExt<'dtb> for DeviceTree<'dtb, State> {}
 
 #[cfg(test)]
 mod tests {
@@ -962,7 +1035,9 @@ mod tests {
     #[test]
     fn edit_and_reserialize_fixture() {
         let dtb = aligned_fixture();
-        let mut tree = DeviceTree::from_dtb(dtb).expect("parse fixture dtb");
+        let mut tree = DeviceTree::from_dtb(dtb)
+            .expect("parse fixture dtb")
+            .into_owned();
 
         let chosen_id = tree
             .get_or_create_node_by_path("/chosen")

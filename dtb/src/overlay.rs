@@ -20,6 +20,7 @@ use crate::ast::Node;
 use crate::ast::NodeEditExt;
 use crate::ast::NodeId;
 use crate::ast::NodeQueryExt;
+use crate::ast::Owned;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OverlayError {
@@ -105,7 +106,7 @@ impl OverlayApplyReport {
     }
 }
 
-impl<'dtb> DeviceTree<'dtb> {
+impl<'dtb> DeviceTree<'dtb, Owned> {
     pub fn apply_overlay<'ov>(
         &mut self,
         overlay_tree: &DeviceTree<'ov>,
@@ -196,12 +197,7 @@ fn collect_fragments(overlay: &DeviceTree<'_>) -> Result<Vec<FragmentInfo>, Over
                 if phandle_bytes.len() != 4 {
                     return Err(OverlayError::InvalidTargetPhandle);
                 }
-                let phandle = u32::from_be_bytes([
-                    phandle_bytes[0],
-                    phandle_bytes[1],
-                    phandle_bytes[2],
-                    phandle_bytes[3],
-                ]);
+                let phandle = read_be_u32(&phandle_bytes[..4]);
                 FragmentTarget::Phandle(phandle)
             }
             (None, Some(path_bytes)) => {
@@ -237,7 +233,7 @@ fn read_node_phandle_pair(node: &Node<'_>) -> Result<(Option<u32>, Option<u32>),
             if value.len() != 4 {
                 return Err(OverlayError::InvalidPhandle);
             }
-            let parsed = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+            let parsed = read_be_u32(&value[..4]);
             if parsed == 0 || parsed == core::u32::MAX {
                 return Err(OverlayError::InvalidPhandle);
             }
@@ -364,12 +360,7 @@ fn apply_local_fixups_recursive(
             if end > value.len() {
                 return Err(OverlayError::LocalFixupOffsetOutOfBounds);
             }
-            let current = u32::from_be_bytes([
-                value[start],
-                value[start + 1],
-                value[start + 2],
-                value[start + 3],
-            ]);
+            let current = read_be_u32(&value[start..end]);
             let patched = current
                 .checked_add(delta)
                 .ok_or(OverlayError::PhandleOverflow)?;
@@ -682,7 +673,7 @@ fn parse_u32_list(bytes: &[u8]) -> Result<Vec<u32>, OverlayError> {
     let mut values = Vec::new();
     let mut idx = 0;
     while idx + 4 <= bytes.len() {
-        let v = u32::from_be_bytes([bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]]);
+        let v = read_be_u32(&bytes[idx..idx + 4]);
         values.push(v);
         idx += 4;
     }
@@ -716,6 +707,11 @@ fn parse_stringlist(bytes: &[u8]) -> Result<Vec<&str>, OverlayError> {
         result.push(s);
     }
     Ok(result)
+}
+
+fn read_be_u32(bytes: &[u8]) -> u32 {
+    let b = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    u32::from_be_bytes(b)
 }
 
 fn split_fixup_entry(entry: &str) -> Result<(&str, &str, &str), OverlayError> {
