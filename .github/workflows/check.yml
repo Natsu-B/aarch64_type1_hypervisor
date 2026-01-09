@@ -202,5 +202,5 @@ jobs:
             (cd u-boot && nix develop --accept-flake-config --command ./init.sh)
             cargo xtest
             cargo xbuild
-            cargo xrun rpi5
+            cargo xbuild rpi5
           '
