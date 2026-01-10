@@ -5,317 +5,432 @@ use typestate::ReadWrite;
 use typestate::Readable;
 use typestate::Writable;
 use typestate::WriteOnly;
-use typestate_macro::RawReg;
+use typestate::bitregs;
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct Pl011Peripherals {
-    pub data: ReadWrite<UARTDR>,                     // 0x0000
-    pub error_status: ReadWrite<u32>,                // 0x0004
-    _reserved0008: [u8; 0x10],                       // 0x0008..0x0018
-    pub flags: ReadOnly<UARTFR>,                     // 0x0018
-    _reserved001c: [u8; 0x04],                       // 0x001C..0x0020
-    pub irda_low_power_counter: ReadWrite<u32>,      // 0x0020
-    pub integer_baud_rate: ReadWrite<u32>,           // 0x0024
-    pub fractional_baud_rate: ReadWrite<u32>,        // 0x0028
-    pub line_control: ReadWrite<UARTLCR>,            // 0x002C
-    pub control: ReadWrite<UARTCR>,                  // 0x0030
-    pub interrupt_fifo_level_select: ReadWrite<u32>, // 0x0034
-    pub interrupt_mask_set_clear: ReadWrite<u32>,    // 0x0038
-    pub raw_interrupt_status: ReadOnly<u32>,         // 0x003C
-    pub masked_interrupt_status: ReadOnly<u32>,      // 0x0040
-    pub interrupt_clear: WriteOnly<UARTICR>,         // 0x0044
-    pub dma_control: ReadWrite<u32>,                 // 0x0048
-    _reserved004c: [u8; 3988],                       // 0x004C..0x0FE0
-    pub peripheral_id: [ReadOnly<u32>; 4],           // 0x0FE0..0x0FF0
-    pub pcell_id: [ReadOnly<u32>; 4],                // 0x0FF0..0x1000
-                                                     // @END (0x1000)
+bitregs! {
+    /// UART Data Register (UARTDR)
+    pub struct UARTDR: u32 {
+        pub data@[7:0],
+        pub fe@[8:8],
+        pub pe@[9:9],
+        pub be@[10:10],
+        pub oe@[11:11],
+        reserved@[31:12] [ignore],
+    }
 }
 
-#[inline(always)]
-const fn mask(width: u32) -> u32 {
-    (1u32 << width) - 1
+bitregs! {
+    /// UART Flag Register (UARTFR)
+    pub struct UARTFR: u32 {
+        pub cts@[0:0],
+        pub dsr@[1:1],
+        pub dcd@[2:2],
+        pub busy@[3:3],
+        pub rxfe@[4:4],
+        pub txff@[5:5],
+        pub rxff@[6:6],
+        pub txfe@[7:7],
+        pub ri@[8:8],
+        reserved@[31:9] [ignore],
+    }
 }
 
-/// UART Data Register
-#[repr(transparent)]
-#[derive(Clone, Copy, RawReg, PartialEq, Eq, Debug)]
-pub struct UARTDR(pub u32);
-
-impl UARTDR {
-    pub const DATA_OFFSET: u32 = 0; // DATA OFFSET(0) NUMBITS(8)
-    pub const DATA_MASK: Self = Self(mask(8) << Self::DATA_OFFSET);
-
-    pub const FE_OFFSET: u32 = 8; // framing error
-    pub const FE_MASK: Self = Self(mask(1) << Self::FE_OFFSET);
-
-    pub const PE_OFFSET: u32 = 9; // parity error
-    pub const PE_MASK: Self = Self(mask(1) << Self::PE_OFFSET);
-
-    pub const BE_OFFSET: u32 = 10; // break error
-    pub const BE_MASK: Self = Self(mask(1) << Self::BE_OFFSET);
-
-    pub const OE_OFFSET: u32 = 11; // overrun error
-    pub const OE_MASK: Self = Self(mask(1) << Self::OE_OFFSET);
+bitregs! {
+    /// UART Line Control Register (UARTLCR_H)
+    pub struct UARTLCR: u32 {
+        pub brk@[0:0],
+        pub pen@[1:1],
+        pub eps@[2:2],
+        pub stp2@[3:3],
+        pub fen@[4:4],
+        pub wlen@[6:5] as WordLen {
+            Bits5 = 0b00,
+            Bits6 = 0b01,
+            Bits7 = 0b10,
+            Bits8 = 0b11,
+        },
+        pub sps@[7:7],
+        reserved@[31:8] [ignore],
+    }
 }
 
-/// UART Flag Register
-#[repr(transparent)]
-#[derive(Clone, Copy, RawReg, PartialEq, Eq, Debug)]
-pub struct UARTFR(pub u32);
-
-impl UARTFR {
-    pub const CTS_OFFSET: u32 = 0; // clear to send
-    pub const CTS_MASK: Self = Self(1 << Self::CTS_OFFSET);
-
-    pub const DSR_OFFSET: u32 = 1; // data set ready
-    pub const DSR_MASK: Self = Self(1 << Self::DSR_OFFSET);
-
-    pub const DCD_OFFSET: u32 = 2; // data carrier detect
-    pub const DCD_MASK: Self = Self(1 << Self::DCD_OFFSET);
-
-    pub const BUSY_OFFSET: u32 = 3; // UART busy
-    pub const BUSY_MASK: Self = Self(1 << Self::BUSY_OFFSET);
-
-    pub const RXFE_OFFSET: u32 = 4; // receive FIFO empty
-    pub const RXFE_MASK: Self = Self(1 << Self::RXFE_OFFSET);
-
-    pub const TXFF_OFFSET: u32 = 5; // transmit FIFO full
-    pub const TXFF_MASK: Self = Self(1 << Self::TXFF_OFFSET);
-
-    pub const RXFF_OFFSET: u32 = 6; // receive FIFO full
-    pub const RXFF_MASK: Self = Self(1 << Self::RXFF_OFFSET);
-
-    pub const TXFE_OFFSET: u32 = 7; // transmit FIFO empty
-    pub const TXFE_MASK: Self = Self(1 << Self::TXFE_OFFSET);
-
-    pub const RI_OFFSET: u32 = 8; // ring indicator
-    pub const RI_MASK: Self = Self(1 << Self::RI_OFFSET);
+bitregs! {
+    /// UART Control Register (UARTCR)
+    pub struct UARTCR: u32 {
+        pub uart_en@[0:0],
+        pub sir_en@[1:1],
+        pub sir_lp@[2:2],
+        reserved@[6:3] [ignore],
+        pub lbe@[7:7],
+        pub txe@[8:8],
+        pub rxe@[9:9],
+        pub dtr@[10:10],
+        pub rts@[11:11],
+        pub out1@[12:12],
+        pub out2@[13:13],
+        pub rtsen@[14:14],
+        pub ctsen@[15:15],
+        reserved@[31:16] [ignore],
+    }
 }
 
-/// UART Line Control Register
-#[repr(transparent)]
-#[derive(Clone, Copy, RawReg, PartialEq, Eq, Debug)]
-pub struct UARTLCR(pub u32);
-
-impl UARTLCR {
-    pub const BRK_OFFSET: u32 = 0; // send break
-    pub const BRK_MASK: Self = Self(1 << Self::BRK_OFFSET);
-
-    pub const PEN_OFFSET: u32 = 1; // parity enable
-    pub const PEN_MASK: Self = Self(1 << Self::PEN_OFFSET);
-
-    pub const EPS_OFFSET: u32 = 2; // parity select
-    pub const EPS_MASK: Self = Self(1 << Self::EPS_OFFSET);
-
-    pub const STP2_OFFSET: u32 = 3; // two stop bits select
-    pub const STP2_MASK: Self = Self(1 << Self::STP2_OFFSET);
-
-    pub const FEN_OFFSET: u32 = 4; // enable FIFO
-    pub const FEN_MASK: Self = Self(1 << Self::FEN_OFFSET);
-
-    pub const WLEN_OFFSET: u32 = 5; // word length NUMBITS(2)
-    pub const WLEN_MASK: Self = Self(mask(2) << Self::WLEN_OFFSET);
-
-    pub const SPS_OFFSET: u32 = 7; // enable stick parity
-    pub const SPS_MASK: Self = Self(1 << Self::SPS_OFFSET);
-
-    // WLEN values
-    pub const WLEN_BIT8: u32 = 0b11;
-    pub const WLEN_BIT8_MASK: Self = Self(Self::WLEN_BIT8 << Self::WLEN_OFFSET);
-    pub const WLEN_BIT7: u32 = 0b10;
-    pub const WLEN_BIT7_MASK: Self = Self(Self::WLEN_BIT7 << Self::WLEN_OFFSET);
-    pub const WLEN_BIT6: u32 = 0b01;
-    pub const WLEN_BIT6_MASK: Self = Self(Self::WLEN_BIT6 << Self::WLEN_OFFSET);
-    pub const WLEN_BIT5: u32 = 0b00;
-    pub const WLEN_BIT5_MASK: Self = Self(Self::WLEN_BIT5 << Self::WLEN_OFFSET);
+bitregs! {
+    /// UART Interrupt FIFO Level Select Register (UARTIFLS)
+    pub struct UARTIFLS: u32 {
+        pub txiflsel@[2:0],
+        pub rxiflsel@[5:3],
+        reserved@[31:6] [ignore],
+    }
 }
 
-/// UART Control Register
-#[repr(transparent)]
-#[derive(Clone, Copy, RawReg, PartialEq, Eq, Debug)]
-pub struct UARTCR(pub u32);
-
-impl UARTCR {
-    pub const UARTEN_OFFSET: u32 = 0; // enable UART
-    pub const UARTEN_MASK: Self = Self(1 << Self::UARTEN_OFFSET);
-
-    pub const SIREN_OFFSET: u32 = 1; // enable SIR
-    pub const SIREN_MASK: Self = Self(1 << Self::SIREN_OFFSET);
-
-    pub const SIRLP_OFFSET: u32 = 2; // enable SIR low power
-    pub const SIRLP_MASK: Self = Self(1 << Self::SIRLP_OFFSET);
-
-    pub const LBE_OFFSET: u32 = 7; // loopback enable
-    pub const LBE_MASK: Self = Self(1 << Self::LBE_OFFSET);
-
-    pub const TXE_OFFSET: u32 = 8; // transmit enable
-    pub const TXE_MASK: Self = Self(1 << Self::TXE_OFFSET);
-
-    pub const RXE_OFFSET: u32 = 9; // receive enable
-    pub const RXE_MASK: Self = Self(1 << Self::RXE_OFFSET);
-
-    pub const DTR_OFFSET: u32 = 10; // data transmit ready
-    pub const DTR_MASK: Self = Self(1 << Self::DTR_OFFSET);
-
-    pub const RTS_OFFSET: u32 = 11; // request to send (旧コードでは LTS)
-    pub const RTS_MASK: Self = Self(1 << Self::RTS_OFFSET);
-
-    pub const OUT1_OFFSET: u32 = 12;
-    pub const OUT1_MASK: Self = Self(1 << Self::OUT1_OFFSET);
-
-    pub const OUT2_OFFSET: u32 = 13;
-    pub const OUT2_MASK: Self = Self(1 << Self::OUT2_OFFSET);
-
-    pub const RTSEN_OFFSET: u32 = 14; // RTS hardware flow control enable
-    pub const RTSEN_MASK: Self = Self(1 << Self::RTSEN_OFFSET);
-
-    pub const CTSEN_OFFSET: u32 = 15; // CTS hardware flow control enable
-    pub const CTSEN_MASK: Self = Self(1 << Self::CTSEN_OFFSET);
+bitregs! {
+    /// UART Interrupt Mask Set/Clear Register (UARTIMSC)
+    pub struct UARTIMSC: u32 {
+        pub rimim@[0:0],
+        pub ctsmim@[1:1],
+        pub dcdmim@[2:2],
+        pub dsrmim@[3:3],
+        pub rxim@[4:4],
+        pub txim@[5:5],
+        pub rtim@[6:6],
+        pub feim@[7:7],
+        pub peim@[8:8],
+        pub beim@[9:9],
+        pub oeim@[10:10],
+        reserved@[31:11] [ignore],
+    }
 }
 
-/// UART Interrupt Clear Register
-#[repr(transparent)]
-#[derive(Clone, Copy, RawReg, PartialEq, Eq, Debug)]
-pub struct UARTICR(pub u32);
+bitregs! {
+    /// UART Raw Interrupt Status Register (UARTRIS)
+    pub struct UARTRIS: u32 {
+        pub rirmis@[0:0],
+        pub ctsrmis@[1:1],
+        pub dcdrmis@[2:2],
+        pub dsrrmis@[3:3],
+        pub rxris@[4:4],
+        pub txris@[5:5],
+        pub rtris@[6:6],
+        pub feris@[7:7],
+        pub peris@[8:8],
+        pub beris@[9:9],
+        pub oeris@[10:10],
+        reserved@[31:11] [ignore],
+    }
+}
+
+bitregs! {
+    /// UART Masked Interrupt Status Register (UARTMIS)
+    pub struct UARTMIS: u32 {
+        pub rimmis@[0:0],
+        pub ctsmmis@[1:1],
+        pub dcdmmis@[2:2],
+        pub dsrmmis@[3:3],
+        pub rxmis@[4:4],
+        pub txmis@[5:5],
+        pub rtmis@[6:6],
+        pub femis@[7:7],
+        pub pemis@[8:8],
+        pub bemis@[9:9],
+        pub oemis@[10:10],
+        reserved@[31:11] [ignore],
+    }
+}
+
+bitregs! {
+    /// UART Interrupt Clear Register (UARTICR)
+    pub struct UARTICR: u32 {
+        pub rimic@[0:0],
+        pub ctsmic@[1:1],
+        pub dcdmic@[2:2],
+        pub dsrmic@[3:3],
+        pub rxic@[4:4],
+        pub txic@[5:5],
+        pub rtic@[6:6],
+        pub feic@[7:7],
+        pub peic@[8:8],
+        pub beic@[9:9],
+        pub oeic@[10:10],
+        reserved@[31:11] [ignore],
+    }
+}
 
 impl UARTICR {
-    pub const RIMIC_OFFSET: u32 = 0; // nUARTRI modem interrupt clear
-    pub const RIMIC_MASK: Self = Self(1 << Self::RIMIC_OFFSET);
-
-    pub const CTSMIC_OFFSET: u32 = 1; // nUARTCTS modem interrupt clear
-    pub const CTSMIC_MASK: Self = Self(1 << Self::CTSMIC_OFFSET);
-
-    pub const DCDMIC_OFFSET: u32 = 2; // nUARTDCD modem interrupt clear
-    pub const DCDMIC_MASK: Self = Self(1 << Self::DCDMIC_OFFSET);
-
-    pub const DSRMIC_OFFSET: u32 = 3; // nUARTDSR modem interrupt clear
-    pub const DSRMIC_MASK: Self = Self(1 << Self::DSRMIC_OFFSET);
-
-    pub const RXIC_OFFSET: u32 = 4; // Receive interrupt clear
-    pub const RXIC_MASK: Self = Self(1 << Self::RXIC_OFFSET);
-
-    pub const TXIC_OFFSET: u32 = 5; // Transmit interrupt clear
-    pub const TXIC_MASK: Self = Self(1 << Self::TXIC_OFFSET);
-
-    pub const RTIC_OFFSET: u32 = 6; // Receive timeout interrupt clear
-    pub const RTIC_MASK: Self = Self(1 << Self::RTIC_OFFSET);
-
-    pub const FEIC_OFFSET: u32 = 7; // Framing error interrupt clear
-    pub const FEIC_MASK: Self = Self(1 << Self::FEIC_OFFSET);
-
-    pub const PEIC_OFFSET: u32 = 8; // Parity error interrupt clear
-    pub const PEIC_MASK: Self = Self(1 << Self::PEIC_OFFSET);
-
-    pub const BEIC_OFFSET: u32 = 9; // Break error interrupt clear
-    pub const BEIC_MASK: Self = Self(1 << Self::BEIC_OFFSET);
-
-    pub const OEIC_OFFSET: u32 = 10; // Overrun error interrupt clear
-    pub const OEIC_MASK: Self = Self(1 << Self::OEIC_OFFSET);
-
-    pub const ALL_OFFSET: u32 = 0; // all interrupt clear
-    pub const ALL_MASK: Self = Self(mask(11) << Self::ALL_OFFSET);
+    pub fn all() -> Self {
+        Self::new()
+            .set(Self::rimic, 1)
+            .set(Self::ctsmic, 1)
+            .set(Self::dcdmic, 1)
+            .set(Self::dsrmic, 1)
+            .set(Self::rxic, 1)
+            .set(Self::txic, 1)
+            .set(Self::rtic, 1)
+            .set(Self::feic, 1)
+            .set(Self::peic, 1)
+            .set(Self::beic, 1)
+            .set(Self::oeic, 1)
+    }
 }
 
-#[derive(Debug)]
+/// FIFO interrupt trigger level selector for UARTIFLS.{rxiflsel,txiflsel}.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum FifoLevel {
+    OneEighth = 0b000,
+    OneQuarter = 0b001,
+    OneHalf = 0b010,
+    ThreeQuarters = 0b011,
+    SevenEighths = 0b100,
+}
+
+impl From<FifoLevel> for u32 {
+    fn from(v: FifoLevel) -> Self {
+        v as u32
+    }
+}
+
+impl TryFrom<u32> for FifoLevel {
+    type Error = ();
+
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        match v & 0b111 {
+            0b000 => Ok(FifoLevel::OneEighth),
+            0b001 => Ok(FifoLevel::OneQuarter),
+            0b010 => Ok(FifoLevel::OneHalf),
+            0b011 => Ok(FifoLevel::ThreeQuarters),
+            0b100 => Ok(FifoLevel::SevenEighths),
+            _ => Err(()),
+        }
+    }
+}
+
+#[repr(C)]
+struct Pl011Peripherals {
+    data: ReadWrite<UARTDR>,
+    error_status: ReadWrite<u32>,
+    reserved0: [u32; 4],
+    flag: ReadOnly<UARTFR>,
+    reserved1: [u32; 2],
+    integer_baud_rate_divisor: ReadWrite<u32>,
+    fractional_baud_rate_divisor: ReadWrite<u32>,
+    line_control: ReadWrite<UARTLCR>,
+    control: ReadWrite<UARTCR>,
+
+    interrupt_fifo_level_select: ReadWrite<UARTIFLS>,
+    interrupt_mask_set_clear: ReadWrite<UARTIMSC>,
+    raw_interrupt_status: ReadOnly<UARTRIS>,
+    masked_interrupt_status: ReadOnly<UARTMIS>,
+    interrupt_clear: WriteOnly<UARTICR>,
+}
+
+#[allow(dead_code)]
 pub struct Pl011Uart {
-    pub(crate) registers: &'static Pl011Peripherals,
+    registers: &'static mut Pl011Peripherals,
+    pub uart_clk: u64,
 }
-
-unsafe impl Sync for Pl011Uart {}
 
 impl Pl011Uart {
-    pub fn new(base_address: usize) -> Self {
+    pub fn new(uart_peripherals: usize, uart_clk: u64) -> Pl011Uart {
+        let pl011_uart =
+            unsafe { &mut *(uart_peripherals as *mut Pl011Peripherals).cast::<Pl011Peripherals>() };
+
         Self {
-            registers: unsafe { &mut *(base_address as *mut Pl011Peripherals) },
+            registers: pl011_uart,
+            uart_clk,
         }
     }
 
     pub fn flush(&self) {
-        // enable pl011 for flushing
         self.registers
             .control
-            .set_bits(UARTCR::UARTEN_MASK + UARTCR::TXE_MASK);
-        self.registers.control.clear_bits(UARTCR::CTSEN_MASK);
-        self.registers.line_control.clear_bits(UARTLCR::BRK_MASK);
-        // wait until flushed
-        let mut spin = 0;
-        while (self.registers.flags.read() & UARTFR::BUSY_MASK) != UARTFR(0) && spin <= 1000 {
-            spin += 1;
-            core::hint::spin_loop();
-        }
+            .set_bits(UARTCR::new().set(UARTCR::uart_en, 1).set(UARTCR::txe, 1));
+        self.registers
+            .control
+            .clear_bits(UARTCR::new().set(UARTCR::ctsen, 1));
+        self.registers
+            .line_control
+            .clear_bits(UARTLCR::new().set(UARTLCR::brk, 1));
+
+        while self.registers.flag.read().get(UARTFR::busy) != 0 {}
     }
 
     pub fn disabled(&self) {
-        self.flush();
-        // disable pl011
         self.registers
             .control
-            .clear_bits(UARTCR::UARTEN_MASK + UARTCR::TXE_MASK + UARTCR::RXE_MASK);
-        // clear all interrupt (write all bits 1)
-        self.registers.interrupt_clear.write(UARTICR::ALL_MASK);
-        // flush FIFO
-        self.registers.line_control.clear_bits(UARTLCR::FEN_MASK);
-        self.registers.interrupt_fifo_level_select.write(0);
-        self.registers.interrupt_mask_set_clear.write(0);
+            .clear_bits(UARTCR::new().set(UARTCR::uart_en, 1));
+        self.registers
+            .interrupt_mask_set_clear
+            .write(UARTIMSC::new());
+        self.registers.interrupt_clear.write(UARTICR::all());
     }
 
-    pub fn init(&self, uart_clk: u32, baudrate: u32) {
+    pub fn init(&mut self, baud_rate: u32) {
+        self.flush();
         self.disabled();
 
-        assert!(uart_clk > 368_6400); // UART_CLK > 3.6864MHz is required
-        let div_x64 = ((4u64 * uart_clk as u64) + (baudrate as u64 / 2)) / baudrate as u64; // round(64*BAUDDIV)
-        let divisor_i = (div_x64 / 64) as u32; // integer part(16bit)
-        let divisor_f = (div_x64 % 64) as u32; // fractional part(6 bit)
-        self.registers.integer_baud_rate.write(divisor_i);
-        self.registers.fractional_baud_rate.write(divisor_f);
-        // enable fifo
+        assert!(self.uart_clk > 368_6400);
+        let divisor = self.uart_clk * 4 / baud_rate as u64;
+        let integer_divisor = divisor / 64;
+        let fractional_divisor = divisor % 64;
+
         self.registers
-            .line_control
-            .write(UARTLCR::WLEN_BIT8_MASK + UARTLCR::FEN_MASK);
-        // turn on UART
+            .integer_baud_rate_divisor
+            .write(integer_divisor as u32);
         self.registers
-            .control
-            .set_bits(UARTCR::UARTEN_MASK + UARTCR::TXE_MASK + UARTCR::RXE_MASK);
+            .fractional_baud_rate_divisor
+            .write(fractional_divisor as u32);
+
+        self.registers.line_control.write(
+            UARTLCR::new()
+                .set_enum(UARTLCR::wlen, WordLen::Bits8)
+                .set(UARTLCR::fen, 1),
+        );
+
+        self.registers.control.write(
+            UARTCR::new()
+                .set(UARTCR::uart_en, 1)
+                .set(UARTCR::txe, 1)
+                .set(UARTCR::rxe, 1),
+        );
+
+        self.registers
+            .interrupt_fifo_level_select
+            .write(UARTIFLS::new());
+        self.registers
+            .interrupt_mask_set_clear
+            .write(UARTIMSC::new());
+        self.registers.interrupt_clear.write(UARTICR::all());
     }
 
-    fn pushb(&self, ch: u32) {
-        while self.registers.flags.read() & UARTFR::TXFF_MASK != UARTFR(0) {
-            core::hint::spin_loop();
-        }
-        self.registers.data.write(UARTDR(ch));
-    }
-
-    pub fn write(&self, char: &str) {
-        for &i in char.as_bytes() {
-            if i == b'\n' {
-                self.pushb('\r' as u32);
+    pub fn write(&mut self, string: &str) {
+        for ch in string.bytes() {
+            if ch == b'\n' {
+                self.pushb(b'\r');
             }
-            self.pushb(i as u32);
+            self.pushb(ch);
         }
     }
 
     pub fn write_byte(&self, byte: u8) {
-        self.pushb(byte as u32);
+        self.pushb(byte);
+    }
+
+    pub fn drain_rx(&self) {
+        while self.registers.flag.read().get(UARTFR::rxfe) == 0 {
+            let _ = self.read_char();
+        }
+    }
+
+    fn pushb(&self, ch: u8) {
+        while self.registers.flag.read().get(UARTFR::txff) != 0 {}
+        self.registers
+            .data
+            .write(UARTDR::new().set(UARTDR::data, ch as u32));
     }
 
     pub fn read_char(&self) -> u8 {
-        while self.registers.flags.read() & UARTFR::RXFE_MASK != UARTFR(0) {
-            core::hint::spin_loop();
-        }
+        while self.registers.flag.read().get(UARTFR::rxfe) != 0 {}
+
         let read = self.registers.data.read();
-        if (read & (UARTDR::FE_MASK + UARTDR::PE_MASK + UARTDR::BE_MASK + UARTDR::OE_MASK))
-            != UARTDR(0)
-        {
+        let has_err = read.get(UARTDR::fe) != 0
+            || read.get(UARTDR::pe) != 0
+            || read.get(UARTDR::be) != 0
+            || read.get(UARTDR::oe) != 0;
+
+        if has_err {
             self.registers.error_status.write(0);
         }
-        (read & UARTDR::DATA_MASK).0 as u8
+
+        read.get(UARTDR::data) as u8
     }
 
-    /// Drain any pending RX characters without returning them.
-    pub fn drain_rx(&self) {
-        while self.registers.flags.read() & UARTFR::RXFE_MASK == UARTFR(0) {
-            let _ = self.registers.data.read();
+    pub fn try_read_byte(&self) -> Option<u8> {
+        if self.registers.flag.read().get(UARTFR::rxfe) != 0 {
+            return None;
+        }
+
+        let read = self.registers.data.read();
+        let has_err = read.get(UARTDR::fe) != 0
+            || read.get(UARTDR::pe) != 0
+            || read.get(UARTDR::be) != 0
+            || read.get(UARTDR::oe) != 0;
+
+        if has_err {
+            self.registers.error_status.write(0);
+        }
+
+        Some(read.get(UARTDR::data) as u8)
+    }
+
+    /// Configure FIFO interrupt trigger levels.
+    pub fn set_fifo_irq_levels(&self, rx: FifoLevel, tx: FifoLevel) {
+        self.registers.interrupt_fifo_level_select.write(
+            UARTIFLS::new()
+                .set_enum(UARTIFLS::rxiflsel, rx)
+                .set_enum(UARTIFLS::txiflsel, tx),
+        );
+    }
+
+    /// Enable selected interrupts by unmasking bits in UARTIMSC.
+    pub fn enable_interrupts(&self, mask: UARTIMSC) {
+        self.registers.interrupt_mask_set_clear.set_bits(mask);
+    }
+
+    /// Disable selected interrupts by masking bits in UARTIMSC.
+    pub fn disable_interrupts(&self, mask: UARTIMSC) {
+        self.registers.interrupt_mask_set_clear.clear_bits(mask);
+    }
+
+    pub fn masked_interrupt_status(&self) -> UARTMIS {
+        self.registers.masked_interrupt_status.read()
+    }
+
+    pub fn raw_interrupt_status(&self) -> UARTRIS {
+        self.registers.raw_interrupt_status.read()
+    }
+
+    pub fn clear_interrupts(&self, mask: UARTICR) {
+        self.registers.interrupt_clear.write(mask);
+    }
+
+    /// Handle RX/RT interrupts: drain RX FIFO and clear relevant interrupt sources.
+    pub fn handle_rx_irq(&self, on_byte: &mut impl FnMut(u8)) {
+        let mis = self.masked_interrupt_status();
+
+        let need_rx = mis.get(UARTMIS::rxmis) != 0 || mis.get(UARTMIS::rtmis) != 0;
+        if need_rx {
+            while let Some(b) = self.try_read_byte() {
+                on_byte(b);
+            }
+        }
+
+        // Clear the sources that are commonly asserted for RX handling.
+        // For level interrupts, draining RX FIFO usually deasserts the line, but clearing is still
+        // recommended per TRM interrupt clear semantics.
+        // (UARTICR is WO; write-1-to-clear for each bit.)
+        let mut icr = UARTICR::new();
+
+        if mis.get(UARTMIS::rxmis) != 0 {
+            icr = icr.set(UARTICR::rxic, 1);
+        }
+        if mis.get(UARTMIS::rtmis) != 0 {
+            icr = icr.set(UARTICR::rtic, 1);
+        }
+        if mis.get(UARTMIS::femis) != 0 {
+            icr = icr.set(UARTICR::feic, 1);
+        }
+        if mis.get(UARTMIS::pemis) != 0 {
+            icr = icr.set(UARTICR::peic, 1);
+        }
+        if mis.get(UARTMIS::bemis) != 0 {
+            icr = icr.set(UARTICR::beic, 1);
+        }
+        if mis.get(UARTMIS::oemis) != 0 {
+            icr = icr.set(UARTICR::oeic, 1);
+        }
+
+        if icr.bits() != 0 {
+            self.clear_interrupts(icr);
         }
     }
 }
@@ -324,9 +439,6 @@ impl fmt::Write for Pl011Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write(s);
         Ok(())
-    }
-    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        fmt::write(self, args)
     }
 }
 

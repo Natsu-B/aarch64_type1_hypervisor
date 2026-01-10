@@ -12,7 +12,7 @@ const COLOR_CYAN: &str = "\x1b[36m";
 const COLOR_RED: &str = "\x1b[31m";
 
 pub fn init_default_uart() {
-    print::debug_uart::init(DEFAULT_UART_BASE, DEFAULT_UART_CLOCK_HZ);
+    print::debug_uart::init(DEFAULT_UART_BASE, DEFAULT_UART_CLOCK_HZ as u64, 115200);
 }
 
 /// A test case that can be executed by the custom runner.

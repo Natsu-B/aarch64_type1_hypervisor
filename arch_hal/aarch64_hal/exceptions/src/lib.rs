@@ -4,7 +4,7 @@
 
 mod common_handler;
 mod el1;
-mod irq_handler;
+pub mod irq_handler;
 pub mod registers;
 pub mod synchronous_handler;
 

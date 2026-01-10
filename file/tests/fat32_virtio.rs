@@ -24,7 +24,7 @@ const HELLO_FINAL_TXT: &str = "FAT32 write path updated this file with a longer 
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
-    debug_uart::init(0x900_0000, 48 * 1000 * 1000);
+    debug_uart::init(0x900_0000, 48 * 1000 * 1000, 115200);
     match run() {
         Ok(()) => {
             println!("fat32_virtio test: PASS");

@@ -18,10 +18,10 @@ const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
-    debug_uart::init(UART_BASE, UART_CLOCK_HZ);
+    debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
 
-    let uart = Pl011Uart::new(UART_BASE);
-    uart.init(UART_CLOCK_HZ, 115200);
+    let mut uart = Pl011Uart::new(UART_BASE, UART_CLOCK_HZ as u64);
+    uart.init(115200);
     uart.drain_rx(); // drop any firmware banner noise before speaking RSP
     let stream = Pl011Stream::new(&uart);
     let mut server: GdbServer<_, 1024> = GdbServer::new(stream);

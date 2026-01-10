@@ -2,9 +2,9 @@ use crate::GLOBAL_ALLOCATOR;
 use crate::SPSR_EL2_M_EL1H;
 use alloc::vec;
 use alloc::vec::Vec;
-use arch_hal::DEBUG_UART;
 use arch_hal::cpu;
 use arch_hal::cpu::CoreAffinity;
+use arch_hal::debug_uart;
 use arch_hal::println;
 use arch_hal::psci::secure_monitor_call;
 use core::arch::asm;
@@ -39,7 +39,7 @@ pub struct HypervisorRegisters {
 
 pub fn setup_multicore(stack: usize) {
     GLOBAL_ALLOCATOR.enable_atomic();
-    DEBUG_UART.enable_atomic();
+    debug_uart::enable_atomic();
     let cpu_id = cpu::get_current_core_id();
     let stack_list = STACK_MEM_FOR_EACH_CPU.lock();
     stack_list.set(vec![(cpu_id, stack)]).unwrap();
