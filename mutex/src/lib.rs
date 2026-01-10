@@ -9,6 +9,8 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 
+pub mod pod;
+
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
