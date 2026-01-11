@@ -154,3 +154,16 @@ This builds U-Boot and generates `boot.scr` from `u-boot/boot.txt`.
 
 If your environment differs, provide a custom init function and pass it to
 `uboot_unit_test_harness!(...)`.
+
+### Stack Smashing Detected
+
+This test framework checks a stack canary **before and after each unit test**.
+If the stack is smashed and the test **crashes/hangs/resets before returning to the harness**,
+the post-test canary check cannot run.
+
+In that case, use a GDB watchpoint on the canary location to stop at the moment it is overwritten:
+
+```gdb
+p/x &__stack_bottom
+watch *(unsigned long long*)&__stack_bottom
+```
