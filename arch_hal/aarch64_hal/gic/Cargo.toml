@@ -30,3 +30,8 @@ harness = false
 name = "vgic_types"
 harness = false
 path = "tests/vgic_types.rs"
+
+[[test]]
+name = "gicv2_ppi_enable"
+path = "tests/gicv2_ppi_enable.rs"
+harness = false

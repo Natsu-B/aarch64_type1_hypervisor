@@ -53,7 +53,7 @@ pub unsafe extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rust_entry() -> ! {
     clear_bss();
-    debug_uart::init(UART_BASE, UART_CLOCK_HZ);
+    debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
     match entry() {
         Ok(()) => {
             println!("vgic_types: PASS");
