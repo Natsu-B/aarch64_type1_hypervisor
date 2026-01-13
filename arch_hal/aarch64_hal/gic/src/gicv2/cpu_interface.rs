@@ -20,7 +20,7 @@ use crate::gicv2::registers::GICC_IAR;
 use crate::gicv2::registers::GICC_PMR;
 
 impl GicCpuInterface for Gicv2 {
-    fn init(&self) -> Result<GicCpuCaps, GicError> {
+    fn init_cpu_interface(&self) -> Result<GicCpuCaps, GicError> {
         let security_ext = self.is_security_extension_implemented();
         // disable cpu interface
         if security_ext {
@@ -138,10 +138,11 @@ impl GicCpuInterface for Gicv2 {
         if security_ext {
             // binary point
             match cfg.binary_point {
-                BinaryPoint::Common(binary_point) => self
+                BinaryPoint::Common(binary_point) if binary_point < 0x8 => self
                     .gicc
                     .bpr
                     .write(GICC_BPR::new().set(GICC_BPR::binary_point, binary_point as u32)),
+                BinaryPoint::Common(_) => return Err(GicError::InvalidState),
                 BinaryPoint::Separate {
                     group0: _,
                     group1: _,
@@ -175,7 +176,7 @@ impl GicCpuInterface for Gicv2 {
         } else {
             // binary point
             match cfg.binary_point {
-                BinaryPoint::Common(binary_point) => {
+                BinaryPoint::Common(binary_point) if binary_point < 0x8 => {
                     self.gicc
                         .ctlr
                         .set_bits(GICC_CTLR::new().set(GICC_CTLR::cbpr, 1));
@@ -183,7 +184,7 @@ impl GicCpuInterface for Gicv2 {
                         .bpr
                         .write(GICC_BPR::new().set(GICC_BPR::binary_point, binary_point as u32));
                 }
-                BinaryPoint::Separate { group0, group1 } => {
+                BinaryPoint::Separate { group0, group1 } if group0 < 0x8 && group1 < 0x8 => {
                     self.gicc
                         .ctlr
                         .clear_bits(GICC_CTLR::new().set(GICC_CTLR::cbpr, 1));
@@ -194,6 +195,7 @@ impl GicCpuInterface for Gicv2 {
                         .abpr
                         .write(GICC_ABPR::new().set(GICC_ABPR::binary_point, group1 as u32));
                 }
+                _ => return Err(GicError::InvalidState),
             }
 
             match cfg.eoi_mode {
