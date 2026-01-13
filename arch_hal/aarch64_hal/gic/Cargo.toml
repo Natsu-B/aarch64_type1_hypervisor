@@ -8,12 +8,25 @@ typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
 cpu = { path = "../cpu" }
 mutex = { path = "../../../mutex" }
+aarch64_mutex = { path = "../aarch64_mutex" }
 
-[dev-dependencies]
+[target.'cfg(target_arch = "aarch64")'.dev-dependencies]
 aarch64_test = { path = "../aarch64_test" }
+aarch64_unit_test = { path = "../aarch64_unit_test" }
+exceptions = { path = "../exceptions" }
 print = { path = "../print" }
 
 [[test]]
 name = "gicv2_pending"
 path = "tests/gicv2_pending.rs"
 harness = false
+
+[[test]]
+name = "gicv2_vgic_pending"
+path = "tests/gicv2_vgic_pending.rs"
+harness = false
+
+[[test]]
+name = "vgic_types"
+harness = false
+path = "tests/vgic_types.rs"

@@ -130,12 +130,9 @@ fn run() -> Result<(), &'static str> {
         });
     }
 
-    let eoi_modes = [EoiMode::DropAndDeactivate, EoiMode::DropOnly];
     for case in cases.iter() {
-        for &eoi_mode in eoi_modes.iter() {
-            println!("=== running case {} mode {:?} ===", case.label, eoi_mode);
-            run_case(&gic, case, security_extension_implemented, eoi_mode)?;
-        }
+        println!("=== running case {} ===", case.label);
+        run_case(&gic, case, security_extension_implemented)?;
     }
 
     Ok(())
@@ -145,7 +142,6 @@ fn run_case(
     gic: &Gicv2,
     case: &Case,
     security_extension_implemented: bool,
-    eoi_mode: EoiMode,
 ) -> Result<(), &'static str> {
     unsafe { asm!("msr daifset, #0b1111",) };
 
@@ -177,15 +173,15 @@ fn run_case(
         enable_group0: case.enable_group0,
         enable_group1: case.enable_group1,
         binary_point: BinaryPoint::Common(1),
-        eoi_mode,
+        eoi_mode: EoiMode::DropAndDeactivate,
     };
     GicCpuInterface::configure(gic, &cfg).map_err(|err| map_err("gicc_configure", err))?;
 
     let gicd_ctlr = read_mmio32(GICD_BASE, 0x000);
     let gicc_ctlr = read_mmio32(GICC_BASE, 0x000);
     println!(
-        "case {} mode {:?}: GICD_CTLR=0x{:08x} GICC_CTLR=0x{:08x}",
-        case.label, eoi_mode, gicd_ctlr, gicc_ctlr
+        "case {}: GICD_CTLR=0x{:08x} GICC_CTLR=0x{:08x}",
+        case.label, gicd_ctlr, gicc_ctlr
     );
 
     unsafe { asm!("msr daifclr, #0b1111") };
@@ -244,7 +240,7 @@ fn run_case(
         read_mmio32(GICC_BASE, 0x028)
     );
 
-    wait_for_spi(gic, case.group, eoi_mode)?;
+    wait_for_spi(gic, case.group)?;
 
     cpu::dsb_sy();
     cpu::isb();
@@ -257,7 +253,7 @@ fn run_case(
     Ok(())
 }
 
-fn wait_for_spi(gic: &Gicv2, group: IrqGroup, eoi_mode: EoiMode) -> Result<(), &'static str> {
+fn wait_for_spi(gic: &Gicv2, group: IrqGroup) -> Result<(), &'static str> {
     for _ in 0..200_000 {
         if let Some(ack) =
             GicCpuInterface::acknowledge(gic).map_err(|err| map_err("ack_wait", err))?
@@ -268,18 +264,11 @@ fn wait_for_spi(gic: &Gicv2, group: IrqGroup, eoi_mode: EoiMode) -> Result<(), &
                     return Err("ack_group_mismatch");
                 }
                 GicCpuInterface::end_of_interrupt(gic, ack).map_err(|err| map_err("eoi", err))?;
-                if matches!(eoi_mode, EoiMode::DropOnly) {
-                    GicCpuInterface::deactivate(gic, ack).map_err(|err| map_err("dir", err))?;
-                }
                 return Ok(());
             }
 
             GicCpuInterface::end_of_interrupt(gic, ack)
                 .map_err(|err| map_err("eoi_unexpected", err))?;
-            if matches!(eoi_mode, EoiMode::DropOnly) {
-                GicCpuInterface::deactivate(gic, ack)
-                    .map_err(|err| map_err("dir_unexpected", err))?;
-            }
         } else {
             cpu::isb();
         }

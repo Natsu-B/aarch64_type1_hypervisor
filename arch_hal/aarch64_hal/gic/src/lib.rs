@@ -1,5 +1,16 @@
-#![cfg_attr(not(test), no_std)]
 #![feature(sync_unsafe_cell)]
+#![feature(generic_const_exprs)]
+#![cfg_attr(not(all(test, not(target_arch = "aarch64"))), no_std)]
+#![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
 
 //! GIC (Generic Interrupt Controller) abstraction for OS (EL1) and hypervisor (EL2) use. (Non-Secure only)
 //!
@@ -17,9 +28,14 @@ pub mod gicv2;
 /// GICv3 implementation (Distributor/Redistributor; CPU interface via system registers; optional ITS/MSI).
 pub mod gicv3;
 
-extern crate alloc;
+pub mod vm;
 
 use cpu::CoreAffinity;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+use exceptions::setup_exception;
+#[cfg(all(test, target_arch = "aarch64"))]
+extern crate alloc;
 
 /// An MMIO region describing a device register frame.
 ///
@@ -79,6 +95,27 @@ pub enum GicError {
     InvalidOffset,
     /// Attempted write to a read-only register.
     ReadOnlyRegister,
+    /// Operation would exceed fixed-capacity resources limits.
+    OutOfResources,
+}
+
+/// Helper for deriving per-VM sizing from the requested vCPU count.
+#[inline(always)]
+pub const fn max_intids_for_vcpus(vcpus: usize) -> usize {
+    let priv_intids = 32usize.saturating_mul(vcpus);
+    let shared = 1020 - 32;
+    let total = priv_intids.saturating_add(shared);
+    if total > 1020 { 1020 } else { total }
+}
+
+/// Compile-time vGIC sizing chosen by crate users via const generics.
+pub struct VgicVmConfig<const VCPUS: usize>;
+
+impl<const VCPUS: usize> VgicVmConfig<VCPUS> {
+    pub const VCPUS: usize = VCPUS;
+    pub const MAX_INTIDS: usize = max_intids_for_vcpus(VCPUS);
+    // Per-PE list register limit for GICv2.
+    pub const MAX_LRS: usize = 64;
 }
 
 /// Decoded acknowledgement token returned by `acknowledge()`.
@@ -391,22 +428,118 @@ pub enum IrqState {
 /// If the requested values cannot be encoded (e.g. ID too large for GICv2 LR), implementations
 /// must return `InvalidVgicIrq`.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct VirtualInterrupt {
-    /// Virtual interrupt ID presented to the guest.
-    pub vintid: u32,
-    /// Optional physical interrupt ID for hardware-backed injection.
-    pub pintid: Option<u32>,
-    /// Whether guest deactivation should raise an EOI maintenance interrupt (HW=0 only).
-    pub eoi_maintenance: bool,
-    /// Virtual priority.
-    pub priority: u8,
-    /// Virtual interrupt group.
-    pub group: IrqGroup,
-    /// Virtual interrupt state.
-    pub state: IrqState,
-    /// Whether this entry represents a hardware-backed interrupt (backend-specific meaning).
-    pub hw: bool,
-    pub source: Option<VcpuId>,
+pub enum VirtualInterrupt {
+    Hardware {
+        /// Virtual interrupt ID presented to the guest.
+        vintid: u32,
+        /// Physical interrupt ID for hardware-backed injection.
+        pintid: u32,
+        /// Virtual priority.
+        priority: u8,
+        /// Virtual interrupt group.
+        group: IrqGroup,
+        /// Virtual interrupt state.
+        state: IrqState,
+        source: Option<VcpuId>,
+    },
+    Software {
+        /// Virtual interrupt ID presented to the guest.
+        vintid: u32,
+        /// Whether guest deactivation should raise an EOI maintenance interrupt.
+        eoi_maintenance: bool,
+        /// Virtual priority.
+        priority: u8,
+        /// Virtual interrupt group.
+        group: IrqGroup,
+        /// Virtual interrupt state.
+        state: IrqState,
+        source: Option<VcpuId>,
+    },
+}
+
+impl VirtualInterrupt {
+    pub const fn vintid(&self) -> u32 {
+        match self {
+            Self::Hardware { vintid, .. } | Self::Software { vintid, .. } => *vintid,
+        }
+    }
+
+    pub const fn pintid(&self) -> Option<u32> {
+        match self {
+            Self::Hardware { pintid, .. } => Some(*pintid),
+            Self::Software { .. } => None,
+        }
+    }
+
+    pub const fn is_hw(&self) -> bool {
+        matches!(self, Self::Hardware { .. })
+    }
+
+    pub const fn eoi_maintenance(&self) -> bool {
+        match self {
+            Self::Hardware { .. } => false,
+            Self::Software {
+                eoi_maintenance, ..
+            } => *eoi_maintenance,
+        }
+    }
+
+    pub const fn priority(&self) -> u8 {
+        match self {
+            Self::Hardware { priority, .. } | Self::Software { priority, .. } => *priority,
+        }
+    }
+
+    pub fn set_priority(&mut self, priority: u8) {
+        match self {
+            Self::Hardware { priority: p, .. } | Self::Software { priority: p, .. } => {
+                *p = priority;
+            }
+        }
+    }
+
+    pub const fn group(&self) -> IrqGroup {
+        match self {
+            Self::Hardware { group, .. } | Self::Software { group, .. } => *group,
+        }
+    }
+
+    pub const fn state(&self) -> IrqState {
+        match self {
+            Self::Hardware { state, .. } | Self::Software { state, .. } => *state,
+        }
+    }
+
+    pub fn set_state(&mut self, state: IrqState) {
+        match self {
+            Self::Hardware { state: s, .. } | Self::Software { state: s, .. } => {
+                *s = state;
+            }
+        }
+    }
+
+    pub fn set_eoi_maintenance(&mut self, enable: bool) {
+        if let Self::Software {
+            eoi_maintenance, ..
+        } = self
+        {
+            *eoi_maintenance = enable;
+        }
+    }
+
+    pub const fn source(&self) -> Option<VcpuId> {
+        match self {
+            Self::Hardware { source, .. } | Self::Software { source, .. } => *source,
+        }
+    }
+
+    pub fn set_source(&mut self, source: Option<VcpuId>) {
+        match self {
+            Self::Hardware { source: s, .. } | Self::Software { source: s, .. } => {
+                *s = source;
+            }
+        }
+    }
 }
 
 /// Version-independent maintenance reasons encoded as a bitset.
@@ -494,6 +627,51 @@ pub struct PIntId(pub u32);
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct VIntId(pub u32);
 
+const PIRQ_MAX_LRS: usize = VgicVmConfig::<1>::MAX_LRS;
+
+pub struct PirqList {
+    ids: [PIntId; PIRQ_MAX_LRS],
+    len: usize,
+}
+
+impl PirqList {
+    pub const fn new() -> Self {
+        Self {
+            ids: [PIntId(0); PIRQ_MAX_LRS],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, id: PIntId) -> Result<(), GicError> {
+        if self.len >= self.ids.len() {
+            return Err(GicError::OutOfResources);
+        }
+        self.ids[self.len] = id;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = PIntId> + '_ {
+        self.ids.iter().copied().take(self.len)
+    }
+}
+
+pub struct PirqNotifications {
+    pub eoi: PirqList,
+    pub deactivate: PirqList,
+    pub resample: PirqList,
+}
+
+impl PirqNotifications {
+    pub const fn new() -> Self {
+        Self {
+            eoi: PirqList::new(),
+            deactivate: PirqList::new(),
+            resample: PirqList::new(),
+        }
+    }
+}
+
 /// Edge/level semantics for injection bookkeeping (esp. mapped pIRQs).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum IrqSense {
@@ -517,6 +695,9 @@ pub trait VgicHw {
     /// Toggle Underflow maintenance interrupt (UIE).
     fn set_underflow_irq(&self, enable: bool) -> Result<(), GicError>;
 
+    /// Inspect the current EOImode (DropAndDeactivate vs DropOnly) for the resident vCPU.
+    fn current_eoi_mode(&self) -> Result<EoiMode, GicError>;
+
     /// Implemented LR count on this PE.
     fn num_lrs(&self) -> Result<usize, GicError>;
 
@@ -526,16 +707,22 @@ pub trait VgicHw {
     /// Bitmap of LRs that caused an EOI maintenance event (bit i == 1).
     fn eoi_lr_bitmap(&self) -> Result<u64, GicError>;
 
+    /// Clear bits in the EOI LR bitmap that were handled (write-one-to-clear).
+    fn clear_eoi_lr_bitmap(&self, bitmap: u64) -> Result<(), GicError>;
+
+    fn take_eoi_count(&self) -> Result<u32, GicError>;
+
     /// Read/Write an LR decoded as a version-independent descriptor.
     fn read_lr(&self, index: usize) -> Result<VirtualInterrupt, GicError>;
     fn write_lr(&self, index: usize, irq: VirtualInterrupt) -> Result<(), GicError>;
 
-    /// Read and clear EOICount (LRENP accounting).
-    fn take_eoi_count(&self) -> Result<u8, GicError>;
-
     /// Accessor for APR (active priority register).
-    fn read_apr(&self) -> Result<u32, GicError>;
-    fn write_apr(&self, value: u32) -> Result<(), GicError>;
+    ///
+    /// `index` selects the backend-specific APR bank/register. GICv2 typically supports only
+    /// `index == 0`; GICv3 may map indices to AP0R/AP1R banks. Implementations must return
+    /// `GicError::IndexOutOfRange` if the index is unsupported.
+    fn read_apr(&self, index: usize) -> Result<u32, GicError>;
+    fn write_apr(&self, index: usize, value: u32) -> Result<(), GicError>;
 
     /// Snapshot maintenance reasons (MISR / ICH_MISR_EL2).
     fn maintenance_reasons(&self) -> Result<MaintenanceReasons, GicError>;
@@ -545,18 +732,74 @@ pub trait VgicHw {
     fn restore_state(&self, state: &Self::SavedState) -> Result<(), GicError>;
 }
 
-/// Dense vCPU bitmask: bit i => vCPU i.
-#[repr(transparent)]
+/// Dense vCPU mask: element i corresponds to vCPU i.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct VcpuMask(pub u16);
+pub struct VcpuMask<const N: usize = 64>(pub [bool; N]);
 
-impl VcpuMask {
-    pub const EMPTY: Self = Self(0);
-    pub const fn contains(self, id: VcpuId) -> bool {
-        (self.0 & (1u16 << id.0)) != 0
+impl<const N: usize> VcpuMask<N> {
+    pub const EMPTY: Self = Self([false; N]);
+
+    pub const fn from_bits(bits: u16) -> Self {
+        let mut arr = [false; N];
+        let mut i = 0;
+        while i < N {
+            // Only the lower 16 bits are representable in `bits`.
+            if i < 16 {
+                arr[i] = (bits & (1u16 << i)) != 0;
+            } else {
+                arr[i] = false;
+            }
+            i += 1;
+        }
+        Self(arr)
     }
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
+
+    pub const fn is_empty(&self) -> bool {
+        let mut i = 0;
+        while i < N {
+            if self.0[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    pub const fn contains(&self, id: VcpuId) -> bool {
+        let idx = id.0 as usize;
+        if idx >= N { false } else { self.0[idx] }
+    }
+
+    pub fn set(&mut self, id: VcpuId) -> Result<(), GicError> {
+        let idx = id.0 as usize;
+        if idx >= N {
+            return Err(GicError::InvalidVcpuId);
+        }
+        self.0[idx] = true;
+        Ok(())
+    }
+
+    pub fn clear(&mut self, id: VcpuId) -> Result<(), GicError> {
+        let idx = id.0 as usize;
+        if idx >= N {
+            return Err(GicError::InvalidVcpuId);
+        }
+        self.0[idx] = false;
+        Ok(())
+    }
+
+    pub fn union_assign(&mut self, other: &Self) {
+        for (dst, src) in self.0.iter_mut().zip(other.0.iter()) {
+            *dst |= *src;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = VcpuId> + '_ {
+        self.0
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| **set)
+            .map(|(idx, _)| VcpuId(idx as u16))
     }
 }
 
@@ -587,6 +830,13 @@ pub enum VgicUpdate {
 }
 impl VgicUpdate {
     fn combine(&mut self, other: &VgicUpdate) {
+        fn set_infallible<const N: usize>(mask: &mut VcpuMask<N>, id: VcpuId) {
+            let idx = id.0 as usize;
+            if idx < N {
+                mask.0[idx] = true;
+            }
+        }
+
         *self = match (*self, *other) {
             (VgicUpdate::None, u) | (u, VgicUpdate::None) => u,
 
@@ -604,12 +854,16 @@ impl VgicUpdate {
                     (VgicTargets::All, _) | (_, VgicTargets::All) => VgicTargets::All,
 
                     (VgicTargets::Mask(m1), VgicTargets::Mask(m2)) => {
-                        VgicTargets::Mask(VcpuMask(m1.0 | m2.0))
+                        let mut mask = m1;
+                        mask.union_assign(&m2);
+                        VgicTargets::Mask(mask)
                     }
 
                     (VgicTargets::Mask(m), VgicTargets::One(id))
                     | (VgicTargets::One(id), VgicTargets::Mask(m)) => {
-                        VgicTargets::Mask(VcpuMask(m.0 | (1u16 << id.0)))
+                        let mut mask = m;
+                        set_infallible(&mut mask, id);
+                        VgicTargets::Mask(mask)
                     }
 
                     (VgicTargets::One(id1), VgicTargets::One(id2)) if id1 == id2 => {
@@ -617,7 +871,10 @@ impl VgicUpdate {
                     }
 
                     (VgicTargets::One(id1), VgicTargets::One(id2)) => {
-                        VgicTargets::Mask(VcpuMask((1 << id1.0) | (1 << id2.0)))
+                        let mut mask = VcpuMask::EMPTY;
+                        set_infallible(&mut mask, id1);
+                        set_infallible(&mut mask, id2);
+                        VgicTargets::Mask(mask)
                     }
                 };
 
@@ -637,7 +894,7 @@ impl VgicUpdate {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VSpiRouting {
-    Targets(u8),
+    Targets(VcpuMask),
     Specific(CoreAffinity),
     AnyParticipating,
 }
@@ -782,32 +1039,52 @@ pub trait VgicSgiRegs: VgicVmInfo {
     fn write_set_sgi_pending_sources_word(
         &mut self,
         target: VcpuId,
-        sgi: u8,
+        word: u8,
         sources: u32,
     ) -> Result<VgicUpdate, GicError>;
     fn write_clear_sgi_pending_sources_word(
         &mut self,
         target: VcpuId,
-        sgi: u8,
+        word: u8,
         sources: u32,
     ) -> Result<VgicUpdate, GicError>;
 
     fn write_set_sgi_pending_sources(
         &mut self,
         target: VcpuId,
-        sgi: u8,
+        word: u8,
         sources: VcpuMask,
     ) -> Result<VgicUpdate, GicError> {
-        self.write_set_sgi_pending_sources_word(target, sgi, sources.0 as u32)
+        let mut bits = 0u32;
+        for (idx, set) in sources.0.iter().enumerate() {
+            if !*set {
+                continue;
+            }
+            if idx >= u32::BITS as usize {
+                return Err(GicError::InvalidVcpuId);
+            }
+            bits |= 1u32 << idx;
+        }
+        self.write_set_sgi_pending_sources_word(target, word, bits)
     }
 
     fn write_clear_sgi_pending_sources(
         &mut self,
         target: VcpuId,
-        sgi: u8,
+        word: u8,
         sources: VcpuMask,
     ) -> Result<VgicUpdate, GicError> {
-        self.write_clear_sgi_pending_sources_word(target, sgi, sources.0 as u32)
+        let mut bits = 0u32;
+        for (idx, set) in sources.0.iter().enumerate() {
+            if !*set {
+                continue;
+            }
+            if idx >= u32::BITS as usize {
+                return Err(GicError::InvalidVcpuId);
+            }
+            bits |= 1u32 << idx;
+        }
+        self.write_clear_sgi_pending_sources_word(target, word, bits)
     }
 
     fn inject_sgi(
@@ -816,20 +1093,25 @@ pub trait VgicSgiRegs: VgicVmInfo {
         targets: VcpuMask,
         sgi: u8,
     ) -> Result<VgicUpdate, GicError> {
-        if sender.0 >= 16 {
+        if sender.0 >= 8 {
             return Err(GicError::InvalidVcpuId);
+        }
+        if sgi >= 16 {
+            return Err(GicError::UnsupportedIntId);
         }
         if targets.is_empty() {
             return Ok(VgicUpdate::None);
         }
 
+        let word = sgi / 4;
+        let lane = sgi % 4;
+        let sources = (1u32 << sender.0) << (lane * 8);
         let mut update = VgicUpdate::None;
-        for bit in 0..16 {
-            if (targets.0 & (1 << bit)) == 0 {
-                continue;
+        for target in targets.iter() {
+            if target.0 as usize >= self.vcpu_count() as usize {
+                return Err(GicError::InvalidVcpuId);
             }
-            let target = VcpuId(bit);
-            let res = self.write_set_sgi_pending_sources_word(target, sgi, 1u32 << sender.0)?;
+            let res = self.write_set_sgi_pending_sources_word(target, word, sources)?;
             update.combine(&res);
         }
         Ok(update)
@@ -874,18 +1156,66 @@ pub trait VgicVcpuModel {
 
     /// Handle a maintenance interrupt for this vCPU on this PE.
     ///
-    /// Typical actions:
+    /// Phase A (inside the vCPU lock):
     /// - Read MISR reasons
     /// - Drain completed EOIs / update software state
     /// - Refill LRs on UNDERFLOW
+    /// - Collect pIRQ notifications without calling back into the VM
+    ///
+    /// Phase B (outside the vCPU lock):
+    /// - Invoke `on_pirq_*` callbacks with the collected notifications
+    ///
+    /// Implementations must keep the Phase A/B split to avoid VM↔vCPU ABBA deadlocks; callbacks
+    /// run without holding vCPU-local locks.
+    fn handle_maintenance_collect<H: VgicHw>(
+        &self,
+        hw: &H,
+    ) -> Result<(VgicUpdate, PirqNotifications), GicError>;
+
     fn handle_maintenance<H: VgicHw>(
         &self,
         hw: &H,
         on_pirq_eoi: &mut impl FnMut(PIntId),
         on_pirq_deactivate: &mut impl FnMut(PIntId),
         on_pirq_resample: &mut impl FnMut(PIntId),
-    ) -> Result<VgicUpdate, GicError>;
+    ) -> Result<VgicUpdate, GicError> {
+        let (update, notifications) = self.handle_maintenance_collect(hw)?;
+        for id in notifications.eoi.iter() {
+            on_pirq_eoi(id);
+        }
+        for id in notifications.deactivate.iter() {
+            on_pirq_deactivate(id);
+        }
+        for id in notifications.resample.iter() {
+            on_pirq_resample(id);
+        }
+        Ok(update)
+    }
 
-    /// Switch in this vCPU's HW state on this PE.
+    /// Mark this vCPU as resident on `core`.
+    ///
+    /// The hypervisor must call this after restoring the backend HW state to the
+    /// current PE and before invoking `refill_lrs`/`handle_maintenance_*`.
+    fn set_resident(&self, core: CoreAffinity) -> Result<(), GicError>;
+
+    /// Clear residency if the vCPU is currently resident on `core`.
+    fn clear_resident(&self, core: CoreAffinity) -> Result<(), GicError>;
+
+    /// Switch out this vCPU's HW state from this PE, synchronizing HW to software state.
     fn switch_out_sync<H: VgicHw>(&self, hw: &H) -> Result<(), GicError>;
 }
+
+/// Minimal queue API exposed by vCPU models for the VM model to stage deliverable interrupts.
+pub trait VgicVcpuQueue {
+    fn enqueue_irq(&self, irq: VirtualInterrupt) -> Result<VgicWork, GicError>;
+    fn cancel_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError>;
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn __unit_test_init() {
+    aarch64_unit_test::init_default_uart();
+    setup_exception();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);
