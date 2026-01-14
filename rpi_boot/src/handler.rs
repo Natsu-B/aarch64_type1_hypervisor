@@ -105,7 +105,7 @@ fn irq_handler() {
         return;
     };
     println_force!("irq number: {}", irq.intid);
-    if irq.intid == 0x79 + 32 {
+    if irq.intid == 120 + 32 {
         debug_uart::handle_rx_irq_force(|bytes| println_force!("interrupt: {}", bytes as char));
     }
 

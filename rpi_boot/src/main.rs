@@ -351,10 +351,26 @@ extern "C" fn main() -> ! {
         })
         .unwrap();
 
+    dtb.find_nodes_by_compatible_view("arm,pl011", &mut |view, string| {
+        if view
+            .reg_iter()
+            .unwrap()
+            .any(|info| info.unwrap().0 == PL011_UART_ADDR.0)
+        {
+            view.for_each_interrupt_specifier(&mut |int| {
+                println!("  pl011 interrupt specifier: {:?}", int);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        }
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
     // setup pl011 interrupts
     gicv2
         .configure_spi(
-            0x79 + 32,
+            120 + 32,
             arch_hal::gic::IrqGroup::Group1,
             0x80,
             arch_hal::gic::TriggerMode::Level,
