@@ -17,8 +17,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aarch64_mutex"
+version = "0.1.0"
+dependencies = [
+ "aarch64_unit_test",
+ "cpu",
+ "exceptions",
+ "mutex",
+]
+
+[[package]]
 name = "aarch64_test"
 version = "0.1.0"
+
+[[package]]
+name = "aarch64_unit_test"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "print",
+]
 
 [[package]]
 name = "allocator"
@@ -141,8 +159,11 @@ dependencies = [
 name = "gic"
 version = "0.1.0"
 dependencies = [
+ "aarch64_mutex",
  "aarch64_test",
+ "aarch64_unit_test",
  "cpu",
+ "exceptions",
  "mutex",
  "print",
  "typestate",
@@ -156,6 +177,9 @@ version = "0.1.0"
 [[package]]
 name = "mutex"
 version = "0.1.0"
+dependencies = [
+ "typestate",
+]
 
 [[package]]
 name = "paging"

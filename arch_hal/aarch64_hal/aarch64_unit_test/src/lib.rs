@@ -1,6 +1,12 @@
 #![no_std]
+#![feature(alloc_error_handler)]
 
+pub mod stack_canary;
+
+use core::alloc::Layout;
 use core::panic::PanicInfo;
+
+use aarch64_test::exit_failure;
 
 pub const DEFAULT_UART_BASE: usize = 0x0900_0000;
 pub const DEFAULT_UART_CLOCK_HZ: u32 = 48_000_000;
@@ -25,6 +31,7 @@ where
     T: Fn(),
 {
     fn run(&self) {
+        stack_canary::check_or_abort("before test");
         print::println!(
             "{}test{} {} ...",
             COLOR_YELLOW,
@@ -32,6 +39,7 @@ where
             core::any::type_name::<T>()
         );
         self();
+        stack_canary::check_or_abort("after test");
         print::println!("{}ok{}", COLOR_GREEN, COLOR_RESET);
     }
 }
@@ -48,6 +56,12 @@ pub fn test_runner(tests: &[&dyn Testable]) {
 pub fn panic_handler(info: &PanicInfo) -> ! {
     print::println!("{}PANIC:{} {}", COLOR_RED, COLOR_RESET, info);
     aarch64_test::exit_failure();
+}
+
+#[alloc_error_handler]
+fn oom(layout: Layout) -> ! {
+    print::println!("[oom] {:?}", layout);
+    exit_failure();
 }
 
 /// Define a U-Boot/QEMU runnable no_std unit-test harness in the test binary.
@@ -99,6 +113,10 @@ macro_rules! uboot_unit_test_harness {
 
             // Bring up minimal console; caller can override via `$init`.
             ($init)();
+
+            // Initialize stack canary after UART is ready.
+            aarch64_unit_test::stack_canary::init();
+            aarch64_unit_test::stack_canary::check_or_abort("after canary init");
 
             // Run generated test harness.
             test_main();

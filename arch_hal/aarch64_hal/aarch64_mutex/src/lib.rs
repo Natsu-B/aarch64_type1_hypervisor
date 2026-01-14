@@ -27,10 +27,6 @@ impl<T> RawSpinLockIrqSave<T> {
         }
     }
 
-    pub fn enable_atomic(&self) {
-        self.inner.enable_atomic();
-    }
-
     pub fn lock_irqsave(&self) -> RawSpinLockIrqSaveGuard<'_, T> {
         let flags = cpu::irq_save();
         let guard = self.inner.lock();
@@ -82,10 +78,6 @@ impl<T> RawRwLockIrqSave<T> {
         Self {
             inner: mutex::RawRwLock::new(value),
         }
-    }
-
-    pub fn enable_atomic(&self) {
-        self.inner.enable_atomic();
     }
 
     pub fn read_irqsave(&self) -> RawRwLockReadIrqSaveGuard<'_, T> {

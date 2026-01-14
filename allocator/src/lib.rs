@@ -237,12 +237,12 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// to another kernel or ELF payload (e.g., Linux).
     ///
     /// # Safety
-    /// - Do not call this after `enable_atomic` has been invoked.
+    /// - Do not call this after `enable_raw_atomics` has been invoked.
     /// - This function does not support atomic access and may cause a deadlock.
     /// - Internally calls `MemoryBlock::trim_for_boot`, which allocates a `Vec`
     ///   while the range-list allocator guard is held and can re-enter the
     ///   global allocator.
-    /// - Only valid before `enable_atomic()` when `RawSpinLock::lock()` is a
+    /// - Only valid before `enable_raw_atomics()` when `RawSpinLock::lock()` is a
     ///   no-op and during single-threaded bring-up; after atomic locking is
     ///   enabled this path can deadlock or spin indefinitely.
     pub fn trim_for_boot(&self, reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
@@ -254,11 +254,6 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
             return Err("allocator not finalized");
         }
         block.trim_for_boot(reserve_bytes)
-    }
-
-    pub fn enable_atomic(&self) {
-        self.range_list_allocator.enable_atomic();
-        self.buddy_allocator.enable_atomic();
     }
 
     #[allow(unused)]
