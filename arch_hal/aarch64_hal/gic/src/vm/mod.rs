@@ -9,7 +9,6 @@ use crate::TriggerMode;
 use crate::VIntId;
 use crate::VSpiRouting;
 use crate::VcpuId;
-use crate::VcpuMask;
 use crate::VgicGuestRegs;
 use crate::VgicIrqScope;
 use crate::VgicPirqModel;
@@ -581,6 +580,7 @@ where
 mod tests {
     use super::*;
     use crate::IrqState;
+    use crate::VcpuMask;
     use crate::VgicSgiRegs;
     use crate::VirtualInterrupt;
     use core::cell::RefCell;

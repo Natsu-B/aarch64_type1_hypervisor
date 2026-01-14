@@ -6,7 +6,7 @@ pub mod stack_canary;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 
-use aarch64_test::exit_success;
+use aarch64_test::exit_failure;
 
 pub const DEFAULT_UART_BASE: usize = 0x0900_0000;
 pub const DEFAULT_UART_CLOCK_HZ: u32 = 48_000_000;
@@ -61,7 +61,7 @@ pub fn panic_handler(info: &PanicInfo) -> ! {
 #[alloc_error_handler]
 fn oom(layout: Layout) -> ! {
     print::println!("[oom] {:?}", layout);
-    exit_success();
+    exit_failure();
 }
 
 /// Define a U-Boot/QEMU runnable no_std unit-test harness in the test binary.
