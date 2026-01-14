@@ -1,6 +1,7 @@
 use core::mem::size_of;
 
 use super::types::read_regs_from_bytes;
+use super::types::read_regs_from_bytes_u128;
 use super::types::read_u32_be;
 use super::view::DtbNodeView;
 
@@ -147,6 +148,95 @@ impl<'a> Iterator for RangesIter<'a> {
     }
 }
 
+pub(crate) struct RangesEntryWide {
+    pub child_base: u128,
+    pub parent_base: u128,
+    pub len: u128,
+}
+
+pub(crate) struct RangesIterWide<'a> {
+    property: &'a [u8],
+    consumed: usize,
+    entry_stride: usize,
+    child_address_cells: u32,
+    parent_address_cells: u32,
+    child_size_cells: u32,
+}
+
+impl<'a> RangesIterWide<'a> {
+    pub(crate) fn new(
+        child_address_cells: u32,
+        parent_address_cells: u32,
+        child_size_cells: u32,
+        property: &'a [u8],
+    ) -> Result<Self, &'static str> {
+        // Up to 4 cells => 128-bit.
+        let max_cells = 4usize;
+        if child_address_cells as usize > max_cells
+            || child_size_cells as usize > max_cells
+            || parent_address_cells as usize > max_cells
+        {
+            return Err("ranges: address/size cells overflow u128");
+        }
+
+        let cell_count = child_address_cells
+            .checked_add(parent_address_cells)
+            .and_then(|v| v.checked_add(child_size_cells))
+            .ok_or("ranges: stride overflow")?;
+        let entry_stride = cell_count
+            .checked_mul(size_of::<u32>() as u32)
+            .ok_or("ranges: stride overflow")? as usize;
+        if entry_stride == 0 {
+            return Err("ranges: zero stride");
+        }
+        if property.len() % entry_stride != 0 {
+            return Err("ranges: length not multiple of stride");
+        }
+
+        Ok(Self {
+            property,
+            consumed: 0,
+            entry_stride,
+            child_address_cells,
+            parent_address_cells,
+            child_size_cells,
+        })
+    }
+
+    fn next_internal(&mut self) -> Result<Option<RangesEntryWide>, &'static str> {
+        if self.consumed == self.property.len() {
+            return Ok(None);
+        }
+        let base = self.consumed;
+        let (child_base, c0) =
+            read_regs_from_bytes_u128(&self.property[base..], self.child_address_cells)?;
+        let (parent_base, c1) =
+            read_regs_from_bytes_u128(&self.property[base + c0..], self.parent_address_cells)?;
+        let (len, c2) =
+            read_regs_from_bytes_u128(&self.property[base + c0 + c1..], self.child_size_cells)?;
+        let consumed = c0
+            .checked_add(c1)
+            .and_then(|v| v.checked_add(c2))
+            .ok_or("ranges: overrun")?;
+        if consumed != self.entry_stride {
+            return Err("ranges: unexpected entry size");
+        }
+        self.consumed += consumed;
+        Ok(Some(RangesEntryWide {
+            child_base,
+            parent_base,
+            len,
+        }))
+    }
+}
+
+impl<'a> Iterator for RangesIterWide<'a> {
+    type Item = Result<RangesEntryWide, &'static str>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_internal().transpose()
+    }
+}
+
 pub struct RegIter<'a, 'dtb, 's> {
     node: &'a DtbNodeView<'dtb, 's>,
     property: &'a [u8],
@@ -211,7 +301,9 @@ impl<'a, 'dtb, 's> RegIter<'a, 'dtb, 's> {
         }
 
         self.remaining = self.remaining.checked_sub(used).ok_or("reg: overrun")?;
-        self.node.translate_address_internal((addr, len)).map(Some)
+        self.node
+            .translate_reg_address_internal((addr, len))
+            .map(Some)
     }
 }
 

@@ -39,6 +39,7 @@ mod tests {
     use core::mem::MaybeUninit;
     use core::mem::align_of;
     use core::ops::ControlFlow;
+    use std::env;
     use std::path::PathBuf;
 
     fn align_dtb(bytes: &[u8]) -> AlignedSliceBox<u8> {
@@ -221,6 +222,80 @@ mod tests {
                     ControlFlow::Break(())
                 }
             })
+            .unwrap();
+
+        if let Some(err) = error {
+            panic!("{}", err);
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn ranges_pci_3cells_translation_works() {
+        let out_dir = env::var_os("OUT_DIR").unwrap();
+        let mut path = PathBuf::from(out_dir);
+        path.push("ranges_pci_3cells.dtb");
+
+        let data = std::fs::read(&path).unwrap();
+        let parser = DtbParser::init(data.as_ptr() as usize).unwrap();
+
+        let mut found = None;
+        parser
+            .find_node(None, Some("test,dev"), &mut |addr, size| {
+                found = Some((addr, size));
+                ControlFlow::Break(())
+            })
+            .unwrap();
+        let (addr, size) = found.unwrap();
+        assert_eq!(addr, 0x4000_1020);
+        assert_eq!(size, 0x100);
+    }
+
+    #[test]
+    fn pcie_reg_iter_skips_self_ranges() {
+        let out_dir = env::var_os("OUT_DIR").unwrap();
+        let mut path = PathBuf::from(out_dir);
+        path.push("pcie_reg_ranges_not_covered.dtb");
+
+        assert!(
+            path.exists(),
+            "{} not found. dtc is required to build DTS fixtures.",
+            path.display()
+        );
+
+        let test_data = std::fs::read(&path).expect("failed to load generated dtb file");
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
+        let parser = DtbParser::init(test_data_addr).unwrap();
+
+        let mut found = false;
+        let mut error: Option<&'static str> = None;
+
+        parser
+            .for_each_node_view(
+                &mut |node| match node.compatible_contains("brcm,bcm2712-pcie") {
+                    Ok(true) => {
+                        found = true;
+                        match node.reg_iter() {
+                            Ok(mut iter) => match iter.next() {
+                                Some(Ok((addr, size))) => {
+                                    assert_eq!(addr, 0x10_0012_0000);
+                                    assert_eq!(size, 0x9310);
+                                }
+                                Some(Err(err)) => error = Some(err),
+                                None => error = Some("reg_iter: no entries"),
+                            },
+                            Err(err) => error = Some(err),
+                        }
+                        ControlFlow::Break(())
+                    }
+                    Ok(false) => ControlFlow::Continue(()),
+                    Err(err) => {
+                        error = Some(err);
+                        ControlFlow::Break(())
+                    }
+                },
+            )
             .unwrap();
 
         if let Some(err) = error {

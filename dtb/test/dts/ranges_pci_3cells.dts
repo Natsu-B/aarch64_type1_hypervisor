@@ -1,0 +1,29 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <2>;
+    #size-cells = <2>;
+
+    pcie@0 {
+        compatible = "test,pcie";
+        #address-cells = <3>;
+        #size-cells = <2>;
+
+        // PCI child (3 cells) -> CPU parent (2 cells)
+        ranges = <0x02000000 0x0 0x0  0x0 0x40000000  0x0 0x00100000>;
+
+        bus@0 {
+            compatible = "simple-bus";
+            #address-cells = <2>;
+            #size-cells = <1>;
+
+            // child (2 cells) -> PCI parent (3 cells)
+            ranges = <0x0 0x0  0x02000000 0x0 0x00001000  0x00000200>;
+
+            dev@20 {
+                compatible = "test,dev";
+                reg = <0x0 0x20  0x100>;
+            };
+        };
+    };
+};

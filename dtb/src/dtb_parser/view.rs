@@ -1,8 +1,10 @@
+use core::convert::TryFrom;
 use core::mem::size_of;
 use core::ops::ControlFlow;
 
 use super::iters::InterruptCellsIter;
 use super::iters::RangesIter;
+use super::iters::RangesIterWide;
 use super::iters::RegIter;
 use super::parser::DtbParser;
 use super::types::NodeScope;
@@ -292,7 +294,7 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         Ok(self.inherited_u32_be(Self::PROP_SIZE_CELLS)?.unwrap_or(1))
     }
 
-    fn translate_one_level(&self, child: (usize, usize)) -> Result<(usize, usize), &'static str> {
+    fn translate_one_level_wide(&self, child: (u128, u128)) -> Result<(u128, u128), &'static str> {
         let ranges = match self.property_bytes(Self::PROP_RANGES)? {
             Some(r) => r,
             None => return Ok(child),
@@ -310,7 +312,7 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
             .0
             .checked_add(child.1)
             .ok_or("ranges: child overflow")?;
-        let mut iter = RangesIter::new(
+        let mut iter = RangesIterWide::new(
             child_address_cells,
             parent_address_cells,
             child_size_cells,
@@ -337,17 +339,41 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         Err("ranges: address not covered")
     }
 
-    pub(crate) fn translate_address_internal(
+    fn translate_address_internal_wide(
         &self,
-        child: (usize, usize),
-    ) -> Result<(usize, usize), &'static str> {
-        let mapped = self.translate_one_level(child)?;
+        child: (u128, u128),
+    ) -> Result<(u128, u128), &'static str> {
+        let mapped = self.translate_one_level_wide(child)?;
         let Some((parent_scope, parent_ancestors)) = self.ancestors.split_last() else {
             return Ok(mapped);
         };
         let parent_view = self
             .parser
             .node_view_from_scope(*parent_scope, parent_ancestors)?;
-        parent_view.translate_address_internal(mapped)
+        parent_view.translate_address_internal_wide(mapped)
+    }
+
+    pub(crate) fn translate_reg_address_internal(
+        &self,
+        parent_addr: (usize, usize),
+    ) -> Result<(usize, usize), &'static str> {
+        let Some((parent_scope, parent_ancestors)) = self.ancestors.split_last() else {
+            return Ok(parent_addr);
+        };
+        let parent_view = self
+            .parser
+            .node_view_from_scope(*parent_scope, parent_ancestors)?;
+        parent_view.translate_address_internal(parent_addr)
+    }
+
+    pub(crate) fn translate_address_internal(
+        &self,
+        child: (usize, usize),
+    ) -> Result<(usize, usize), &'static str> {
+        let mapped = self.translate_address_internal_wide((child.0 as u128, child.1 as u128))?;
+        let addr =
+            usize::try_from(mapped.0).map_err(|_| "ranges: mapped address overflow usize")?;
+        let len = usize::try_from(mapped.1).map_err(|_| "ranges: mapped size overflow usize")?;
+        Ok((addr, len))
     }
 }
