@@ -9,3 +9,4 @@ alloc = []
 
 [dependencies]
 allocator = { path = "../allocator", features = ["no-alloc-error-handler"] }
+typestate = { path = "../typestate" }

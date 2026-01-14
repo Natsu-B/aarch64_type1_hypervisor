@@ -421,7 +421,7 @@ extern "C" fn main() -> ! {
     reserved_memory.push((program_start, program_end - program_start));
     reserved_memory.push((DTB_PTR, dtb.get_size()));
 
-    let mut tree = DeviceTree::from_parser(&dtb_modified).unwrap();
+    let mut tree = DeviceTree::from_parser(&dtb_modified).unwrap().into_owned();
     let chosen_id = tree.get_or_create_node_by_path("/chosen").unwrap();
     let initrd_range = remove_initrd(&mut tree, chosen_id);
     remove_initrd_memreserve(&mut tree, initrd_range);
