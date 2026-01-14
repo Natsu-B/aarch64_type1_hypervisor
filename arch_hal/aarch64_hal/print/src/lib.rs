@@ -112,10 +112,6 @@ pub fn flush() {
 pub mod debug_uart {
     use super::*;
 
-    pub fn enable_atomic() {
-        DEBUG_UART.enable_atomic();
-    }
-
     pub fn init(uart_peripherals: usize, uart_clk: u64, baud_rate: u32) {
         super::init(uart_peripherals, uart_clk, baud_rate);
     }

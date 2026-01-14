@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
+#![feature(sync_unsafe_cell)]
 
-use core::cell::Cell;
+use core::cell::SyncUnsafeCell;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::ops::Deref;
@@ -10,6 +11,34 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 
 pub mod pod;
+
+static RAW_ATOMICS_ENABLED: SyncUnsafeCell<bool> = SyncUnsafeCell::new(false);
+
+#[inline]
+fn raw_atomics_enabled() -> bool {
+    // SAFETY: `RAW_ATOMICS_ENABLED` is only written during single-core bring-up,
+    // and reads are allowed as a simple flag check after that point.
+    unsafe { *RAW_ATOMICS_ENABLED.get() }
+}
+
+/// Enables raw atomic operations globally for this crate.
+///
+/// # Invariants
+/// - Call only after paging/caches/memory attributes are enabled. If called too early,
+///   subsequent lock/atomic operations will execute atomic RMW instructions while the
+///   platform still forbids them, which can trap or lead to unpredictable memory behavior.
+/// - Call before secondary cores start and before any concurrent lock usage. If called
+///   concurrently with readers, some operations may remain non-atomic while others become
+///   atomic, leading to data races, lost updates, or aliasing UB.
+/// - This function is intentionally unsynchronized and must only run during single-core
+///   bring-up to avoid races with `raw_atomics_enabled()` readers.
+#[inline]
+pub fn enable_raw_atomics() {
+    // SAFETY: callers must uphold the bring-up sequencing and single-core invariants above.
+    unsafe {
+        *RAW_ATOMICS_ENABLED.get() = true;
+    }
+}
 
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
@@ -89,9 +118,6 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 }
 
 #[inline(always)]
-fn lock_none(_: &AtomicBool) {}
-
-#[inline(always)]
 fn lock_atomic(locked: &AtomicBool) {
     while locked
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -105,18 +131,6 @@ fn lock_atomic(locked: &AtomicBool) {
 fn unlock_atomic(locked: &AtomicBool) {
     locked.store(false, Ordering::Release);
 }
-
-#[inline(always)]
-fn rw_read_lock_none(_: &AtomicUsize) {}
-
-#[inline(always)]
-fn rw_read_unlock_none(_: &AtomicUsize) {}
-
-#[inline(always)]
-fn rw_write_lock_none(_: &AtomicUsize) {}
-
-#[inline(always)]
-fn rw_write_unlock_none(_: &AtomicUsize) {}
 
 const WRITE_FLAG: usize = 1 << (usize::BITS - 1);
 
@@ -194,16 +208,7 @@ fn rw_write_unlock_atomic(state: &AtomicUsize) {
     state.fetch_and(!WRITE_FLAG, Ordering::Release);
 }
 
-type LockFn = fn(&AtomicBool);
-type UnLockFn = fn(&AtomicBool);
-type ReadLockFn = fn(&AtomicUsize);
-type ReadUnlockFn = fn(&AtomicUsize);
-type WriteLockFn = fn(&AtomicUsize);
-type WriteUnlockFn = fn(&AtomicUsize);
-
 pub struct RawSpinLock<T: ?Sized> {
-    lock_fn: Cell<LockFn>,
-    unlock_fn: Cell<UnLockFn>,
     locked: AtomicBool,
     data: UnsafeCell<T>,
 }
@@ -219,18 +224,19 @@ unsafe impl<T: ?Sized + Send> Sync for RawSpinLock<T> {}
 impl<T> RawSpinLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
-            lock_fn: Cell::new(lock_none),
-            unlock_fn: Cell::new(lock_none),
             locked: AtomicBool::new(false),
             data: UnsafeCell::new(data),
         }
     }
 
     pub fn lock(&self) -> RawSpinLockGuard<'_, T> {
-        self.lock_fn.get()(&self.locked);
+        let unlock_on_drop = raw_atomics_enabled();
+        if unlock_on_drop {
+            lock_atomic(&self.locked);
+        }
         RawSpinLockGuard {
             lock: self,
-            unlock_on_drop: true,
+            unlock_on_drop,
         }
     }
 
@@ -248,16 +254,6 @@ impl<T> RawSpinLock<T> {
             unlock_on_drop: false,
         }
     }
-
-    /// Switches the lock into an atomic spin lock once multiple CPUs are active.
-    ///
-    /// Until this is called, [`lock`](Self::lock) is effectively a no-op so the
-    /// raw lock can be used during single-threaded bring-up without paying the
-    /// cost of atomic instructions.
-    pub fn enable_atomic(&self) {
-        self.lock_fn.set(lock_atomic);
-        self.unlock_fn.set(unlock_atomic);
-    }
 }
 
 #[cfg(test)]
@@ -270,7 +266,7 @@ impl<T: ?Sized> RawSpinLock<T> {
 impl<T> Drop for RawSpinLockGuard<'_, T> {
     fn drop(&mut self) {
         if self.unlock_on_drop {
-            self.lock.unlock_fn.get()(&self.lock.locked);
+            unlock_atomic(&self.lock.locked);
         }
     }
 }
@@ -288,26 +284,25 @@ impl<T> DerefMut for RawSpinLockGuard<'_, T> {
     }
 }
 
-/// Raw reader-writer lock that starts as a no-op until atomics are enabled.
+/// Raw reader-writer lock that starts as a no-op until raw atomics are enabled.
 ///
-/// Before [`enable_atomic`](Self::enable_atomic) is called, lock/unlock operations are
-/// intentionally no-ops so the lock can be used during single-core bring-up where mutual
-/// exclusion is enforced externally (for example, by masking interrupts).
+/// Before [`enable_raw_atomics`](crate::enable_raw_atomics) is called, lock/unlock
+/// operations are intentionally no-ops so the lock can be used during single-core
+/// bring-up where mutual exclusion is enforced externally (for example, by masking
+/// interrupts).
 pub struct RawRwLock<T: ?Sized> {
-    read_lock_fn: Cell<ReadLockFn>,
-    read_unlock_fn: Cell<ReadUnlockFn>,
-    write_lock_fn: Cell<WriteLockFn>,
-    write_unlock_fn: Cell<WriteUnlockFn>,
     state: AtomicUsize,
     data: UnsafeCell<T>,
 }
 
 pub struct RawRwLockReadGuard<'a, T: ?Sized> {
     lock: &'a RawRwLock<T>,
+    unlock_on_drop: bool,
 }
 
 pub struct RawRwLockWriteGuard<'a, T: ?Sized> {
     lock: &'a RawRwLock<T>,
+    unlock_on_drop: bool,
 }
 
 unsafe impl<T: ?Sized + Send + Sync> Sync for RawRwLock<T> {}
@@ -316,34 +311,31 @@ unsafe impl<T: ?Sized + Send> Send for RawRwLock<T> {}
 impl<T> RawRwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
-            read_lock_fn: Cell::new(rw_read_lock_none),
-            read_unlock_fn: Cell::new(rw_read_unlock_none),
-            write_lock_fn: Cell::new(rw_write_lock_none),
-            write_unlock_fn: Cell::new(rw_write_unlock_none),
             state: AtomicUsize::new(0),
             data: UnsafeCell::new(data),
         }
     }
 
     pub fn read(&self) -> RawRwLockReadGuard<'_, T> {
-        self.read_lock_fn.get()(&self.state);
-        RawRwLockReadGuard { lock: self }
+        let unlock_on_drop = raw_atomics_enabled();
+        if unlock_on_drop {
+            rw_read_lock_atomic(&self.state);
+        }
+        RawRwLockReadGuard {
+            lock: self,
+            unlock_on_drop,
+        }
     }
 
     pub fn write(&self) -> RawRwLockWriteGuard<'_, T> {
-        self.write_lock_fn.get()(&self.state);
-        RawRwLockWriteGuard { lock: self }
-    }
-
-    /// Switches the lock into an atomic reader-writer lock once multiple CPUs are active.
-    ///
-    /// Until this is called, locking is effectively a no-op so the raw lock can be used
-    /// during single-threaded bring-up without paying the cost of atomic instructions.
-    pub fn enable_atomic(&self) {
-        self.read_lock_fn.set(rw_read_lock_atomic);
-        self.read_unlock_fn.set(rw_read_unlock_atomic);
-        self.write_lock_fn.set(rw_write_lock_atomic);
-        self.write_unlock_fn.set(rw_write_unlock_atomic);
+        let unlock_on_drop = raw_atomics_enabled();
+        if unlock_on_drop {
+            rw_write_lock_atomic(&self.state);
+        }
+        RawRwLockWriteGuard {
+            lock: self,
+            unlock_on_drop,
+        }
     }
 }
 
@@ -364,7 +356,9 @@ impl<T: ?Sized> RawRwLock<T> {
 
 impl<T: ?Sized> Drop for RawRwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.read_unlock_fn.get()(&self.lock.state);
+        if self.unlock_on_drop {
+            rw_read_unlock_atomic(&self.lock.state);
+        }
     }
 }
 
@@ -378,7 +372,9 @@ impl<T: ?Sized> Deref for RawRwLockReadGuard<'_, T> {
 
 impl<T: ?Sized> Drop for RawRwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.write_unlock_fn.get()(&self.lock.state);
+        if self.unlock_on_drop {
+            rw_write_unlock_atomic(&self.lock.state);
+        }
     }
 }
 
@@ -519,174 +515,205 @@ mod tests {
     use super::*;
     use core::time::Duration;
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::thread;
 
-    #[test]
-    fn raw_spinlock_defaults_to_noop_locking() {
-        let lock = RawSpinLock::new(0usize);
-
-        let guard1 = lock.lock();
-        {
-            let mut guard2 = lock.lock();
-            *guard2 = 1;
+    fn with_raw_atomics_mode(enabled: bool, f: impl FnOnce()) {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let prev = raw_atomics_enabled();
+        // SAFETY: the test mutex serializes access and tests are single-threaded in this scope.
+        unsafe {
+            *RAW_ATOMICS_ENABLED.get() = enabled;
         }
-
-        assert_eq!(*guard1, 1);
-        drop(guard1);
-
-        let guard = lock.lock();
-        assert_eq!(*guard, 1);
+        f();
+        // SAFETY: restore the prior state while still holding the test mutex.
+        unsafe {
+            *RAW_ATOMICS_ENABLED.get() = prev;
+        }
         drop(guard);
     }
 
     #[test]
-    fn raw_spinlock_enable_atomic_switches_to_atomic() {
-        let lock = RawSpinLock::new(0u32);
+    fn raw_spinlock_defaults_to_noop_locking() {
+        with_raw_atomics_mode(false, || {
+            let lock = RawSpinLock::new(0usize);
 
-        assert!(!lock.is_locked());
+            let guard1 = lock.lock();
+            {
+                let mut guard2 = lock.lock();
+                *guard2 = 1;
+            }
 
-        {
-            let _guard = lock.lock();
-            // No locking applied yet.
+            assert_eq!(*guard1, 1);
+            drop(guard1);
+
+            let guard = lock.lock();
+            assert_eq!(*guard, 1);
+            drop(guard);
+        });
+    }
+
+    #[test]
+    fn raw_spinlock_global_raw_atomics_controls_locking() {
+        with_raw_atomics_mode(false, || {
+            let lock = RawSpinLock::new(0u32);
             assert!(!lock.is_locked());
-        }
 
-        lock.enable_atomic();
+            {
+                let _guard = lock.lock();
+                // No locking applied yet.
+                assert!(!lock.is_locked());
+            }
+        });
 
-        let guard = lock.lock();
-        assert!(lock.is_locked());
-        drop(guard);
+        with_raw_atomics_mode(true, || {
+            let lock = RawSpinLock::new(0u32);
+            let guard = lock.lock();
+            assert!(lock.is_locked());
+            drop(guard);
 
-        assert!(!lock.is_locked());
+            assert!(!lock.is_locked());
 
-        let guard = lock.lock();
-        assert!(lock.is_locked());
-        drop(guard);
-        assert!(!lock.is_locked());
+            let guard = lock.lock();
+            assert!(lock.is_locked());
+            drop(guard);
+            assert!(!lock.is_locked());
+        });
     }
 
     #[test]
     fn raw_rwlock_defaults_to_noop_locking() {
-        let lock = RawRwLock::new(0usize);
+        with_raw_atomics_mode(false, || {
+            let lock = RawRwLock::new(0usize);
 
-        {
-            let mut writer = lock.write();
-            *writer = 1;
-        }
+            {
+                let mut writer = lock.write();
+                *writer = 1;
+            }
 
-        let reader = lock.read();
-        assert_eq!(*reader, 1);
-        drop(reader);
+            let reader = lock.read();
+            assert_eq!(*reader, 1);
+            drop(reader);
+        });
     }
 
     #[test]
-    fn raw_rwlock_enable_atomic_switches_to_atomic() {
-        let lock = RawRwLock::new(0u32);
+    fn raw_rwlock_global_raw_atomics_controls_locking() {
+        with_raw_atomics_mode(false, || {
+            let lock = RawRwLock::new(0u32);
 
-        assert_eq!(lock.raw_state(), 0);
-
-        {
-            let _reader = lock.read();
             assert_eq!(lock.raw_state(), 0);
-        }
 
-        {
-            let mut writer = lock.write();
-            *writer = 1;
+            {
+                let _reader = lock.read();
+                assert_eq!(lock.raw_state(), 0);
+            }
+
+            {
+                let mut writer = lock.write();
+                *writer = 1;
+                assert_eq!(lock.raw_state(), 0);
+            }
+
             assert_eq!(lock.raw_state(), 0);
-        }
+        });
 
-        assert_eq!(lock.raw_state(), 0);
+        with_raw_atomics_mode(true, || {
+            let lock = RawRwLock::new(0u32);
 
-        lock.enable_atomic();
+            {
+                let _reader = lock.read();
+                assert_eq!(lock.read_count(), 1);
+                assert!(!lock.is_write_locked());
+            }
 
-        {
-            let _reader = lock.read();
-            assert_eq!(lock.read_count(), 1);
-            assert!(!lock.is_write_locked());
-        }
-
-        assert_eq!(lock.read_count(), 0);
-
-        {
-            let _reader_one = lock.read();
-            let _reader_two = lock.read();
-            assert_eq!(lock.read_count(), 2);
-        }
-
-        assert_eq!(lock.read_count(), 0);
-
-        {
-            let mut writer = lock.write();
-            assert!(lock.is_write_locked());
-            *writer = 2;
             assert_eq!(lock.read_count(), 0);
-        }
 
-        assert!(!lock.is_write_locked());
-        assert_eq!(lock.read_count(), 0);
+            {
+                let _reader_one = lock.read();
+                let _reader_two = lock.read();
+                assert_eq!(lock.read_count(), 2);
+            }
+
+            assert_eq!(lock.read_count(), 0);
+
+            {
+                let mut writer = lock.write();
+                assert!(lock.is_write_locked());
+                *writer = 2;
+                assert_eq!(lock.read_count(), 0);
+            }
+
+            assert!(!lock.is_write_locked());
+            assert_eq!(lock.read_count(), 0);
+        });
     }
 
     #[test]
     fn raw_rwlock_multithreaded_after_enabling_atomic() {
-        let lock = Arc::new(RawRwLock::new(0usize));
-        lock.enable_atomic();
+        with_raw_atomics_mode(true, || {
+            let lock = Arc::new(RawRwLock::new(0usize));
 
-        let mut handles = vec![];
+            let mut handles = vec![];
 
-        let writer_lock = Arc::clone(&lock);
-        handles.push(thread::spawn(move || {
-            for _ in 0..100 {
-                let mut writer = writer_lock.write();
-                *writer += 1;
-                thread::sleep(Duration::from_millis(1));
-            }
-        }));
-
-        for _ in 0..10 {
-            let reader_lock = Arc::clone(&lock);
+            let writer_lock = Arc::clone(&lock);
             handles.push(thread::spawn(move || {
-                for _ in 0..50 {
-                    let reader = reader_lock.read();
-                    let value = *reader;
-                    assert!(value <= 100);
+                for _ in 0..100 {
+                    let mut writer = writer_lock.write();
+                    *writer += 1;
                     thread::sleep(Duration::from_millis(1));
                 }
             }));
-        }
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+            for _ in 0..10 {
+                let reader_lock = Arc::clone(&lock);
+                handles.push(thread::spawn(move || {
+                    for _ in 0..50 {
+                        let reader = reader_lock.read();
+                        let value = *reader;
+                        assert!(value <= 100);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }));
+            }
 
-        assert_eq!(*lock.read(), 100);
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            assert_eq!(*lock.read(), 100);
+        });
     }
 
     #[test]
     fn raw_spinlock_no_lock_does_not_unlock_in_atomic_mode() {
-        let lock = RawSpinLock::new(0u32);
-        lock.enable_atomic();
-        lock.locked.store(true, Ordering::Relaxed);
+        with_raw_atomics_mode(true, || {
+            let lock = RawSpinLock::new(0u32);
+            lock.locked.store(true, Ordering::Relaxed);
 
-        {
-            let _guard = unsafe { lock.no_lock() };
-        }
+            {
+                let _guard = unsafe { lock.no_lock() };
+            }
 
-        assert!(lock.locked.load(Ordering::Relaxed));
-        lock.locked.store(false, Ordering::Relaxed);
+            assert!(lock.locked.load(Ordering::Relaxed));
+            lock.locked.store(false, Ordering::Relaxed);
+        });
     }
 
     #[test]
     fn raw_spinlock_lock_still_unlocks_in_atomic_mode() {
-        let lock = RawSpinLock::new(0u32);
-        lock.enable_atomic();
+        with_raw_atomics_mode(true, || {
+            let lock = RawSpinLock::new(0u32);
 
-        {
-            let _guard = lock.lock();
-            assert!(lock.is_locked());
-        }
+            {
+                let _guard = lock.lock();
+                assert!(lock.is_locked());
+            }
 
-        assert!(!lock.is_locked());
+            assert!(!lock.is_locked());
+        });
     }
 
     #[test]

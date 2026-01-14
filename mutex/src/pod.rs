@@ -1,4 +1,3 @@
-use core::cell::Cell;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::Ordering;
@@ -9,26 +8,27 @@ use typestate::atomic_raw::AtomicRaw;
 // ===== RawAtomicPod =======================================================
 //
 // A bring-up friendly atomic cell:
-// - Before enable_atomic(): non-atomic plain memory access (single-core bring-up).
-// - After enable_atomic(): atomic operations via Atomic*::from_ptr().
+// - Before enable_raw_atomics(): non-atomic plain memory access (single-core bring-up).
+// - After enable_raw_atomics(): atomic operations via Atomic*::from_ptr().
 //
-// This is intentionally "raw": enable_atomic() is not synchronized and must be
+// This is intentionally "raw": enable_raw_atomics() is not synchronized and must be
 // called before introducing concurrent access.
 
 /// A "raw" atomic POD that starts as non-atomic until atomics are enabled.
 ///
-/// - Before `enable_atomic()`: operations are performed non-atomically (intended for single-core bring-up).
-/// - After `enable_atomic()`: operations use Atomic* on the same storage without requiring IRQ masking.
+/// - Before `enable_raw_atomics()`: operations are performed non-atomically (intended for single-core bring-up).
+/// - After `enable_raw_atomics()`: operations use Atomic* on the same storage without requiring IRQ masking.
 ///
 /// # Safety / Invariants
-/// - `enable_atomic()` must be called only during a phase where no concurrent accesses exist.
-/// - After `enable_atomic()`, you must not perform conflicting non-atomic accesses to the same value.
+/// - `enable_raw_atomics()` must be called only during a phase where no concurrent accesses exist.
+/// - Using these operations concurrently before raw atomics are enabled is unsupported and can
+///   cause data races or aliasing UB.
+/// - After `enable_raw_atomics()`, you must not perform conflicting non-atomic accesses to the same value.
 ///   (This includes taking `&mut` to the underlying storage while other cores use atomics.)
 pub struct RawAtomicPod<T: RawReg>
 where
     T::Raw: AtomicRaw,
 {
-    atomic_enabled: Cell<bool>,
     raw: UnsafeCell<T::Raw>,
     _phantom: PhantomData<T>,
 }
@@ -53,7 +53,6 @@ where
     pub const fn new_raw(init: T::Raw) -> Self {
         let _ = Self::_LAYOUT_OK;
         Self {
-            atomic_enabled: Cell::new(false),
             raw: UnsafeCell::new(init),
             _phantom: PhantomData,
         }
@@ -63,19 +62,9 @@ where
     pub fn new(init: T) -> Self {
         let _ = Self::_LAYOUT_OK;
         Self {
-            atomic_enabled: Cell::new(false),
             raw: UnsafeCell::new(init.to_raw()),
             _phantom: PhantomData,
         }
-    }
-
-    /// Switches to atomic operations once multiple CPUs are active.
-    ///
-    /// # Safety contract
-    /// Call only when no other execution context can access this value concurrently.
-    #[inline]
-    pub fn enable_atomic(&self) {
-        self.atomic_enabled.set(true);
     }
 
     #[inline(always)]
@@ -89,7 +78,7 @@ where
 
     #[inline]
     pub fn load(&self, order: Ordering) -> T {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::load(a, order))
         } else {
@@ -100,7 +89,7 @@ where
 
     #[inline]
     pub fn store(&self, val: T, order: Ordering) {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             <T::Raw as AtomicRaw>::store(a, val.to_raw(), order);
         } else {
@@ -111,7 +100,7 @@ where
 
     #[inline]
     pub fn swap(&self, val: T, order: Ordering) -> T {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::swap(a, val.to_raw(), order))
         } else {
@@ -127,7 +116,7 @@ where
     where
         T::Raw: core::ops::BitOr<Output = T::Raw>,
     {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::fetch_or(a, val.to_raw(), order))
         } else {
@@ -144,7 +133,7 @@ where
     where
         T::Raw: core::ops::BitAnd<Output = T::Raw>,
     {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::fetch_and(a, val.to_raw(), order))
         } else {
@@ -161,7 +150,7 @@ where
     where
         T::Raw: core::ops::BitXor<Output = T::Raw>,
     {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::fetch_xor(a, val.to_raw(), order))
         } else {
@@ -192,7 +181,7 @@ where
         success: Ordering,
         failure: Ordering,
     ) -> Result<T, T> {
-        if self.atomic_enabled.get() {
+        if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
             <T::Raw as AtomicRaw>::compare_exchange(
                 a,

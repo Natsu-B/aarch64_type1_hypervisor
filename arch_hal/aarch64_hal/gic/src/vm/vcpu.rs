@@ -250,12 +250,6 @@ impl<
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn enable_atomic(&self) {
-        self.inner.enable_atomic();
-        self.need_refill.enable_atomic();
-    }
-
     pub(crate) fn cancel(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError> {
         let key = LrKey { vintid, source };
         let mut inner = self.inner.lock_irqsave();

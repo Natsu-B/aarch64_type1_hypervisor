@@ -124,12 +124,6 @@ impl Gicv2 {
         })
     }
 
-    pub fn enable_atomic(&self) {
-        self.mutex.enable_atomic();
-        self.logical_groups.enable_atomic();
-        self.affinity_table.enable_atomic();
-    }
-
     #[inline]
     fn max_intid(&self) -> u32 {
         let typer = self.gicd.typer.read();

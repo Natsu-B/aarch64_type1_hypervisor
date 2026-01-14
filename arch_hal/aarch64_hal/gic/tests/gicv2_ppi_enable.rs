@@ -95,7 +95,6 @@ fn run() -> Result<(), &'static str> {
     )
     .map_err(|err| map_err("gic_new", err))?;
 
-    gic.enable_atomic();
     gic.init_distributor()
         .map_err(|err| map_err("gicd_init", err))?;
     let caps = gic

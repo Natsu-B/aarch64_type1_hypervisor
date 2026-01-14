@@ -839,7 +839,7 @@ impl MemoryBlock {
     ///
     /// # Safety
     /// Allocates a `Vec` while `self` is exclusively borrowed under the allocator
-    /// lock; callers must ensure this path only runs before `enable_atomic`
+    /// lock; callers must ensure this path only runs before `enable_raw_atomics`
     /// (when `RawSpinLock::lock()` is a no-op) and while execution is
     /// single-threaded. After atomic locking is enabled, re-entering the global
     /// allocator here may deadlock or spin forever.
