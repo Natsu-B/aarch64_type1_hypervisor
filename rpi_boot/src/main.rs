@@ -13,6 +13,12 @@ use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::gic::GicCpuConfig;
+use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::GicDistributor;
+use arch_hal::gic::GicPpi;
+use arch_hal::gic::MmioRegion;
+use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::paging::EL2Stage1PageTypes;
 use arch_hal::paging::EL2Stage1Paging;
 use arch_hal::paging::EL2Stage1PagingSetting;
@@ -21,6 +27,8 @@ use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+use arch_hal::println_force;
+use arch_hal::timer::El2PhysicalTimer;
 use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::global_asm;
@@ -31,6 +39,7 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
+use core::time::Duration;
 use core::usize;
 use dtb::DeviceTree;
 use dtb::DeviceTreeEditExt;
@@ -56,11 +65,12 @@ unsafe extern "C" {
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 static RP1_BASE: usize = 0x1c_0000_0000;
 static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
 static RP1_PAD: usize = RP1_BASE + 0xf_0000;
-static PL011_UART_ADDR: usize = RP1_BASE + 0x3_0000;
-// static PL011_UART_ADDR: usize = 0x10_7D00_1000;
+// static PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
+static PL011_UART_ADDR: (usize, u64) = (0x10_7D00_1000, 44 * 1000 * 1000);
 
 #[repr(C)]
 struct LinuxHeader {
@@ -113,8 +123,7 @@ extern "C" fn main() -> ! {
     let linux_image = &raw mut _LINUX_IMAGE as *const _ as usize;
     let stack_top = &raw mut _STACK_TOP as *const _ as usize;
 
-    debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000, 115200);
-    // debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000, 115200);
+    debug_uart::init(PL011_UART_ADDR.0, PL011_UART_ADDR.1, 115200);
     cpu::isb();
     cpu::dsb_ish();
     debug_uart::write("HelloWorld!!!");
@@ -276,13 +285,13 @@ extern "C" fn main() -> ! {
     paging_data.push(Stage2PagingSetting {
         ipa: memory_last_addr,
         pa: memory_last_addr,
-        size: PL011_UART_ADDR - memory_last_addr,
+        size: PL011_UART_ADDR.0 - memory_last_addr,
         types: Stage2PageTypes::Device,
     });
     paging_data.push(Stage2PagingSetting {
-        ipa: PL011_UART_ADDR + 0x1000,
-        pa: PL011_UART_ADDR + 0x1000,
-        size: ipa_space - PL011_UART_ADDR - 0x1000,
+        ipa: PL011_UART_ADDR.0 + 0x1000,
+        pa: PL011_UART_ADDR.0 + 0x1000,
+        size: ipa_space - PL011_UART_ADDR.0 - 0x1000,
         types: Stage2PageTypes::Device,
     });
     stage1_paging_data.push(EL2Stage1PagingSetting {
@@ -297,6 +306,94 @@ extern "C" fn main() -> ! {
     Stage2Paging::enable_stage2_translation(true);
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
+
+    // setup gicv2
+    println!("setup gicv2...");
+    let mut gic_distributor = None;
+    let mut gic_cpu_interface = None;
+    let mut i = 0;
+    dtb.find_node(None, Some("arm,gic-400"), &mut |addr, size| {
+        match i {
+            0 => {
+                gic_distributor = Some(MmioRegion { base: addr, size });
+            }
+            1 => {
+                gic_cpu_interface = Some(MmioRegion { base: addr, size });
+            }
+            _ => {
+                println!(
+                    "extra gic-400 node found: addr=0x{:X}, size=0x{:X}",
+                    addr, size
+                );
+            }
+        }
+        i += 1;
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    let gicv2 = Gicv2::new(
+        gic_distributor.expect("gic distributor missing"),
+        gic_cpu_interface.expect("gic cpu interface missing"),
+        None,
+        None,
+    )
+    .unwrap();
+    gicv2.init_distributor().unwrap();
+    let caps = gicv2.init_cpu_interface().unwrap();
+    println!("GICv2 CPU Interface capabilities: {:?}", caps);
+    gicv2
+        .configure(&GicCpuConfig {
+            priority_mask: 0xff,
+            enable_group0: false,
+            enable_group1: true,
+            binary_point: arch_hal::gic::BinaryPoint::Common(caps.binary_points_min),
+            eoi_mode: arch_hal::gic::EoiMode::DropOnly,
+        })
+        .unwrap();
+
+    // setup pl011 interrupts
+    gicv2
+        .configure_spi(
+            0x79 + 32,
+            arch_hal::gic::IrqGroup::Group1,
+            0x80,
+            arch_hal::gic::TriggerMode::Level,
+            arch_hal::gic::SpiRoute::Specific(cpu::get_current_core_id()),
+            arch_hal::gic::EnableOp::Enable,
+        )
+        .unwrap();
+
+    // setup timer
+    gicv2
+        .configure_ppi(
+            0xa + 16,
+            arch_hal::gic::IrqGroup::Group1,
+            0x80,
+            arch_hal::gic::TriggerMode::Level,
+            arch_hal::gic::EnableOp::Enable,
+        )
+        .unwrap();
+
+    debug_uart::enable_rx_interrupts(arch_hal::pl011::FifoLevel::OneEighth, true);
+
+    unsafe {
+        core::arch::asm!("msr daifclr, #3", options(nostack, preserves_flags)); // enable irq
+    }
+
+    unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
+
+    let phy = El2PhysicalTimer::new();
+    // phy.set_timeout(Duration::from_secs(1));
+
+    loop {
+        systimer.wait(Duration::from_secs(1));
+        println!("UARTMIS: 0x{:X}", unsafe {
+            ptr::read_volatile((PL011_UART_ADDR.0 + 0x40) as *const u32)
+        });
+        dump_uart_gic(gic_distributor.unwrap().base, PL011_UART_ADDR.0, 0x79 + 32);
+        debug_uart::handle_rx_irq_force(|byte| println_force!("force: {}", byte));
+        println!("wait for interrupt...");
+    }
 
     multicore::setup_multicore(stack_top);
 
@@ -329,7 +426,7 @@ extern "C" fn main() -> ! {
     let initrd_range = remove_initrd(&mut tree, chosen_id);
     remove_initrd_memreserve(&mut tree, initrd_range);
     append_reserved_memory(&mut tree, &reserved_memory);
-    configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR).unwrap();
+    configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR.0).unwrap();
 
     let dtb_box = tree.into_dtb_box().unwrap();
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
@@ -363,10 +460,46 @@ extern "C" fn main() -> ! {
     }
 }
 
+#[inline(always)]
+unsafe fn mmio_read32(addr: usize) -> u32 {
+    core::ptr::read_volatile(addr as *const u32)
+}
+
+fn dump_uart_gic(gicd_base: usize, uart_base: usize, intid: u32) {
+    let n = (intid / 32) as usize;
+    let bit = (intid % 32) as u32;
+    let mask = 1u32 << bit;
+
+    unsafe {
+        let u_imsc = mmio_read32(uart_base + 0x38);
+        let u_ris = mmio_read32(uart_base + 0x3c);
+        let u_mis = mmio_read32(uart_base + 0x40);
+
+        let g_isen = mmio_read32(gicd_base + 0x100 + 4 * n);
+        let g_ispe = mmio_read32(gicd_base + 0x200 + 4 * n);
+
+        arch_hal::println!(
+            "UART: IMSC=0x{:08X} RIS=0x{:08X} MIS=0x{:08X}",
+            u_imsc,
+            u_ris,
+            u_mis
+        );
+        arch_hal::println!(
+            "GICD: ISENABLER{}=0x{:08X} (en={}) ISPENDR{}=0x{:08X} (pend={})",
+            n,
+            g_isen,
+            (g_isen & mask) != 0,
+            n,
+            g_ispe,
+            (g_ispe & mask) != 0
+        );
+    }
+}
+
 extern "C" fn el1_main() {
     let hello = "hello world from el1_main\n";
     for i in hello.as_bytes() {
-        unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
+        unsafe { ptr::write_volatile(PL011_UART_ADDR.0 as *mut u8, *i) };
     }
 
     // jump linux
@@ -523,8 +656,7 @@ fn update_bootargs(
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 48_000_000);
-    // let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 44_000_000);
+    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR.0, PL011_UART_ADDR.1);
     debug_uart.init(115200);
     debug_uart.write("core 0 panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));

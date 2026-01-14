@@ -1,6 +1,9 @@
 use arch_hal::cpu;
+use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::gic::GicCpuInterface;
 use arch_hal::println;
+use arch_hal::println_force;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
@@ -11,11 +14,13 @@ use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
 
+use crate::GICV2_DRIVER;
 use crate::PL011_UART_ADDR;
 use crate::multicore::ap_on;
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
+    exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // intercept guest PSCI CPU_ON for hypervisor-controlled AP bring-up.
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, ap_on);
@@ -56,7 +61,7 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-                let uart = PL011_UART_ADDR;
+                let uart = PL011_UART_ADDR.0;
                 if (uart..uart + 0x1000).contains(&(address as usize)) {
                     if uart == address as usize && reg_val == b'\n' as u64 {
                         println!("\nhypervisor: alive");
@@ -89,6 +94,23 @@ fn data_abort_handler(
     }
     // advance elr_el2
     cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+}
+
+fn irq_handler() {
+    println_force!("irq received");
+    let gicv2 = unsafe { &*GICV2_DRIVER.get() }.as_ref().unwrap();
+    let irq = gicv2.acknowledge().unwrap();
+    let Some(irq) = irq else {
+        println_force!("spurious irq");
+        return;
+    };
+    println_force!("irq number: {}", irq.intid);
+    if irq.intid == 0x79 + 32 {
+        debug_uart::handle_rx_irq_force(|bytes| println_force!("interrupt: {}", bytes as char));
+    }
+
+    gicv2.end_of_interrupt(irq).unwrap();
+    gicv2.deactivate(irq).unwrap();
 }
 
 fn deny_handler(regs: &mut cpu::Registers) {
