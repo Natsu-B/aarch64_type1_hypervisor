@@ -148,6 +148,21 @@ bitregs! {
 }
 
 bitregs! {
+    /// ID_AA64DFR0_EL1 — AArch64 Debug Feature Register 0
+    /// Purpose:
+    ///     Provides information about the implemented debug architecture, including breakpoint count.
+    pub(crate) struct ID_AA64DFR0_EL1: u64 {
+        reserved@[11:0] [res0],
+        // BRPs: number of breakpoint registers minus one.
+        pub(crate) brps@[15:12],
+        reserved@[19:16] [res1],
+        // WRPs: number of watchpoint registers minus one.
+        pub(crate) wrps@[23:20],
+        reserved@[63:24] [res0],
+    }
+}
+
+bitregs! {
     pub(crate) struct MPIDR_EL1: u64 {
         pub(crate) aff0@[7:0],
         pub(crate) aff1@[15:8],

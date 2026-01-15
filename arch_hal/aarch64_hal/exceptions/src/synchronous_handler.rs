@@ -17,18 +17,25 @@ use psci::handle_secure_monitor_call;
 
 pub type DataAbortHandler =
     fn(&mut u64, u64, InstructionRegisterSize, SyndromeAccessSize, WriteNotRead);
+pub type DebugExceptionHandler = fn(&mut Registers, ExceptionClass);
 
 static SYNCHRONOUS_HANDLER: SyncUnsafeCell<SynchronousHandler> =
     SyncUnsafeCell::new(SynchronousHandler {
         data_abort_func: None,
+        debug_func: None,
     });
 
 struct SynchronousHandler {
     data_abort_func: Option<DataAbortHandler>,
+    debug_func: Option<DebugExceptionHandler>,
 }
 
 pub fn set_data_abort_handler(handler: DataAbortHandler) {
     unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.data_abort_func = Some(handler);
+}
+
+pub fn set_debug_handler(handler: DebugExceptionHandler) {
+    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.debug_func = Some(handler);
 }
 
 pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
@@ -78,6 +85,13 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                         return;
                     }
                     handle_secure_monitor_call(reg);
+                }
+                ExceptionClass::BreakpointLowerLevel
+                | ExceptionClass::SoftwareStepLowerLevel
+                | ExceptionClass::WatchpointLowerLevel => {
+                    unsafe { &*SYNCHRONOUS_HANDLER.get() }
+                        .debug_func
+                        .expect("debug handler not registered")(reg, ec);
                 }
                 _ => panic!("unexpected ESR_EL2 EC value: {:?}", ec),
             }

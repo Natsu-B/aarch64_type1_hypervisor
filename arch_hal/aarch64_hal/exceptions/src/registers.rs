@@ -224,7 +224,7 @@ bitregs! {
             }
         }
         pub(crate) il@[25:25],
-        pub(crate) ec@[31:26] as ExceptionClass {
+        pub ec@[31:26] as ExceptionClass {
             // unknown reason
             UnknownReason                  = 0b00_0000,
             TrappedWFInstruction           = 0b00_0001,
@@ -232,6 +232,12 @@ bitregs! {
             DataAbortFormLowerLevel        = 0b10_0100,
             // SMC Instruction Exception in Aarch64 state
             SMCInstructionExecution        = 0b01_0111,
+            // Breakpoint from lower EL (AArch64)
+            BreakpointLowerLevel           = 0b11_0000,
+            // Software step from lower EL (AArch64)
+            SoftwareStepLowerLevel         = 0b11_0010,
+            // Watchpoint from lower EL (AArch64)
+            WatchpointLowerLevel           = 0b11_0100,
         },
         pub(crate) iss2@[55:32],
         reserved@[63:56] [res0],
