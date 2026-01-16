@@ -315,6 +315,16 @@ impl Pl011Uart {
         self.pushb(byte);
     }
 
+    pub fn try_write_byte(&self, byte: u8) -> bool {
+        if self.registers.flag.read().get(UARTFR::txff) != 0 {
+            return false;
+        }
+        self.registers
+            .data
+            .write(UARTDR::new().set(UARTDR::data, byte as u32));
+        true
+    }
+
     pub fn drain_rx(&self) {
         while self.registers.flag.read().get(UARTFR::rxfe) == 0 {
             let _ = self.read_char();

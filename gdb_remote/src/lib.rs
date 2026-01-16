@@ -1,6 +1,7 @@
 #![no_std]
 
 use byte_stream::ByteStream;
+use byte_stream::ByteStreamBlockingExt;
 
 mod target;
 
@@ -36,7 +37,9 @@ pub enum ProcessResult {
     MonitorExit,
 }
 
-/// Minimal GDB RSP server operating on a blocking byte stream.
+/// Minimal GDB RSP server operating on a byte stream.
+///
+/// The server logic uses blocking helpers and is not IRQ-safe.
 pub struct GdbServer<S: ByteStream, const MAX_PKT: usize> {
     stream: S,
 }
@@ -54,7 +57,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
     ) -> Result<ProcessResult, GdbError<S::Error, T::Error>> {
         let mut buf = [0u8; MAX_PKT];
         let payload_len = loop {
-            match recv_packet::<_, MAX_PKT, T::Error>(&mut self.stream, &mut buf) {
+            match recv_packet::<_, MAX_PKT, T::Error>(&self.stream, &mut buf) {
                 Ok(Some(len)) => break len,
                 Ok(None) => continue,
                 Err(GdbError::PacketTooLong) | Err(GdbError::MalformedPacket) => continue,
@@ -64,7 +67,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let payload = &buf[..payload_len];
 
         if payload == b"?" {
-            send_packet::<_, T::Error>(&mut self.stream, b"S05")?;
+            send_packet::<_, T::Error>(&self.stream, b"S05")?;
             return Ok(ProcessResult::None);
         }
 
@@ -82,11 +85,11 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             Some(b'c') => self.handle_continue::<T>(payload),
             Some(b's') => self.handle_step::<T>(payload),
             Some(b'v') => {
-                send_packet::<_, T::Error>(&mut self.stream, b"")?;
+                send_packet::<_, T::Error>(&self.stream, b"")?;
                 Ok(ProcessResult::None)
             }
             _ => {
-                send_packet::<_, T::Error>(&mut self.stream, b"")?;
+                send_packet::<_, T::Error>(&self.stream, b"")?;
                 Ok(ProcessResult::None)
             }
         }
@@ -102,7 +105,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             match result {
                 Ok(ProcessResult::MonitorExit) => return Ok(()),
                 Ok(ProcessResult::Resume(_)) => {
-                    send_packet::<_, T::Error>(&mut self.stream, b"")?;
+                    send_packet::<_, T::Error>(&self.stream, b"")?;
                 }
                 Ok(ProcessResult::None) => {}
                 Err(GdbError::PacketTooLong) | Err(GdbError::MalformedPacket) => {
@@ -120,7 +123,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
     ) -> Result<ProcessResult, GdbError<S::Error, T::Error>> {
         if payload.starts_with(b"qSupported") {
             send_packet::<_, T::Error>(
-                &mut self.stream,
+                &self.stream,
                 b"PacketSize=400;swbreak+;hwbreak-;vMustReplyEmpty+",
             )?;
             return Ok(ProcessResult::None);
@@ -131,26 +134,26 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             let decoded_len = match hex_decode(rest, &mut decoded) {
                 Ok(len) => len,
                 Err(_) => {
-                    send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                    send_packet::<_, T::Error>(&self.stream, b"E01")?;
                     return Ok(ProcessResult::None);
                 }
             };
             let text = match core::str::from_utf8(&decoded[..decoded_len]) {
                 Ok(t) => t,
                 Err(_) => {
-                    send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                    send_packet::<_, T::Error>(&self.stream, b"E01")?;
                     return Ok(ProcessResult::None);
                 }
             };
             if text.trim() == "exit 0" {
-                send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
+                send_packet::<_, T::Error>(&self.stream, b"OK")?;
                 return Ok(ProcessResult::MonitorExit);
             }
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         }
 
-        send_packet::<_, T::Error>(&mut self.stream, b"")?;
+        send_packet::<_, T::Error>(&self.stream, b"")?;
         Ok(ProcessResult::None)
     }
 
@@ -161,15 +164,15 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let mut regs = [0u8; MAX_PKT];
         let len = target.read_registers(&mut regs).map_err(GdbError::Target)?;
         if len.saturating_mul(2) > MAX_PKT {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         }
         let mut out = [0u8; MAX_PKT];
         let Some(hex_len) = hex_encode(&regs[..len], &mut out) else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         };
-        send_packet::<_, T::Error>(&mut self.stream, &out[..hex_len])?;
+        send_packet::<_, T::Error>(&self.stream, &out[..hex_len])?;
         Ok(ProcessResult::None)
     }
 
@@ -181,13 +184,13 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let data_hex = &payload[1..];
         let mut regs = [0u8; MAX_PKT];
         let Ok(len) = hex_decode(data_hex, &mut regs) else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         };
         target
             .write_registers(&regs[..len])
             .map_err(GdbError::Target)?;
-        send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
+        send_packet::<_, T::Error>(&self.stream, b"OK")?;
         Ok(ProcessResult::None)
     }
 
@@ -199,7 +202,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let regno = match parse_hex_u32(&payload[1..]) {
             Some(r) => r,
             None => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                send_packet::<_, T::Error>(&self.stream, b"E01")?;
                 return Ok(ProcessResult::None);
             }
         };
@@ -209,15 +212,15 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             .read_register(regno, &mut reg)
             .map_err(GdbError::Target)?;
         if len.saturating_mul(2) > MAX_PKT {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         }
         let mut out = [0u8; MAX_PKT];
         let Some(hex_len) = hex_encode(&reg[..len], &mut out) else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         };
-        send_packet::<_, T::Error>(&mut self.stream, &out[..hex_len])?;
+        send_packet::<_, T::Error>(&self.stream, &out[..hex_len])?;
         Ok(ProcessResult::None)
     }
 
@@ -228,7 +231,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
     ) -> Result<ProcessResult, GdbError<S::Error, T::Error>> {
         let body = &payload[1..];
         let Some(eq_pos) = body.iter().position(|&b| b == b'=') else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         };
         let regno_hex = &body[..eq_pos];
@@ -237,21 +240,21 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let regno = match parse_hex_u32(regno_hex) {
             Some(r) => r,
             None => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                send_packet::<_, T::Error>(&self.stream, b"E01")?;
                 return Ok(ProcessResult::None);
             }
         };
 
         let mut reg = [0u8; MAX_PKT];
         let Ok(len) = hex_decode(val_hex, &mut reg) else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         };
 
         target
             .write_register(regno, &reg[..len])
             .map_err(GdbError::Target)?;
-        send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
+        send_packet::<_, T::Error>(&self.stream, b"OK")?;
         Ok(ProcessResult::None)
     }
 
@@ -263,25 +266,25 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let (addr, len) = match parse_addr_len::<S::Error, T::Error>(payload) {
             Ok(v) => v,
             Err(_) => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+                send_packet::<_, T::Error>(&self.stream, b"E02")?;
                 return Ok(ProcessResult::None);
             }
         };
         if addr.checked_add(len).is_none() {
             // Workaround for a GDB bug that can send wrapped "m" packets like "$mfffffffffffffffc,4#...".
             // If the address+length overflows, treat it as EFAULT (14) and keep the session running.
-            send_packet::<_, T::Error>(&mut self.stream, b"E14")?;
+            send_packet::<_, T::Error>(&self.stream, b"E14")?;
             return Ok(ProcessResult::None);
         }
         let len_usize = match usize::try_from(len) {
             Ok(v) => v,
             Err(_) => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                send_packet::<_, T::Error>(&self.stream, b"E01")?;
                 return Ok(ProcessResult::None);
             }
         };
         if len_usize > MAX_PKT {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         }
 
@@ -292,10 +295,10 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
 
         let mut out = [0u8; MAX_PKT];
         let Some(hex_len) = hex_encode(&data[..len_usize], &mut out) else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+            send_packet::<_, T::Error>(&self.stream, b"E01")?;
             return Ok(ProcessResult::None);
         };
-        send_packet::<_, T::Error>(&mut self.stream, &out[..hex_len])?;
+        send_packet::<_, T::Error>(&self.stream, &out[..hex_len])?;
         Ok(ProcessResult::None)
     }
 
@@ -305,7 +308,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         payload: &[u8],
     ) -> Result<ProcessResult, GdbError<S::Error, T::Error>> {
         let Some(colon) = payload.iter().position(|&b| b == b':') else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+            send_packet::<_, T::Error>(&self.stream, b"E02")?;
             return Ok(ProcessResult::None);
         };
         let header = &payload[..colon];
@@ -314,25 +317,25 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let (addr, len) = match parse_addr_len::<S::Error, T::Error>(header) {
             Ok(v) => v,
             Err(_) => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+                send_packet::<_, T::Error>(&self.stream, b"E02")?;
                 return Ok(ProcessResult::None);
             }
         };
 
         let mut data = [0u8; MAX_PKT];
         let Ok(decoded) = hex_decode(data_hex, &mut data) else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E03")?;
+            send_packet::<_, T::Error>(&self.stream, b"E03")?;
             return Ok(ProcessResult::None);
         };
         if decoded as u64 != len {
-            send_packet::<_, T::Error>(&mut self.stream, b"E03")?;
+            send_packet::<_, T::Error>(&self.stream, b"E03")?;
             return Ok(ProcessResult::None);
         }
 
         target
             .write_memory(addr, &data[..decoded])
             .map_err(GdbError::Target)?;
-        send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
+        send_packet::<_, T::Error>(&self.stream, b"OK")?;
         Ok(ProcessResult::None)
     }
 
@@ -342,7 +345,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         payload: &[u8],
     ) -> Result<ProcessResult, GdbError<S::Error, T::Error>> {
         let Some(colon) = payload.iter().position(|&b| b == b':') else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+            send_packet::<_, T::Error>(&self.stream, b"E02")?;
             return Ok(ProcessResult::None);
         };
         let header = &payload[..colon];
@@ -351,7 +354,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let (addr, len) = match parse_addr_len::<S::Error, T::Error>(header) {
             Ok(v) => v,
             Err(_) => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+                send_packet::<_, T::Error>(&self.stream, b"E02")?;
                 return Ok(ProcessResult::None);
             }
         };
@@ -359,19 +362,19 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         let mut decoded = [0u8; MAX_PKT];
         let Ok(decoded_len) = decode_rsp_binary(binary, &mut decoded) else {
             // Malformed escape or output buffer overflow.
-            send_packet::<_, T::Error>(&mut self.stream, b"E03")?;
+            send_packet::<_, T::Error>(&self.stream, b"E03")?;
             return Ok(ProcessResult::None);
         };
 
         if decoded_len as u64 != len {
-            send_packet::<_, T::Error>(&mut self.stream, b"E03")?;
+            send_packet::<_, T::Error>(&self.stream, b"E03")?;
             return Ok(ProcessResult::None);
         }
 
         target
             .write_memory(addr, &decoded[..decoded_len])
             .map_err(GdbError::Target)?;
-        send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
+        send_packet::<_, T::Error>(&self.stream, b"OK")?;
         Ok(ProcessResult::None)
     }
 
@@ -382,7 +385,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         insert: bool,
     ) -> Result<ProcessResult, GdbError<S::Error, T::Error>> {
         if payload.len() < 2 || payload[1] != b'0' {
-            send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+            send_packet::<_, T::Error>(&self.stream, b"E02")?;
             return Ok(ProcessResult::None);
         }
         let mut body = &payload[2..];
@@ -390,14 +393,14 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             body = stripped;
         }
         let Some(comma) = body.iter().position(|&b| b == b',') else {
-            send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+            send_packet::<_, T::Error>(&self.stream, b"E02")?;
             return Ok(ProcessResult::None);
         };
         let addr_hex = &body[..comma];
         let addr = match parse_hex_u64(addr_hex) {
             Some(a) => a,
             None => {
-                send_packet::<_, T::Error>(&mut self.stream, b"E02")?;
+                send_packet::<_, T::Error>(&self.stream, b"E02")?;
                 return Ok(ProcessResult::None);
             }
         };
@@ -412,7 +415,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
                 .map_err(GdbError::Target)?;
         }
 
-        send_packet::<_, T::Error>(&mut self.stream, b"OK")?;
+        send_packet::<_, T::Error>(&self.stream, b"OK")?;
         Ok(ProcessResult::None)
     }
 
@@ -424,7 +427,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             match parse_hex_u64(&payload[1..]) {
                 Some(addr) => Some(addr),
                 None => {
-                    send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                    send_packet::<_, T::Error>(&self.stream, b"E01")?;
                     return Ok(ProcessResult::None);
                 }
             }
@@ -442,7 +445,7 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             match parse_hex_u64(&payload[1..]) {
                 Some(addr) => Some(addr),
                 None => {
-                    send_packet::<_, T::Error>(&mut self.stream, b"E01")?;
+                    send_packet::<_, T::Error>(&self.stream, b"E01")?;
                     return Ok(ProcessResult::None);
                 }
             }
@@ -456,12 +459,12 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
 /// Receive a single RSP packet into `buf`, returning the payload length.
 /// If a Ctrl-C (0x03) is observed, a stop reply is sent and `None` is returned.
 pub fn recv_packet<S: ByteStream, const N: usize, TE>(
-    stream: &mut S,
+    stream: &S,
     buf: &mut [u8; N],
 ) -> Result<Option<usize>, GdbError<S::Error, TE>> {
     // Wait for '$' start marker.
     loop {
-        let byte = stream.read().map_err(GdbError::Stream)?;
+        let byte = stream.read_blocking().map_err(GdbError::Stream)?;
         match byte {
             b'$' => break,
             0x03 => {
@@ -475,7 +478,7 @@ pub fn recv_packet<S: ByteStream, const N: usize, TE>(
 
     let mut idx = 0usize;
     loop {
-        let byte = stream.read().map_err(GdbError::Stream)?;
+        let byte = stream.read_blocking().map_err(GdbError::Stream)?;
         match byte {
             b'#' => break,
             b => {
@@ -489,12 +492,12 @@ pub fn recv_packet<S: ByteStream, const N: usize, TE>(
 
     let mut checksum_bytes = [0u8; 2];
     for slot in checksum_bytes.iter_mut() {
-        *slot = stream.read().map_err(GdbError::Stream)?;
+        *slot = stream.read_blocking().map_err(GdbError::Stream)?;
     }
 
     if idx > buf.len() {
         // Consume overlong packet, send NAK, and signal an error.
-        stream.write(b'-').map_err(GdbError::Stream)?;
+        stream.write_blocking(b'-').map_err(GdbError::Stream)?;
         return Err(GdbError::PacketTooLong);
     }
 
@@ -508,17 +511,17 @@ pub fn recv_packet<S: ByteStream, const N: usize, TE>(
     let checksum_recv = (high << 4) | low;
 
     if checksum_calc == checksum_recv {
-        stream.write(b'+').map_err(GdbError::Stream)?;
+        stream.write_blocking(b'+').map_err(GdbError::Stream)?;
         Ok(Some(idx))
     } else {
-        stream.write(b'-').map_err(GdbError::Stream)?;
+        stream.write_blocking(b'-').map_err(GdbError::Stream)?;
         Err(GdbError::MalformedPacket)
     }
 }
 
 /// Send an RSP packet containing `payload`.
 pub fn send_packet<S: ByteStream, TE>(
-    stream: &mut S,
+    stream: &S,
     payload: &[u8],
 ) -> Result<(), GdbError<S::Error, TE>> {
     let mut checksum: u8 = 0;
@@ -526,14 +529,16 @@ pub fn send_packet<S: ByteStream, TE>(
         checksum = checksum.wrapping_add(b);
     }
 
-    stream.write(b'$').map_err(GdbError::Stream)?;
-    stream.write_all(payload).map_err(GdbError::Stream)?;
-    stream.write(b'#').map_err(GdbError::Stream)?;
+    stream.write_blocking(b'$').map_err(GdbError::Stream)?;
     stream
-        .write(HEX[(checksum >> 4) as usize])
+        .write_all_blocking(payload)
+        .map_err(GdbError::Stream)?;
+    stream.write_blocking(b'#').map_err(GdbError::Stream)?;
+    stream
+        .write_blocking(HEX[(checksum >> 4) as usize])
         .map_err(GdbError::Stream)?;
     stream
-        .write(HEX[(checksum & 0xF) as usize])
+        .write_blocking(HEX[(checksum & 0xF) as usize])
         .map_err(GdbError::Stream)?;
     stream.flush().map_err(GdbError::Stream)?;
     Ok(())
