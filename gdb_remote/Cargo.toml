@@ -3,6 +3,10 @@ name = "gdb_remote"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+gdb_monitor_debug = []
+
 [dependencies]
 byte_stream = { path = "../byte_stream" }
 

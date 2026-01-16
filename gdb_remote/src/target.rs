@@ -1,4 +1,5 @@
 /// Actions requested by the debugger when resuming execution.
+#[derive(Debug)]
 pub enum ResumeAction {
     Continue(Option<u64>), // optional new program counter
     Step(Option<u64>),     // optional new program counter

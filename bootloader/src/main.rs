@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 extern crate alloc;
+mod gdb;
 mod handler;
 use alloc::alloc::alloc;
 use allocator::define_global_allocator;

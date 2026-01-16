@@ -640,3 +640,31 @@ pub fn clean_data_cache_all() {
         asm!("msr csselr_el1, {0}", in(reg) 0u64);
     }
 }
+
+/// Translate a guest IPA to a physical address using Stage-2 translation.
+///
+/// Stage-2 must already be configured and enabled. The returned physical address is expected to be
+/// directly accessible from EL2 in the current boot flow (identity mapping).
+pub fn ipa_to_pa_el2(ipa: u64) -> Option<u64> {
+    let par_after: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, par_el1",
+            "at S12E1R, {ipa}",
+            "isb",
+            "mrs {par_after}, par_el1",
+            "msr par_el1, {tmp}",
+            tmp        = lateout(reg) _,
+            par_after  = out(reg) par_after,
+            ipa        = in(reg) ipa,
+            options(nostack)
+        );
+    }
+
+    if (par_after & 1) != 0 {
+        return None;
+    }
+
+    let pa = par_after & 0x0000_FFFF_FFFF_F000;
+    Some(pa | (ipa & 0xFFF))
+}
