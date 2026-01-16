@@ -17,3 +17,4 @@ aarch64_test = { path = "./aarch64_test", optional = true }
 psci = { path = "./psci" }
 gic = { path = "./gic" }
 timer = { path = "./timer" }
+aarch64_mutex = { path = "./aarch64_mutex" }
