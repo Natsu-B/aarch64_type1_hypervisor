@@ -47,10 +47,12 @@ pub enum ProcessResult {
     None,
     /// Resume execution with the provided action.
     Resume(ResumeAction),
-    /// Special-case monitor exit used by the UEFI test harness.
+    /// Special-case monitor-exit used by the UEFI test harness.
+    ///
+    /// Note: This is triggered after `qRcmd "exit 0"` arms an exit request and the client
+    /// subsequently sends a session-termination packet (e.g. `vKill`, `D`, or `k`).
     MonitorExit,
 }
-
 type TargetErr<T> = TargetError<<T as Target>::RecoverableError, <T as Target>::UnrecoverableError>;
 type GdbServerError<S, T> = GdbError<
     <S as ByteStream>::Error,
@@ -63,14 +65,17 @@ type GdbServerError<S, T> = GdbError<
 /// The server logic uses blocking helpers and is not IRQ-safe.
 pub struct GdbServer<S: ByteStream, const MAX_PKT: usize> {
     stream: S,
+    monitor_exit_armed: bool,
 }
 
 impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
     /// Create a new server wrapping the provided stream.
     pub fn new(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            monitor_exit_armed: false,
+        }
     }
-
     #[cfg(feature = "gdb_monitor_debug")]
     pub fn debug_console_fmt(&mut self, args: fmt::Arguments<'_>) {
         // Ensure the message and framing stay within the advertised maximum packet size.
@@ -177,6 +182,27 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
                     debug_printable_prefix(payload)
                 );
                 self.handle_query(target, payload)
+            }
+            Some(b'D') => {
+                // Detach. Reply OK. If a monitor-exit was armed, finish the harness.
+                gdb_debug!(self, "dispatch: 'D' (detach)");
+                self.send_ok::<T>()?;
+                if self.monitor_exit_armed {
+                    self.monitor_exit_armed = false;
+                    return Ok(ProcessResult::MonitorExit);
+                }
+                Ok(ProcessResult::None)
+            }
+            Some(b'k') => {
+                // Kill. Reply OK (harmless even if client ignores it).
+                // If a monitor-exit was armed, finish the harness.
+                gdb_debug!(self, "dispatch: 'k' (kill)");
+                self.send_ok::<T>()?;
+                if self.monitor_exit_armed {
+                    self.monitor_exit_armed = false;
+                    return Ok(ProcessResult::MonitorExit);
+                }
+                Ok(ProcessResult::None)
             }
             Some(b'g') => {
                 gdb_debug!(self, "dispatch: 'g' (read all registers)");
@@ -294,7 +320,11 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         }
     }
 
-    /// Run until a qRcmd "exit 0" request is received.
+    /// Run until the monitor-exit sequence completes.
+    ///
+    /// The sequence is:
+    /// 1) client sends `qRcmd "exit 0"` (server replies OK and arms an exit)
+    /// 2) client sends `vKill` (or `D`/`k`), server replies OK and returns `MonitorExit`
     pub fn run_until_monitor_exit<T: Target>(
         &mut self,
         target: &mut T,
@@ -391,6 +421,9 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         );
         if payload.starts_with(b"qSupported") {
             gdb_debug!(self, "handle_query: qSupported");
+            // A new handshake implies a new session. Clear any stale monitor-exit state.
+            self.monitor_exit_armed = false;
+
             let caps = target.capabilities();
             let mut reply = [0u8; 128];
             let mut idx = 0usize;
@@ -451,7 +484,11 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             );
             if text.trim() == "exit 0" {
                 self.send_ok::<T>()?;
-                return Ok(ProcessResult::MonitorExit);
+                // Do NOT terminate immediately: GDB typically sends `vKill` (or `D`)
+                // after this command as part of its shutdown path. Exiting here makes
+                // the transport disappear mid-teardown (Broken pipe).
+                self.monitor_exit_armed = true;
+                return Ok(ProcessResult::None);
             }
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
@@ -989,6 +1026,17 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             "handle_v_packet: payload=\"{}\"",
             debug_printable_prefix(payload)
         );
+        // GDB sends `vKill;...` during shutdown (`quit`). Reply OK so GDB can complete
+        // teardown. If `monitor exit 0` was armed, finish the harness now.
+        if payload.starts_with(b"vKill") {
+            gdb_debug!(self, "handle_v_packet: vKill");
+            self.send_ok::<T>()?;
+            if self.monitor_exit_armed {
+                self.monitor_exit_armed = false;
+                return Ok(ProcessResult::MonitorExit);
+            }
+            return Ok(ProcessResult::None);
+        }
         if payload == b"vCont?" {
             if target.capabilities().contains(TargetCapabilities::VCONT) {
                 self.send::<T>(b"vCont;c;s")?;

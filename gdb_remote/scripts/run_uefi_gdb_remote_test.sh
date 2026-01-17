@@ -19,6 +19,10 @@ QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64}
 GDB_BIN=${GDB_BIN:-gdb}
 UART_PORT=${UART_PORT:-12355}
 
+# If xtask provided a QEMU gdbstub socket path, enable it for timeout debugging.
+if [ -n "${XTASK_QEMU_GDB_SOCKET:-}" ]; then
+    rm -f "${XTASK_QEMU_GDB_SOCKET}"
+fi
 "$QEMU_BIN" \
   -M virt,gic-version=3,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
@@ -27,6 +31,7 @@ UART_PORT=${UART_PORT:-12355}
   -nographic \
   -semihosting-config enable=on,target=native \
   -no-reboot -no-shutdown \
+  ${XTASK_QEMU_GDB_SOCKET:+-gdb unix:${XTASK_QEMU_GDB_SOCKET},server,nowait} \
   -serial tcp:127.0.0.1:${UART_PORT},server,nowait \
   -drive file=fat:rw:"$SCRIPT_DIR/../bin",format=raw,if=none,media=disk,id=disk \
   -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0 &
