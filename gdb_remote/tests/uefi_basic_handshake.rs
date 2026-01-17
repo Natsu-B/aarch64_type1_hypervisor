@@ -9,6 +9,8 @@ use aarch64_test::exit_success;
 use core::convert::Infallible;
 use gdb_remote::GdbServer;
 use gdb_remote::Target;
+use gdb_remote::TargetCapabilities;
+use gdb_remote::TargetError;
 use print::debug_uart;
 use print::pl011::Pl011Uart;
 use print::stream::Pl011Stream;
@@ -39,19 +41,26 @@ extern "C" fn efi_main() -> ! {
 
 struct DummyTarget;
 
-impl Target for DummyTarget {
-    type Error = Infallible;
+type DummyError = TargetError<Infallible, Infallible>;
 
-    fn read_registers(&mut self, dst: &mut [u8]) -> Result<usize, Self::Error> {
+impl Target for DummyTarget {
+    type RecoverableError = Infallible;
+    type UnrecoverableError = Infallible;
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::SW_BREAK | TargetCapabilities::VCONT
+    }
+
+    fn read_registers(&mut self, dst: &mut [u8]) -> Result<usize, DummyError> {
         dst.fill(0);
         Ok(dst.len().min(16))
     }
 
-    fn write_registers(&mut self, _src: &[u8]) -> Result<(), Self::Error> {
+    fn write_registers(&mut self, _src: &[u8]) -> Result<(), DummyError> {
         Ok(())
     }
 
-    fn read_register(&mut self, _regno: u32, dst: &mut [u8]) -> Result<usize, Self::Error> {
+    fn read_register(&mut self, _regno: u32, dst: &mut [u8]) -> Result<usize, DummyError> {
         if !dst.is_empty() {
             dst[0] = 0;
             return Ok(1);
@@ -59,24 +68,24 @@ impl Target for DummyTarget {
         Ok(0)
     }
 
-    fn write_register(&mut self, _regno: u32, _src: &[u8]) -> Result<(), Self::Error> {
+    fn write_register(&mut self, _regno: u32, _src: &[u8]) -> Result<(), DummyError> {
         Ok(())
     }
 
-    fn read_memory(&mut self, _addr: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
+    fn read_memory(&mut self, _addr: u64, dst: &mut [u8]) -> Result<(), DummyError> {
         dst.fill(0);
         Ok(())
     }
 
-    fn write_memory(&mut self, _addr: u64, _src: &[u8]) -> Result<(), Self::Error> {
+    fn write_memory(&mut self, _addr: u64, _src: &[u8]) -> Result<(), DummyError> {
         Ok(())
     }
 
-    fn insert_sw_breakpoint(&mut self, _addr: u64) -> Result<(), Self::Error> {
+    fn insert_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
         Ok(())
     }
 
-    fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), Self::Error> {
+    fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
         Ok(())
     }
 }
