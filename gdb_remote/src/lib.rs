@@ -1277,6 +1277,7 @@ pub fn recv_packet<S: ByteStream, const N: usize, R, U>(
     if idx > buf.len() {
         // Consume overlong packet, send NAK, and signal an error.
         stream.write_blocking(b'-').map_err(GdbError::Stream)?;
+        stream.flush().map_err(GdbError::Stream)?;
         return Err(GdbError::PacketTooLong);
     }
 
@@ -1291,9 +1292,11 @@ pub fn recv_packet<S: ByteStream, const N: usize, R, U>(
 
     if checksum_calc == checksum_recv {
         stream.write_blocking(b'+').map_err(GdbError::Stream)?;
+        stream.flush().map_err(GdbError::Stream)?;
         Ok(Some(idx))
     } else {
         stream.write_blocking(b'-').map_err(GdbError::Stream)?;
+        stream.flush().map_err(GdbError::Stream)?;
         Err(GdbError::MalformedPacket)
     }
 }

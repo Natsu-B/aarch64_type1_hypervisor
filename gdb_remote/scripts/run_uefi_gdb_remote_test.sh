@@ -17,21 +17,24 @@ cp "$PATH_TO_ELF" "$BIN_DIR/BOOTAA64.EFI"
 
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64}
 GDB_BIN=${GDB_BIN:-gdb}
-UART_PORT=${UART_PORT:-12355}
+    UART_PORT=${UART_PORT:-12355}
 
-# If xtask provided a QEMU gdbstub socket path, enable it for timeout debugging.
-if [ -n "${XTASK_QEMU_GDB_SOCKET:-}" ]; then
-    rm -f "${XTASK_QEMU_GDB_SOCKET}"
-fi
-"$QEMU_BIN" \
+    # If xtask provided a QEMU gdbstub socket path, enable it for timeout debugging.
+    QEMU_GDB_ARGS=""
+    if [ -n "${XTASK_QEMU_GDB_SOCKET:-}" ]; then
+        rm -f "${XTASK_QEMU_GDB_SOCKET}"
+        QEMU_GDB_ARGS="-gdb unix:${XTASK_QEMU_GDB_SOCKET},server,nowait"
+    fi
+
+    "$QEMU_BIN" \
   -M virt,gic-version=3,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
   -cpu cortex-a53 -smp 4 -m 1G \
   -bios "$REPO_ROOT/test/RELEASEAARCH64_QEMU_EFI.fd" \
   -nographic \
   -semihosting-config enable=on,target=native \
-  -no-reboot -no-shutdown \
-  ${XTASK_QEMU_GDB_SOCKET:+-gdb unix:${XTASK_QEMU_GDB_SOCKET},server,nowait} \
+        -no-reboot -no-shutdown \
+        ${QEMU_GDB_ARGS} \  ${XTASK_QEMU_GDB_SOCKET:+-gdb unix:${XTASK_QEMU_GDB_SOCKET},server,nowait} \
   -serial tcp:127.0.0.1:${UART_PORT},server,nowait \
   -drive file=fat:rw:"$SCRIPT_DIR/../bin",format=raw,if=none,media=disk,id=disk \
   -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0 &
