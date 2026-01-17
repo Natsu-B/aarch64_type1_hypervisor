@@ -445,7 +445,91 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             } else {
                 append_bytes(&mut reply, &mut idx, b";vContSupported-");
             }
+            if caps.contains(TargetCapabilities::XFER_FEATURES) {
+                append_bytes(&mut reply, &mut idx, b";qXfer:features:read+");
+            }
             self.send::<T>(&reply[..idx])?;
+            return Ok(ProcessResult::None);
+        }
+
+        if let Some(rest) = payload.strip_prefix(b"qXfer:features:read:") {
+            if !target
+                .capabilities()
+                .contains(TargetCapabilities::XFER_FEATURES)
+            {
+                self.send_empty::<T>()?;
+                return Ok(ProcessResult::None);
+            }
+            let Some((annex, offset, length)) = parse_qxfer_features_read(rest) else {
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            };
+            let annex = match core::str::from_utf8(annex) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+            };
+
+            let data = match target.xfer_features(annex) {
+                Ok(Some(data)) => data,
+                Ok(None) | Err(TargetError::NotSupported) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+                Err(TargetError::Recoverable(e)) => {
+                    self.reply_recoverable(target, &e)?;
+                    return Ok(ProcessResult::None);
+                }
+                Err(TargetError::Unrecoverable(e)) => {
+                    return Err(GdbError::Target(TargetError::Unrecoverable(e)));
+                }
+            };
+
+            let offset = match usize::try_from(offset) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+            };
+            let length = match usize::try_from(length) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+            };
+
+            if offset >= data.len() {
+                self.send::<T>(b"l")?;
+                return Ok(ProcessResult::None);
+            }
+
+            let max_len = core::cmp::min(length, data.len() - offset);
+            if max_len == 0 {
+                let prefix = if offset < data.len() { b'm' } else { b'l' };
+                let reply = [prefix];
+                self.send::<T>(&reply)?;
+                return Ok(ProcessResult::None);
+            }
+
+            let mut reply = [0u8; MAX_PKT];
+            if reply.is_empty() {
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
+            let (consumed, encoded_len) =
+                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..]);
+            if consumed == 0 {
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
+
+            let more = offset + consumed < data.len();
+            reply[0] = if more { b'm' } else { b'l' };
+            self.send::<T>(&reply[..1 + encoded_len])?;
             return Ok(ProcessResult::None);
         }
 
@@ -1379,6 +1463,23 @@ fn parse_flash_header(buf: &[u8]) -> Option<(u64, u64)> {
     Some((addr, len))
 }
 
+fn parse_qxfer_features_read(buf: &[u8]) -> Option<(&[u8], u64, u64)> {
+    let mut parts = buf.splitn(2, |&b| b == b':');
+    let annex = parts.next()?;
+    let rest = parts.next()?;
+
+    if annex.is_empty() {
+        return None;
+    }
+
+    let mut range = rest.splitn(2, |&b| b == b',');
+    let offset_hex = range.next()?;
+    let len_hex = range.next()?;
+    let offset = parse_hex_u64(offset_hex)?;
+    let len = parse_hex_u64(len_hex)?;
+    Some((annex, offset, len))
+}
+
 fn parse_addr_len<SE, R, U>(payload: &[u8]) -> Result<(u64, u64), GdbError<SE, R, U>> {
     let body = payload.get(1..).ok_or(GdbError::MalformedPacket)?;
     let Some(comma) = body.iter().position(|&b| b == b',') else {
@@ -1486,4 +1587,34 @@ fn decode_rsp_binary(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
     }
 
     Ok(out_idx)
+}
+
+/// Encode RSP binary data (with 0x7d escaping) into `dst`.
+/// Returns (bytes_consumed, bytes_written).
+fn encode_rsp_binary(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
+    let mut in_idx = 0usize;
+    let mut out_idx = 0usize;
+
+    while in_idx < src.len() {
+        let b = src[in_idx];
+        let needs_escape = b == b'$' || b == b'#' || b == b'}';
+        let needed = if needs_escape { 2 } else { 1 };
+
+        if out_idx + needed > dst.len() {
+            break;
+        }
+
+        if needs_escape {
+            dst[out_idx] = b'}';
+            dst[out_idx + 1] = b ^ 0x20;
+            out_idx += 2;
+        } else {
+            dst[out_idx] = b;
+            out_idx += 1;
+        }
+
+        in_idx += 1;
+    }
+
+    (in_idx, out_idx)
 }

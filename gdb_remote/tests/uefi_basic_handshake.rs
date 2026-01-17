@@ -15,8 +15,13 @@ use print::debug_uart;
 use print::pl011::Pl011Uart;
 use print::stream::Pl011Stream;
 
-const UART_BASE: usize = 0x900_0000;
+// Use the 2nd PL011 (UART1) on QEMU virt for the RSP channel.
+// UART0 is typically used as the UEFI firmware console and can inject non-RSP output.
+const UART_BASE: usize = 0x901_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
+
+// AArch64 core regset (x0-x30, sp, pc, cpsr).
+const CORE_REG_BYTES: usize = 31 * 8 + 8 + 8 + 4;
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
@@ -24,7 +29,8 @@ extern "C" fn efi_main() -> ! {
 
     let mut uart = Pl011Uart::new(UART_BASE, UART_CLOCK_HZ as u64);
     uart.init(115200);
-    uart.drain_rx(); // drop any firmware banner noise before speaking RSP
+    // Drain any stale bytes (should be empty for UART1, but keep it defensive).
+    uart.drain_rx();
     let stream = Pl011Stream::new(&uart);
     let mut server: GdbServer<_, 1024> = GdbServer::new(stream);
     let mut target = DummyTarget;
@@ -52,8 +58,11 @@ impl Target for DummyTarget {
     }
 
     fn read_registers(&mut self, dst: &mut [u8]) -> Result<usize, DummyError> {
-        dst.fill(0);
-        Ok(dst.len().min(16))
+        if dst.len() < CORE_REG_BYTES {
+            return Err(TargetError::NotSupported);
+        }
+        dst[..CORE_REG_BYTES].fill(0);
+        Ok(CORE_REG_BYTES)
     }
 
     fn write_registers(&mut self, _src: &[u8]) -> Result<(), DummyError> {
@@ -61,11 +70,21 @@ impl Target for DummyTarget {
     }
 
     fn read_register(&mut self, _regno: u32, dst: &mut [u8]) -> Result<usize, DummyError> {
-        if !dst.is_empty() {
-            dst[0] = 0;
-            return Ok(1);
+        // Match the same minimal AArch64 core regset:
+        // 0..=30: x0..x30 (8 bytes)
+        // 31: sp (8 bytes)
+        // 32: pc (8 bytes)
+        // 33: cpsr (4 bytes)
+        let need = match _regno {
+            0..=32 => 8,
+            33 => 4,
+            _ => return Err(TargetError::NotSupported),
+        };
+        if dst.len() < need {
+            return Err(TargetError::NotSupported);
         }
-        Ok(0)
+        dst[..need].fill(0);
+        Ok(need)
     }
 
     fn write_register(&mut self, _regno: u32, _src: &[u8]) -> Result<(), DummyError> {

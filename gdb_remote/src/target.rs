@@ -25,6 +25,7 @@ impl TargetCapabilities {
     pub const WATCH_R: Self = Self(1 << 3);
     pub const WATCH_A: Self = Self(1 << 4);
     pub const VCONT: Self = Self(1 << 5);
+    pub const XFER_FEATURES: Self = Self(1 << 6);
 
     pub const fn empty() -> Self {
         Self::NONE
@@ -73,6 +74,13 @@ pub trait Target {
 
     fn recoverable_error_code(&self, _e: &Self::RecoverableError) -> u8 {
         1
+    }
+
+    fn xfer_features(
+        &mut self,
+        _annex: &str,
+    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        Ok(None)
     }
 
     /// Read all registers into `dst`, returning bytes written.

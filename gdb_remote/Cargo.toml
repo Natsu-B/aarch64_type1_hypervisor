@@ -22,3 +22,8 @@ test = false
 name = "uefi_basic_handshake"
 path = "tests/uefi_basic_handshake.rs"
 harness = false
+
+[[test]]
+name = "uefi_qxfer_features"
+path = "tests/uefi_qxfer_features.rs"
+harness = false
