@@ -3,9 +3,20 @@
 version = 4
 
 [[package]]
+name = "aarch64_gdb"
+version = "0.1.0"
+dependencies = [
+ "byte_stream",
+ "cpu",
+ "exceptions",
+ "gdb_remote",
+]
+
+[[package]]
 name = "aarch64_hal"
 version = "0.1.0"
 dependencies = [
+ "aarch64_gdb",
  "aarch64_mutex",
  "aarch64_test",
  "cpu",

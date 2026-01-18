@@ -175,3 +175,15 @@ bitregs! {
         reserved@[63:40] [res0],
     }
 }
+
+bitregs! {
+    /// MDSCR_EL1 — Monitor Debug System Control Register.
+    pub struct MDSCR_EL1: u64 {
+        pub ss@[0:0],
+        reserved@[12:1] [ignore],
+        pub kde@[13:13],
+        reserved@[14:14] [ignore],
+        pub mde@[15:15],
+        reserved@[63:16] [ignore],
+    }
+}

@@ -453,3 +453,6 @@ impl fmt::Write for Pl011Uart {
 }
 
 unsafe impl Send for Pl011Uart {}
+// SAFETY: Pl011Uart provides interior mutability over MMIO registers; callers must ensure
+// any concurrent access is synchronized at a higher level (e.g. by masking IRQs or locks).
+unsafe impl Sync for Pl011Uart {}

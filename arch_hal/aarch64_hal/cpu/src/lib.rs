@@ -7,6 +7,7 @@ use core::sync::atomic::compiler_fence;
 use crate::registers::ID_AA64DFR0_EL1;
 use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::ID_AA64PFR0_EL1;
+use crate::registers::MDSCR_EL1;
 use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
 pub mod registers;
@@ -281,16 +282,17 @@ pub fn set_sp_el1(sp_el1: u64) {
     unsafe { asm!("msr sp_el1, {}", in(reg) sp_el1) };
 }
 
-pub fn get_mdscr_el1() -> u64 {
+pub fn get_mdscr_el1() -> MDSCR_EL1 {
     let mdscr_el1: u64;
     // SAFETY: Reads the current MDSCR_EL1 value.
     unsafe { asm!("mrs {}, mdscr_el1", out(reg) mdscr_el1) };
-    mdscr_el1
+    MDSCR_EL1::from_bits(mdscr_el1)
 }
 
-pub fn set_mdscr_el1(mdscr_el1: u64) {
+pub fn set_mdscr_el1(mdscr_el1: MDSCR_EL1) {
+    let bits = mdscr_el1.bits();
     // SAFETY: Caller ensures the debug control settings are valid for EL1 execution.
-    unsafe { asm!("msr mdscr_el1, {}", in(reg) mdscr_el1) };
+    unsafe { asm!("msr mdscr_el1, {}", in(reg) bits) };
 }
 
 pub fn get_spsr_el2() -> u64 {
@@ -309,6 +311,97 @@ pub fn get_mpidr_el1() -> u64 {
     let val: u64;
     unsafe { asm!("mrs {val}, mpidr_el1", val = out(reg) val) };
     val
+}
+
+pub fn get_tpidr_el0() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDR_EL0 value.
+    unsafe { asm!("mrs {val}, tpidr_el0", val = out(reg) val) };
+    val
+}
+
+pub fn set_tpidr_el0(val: u64) {
+    // SAFETY: Caller ensures the TPIDR_EL0 value is valid for the running context.
+    unsafe { asm!("msr tpidr_el0, {}", in(reg) val) };
+}
+
+pub fn get_tpidrro_el0() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDRRO_EL0 value.
+    unsafe { asm!("mrs {val}, tpidrro_el0", val = out(reg) val) };
+    val
+}
+
+pub fn get_tpidr_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDR_EL1 value.
+    unsafe { asm!("mrs {val}, tpidr_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_tpidr_el1(val: u64) {
+    // SAFETY: Caller ensures the TPIDR_EL1 value is valid for the running context.
+    unsafe { asm!("msr tpidr_el1, {}", in(reg) val) };
+}
+
+pub fn get_sctlr_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current SCTLR_EL1 value.
+    unsafe { asm!("mrs {val}, sctlr_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_sctlr_el1(val: u64) {
+    // SAFETY: Caller ensures the SCTLR_EL1 value is valid for the running context.
+    unsafe { asm!("msr sctlr_el1, {}", in(reg) val) };
+}
+
+pub fn get_ttbr0_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TTBR0_EL1 value.
+    unsafe { asm!("mrs {val}, ttbr0_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_ttbr0_el1(val: u64) {
+    // SAFETY: Caller ensures the TTBR0_EL1 value is valid for the running context.
+    unsafe { asm!("msr ttbr0_el1, {}", in(reg) val) };
+}
+
+pub fn get_ttbr1_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TTBR1_EL1 value.
+    unsafe { asm!("mrs {val}, ttbr1_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_ttbr1_el1(val: u64) {
+    // SAFETY: Caller ensures the TTBR1_EL1 value is valid for the running context.
+    unsafe { asm!("msr ttbr1_el1, {}", in(reg) val) };
+}
+
+pub fn get_tcr_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TCR_EL1 value.
+    unsafe { asm!("mrs {val}, tcr_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_tcr_el1(val: u64) {
+    // SAFETY: Caller ensures the TCR_EL1 value is valid for the running context.
+    unsafe { asm!("msr tcr_el1, {}", in(reg) val) };
+}
+
+pub fn get_mair_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current MAIR_EL1 value.
+    unsafe { asm!("mrs {val}, mair_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_mair_el1(val: u64) {
+    // SAFETY: Caller ensures the MAIR_EL1 value is valid for the running context.
+    unsafe { asm!("msr mair_el1, {}", in(reg) val) };
 }
 
 pub fn get_hcr_el2() -> u64 {

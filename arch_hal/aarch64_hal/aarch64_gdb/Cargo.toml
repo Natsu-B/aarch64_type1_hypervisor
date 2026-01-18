@@ -1,0 +1,10 @@
+[package]
+name = "aarch64_gdb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+byte_stream = { path = "../../../byte_stream" }
+gdb_remote = { path = "../../../gdb_remote", default-features = false }
+cpu = { path = "../cpu" }
+exceptions = { path = "../exceptions" }
