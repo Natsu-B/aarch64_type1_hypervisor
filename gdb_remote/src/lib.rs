@@ -449,6 +449,8 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             self.monitor_exit_armed = false;
 
             let caps = target.capabilities();
+            let wants_aarch64_xml = caps.contains(TargetCapabilities::XFER_FEATURES)
+                && qsupported_has_xml_registers(payload, b"aarch64");
             let mut reply = [0u8; 128];
             let mut idx = 0usize;
             append_bytes(&mut reply, &mut idx, b"PacketSize=");
@@ -472,6 +474,9 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             }
             if caps.contains(TargetCapabilities::XFER_FEATURES) {
                 append_bytes(&mut reply, &mut idx, b";qXfer:features:read+");
+            }
+            if wants_aarch64_xml {
+                append_bytes(&mut reply, &mut idx, b";xmlRegisters=aarch64");
             }
             self.send::<T>(&reply[..idx])?;
             return Ok(ProcessResult::None);
@@ -1509,6 +1514,30 @@ fn parse_qxfer_features_read(buf: &[u8]) -> Option<(&[u8], u64, u64)> {
     let offset = parse_hex_u64(offset_hex)?;
     let len = parse_hex_u64(len_hex)?;
     Some((annex, offset, len))
+}
+
+fn qsupported_has_xml_registers(payload: &[u8], arch: &[u8]) -> bool {
+    let Some(rest) = payload.strip_prefix(b"qSupported") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(b":") else {
+        return false;
+    };
+
+    for item in rest.split(|&b| b == b';') {
+        let mut parts = item.splitn(2, |&b| b == b'=');
+        let key = parts.next().unwrap_or(&[]);
+        if key != b"xmlRegisters" {
+            continue;
+        }
+        let list = parts.next().unwrap_or(&[]);
+        for value in list.split(|&b| b == b',') {
+            if value == arch {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn parse_addr_len<SE, R, U>(payload: &[u8]) -> Result<(u64, u64), GdbError<SE, R, U>> {
