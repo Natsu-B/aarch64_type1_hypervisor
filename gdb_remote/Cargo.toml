@@ -27,3 +27,8 @@ harness = false
 name = "uefi_qxfer_features"
 path = "tests/uefi_qxfer_features.rs"
 harness = false
+
+[[test]]
+name = "uefi_packet_size"
+path = "tests/uefi_packet_size.rs"
+harness = false

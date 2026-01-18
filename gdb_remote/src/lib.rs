@@ -4,7 +4,7 @@ use byte_stream::ByteStream;
 use byte_stream::ByteStreamBlockingExt;
 use core::fmt;
 
-#[cfg(feature = "gdb_monitor_debug")]
+#[cfg(any(feature = "gdb_monitor_debug", test))]
 use core::fmt::Write;
 
 #[macro_export]
@@ -66,28 +66,52 @@ type GdbServerError<S, T> = GdbError<
 pub struct GdbServer<S: ByteStream, const MAX_PKT: usize> {
     stream: S,
     monitor_exit_armed: bool,
+    advertised_packet_size: usize,
 }
 
 impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
     /// Create a new server wrapping the provided stream.
     pub fn new(stream: S) -> Self {
+        Self::new_with_packet_size(stream, MAX_PKT)
+    }
+
+    /// Create a new server with an explicitly advertised packet size.
+    pub fn new_with_packet_size(stream: S, packet_size: usize) -> Self {
+        let advertised_packet_size = Self::clamp_packet_size(packet_size);
         Self {
             stream,
             monitor_exit_armed: false,
+            advertised_packet_size,
         }
     }
-    #[cfg(feature = "gdb_monitor_debug")]
+
+    fn clamp_packet_size(packet_size: usize) -> usize {
+        let mut size = packet_size;
+        if size == 0 {
+            size = 1;
+        }
+        if size > MAX_PKT {
+            size = MAX_PKT;
+        }
+        size
+    }
+
+    fn out_payload_cap(&self) -> usize {
+        self.advertised_packet_size.min(MAX_PKT)
+    }
+    #[cfg(any(feature = "gdb_monitor_debug", test))]
     pub fn debug_console_fmt(&mut self, args: fmt::Arguments<'_>) {
         // Ensure the message and framing stay within the advertised maximum packet size.
-        const MAX_MSG: usize = if MAX_PKT > 1 { (MAX_PKT - 1) / 2 } else { 0 };
+        let out_cap = self.out_payload_cap();
+        let max_msg = out_cap.saturating_sub(1) / 2;
 
-        if MAX_MSG == 0 {
+        if max_msg == 0 {
             return;
         }
 
-        let mut msg_buf = [0u8; MAX_MSG];
+        let mut msg_buf = [0u8; MAX_PKT];
         let mut writer = DebugBufWriter {
-            buf: &mut msg_buf,
+            buf: &mut msg_buf[..max_msg],
             pos: 0,
         };
 
@@ -96,13 +120,13 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
 
         let mut payload = [0u8; MAX_PKT];
         payload[0] = b'O';
-        let hex_len = hex_encode(msg, &mut payload[1..]);
+        let hex_len = hex_encode(msg, &mut payload[1..out_cap]);
         let total_len = 1usize.saturating_add(hex_len);
 
         let _ = send_packet::<S, (), ()>(&self.stream, &payload[..total_len]);
     }
 
-    #[cfg(not(feature = "gdb_monitor_debug"))]
+    #[cfg(all(not(feature = "gdb_monitor_debug"), not(test)))]
     pub fn debug_console_fmt(&mut self, _args: fmt::Arguments<'_>) {
         let _ = _args;
     }
@@ -428,7 +452,8 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             let mut reply = [0u8; 128];
             let mut idx = 0usize;
             append_bytes(&mut reply, &mut idx, b"PacketSize=");
-            append_hex_u64(&mut reply, &mut idx, MAX_PKT as u64);
+            // PacketSize is decimal per the RSP specification.
+            append_dec_u64(&mut reply, &mut idx, self.out_payload_cap() as u64);
             append_bytes(&mut reply, &mut idx, b";vMustReplyEmpty+;vFlash+");
             if caps.contains(TargetCapabilities::SW_BREAK) {
                 append_bytes(&mut reply, &mut idx, b";swbreak+");
@@ -515,13 +540,15 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
                 return Ok(ProcessResult::None);
             }
 
-            let mut reply = [0u8; MAX_PKT];
-            if reply.is_empty() {
+            let cap = self.out_payload_cap();
+            if cap < 1 {
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
             }
+
+            let mut reply = [0u8; MAX_PKT];
             let (consumed, encoded_len) =
-                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..]);
+                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap]);
             if consumed == 0 {
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
@@ -595,13 +622,14 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
         };
         gdb_debug!(self, "handle_read_all_registers: total_len={} bytes", len);
 
+        let out_cap = self.out_payload_cap();
         let expected_hex_len = len.saturating_mul(2);
-        if expected_hex_len > MAX_PKT {
+        if expected_hex_len > out_cap {
             gdb_debug!(
                 self,
-                "handle_read_all_registers: response too large hex_len={} MAX_PKT={}",
+                "handle_read_all_registers: response too large hex_len={} out_cap={}",
                 expected_hex_len,
-                MAX_PKT
+                out_cap
             );
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
@@ -676,13 +704,15 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
             Some(len) => len,
             None => return Ok(ProcessResult::None),
         };
+        let out_cap = self.out_payload_cap();
         let expected_hex_len = len.saturating_mul(2);
-        if expected_hex_len > MAX_PKT {
+        if expected_hex_len > out_cap {
             gdb_debug!(
                 self,
-                "handle_read_single_register: response too large regno={} hex_len={}",
+                "handle_read_single_register: response too large regno={} hex_len={} out_cap={}",
                 regno,
-                expected_hex_len
+                expected_hex_len,
+                out_cap
             );
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
@@ -794,24 +824,25 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
                 return Ok(ProcessResult::None);
             }
         };
-        if len_usize > MAX_PKT {
+        let out_cap = self.out_payload_cap();
+        if len_usize > out_cap {
             gdb_debug!(
                 self,
-                "handle_read_memory: len_usize {} exceeds MAX_PKT {}, sending E01",
+                "handle_read_memory: len_usize {} exceeds out_cap {}, sending E01",
                 len_usize,
-                MAX_PKT
+                out_cap
             );
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
 
         let expected_hex_len = len_usize.saturating_mul(2);
-        if expected_hex_len > MAX_PKT {
+        if expected_hex_len > out_cap {
             gdb_debug!(
                 self,
-                "handle_read_memory: hex response too large hex_len={} MAX_PKT={}",
+                "handle_read_memory: hex response too large hex_len={} out_cap={}",
                 expected_hex_len,
-                MAX_PKT
+                out_cap
             );
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
@@ -1246,13 +1277,13 @@ impl<S: ByteStream, const MAX_PKT: usize> GdbServer<S, MAX_PKT> {
     }
 }
 
-#[cfg(feature = "gdb_monitor_debug")]
+#[cfg(any(feature = "gdb_monitor_debug", test))]
 struct DebugBufWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
 }
 
-#[cfg(feature = "gdb_monitor_debug")]
+#[cfg(any(feature = "gdb_monitor_debug", test))]
 impl<'a> fmt::Write for DebugBufWriter<'a> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let bytes = s.as_bytes();
@@ -1514,6 +1545,33 @@ fn append_hex_u64(buf: &mut [u8], idx: &mut usize, mut val: u64) {
             tmp[len] = HEX[digit];
             len += 1;
             val >>= 4;
+        }
+    }
+
+    let end = idx.saturating_add(len);
+    if end > buf.len() {
+        return;
+    }
+
+    for i in 0..len {
+        buf[*idx + i] = tmp[len - 1 - i];
+    }
+    *idx = end;
+}
+
+fn append_dec_u64(buf: &mut [u8], idx: &mut usize, mut val: u64) {
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+
+    if val == 0 {
+        tmp[0] = b'0';
+        len = 1;
+    } else {
+        while val != 0 {
+            let digit = (val % 10) as u8;
+            tmp[len] = b'0' + digit;
+            len += 1;
+            val /= 10;
         }
     }
 

@@ -17,8 +17,9 @@ use print::stream::Pl011Stream;
 
 // Use the 2nd PL011 (UART1) on QEMU virt for the RSP channel.
 // UART0 is typically used as the UEFI firmware console and can inject non-RSP output.
-const UART_BASE: usize = 0x901_0000;
-const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
+const UART_BASE: usize = 0x904_0000;
+// QEMU virt PL011 UARTs run at 24MHz.
+const UART_CLOCK_HZ: u32 = 24 * 1_000_000;
 
 // AArch64 core regset (x0-x30, sp, pc, cpsr).
 const CORE_REG_BYTES: usize = 31 * 8 + 8 + 8 + 4;
@@ -32,7 +33,7 @@ extern "C" fn efi_main() -> ! {
     // Drain any stale bytes (should be empty for UART1, but keep it defensive).
     uart.drain_rx();
     let stream = Pl011Stream::new(&uart);
-    let mut server: GdbServer<_, 1024> = GdbServer::new(stream);
+    let mut server: GdbServer<_, 2048> = GdbServer::new(stream);
     let mut target = DummyTarget;
 
     match server.run_until_monitor_exit(&mut target) {
@@ -49,6 +50,8 @@ struct DummyTarget;
 
 type DummyError = TargetError<Infallible, Infallible>;
 
+const DUMMY_REG: u64 = 0x0000_0000_4000_0000;
+
 impl Target for DummyTarget {
     type RecoverableError = Infallible;
     type UnrecoverableError = Infallible;
@@ -61,7 +64,17 @@ impl Target for DummyTarget {
         if dst.len() < CORE_REG_BYTES {
             return Err(TargetError::NotSupported);
         }
-        dst[..CORE_REG_BYTES].fill(0);
+        // Fill a minimal AArch64 core regset:
+        // x0..x30, sp, pc are 64-bit; cpsr is 32-bit.
+        let r64 = DUMMY_REG.to_le_bytes();
+        let mut off = 0usize;
+        // 33 x 64-bit regs: x0..x30 (31) + sp (1) + pc (1)
+        for _ in 0..=32 {
+            dst[off..off + 8].copy_from_slice(&r64);
+            off += 8;
+        }
+        // cpsr (32-bit)
+        dst[off..off + 4].copy_from_slice(&(DUMMY_REG as u32).to_le_bytes());
         Ok(CORE_REG_BYTES)
     }
 
@@ -83,7 +96,8 @@ impl Target for DummyTarget {
         if dst.len() < need {
             return Err(TargetError::NotSupported);
         }
-        dst[..need].fill(0);
+        let r64 = DUMMY_REG.to_le_bytes();
+        dst[..need].copy_from_slice(&r64[..need]);
         Ok(need)
     }
 
