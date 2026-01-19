@@ -7,6 +7,8 @@ use typestate::Writable;
 use typestate::WriteOnly;
 use typestate::bitregs;
 
+use crate::pl011;
+
 bitregs! {
     /// UART Data Register (UARTDR)
     pub struct UARTDR: u32 {
@@ -379,6 +381,19 @@ impl Pl011Uart {
                 .set_enum(UARTIFLS::rxiflsel, rx)
                 .set_enum(UARTIFLS::txiflsel, tx),
         );
+    }
+
+    /// Enable RX-related interrupts (RX FIFO + optional timeout).
+    pub fn enable_rx_interrupts(&self, rx_level: FifoLevel, enable_timeout: bool) {
+        self.set_fifo_irq_levels(rx_level, FifoLevel::OneEighth);
+        self.registers.interrupt_clear.write(UARTICR::all());
+
+        let mut mask = UARTIMSC::new().set(UARTIMSC::rxim, 1);
+        if enable_timeout {
+            mask = mask.set(UARTIMSC::rtim, 1);
+        }
+        self.clear_interrupts(UARTICR::all());
+        self.enable_interrupts(mask);
     }
 
     /// Enable selected interrupts by unmasking bits in UARTIMSC.

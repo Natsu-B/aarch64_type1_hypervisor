@@ -11,6 +11,7 @@ MNT2="$SCRIPT_DIR/mnt2"
 ROOTFS_IMG="$BIN/DISK0"
 
 SIZE_MB=2048
+GDB_PORT=${GDB_PORT:-3333}
 
 mkdir -p "$BIN" "$MNT1" "$MNT2"
 
@@ -38,7 +39,6 @@ sudo cp "$PATH_TO_ELF"               "$MNT1/elf-hypervisor.elf"
 sudo cp "$BIN/boot.scr"              "$MNT1/boot.scr"      || true
 sudo cp "$BIN/u-boot.bin"            "$MNT1/u-boot.bin"    || true
 sudo cp "$BIN/Image"                 "$MNT1/image"
-sudo cp "$BIN/qemu_mod.dtb"          "$MNT1/qemu.dtb"
 sync
 
 sudo dd if="$ROOTFS_IMG" of="${LOOP}p2" bs=4M conv=fsync
@@ -47,10 +47,13 @@ sudo umount "$MNT1"
 sudo losetup -d "$LOOP"
 
 qemu-system-aarch64 \
-  -M virt,gic-version=3,secure=off,virtualization=on \
+  -M virt,gic-version=2,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
   -smp 4 -bios "$BIN/u-boot.bin" -cpu cortex-a55 -m 4G \
   -nographic \
+  -serial mon:stdio \
+  -chardev socket,id=gdbserial,port=${GDB_PORT},host=127.0.0.1,server=on,wait=off \
+  -serial chardev:gdbserial \
   -device virtio-blk-device,drive=disk \
   -drive file="$DISK_IMG",format=raw,if=none,media=disk,id=disk \
   -gdb tcp::1234 #-S

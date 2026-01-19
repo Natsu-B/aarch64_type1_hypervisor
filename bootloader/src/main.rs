@@ -1,20 +1,39 @@
 #![feature(once_cell_get_mut)]
 #![feature(sync_unsafe_cell)]
+#![feature(generic_const_exprs)]
 #![no_std]
 #![no_main]
 #![recursion_limit = "256"]
 
 extern crate alloc;
-mod gdb;
+mod debug;
+mod gdb_uart;
 mod handler;
+mod irq_decode;
+mod vgic;
 use alloc::alloc::alloc;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
 use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::gic;
+use arch_hal::gic::BinaryPoint;
+use arch_hal::gic::EnableOp;
+use arch_hal::gic::EoiMode;
+use arch_hal::gic::GicCpuConfig;
+use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::GicDistributor;
+use arch_hal::gic::GicPpi;
+use arch_hal::gic::IrqGroup;
+use arch_hal::gic::SpiRoute;
+use arch_hal::gic::TriggerMode;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
+use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::timer::SystemTimer;
@@ -28,14 +47,18 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
-use core::ptr::slice_from_raw_parts_mut;
+use core::ptr::slice_from_raw_parts;
 use core::slice;
 use core::usize;
-use dtb::DtbGenerator;
+use dtb::DeviceTree;
+use dtb::DeviceTreeEditExt;
+use dtb::DeviceTreeQueryExt;
 use dtb::DtbParser;
-use file::OpenOptions;
-use file::StorageDevice;
-use typestate::Le;
+use dtb::NameRef;
+use dtb::NodeEditExt;
+use dtb::NodeQueryExt;
+use dtb::ValueRef;
+use file::AlignedSliceBox;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -46,28 +69,40 @@ unsafe extern "C" {
 }
 
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
-static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
-pub(crate) static UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
+pub(crate) static GUEST_UART: SyncUnsafeCell<Option<UartNode>> = SyncUnsafeCell::new(None);
+pub(crate) static GDB_UART: SyncUnsafeCell<Option<UartNode>> = SyncUnsafeCell::new(None);
+static DEBUG_UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
+
+const MAX_MEM_REGIONS: usize = 8;
+static MEM_REGION_COUNT: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+static MEM_REGIONS: SyncUnsafeCell<[MemoryRegion; MAX_MEM_REGIONS]> =
+    SyncUnsafeCell::new([MemoryRegion { base: 0, size: 0 }; MAX_MEM_REGIONS]);
 
 const PL011_UART_ADDR: usize = 0x900_0000;
+const UART_CLOCK_HZ: u64 = 48 * 1_000_000;
+const UART_BAUD: u32 = 115_200;
 
-#[repr(C)]
-struct LinuxHeader {
-    code0: u32,
-    code1: u32,
-    text_offset: Le<u64>,
-    image_size: Le<u64>,
-    flags: Le<u64>,
-    res2: u64,
-    res3: u64,
-    res4: u64,
-    magic: [u8; 4],
-    res5: u32,
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct UartNode {
+    base: usize,
+    size: usize,
+    irq: Option<u32 /* intid */>,
 }
 
-impl LinuxHeader {
-    const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct MemoryRegion {
+    base: usize,
+    size: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Gicv2Info {
+    dist: gic::MmioRegion,
+    cpu: gic::MmioRegion,
+    gich: Option<gic::MmioRegion>,
+    gicv: Option<gic::MmioRegion>,
+    maintenance_intid: Option<u32>,
 }
 
 define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
@@ -88,17 +123,65 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
             .unwrap();
     let dtb = DtbParser::init(dtb_ptr).unwrap();
-    let mut pl011_addr = None;
-    let mut pl011_size = None;
-    dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
-        debug_uart::init(addr, 48 * 1000 * 1000, 115200);
-        pl011_addr = Some(addr);
-        pl011_size = Some(size);
-        ControlFlow::Break(())
+    let mut i = 0;
+    dtb.find_nodes_by_compatible_view("arm,pl011", &mut |view, _| {
+        match i {
+            0 => unsafe {
+                let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
+                *GUEST_UART.get() = Some(UartNode {
+                    base: tmp.0,
+                    size: tmp.1,
+                    irq: {
+                        let mut tmp = None;
+                        view.for_each_interrupt_specifier(&mut |cells| {
+                            tmp = Some(
+                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec")
+                                    + 32,
+                            );
+                            ControlFlow::Break(())
+                        })
+                        .unwrap();
+                        tmp
+                    },
+                });
+                *DEBUG_UART_ADDR.get() = Some(tmp.0);
+            },
+            1 => unsafe {
+                let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
+                *GDB_UART.get() = Some(UartNode {
+                    base: tmp.0,
+                    size: tmp.1,
+                    irq: {
+                        let mut tmp = None;
+                        view.for_each_interrupt_specifier(&mut |cells| {
+                            tmp = Some(
+                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec")
+                                    + 32,
+                            );
+                            ControlFlow::Break(())
+                        })
+                        .unwrap();
+                        tmp
+                    },
+                });
+            },
+            _ => return ControlFlow::Break(()),
+        }
+        i += 1;
+        ControlFlow::Continue(())
     })
     .unwrap();
-    unsafe { *UART_ADDR.get() = pl011_addr };
-    println!("debug uart starting...\r\n");
+    let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
+    let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
+    debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
+    gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+    debug::init_gdb_stub();
+    println!(
+        "debug uart starting (guest console @ 0x{:X})...\r\n",
+        guest_uart.base
+    );
+    let gic_info = find_gicv2_info(&dtb).unwrap();
+
     assert_eq!(cpu::get_current_el(), 2);
 
     let mut systimer = SystemTimer::new();
@@ -111,6 +194,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     GLOBAL_ALLOCATOR.init();
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
         GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
+        record_memory_region(addr, size);
         ControlFlow::Continue(())
     })
     .unwrap();
@@ -146,10 +230,15 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     println!("allocator setup success!!!");
     // setup paging
     println!("start paging...");
-    let pl011_addr = pl011_addr.unwrap();
-    let pl011_size = pl011_size.unwrap();
-    println!("pl011 addr: 0x{:X}, size: 0x{:X}", pl011_addr, pl011_size);
-    let parange = match cpu::get_parange().unwrap() {
+    println!(
+        "guest uart addr: 0x{:X}, size: 0x{:X}",
+        guest_uart.base, guest_uart.size
+    );
+    println!(
+        "gdb uart addr: 0x{:X}, size: 0x{:X}",
+        gdb_uart.base, gdb_uart.size
+    );
+    let parange_bits: u32 = match cpu::get_parange().unwrap() {
         cpu::registers::PARange::PA32bits4GB => 32,
         cpu::registers::PARange::PA36bits64GB => 36,
         cpu::registers::PARange::PA40bits1TB => 40,
@@ -159,105 +248,61 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         cpu::registers::PARange::PA52bits4PB => 52,
         cpu::registers::PARange::PA56bits64PB => 56,
     };
-    let paging_data: [Stage2PagingSetting; 2] = [
-        Stage2PagingSetting {
-            ipa: 0x0000,
-            pa: 0x0000,
-            size: pl011_addr,
-            types: Stage2PageTypes::Normal,
-        },
-        Stage2PagingSetting {
-            ipa: pl011_addr + pl011_size,
-            pa: pl011_addr + pl011_size,
-            size: (1 << parange) - pl011_addr - pl011_size,
-            types: Stage2PageTypes::Normal,
-        },
+    let excludes = [
+        (guest_uart.base, guest_uart.size),
+        (gdb_uart.base, gdb_uart.size),
+        (gic_info.dist.base, gic_info.dist.size),
+        (gic_info.cpu.base, gic_info.cpu.size),
     ];
-    Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
+    let (paging_data, paging_count) = build_stage2_identity_map(parange_bits, &excludes);
+    Stage2Paging::init_stage2paging(&paging_data[..paging_count], &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(false);
     println!("paging success!!!");
     println!("setup exception");
     exceptions::setup_exception();
     handler::setup_handler();
-    let mut file_driver = None;
-    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, _size| {
-        if let Ok(driver) = StorageDevice::new_virtio(addr) {
-            file_driver = Some(driver);
-        }
-        ControlFlow::Continue(())
-    })
-    .unwrap();
-    let file_driver = file_driver.unwrap();
-    let linux = file_driver
-        .open(0, "/image", &file::OpenOptions::Read)
-        .unwrap();
-    println!("get linux header");
-    let mut linux_header: MaybeUninit<LinuxHeader> = MaybeUninit::uninit();
-    linux
-        .read_at(0, unsafe {
-            &mut *slice_from_raw_parts_mut(
-                &mut linux_header as *mut _ as *mut MaybeUninit<u8>,
-                size_of::<LinuxHeader>(),
-            )
-        })
-        .unwrap();
-    let linux_header = unsafe { linux_header.assume_init() };
-    // check
-    if linux_header.magic != LinuxHeader::MAGIC {
-        panic!("invalid linux header");
+    let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
+    vgic::init(&gic, &gic_info, guest_uart).unwrap();
+    handler::register_gic(gic, Some(gdb_uart_intid));
+    {
+        let mdcr = cpu::get_mdcr_el2();
+        // Trap debug exceptions from lower EL to EL2 (MDCR_EL2.TDE).
+        cpu::set_mdcr_el2(mdcr | (1 << 8));
     }
-    let image_size = linux_header.image_size.read() as usize;
-    let text_offset = linux_header.text_offset.read() as usize;
-    let linux_image = unsafe {
-        alloc(
-            Layout::from_size_align(
-                image_size + text_offset,
-                0x2 * 0x1000 * 0x1000, /* 2MiB */
-            )
-            .unwrap(),
-        )
+    cpu::enable_irq();
+    let modified = {
+        let mut dtb_bytes = AlignedSliceBox::new_uninit_with_align(dtb.get_size(), 32).unwrap();
+        dtb_bytes.copy_from_slice(unsafe {
+            &*slice_from_raw_parts(dtb_ptr as *const MaybeUninit<u8>, dtb.get_size())
+        });
+        unsafe { dtb_bytes.assume_init() }
     };
-    if linux_image.is_null() {
-        panic!("allocation failed");
-    }
-    println!("load linux image");
-    linux
-        .read_at(0, unsafe {
-            &mut *slice_from_raw_parts_mut(
-                linux_image.add(text_offset) as *mut MaybeUninit<u8>,
-                linux.size().unwrap() as usize,
-            )
-        })
-        .unwrap();
-    let jump_addr = unsafe { linux_image.add(text_offset) };
-    unsafe { *LINUX_ADDR.get() = jump_addr as usize };
-    let modified = file_driver
-        .open(0, "/qemu.dtb", &OpenOptions::Read)
-        .unwrap()
-        .read(8)
-        .unwrap();
-    let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
+    let mut dtb_tree = DeviceTree::from_dtb(&modified).unwrap().to_owned();
+    apply_guest_dt_edits(
+        &mut dtb_tree,
+        unsafe { &*GUEST_UART.get() }.unwrap().base,
+        &gic_info,
+    )
+    .unwrap();
 
-    drop(file_driver);
-    println!("file system closed");
     let mut reserved_memory = GLOBAL_ALLOCATOR
         .trim_for_boot(0x1000 * 0x1000 * 128)
         .unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, stack_start));
 
-    let new_dtb = DtbGenerator::new(&dtb_modified);
-    let dtb_size = new_dtb.get_required_size(reserved_memory.len());
-    let dtb_data = unsafe {
-        &mut *slice_from_raw_parts_mut(
-            alloc::alloc::alloc(Layout::from_size_align_unchecked(dtb_size.0, dtb_size.1)),
-            dtb_size.0,
-        )
-    };
-    new_dtb
-        .make_dtb(dtb_data, reserved_memory.as_ref(), false)
-        .unwrap();
-    unsafe { *DTB_ADDR.get() = dtb_data.as_ptr() as usize };
+    for (addr, size) in &reserved_memory {
+        dtb_tree.mem_reserve.push(dtb::MemReserve {
+            address: *addr as u64,
+            size: *size as u64,
+        });
+    }
+    let dtb_box = dtb_tree.into_dtb_box().unwrap();
+    let (dtb_ptr, _dtb_len, _dtb_align) = allocator::AlignedSliceBox::into_raw_parts(dtb_box);
+    // SAFETY: the DTB allocation is intentionally leaked so the guest can access it.
+    unsafe {
+        *DTB_ADDR.get() = dtb_ptr as usize;
+    }
     println!("jumping linux...");
 
     unsafe {
@@ -288,14 +333,8 @@ extern "C" fn el1_main() {
     for i in hello.as_bytes() {
         unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
     }
-
-    // jump linux
-    unsafe {
-        core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
-
-        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
-            *LINUX_ADDR.get() as usize
-        )(*DTB_ADDR.get(), 0, 0, 0);
+    loop {
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
@@ -323,10 +362,528 @@ fn str_to_usize(s: &str) -> Option<usize> {
     usize::from_str_radix(start?, radix).ok()
 }
 
+fn record_memory_region(base: usize, size: usize) {
+    if size == 0 {
+        return;
+    }
+    // SAFETY: early boot records memory regions before secondary cores or interrupts are enabled.
+    unsafe {
+        let count = &mut *MEM_REGION_COUNT.get();
+        if *count >= MAX_MEM_REGIONS {
+            return;
+        }
+        let regions = &mut *MEM_REGIONS.get();
+        regions[*count] = MemoryRegion { base, size };
+        *count += 1;
+    }
+}
+
+fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
+    const COMPATS: [&str; 13] = [
+        "arm,arm1176jzf-devchip-gic",
+        "arm,arm11mp-gic",
+        "arm,cortex-a15-gic",
+        "arm,cortex-a7-gic",
+        "arm,cortex-a9-gic",
+        "arm,eb11mp-gic",
+        "arm,gic-400",
+        "arm,pl390",
+        "arm,tc11mp-gic",
+        "brcm,brahma-b15-gic",
+        "nvidia,tegra210-agic",
+        "qcom,msm-8660-qgic",
+        "qcom,msm-qgic2",
+    ];
+    let mut found: Option<Gicv2Info> = None;
+    let mut error = None;
+    for compat in COMPATS {
+        dtb.find_nodes_by_compatible_view(compat, &mut |view, name| {
+            println!("found GICv2 node: {}", compat);
+            let mut regs = match view.reg_iter() {
+                Ok(it) => it,
+                Err(e) => {
+                    error = Some(e);
+                    return ControlFlow::Break(());
+                }
+            };
+            let Some(Ok((dist_base, _dist_size))) = regs.next() else {
+                return ControlFlow::Continue(());
+            };
+            let Some(Ok((cpu_base, _cpu_size))) = regs.next() else {
+                return ControlFlow::Continue(());
+            };
+            let gich = regs
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(base, _size)| gic::MmioRegion { base, size: 0x1000 });
+            let gicv = regs
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(base, _size)| gic::MmioRegion { base, size: 0x2000 });
+            let mut maintenance_intid = None;
+            if let Err(e) = view.for_each_interrupt_specifier(&mut |cells| {
+                if maintenance_intid.is_some() {
+                    return ControlFlow::Break(());
+                }
+                if let Ok(intid) = irq_decode::dt_irq_to_pintid(cells) {
+                    maintenance_intid = Some(intid);
+                }
+                ControlFlow::Break(())
+            }) {
+                error = Some(e);
+                return ControlFlow::Break(());
+            }
+
+            found = Some(Gicv2Info {
+                dist: gic::MmioRegion {
+                    base: dist_base,
+                    size: 0x1000,
+                },
+                cpu: gic::MmioRegion {
+                    base: cpu_base,
+                    size: 0x2000,
+                },
+                gich,
+                gicv,
+                maintenance_intid,
+            });
+            ControlFlow::Break(())
+        })?;
+        if found.is_some() {
+            break;
+        }
+    }
+    if let Some(err) = error {
+        return Err(err);
+    }
+    found.ok_or("gic: missing GICv2 node")
+}
+
+fn init_gicv2_for_gdb(
+    info: &Gicv2Info,
+    gdb_uart: UartNode,
+) -> Result<(gic::gicv2::Gicv2, u32), &'static str> {
+    let virt = match (info.gich, info.gicv, info.maintenance_intid) {
+        (Some(gich), Some(gicv), Some(maint)) => Some(gic::gicv2::Gicv2VirtualizationRegion {
+            gich,
+            gicv,
+            maintenance_interrupt_id: maint,
+        }),
+        _ => None,
+    };
+    println!("gic v2: {:?}", info);
+    let gic =
+        gic::gicv2::Gicv2::new(info.dist, info.cpu, virt, None).map_err(|_| "gic: init failed")?;
+    gic.init_distributor().map_err(|_| "gic: init dist")?;
+    let _caps = gic.init_cpu_interface().map_err(|_| "gic: init cpu")?;
+    let cfg = GicCpuConfig {
+        priority_mask: 0xff,
+        enable_group0: false,
+        enable_group1: true,
+        binary_point: BinaryPoint::Common(0),
+        eoi_mode: EoiMode::DropAndDeactivate,
+    };
+    gic.configure(&cfg).map_err(|_| "gic: configure")?;
+
+    let gdb_intid = gdb_uart.irq.ok_or("gic: gdb uart missing IRQ")?;
+
+    gic.configure_spi(
+        gdb_intid,
+        IrqGroup::Group1,
+        0x80,
+        TriggerMode::Level,
+        SpiRoute::Specific(cpu::get_current_core_id()),
+        EnableOp::Enable,
+    )
+    .map_err(|_| "gic: configure spi")?;
+
+    Ok((gic, gdb_intid))
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Range {
+    start: usize,
+    end: usize,
+}
+
+fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.checked_add(align - 1).unwrap_or(usize::MAX) & !(align - 1)
+}
+
+fn build_stage2_identity_map(
+    parange_bits: u32,
+    excludes: &[(usize, usize)],
+) -> ([Stage2PagingSetting; 5], usize) {
+    const PAGE_SIZE: usize = 0x1000;
+    const MAX_EXCLUDES: usize = 4;
+    const MAX_SEGMENTS: usize = 5;
+
+    let limit = 1usize
+        .checked_shl(parange_bits)
+        .expect("parange exceeds usize width");
+
+    let mut raw = [Range { start: 0, end: 0 }; MAX_EXCLUDES];
+    let mut raw_count = 0usize;
+    for &(base, size) in excludes.iter() {
+        if size == 0 || raw_count >= raw.len() {
+            continue;
+        }
+        let start = align_down(base, PAGE_SIZE);
+        let end = align_up(base.saturating_add(size), PAGE_SIZE).min(limit);
+        if start >= limit || end <= start {
+            continue;
+        }
+        raw[raw_count] = Range { start, end };
+        raw_count += 1;
+    }
+
+    for i in 0..raw_count {
+        for j in i + 1..raw_count {
+            if raw[i].start > raw[j].start {
+                raw.swap(i, j);
+            }
+        }
+    }
+
+    let mut merged = [Range { start: 0, end: 0 }; MAX_EXCLUDES];
+    let mut merged_count = 0usize;
+    for idx in 0..raw_count {
+        let r = raw[idx];
+        if merged_count == 0 {
+            merged[0] = r;
+            merged_count = 1;
+            continue;
+        }
+        let last = &mut merged[merged_count - 1];
+        if r.start <= last.end {
+            last.end = last.end.max(r.end);
+        } else {
+            merged[merged_count] = r;
+            merged_count += 1;
+        }
+    }
+
+    let mut settings = core::array::from_fn(|_| Stage2PagingSetting {
+        ipa: 0,
+        pa: 0,
+        size: 0,
+        types: Stage2PageTypes::Normal,
+    });
+    let mut seg_count = 0usize;
+    let mut cursor = 0usize;
+    for idx in 0..merged_count {
+        let r = merged[idx];
+        if cursor < r.start {
+            settings[seg_count] = Stage2PagingSetting {
+                ipa: cursor,
+                pa: cursor,
+                size: r.start - cursor,
+                types: Stage2PageTypes::Normal,
+            };
+            seg_count += 1;
+        }
+        cursor = r.end;
+    }
+    if cursor < limit {
+        settings[seg_count] = Stage2PagingSetting {
+            ipa: cursor,
+            pa: cursor,
+            size: limit - cursor,
+            types: Stage2PageTypes::Normal,
+        };
+        seg_count += 1;
+    }
+
+    debug_assert!(seg_count > 0 && seg_count <= MAX_SEGMENTS);
+    (settings, seg_count)
+}
+
+fn apply_guest_uart_dt_edit(
+    tree: &mut DeviceTree<'static>,
+    guest_uart_base: usize,
+) -> Result<(), &'static str> {
+    let mut guest_node = None;
+    let mut disable_nodes = Vec::new();
+
+    for id in 0..tree.nodes.len() {
+        if !node_compatible_contains(tree, id, "arm,pl011")? {
+            continue;
+        }
+        let Some(base) = node_reg_base(tree, id)? else {
+            continue;
+        };
+        if base == guest_uart_base {
+            guest_node = Some(id);
+        } else {
+            disable_nodes.push(id);
+        }
+    }
+
+    let guest_node = guest_node.ok_or("guest UART node not found in DT")?;
+    for id in disable_nodes.iter().copied() {
+        if let Some(node) = tree.node_mut(id) {
+            node.set_property(
+                NameRef::Borrowed("status"),
+                ValueRef::Owned(b"disabled\0".to_vec()),
+            );
+        }
+    }
+
+    if let Some(chosen) = tree.find_node_by_path("/chosen") {
+        if let Some(path) = node_path(tree, guest_node) {
+            let mut value = Vec::with_capacity(path.len() + 1);
+            value.extend_from_slice(path.as_bytes());
+            value.push(0);
+            if let Some(node) = tree.node_mut(chosen) {
+                node.set_property(NameRef::Borrowed("stdout-path"), ValueRef::Owned(value));
+            }
+        }
+    }
+
+    if let Some(aliases) = tree.find_node_by_path("/aliases") {
+        let mut remove: Vec<String> = Vec::new();
+        for id in disable_nodes.iter().copied() {
+            if let Some(path) = node_path(tree, id) {
+                if let Some(node) = tree.node(aliases) {
+                    for prop in &node.properties {
+                        if let Some(value) = decode_cstr(prop.value.as_slice()) {
+                            if value == path {
+                                remove.push(String::from(prop.name.as_str()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(node) = tree.node_mut(aliases) {
+            for name in remove {
+                node.remove_property(&name);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_guest_dt_edits(
+    tree: &mut DeviceTree<'static>,
+    guest_uart_base: usize,
+    gic_info: &Gicv2Info,
+) -> Result<(), &'static str> {
+    apply_guest_bootargs(tree, guest_uart_base)?;
+    apply_guest_uart_dt_edit(tree, guest_uart_base)?;
+    if let Some(gicv) = gic_info.gicv {
+        update_gicv2_cpu_interface_reg(tree, gicv)?;
+    }
+    Ok(())
+}
+
+fn apply_guest_bootargs(
+    tree: &mut DeviceTree<'static>,
+    guest_uart_base: usize,
+) -> Result<(), &'static str> {
+    let chosen = tree.get_or_create_node_by_path("/chosen")?;
+    let bootargs = alloc::format!(
+        "root=/dev/vda2 rw rootwait earlycon=pl011,0x{:08x}",
+        guest_uart_base
+    );
+    let mut value = bootargs.into_bytes();
+    value.push(0);
+    if let Some(node) = tree.node_mut(chosen) {
+        node.set_property(NameRef::Borrowed("bootargs"), ValueRef::Owned(value));
+    }
+    Ok(())
+}
+
+fn update_gicv2_cpu_interface_reg(
+    tree: &mut DeviceTree<'static>,
+    gicv: gic::MmioRegion,
+) -> Result<(), &'static str> {
+    const COMPATS: [&str; 2] = ["arm,gic-400", "arm,cortex-a15-gic"];
+    let mut gic_node = None;
+    for id in 0..tree.nodes.len() {
+        for compat in COMPATS {
+            if node_compatible_contains(tree, id, compat)? {
+                gic_node = Some(id);
+                break;
+            }
+        }
+        if gic_node.is_some() {
+            break;
+        }
+    }
+    let Some(node_id) = gic_node else {
+        return Ok(());
+    };
+
+    let parent = tree
+        .node(node_id)
+        .and_then(|n| n.parent)
+        .unwrap_or(tree.root);
+    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
+    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
+    let stride = (addr_cells + size_cells) * 4;
+    let Some(node) = tree.node(node_id) else {
+        return Ok(());
+    };
+    let Some(reg) = node.property("reg") else {
+        return Ok(());
+    };
+    let mut bytes = reg.value.as_slice().to_vec();
+    if bytes.len() < stride * 2 {
+        return Err("gic: reg property too short");
+    }
+    let base_off = stride;
+    write_be_u32s(&mut bytes, base_off, addr_cells, gicv.base as u64)?;
+    write_be_u32s(
+        &mut bytes,
+        base_off + addr_cells * 4,
+        size_cells,
+        gicv.size as u64,
+    )?;
+
+    if let Some(node) = tree.node_mut(node_id) {
+        node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
+    }
+    Ok(())
+}
+
+fn node_compatible_contains(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+    needle: &str,
+) -> Result<bool, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(false);
+    };
+    let Some(prop) = node.property("compatible") else {
+        return Ok(false);
+    };
+    let bytes = prop.value.as_slice();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| start + p)
+            .unwrap_or(bytes.len());
+        if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
+            if entry == needle {
+                return Ok(true);
+            }
+        }
+        start = end + 1;
+    }
+    Ok(false)
+}
+
+fn node_reg_base(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+) -> Result<Option<usize>, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(None);
+    };
+    let Some(prop) = node.property("reg") else {
+        return Ok(None);
+    };
+    let parent = node.parent.unwrap_or(tree.root);
+    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2);
+    let addr_cells = usize::try_from(addr_cells).map_err(|_| "reg: address-cells overflow")?;
+    let bytes = prop.value.as_slice();
+    if bytes.len() < addr_cells * 4 {
+        return Ok(None);
+    }
+    let mut value: u64 = 0;
+    for i in 0..addr_cells {
+        let cell = read_be_u32(bytes, i * 4)?;
+        value = (value << 32) | cell as u64;
+    }
+    Ok(Some(value as usize))
+}
+
+fn property_u32(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+    key: &str,
+) -> Result<Option<u32>, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(None);
+    };
+    let Some(prop) = node.property(key) else {
+        return Ok(None);
+    };
+    let bytes = prop.value.as_slice();
+    if bytes.len() != 4 {
+        return Ok(None);
+    }
+    Ok(Some(read_be_u32(bytes, 0)?))
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
+    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
+    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
+    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
+    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
+    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
+    slice.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn write_be_u32s(
+    bytes: &mut [u8],
+    offset: usize,
+    cells: usize,
+    value: u64,
+) -> Result<(), &'static str> {
+    for i in 0..cells {
+        let shift = 32 * (cells - 1 - i);
+        let cell = ((value >> shift) & 0xffff_ffff) as u32;
+        write_be_u32(bytes, offset + i * 4, cell)?;
+    }
+    Ok(())
+}
+
+fn node_path(tree: &DeviceTree<'static>, node_id: usize) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let node = tree.node(id)?;
+        let name = node.name.as_str();
+        if !name.is_empty() && name != "/" {
+            parts.push(name);
+        }
+        current = node.parent;
+    }
+    parts.reverse();
+    let mut path = String::from("/");
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            path.push('/');
+        }
+        path.push_str(part);
+    }
+    Some(path)
+}
+
+fn decode_cstr(bytes: &[u8]) -> Option<&str> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end]).ok()
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 48_000_000);
-    debug_uart.init(115200);
+    // SAFETY: panic path uses a best-effort UART address chosen during early boot.
+    let uart_addr = unsafe { *DEBUG_UART_ADDR.get() }.unwrap_or(PL011_UART_ADDR);
+    let mut debug_uart = Pl011Uart::new(uart_addr, UART_CLOCK_HZ);
+    debug_uart.init(UART_BAUD);
     debug_uart.write("core 0 panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}

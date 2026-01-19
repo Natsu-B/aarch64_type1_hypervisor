@@ -121,6 +121,14 @@ impl Target for DummyTarget {
     fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
         Ok(())
     }
+
+    fn insert_hw_breakpoint(&mut self, _addr: u64, _kind: u64) -> Result<(), DummyError> {
+        Err(TargetError::NotSupported)
+    }
+
+    fn remove_hw_breakpoint(&mut self, _addr: u64, _kind: u64) -> Result<(), DummyError> {
+        Err(TargetError::NotSupported)
+    }
 }
 
 #[panic_handler]

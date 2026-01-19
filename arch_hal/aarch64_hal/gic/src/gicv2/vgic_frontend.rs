@@ -82,6 +82,11 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         }
     }
 
+    pub fn with_hw_gicd(mut self, gicd: &'a GicV2Distributor) -> Self {
+        self.gicd = Some(gicd);
+        self
+    }
+
     #[inline]
     fn ensure_vcpu(&self, vcpu: VcpuId) -> Result<(), GicError> {
         // GICv2 architectural limit: up to 8 CPU interfaces.

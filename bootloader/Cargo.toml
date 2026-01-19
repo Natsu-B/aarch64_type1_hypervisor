@@ -10,6 +10,7 @@ typestate = { path = "../typestate" }
 file = { path = "../file" }
 elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
+byte_stream = { path = "../byte_stream" }
 mutex = { path = "../mutex" }
 
 [profile.release]

@@ -140,15 +140,7 @@ pub mod debug_uart {
         let mut guard = DEBUG_UART.lock();
         let Some(uart) = guard.get_mut() else { return };
 
-        uart.set_fifo_irq_levels(level, pl011::FifoLevel::OneEighth);
-
-        let mut mask = pl011::UARTIMSC::new().set(pl011::UARTIMSC::rxim, 1);
-        if enable_timeout {
-            mask = mask.set(pl011::UARTIMSC::rtim, 1);
-        }
-
-        uart.clear_interrupts(pl011::UARTICR::all());
-        uart.enable_interrupts(mask);
+        uart.enable_rx_interrupts(level, enable_timeout);
     }
 
     /// IRQ-context RX handler that never takes the lock.
