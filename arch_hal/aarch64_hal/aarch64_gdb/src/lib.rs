@@ -1,8 +1,7 @@
-#![feature(sync_unsafe_cell)]
 #![no_std]
 
+use aarch64_mutex::RawSpinLockIrqSave;
 use byte_stream::ByteStream;
-use core::cell::SyncUnsafeCell;
 use cpu::Registers;
 use cpu::registers::MDSCR_EL1;
 use exceptions::registers::ExceptionClass;
@@ -37,11 +36,12 @@ impl Aarch64TargetDesc {
 
 pub const REG_X0: usize = 0;
 pub const REG_X30: usize = 30;
-pub const REG_SP: usize = 31;
-pub const REG_PC: usize = 32;
-pub const REG_CPSR: usize = 33;
+pub const REG_XZR: usize = 31;
+pub const REG_SP: usize = 32;
+pub const REG_PC: usize = 33;
+pub const REG_CPSR: usize = 34;
 
-pub const CORE_REG_COUNT: usize = 34;
+pub const CORE_REG_COUNT: usize = REG_CPSR + 1;
 pub const EXTRA_REG_BASE: usize = CORE_REG_COUNT;
 
 pub const REG_TPIDR_EL0: usize = EXTRA_REG_BASE + 0;
@@ -64,6 +64,9 @@ pub const G_PACKET_BYTES: usize = CORE_REG_BYTES + EXTRA_REG_BYTES;
 pub const fn core_reg_offset(regnum: usize) -> Option<(usize, usize)> {
     if regnum <= REG_X30 {
         return Some((regnum * 8, 8));
+    }
+    if regnum == REG_XZR {
+        return Some((REG_XZR * 8, 8));
     }
     if regnum == REG_SP {
         return Some((REG_SP * 8, 8));
@@ -223,7 +226,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
                 .write(addr, &brk)
                 .map_err(Aarch64GdbError::Memory)?;
             cpu::clean_dcache_poc(addr as usize, 4);
-            cpu::invalidate_icache_all();
+            cpu::invalidate_icache_range(addr as usize, 4);
             self.breakpoints.slots[slot].installed = true;
             return Ok(());
         }
@@ -242,7 +245,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             .write(addr, &brk)
             .map_err(Aarch64GdbError::Memory)?;
         cpu::clean_dcache_poc(addr as usize, 4);
-        cpu::invalidate_icache_all();
+        cpu::invalidate_icache_range(addr as usize, 4);
 
         self.breakpoints.slots[slot] = SwBreakpoint {
             addr,
@@ -264,7 +267,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
                 .write(addr, &bytes)
                 .map_err(Aarch64GdbError::Memory)?;
             cpu::clean_dcache_poc(addr as usize, 4);
-            cpu::invalidate_icache_all();
+            cpu::invalidate_icache_range(addr as usize, 4);
         }
 
         self.breakpoints.slots[slot] = SwBreakpoint::empty();
@@ -292,7 +295,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             .write(entry.addr, &bytes)
             .map_err(Aarch64GdbError::Memory)?;
         cpu::clean_dcache_poc(entry.addr as usize, 4);
-        cpu::invalidate_icache_all();
+        cpu::invalidate_icache_range(entry.addr as usize, 4);
         entry.installed = false;
         Ok(())
     }
@@ -310,7 +313,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             .write(entry.addr, &brk)
             .map_err(Aarch64GdbError::Memory)?;
         cpu::clean_dcache_poc(entry.addr as usize, 4);
-        cpu::invalidate_icache_all();
+        cpu::invalidate_icache_range(entry.addr as usize, 4);
         entry.installed = true;
         Ok(())
     }
@@ -367,6 +370,9 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             dst[offset..offset + 8].copy_from_slice(&regs[idx].to_le_bytes());
             offset += 8;
         }
+        dst[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        offset += 8;
+
         let sp = cpu::get_sp_el1();
         dst[offset..offset + 8].copy_from_slice(&sp.to_le_bytes());
         offset += 8;
@@ -407,7 +413,11 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             regs[idx] = read_u64(&src[offset..offset + 8])?;
             offset += 8;
         }
-        regs[REG_SP] = read_u64(&src[offset..offset + 8])?;
+        let _ = read_u64(&src[offset..offset + 8])?;
+        offset += 8;
+
+        let sp = read_u64(&src[offset..offset + 8])?;
+        cpu::set_sp_el1(sp);
         offset += 8;
 
         let pc = read_u64(&src[offset..offset + 8])?;
@@ -434,6 +444,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
                 let regs = regs_as_array(self.regs);
                 write_u64(dst, regs[regno as usize])
             }
+            REG_XZR => write_u64(dst, 0),
             REG_SP => write_u64(dst, cpu::get_sp_el1()),
             REG_PC => write_u64(dst, cpu::get_elr_el2()),
             REG_CPSR => write_u32(dst, cpu::get_spsr_el2() as u32),
@@ -460,6 +471,9 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             REG_X0..=REG_X30 => {
                 let regs = regs_as_array(self.regs);
                 regs[regno as usize] = read_u64(src)?;
+            }
+            REG_XZR => {
+                let _ = read_u64(src)?;
             }
             REG_SP => {
                 let sp = read_u64(src)?;
@@ -541,19 +555,23 @@ struct DebugStubPtr(*mut dyn DebugStub);
 
 // SAFETY: The global debug stub pointer is registered once and only accessed
 // through this module's serialized exception path.
+unsafe impl Send for DebugStubPtr {}
 unsafe impl Sync for DebugStubPtr {}
 
-static DEBUG_STUB: SyncUnsafeCell<Option<DebugStubPtr>> = SyncUnsafeCell::new(None);
+static DEBUG_STUB: RawSpinLockIrqSave<Option<DebugStubPtr>> = RawSpinLockIrqSave::new(None);
 
 pub fn register_debug_stub(stub: &'static mut dyn DebugStub) {
     let ptr: *mut dyn DebugStub = stub;
-    // SAFETY: Callers ensure a single global stub is registered and accessed serially.
-    unsafe { *DEBUG_STUB.get() = Some(DebugStubPtr(ptr)) };
+    let mut guard = DEBUG_STUB.lock_irqsave();
+    *guard = Some(DebugStubPtr(ptr));
 }
 
 pub fn debug_exception_entry(regs: &mut Registers, ec: ExceptionClass) {
-    // SAFETY: Exception handlers run single-threaded on the current core.
-    let Some(stub) = (unsafe { *DEBUG_STUB.get() }) else {
+    let stub = {
+        let guard = DEBUG_STUB.lock_irqsave();
+        *guard
+    };
+    let Some(stub) = stub else {
         return;
     };
     // SAFETY: pointer originates from a registered &mut DebugStub.

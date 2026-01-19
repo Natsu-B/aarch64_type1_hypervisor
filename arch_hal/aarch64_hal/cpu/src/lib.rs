@@ -92,6 +92,13 @@ fn dcache_line_size() -> usize {
     4usize << dminline
 }
 
+fn icache_line_size() -> usize {
+    let ctr_el0: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
+    let iminline = (ctr_el0 & 0xf) as usize;
+    4usize << iminline
+}
+
 pub fn get_current_el() -> u64 {
     let current_el: u64;
     unsafe { asm!("mrs {}, currentel", out(reg) current_el) };
@@ -593,6 +600,31 @@ pub fn invalidate_icache_all() {
             "isb",
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// Invalidate instruction cache for a virtual address range to PoU.
+///
+/// This is intended for self-modifying code / breakpoint patching:
+/// - Ensure the modified data has been cleaned to PoU/PoC as required before calling.
+/// - This function performs the required barriers for the I-cache invalidate sequence.
+pub fn invalidate_icache_range(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = icache_line_size();
+    let start = addr & !(line - 1);
+    let end = addr.saturating_add(len).saturating_add(line - 1) & !(line - 1);
+
+    // SAFETY: `ic ivau` operates on the current EL VA space; callers must provide a valid mapped range.
+    unsafe {
+        let mut p = start;
+        while p < end {
+            asm!("ic ivau, {}", in(reg) p);
+            p += line;
+        }
+        asm!("dsb ish");
+        asm!("isb");
     }
 }
 

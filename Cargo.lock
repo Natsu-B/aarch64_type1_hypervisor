@@ -6,6 +6,7 @@ version = 4
 name = "aarch64_gdb"
 version = "0.1.0"
 dependencies = [
+ "aarch64_mutex",
  "byte_stream",
  "cpu",
  "exceptions",

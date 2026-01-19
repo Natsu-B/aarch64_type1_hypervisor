@@ -31,7 +31,8 @@
   <reg name="x28" bitsize="64" type="uint64" regnum="28"/>
   <reg name="x29" bitsize="64" type="uint64" regnum="29"/>
   <reg name="x30" bitsize="64" type="uint64" regnum="30"/>
-  <reg name="sp" bitsize="64" type="uint64" regnum="31"/>
-  <reg name="pc" bitsize="64" type="code_ptr" regnum="32"/>
-  <reg name="cpsr" bitsize="32" type="uint32" regnum="33"/>
+  <reg name="xzr" bitsize="64" type="uint64" regnum="31"/>
+  <reg name="sp" bitsize="64" type="uint64" regnum="32"/>
+  <reg name="pc" bitsize="64" type="code_ptr" regnum="33"/>
+  <reg name="cpsr" bitsize="32" type="uint32" regnum="34"/>
 </feature>

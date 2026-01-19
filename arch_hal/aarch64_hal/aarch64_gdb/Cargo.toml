@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 byte_stream = { path = "../../../byte_stream" }
 gdb_remote = { path = "../../../gdb_remote", default-features = false }
+aarch64_mutex = { path = "../aarch64_mutex" }
 cpu = { path = "../cpu" }
 exceptions = { path = "../exceptions" }
