@@ -14,6 +14,7 @@ use arch_hal::gic::VgicVcpuModel;
 use arch_hal::gic::VgicVmInfo;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::vgic_frontend::Gicv2AccessSize;
+use arch_hal::gic::gicv2::vgic_frontend::Gicv2DistIdRegs;
 use arch_hal::gic::gicv2::vgic_frontend::Gicv2Frontend;
 use core::cell::SyncUnsafeCell;
 
@@ -25,6 +26,7 @@ static VGIC_VM: RawSpinLockIrqSave<Option<gic::vm::GicVmModelForVcpus<1>>> =
     RawSpinLockIrqSave::new(None);
 static GICD_RANGE: SyncUnsafeCell<Option<(usize, usize)>> = SyncUnsafeCell::new(None);
 static MAINT_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
+static GICD_ID: SyncUnsafeCell<Option<Gicv2DistIdRegs>> = SyncUnsafeCell::new(None);
 
 pub fn init(gic: &Gicv2, info: &Gicv2Info, guest_uart: UartNode) -> Result<(), &'static str> {
     let mut vm = gic
@@ -59,6 +61,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, guest_uart: UartNode) -> Result<(), &
     unsafe {
         *GICD_RANGE.get() = Some((info.dist.base, info.dist.size));
         *MAINT_INTID.get() = info.maintenance_intid;
+        *GICD_ID.get() = Some(Gicv2DistIdRegs::from_hw_gicd(gic.distributor()));
     }
     let mut guard = VGIC_VM.lock_irqsave();
     *guard = Some(vm);
@@ -82,11 +85,11 @@ pub fn handle_gicd_read(addr: usize, access_size: Gicv2AccessSize) -> Result<u32
     // SAFETY: GICD range is initialized once before guest entry.
     let (base, _) = unsafe { (*GICD_RANGE.get()).ok_or(GicError::InvalidAddress)? };
     let offset = addr.saturating_sub(base) as u32;
-    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    let dist_id = unsafe { (*GICD_ID.get()).ok_or(GicError::InvalidState)? };
 
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
-    let mut frontend = Gicv2Frontend::new(vm).with_hw_gicd(gic.distributor());
+    let mut frontend = Gicv2Frontend::new(vm, dist_id);
     frontend.handle_distributor_read(VcpuId(0), offset, access_size)
 }
 
@@ -99,10 +102,11 @@ pub fn handle_gicd_write(
     let (base, _) = unsafe { (*GICD_RANGE.get()).ok_or(GicError::InvalidAddress)? };
     let offset = addr.saturating_sub(base) as u32;
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    let dist_id = unsafe { (*GICD_ID.get()).ok_or(GicError::InvalidState)? };
 
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
-    let mut frontend = Gicv2Frontend::new(vm).with_hw_gicd(gic.distributor());
+    let mut frontend = Gicv2Frontend::new(vm, dist_id);
     let update = frontend.handle_distributor_write(VcpuId(0), offset, access_size, value)?;
     apply_update(vm, gic, update)
 }

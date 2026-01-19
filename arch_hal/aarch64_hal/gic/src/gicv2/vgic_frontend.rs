@@ -46,6 +46,50 @@ impl Gicv2AccessSize {
     }
 }
 
+/// Snapshot of GICv2 Distributor ID registers used for vGIC emulation.
+///
+/// These registers are architecturally read-only and should not change while the GIC is running.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Gicv2DistIdRegs {
+    typer: u32,
+    iidr: u32,
+    pidr: [u32; 8],
+    cidr: [u32; 4],
+}
+
+impl Gicv2DistIdRegs {
+    /// All-zero fallback (used when no hardware snapshot is available).
+    pub const ZERO: Self = Self {
+        typer: 0,
+        iidr: 0,
+        pidr: [0; 8],
+        cidr: [0; 4],
+    };
+
+    /// Read Distributor ID registers from hardware.
+    pub fn from_hw_gicd(gicd: &GicV2Distributor) -> Self {
+        let typer = gicd.typer.read().bits();
+        let iidr = gicd.iidr.read();
+
+        let mut pidr = [0u32; 8];
+        for (i, v) in pidr.iter_mut().enumerate() {
+            *v = gicd.pidr[i].read();
+        }
+
+        let mut cidr = [0u32; 4];
+        for (i, v) in cidr.iter_mut().enumerate() {
+            *v = gicd.cidr[i].read();
+        }
+
+        Self {
+            typer,
+            iidr,
+            pidr,
+            cidr,
+        }
+    }
+}
+
 fn decode_sgir_targets(
     vcpu_count: u16,
     requester: VcpuId,
@@ -71,20 +115,19 @@ fn decode_sgir_targets(
 
 pub struct Gicv2Frontend<'a, M: VgicVmModel> {
     vgic_model: &'a mut M,
-    gicd: Option<&'a GicV2Distributor>,
+    dist_id: Gicv2DistIdRegs,
 }
 
 impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
-    pub fn new(vgic_model: &'a mut M) -> Self {
+    pub fn new(vgic_model: &'a mut M, dist_id: Gicv2DistIdRegs) -> Self {
         Self {
             vgic_model,
-            gicd: None,
+            dist_id,
         }
     }
 
-    pub fn with_hw_gicd(mut self, gicd: &'a GicV2Distributor) -> Self {
-        self.gicd = Some(gicd);
-        self
+    pub fn new_with_hw_gicd(vgic_model: &'a mut M, gicd: &GicV2Distributor) -> Self {
+        Self::new(vgic_model, Gicv2DistIdRegs::from_hw_gicd(gicd))
     }
 
     #[inline]
@@ -564,10 +607,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                 slice_reg(ctlr.bits(), offset - GICD_CTLR_OFFSET)?
             }
             GICD_TYPER_OFFSET..GICD_TYPER_END => {
-                let mut typer = self
-                    .gicd
-                    .map(|g| g.typer.read())
-                    .unwrap_or_else(GICD_TYPER::new);
+                let mut typer = GICD_TYPER::from_bits(self.dist_id.typer);
                 let it_lines_number = ((MAX_VIRTUAL_INTID + 1 + 31) / 32).saturating_sub(1) & 0x1f;
                 let cpus = cmp::min(self.vgic_model.vcpu_count(), 8).saturating_sub(1) as u32 & 0x7;
                 typer = typer
@@ -578,7 +618,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                 slice_reg(typer.bits(), offset - GICD_TYPER_OFFSET)?
             }
             GICD_IIDR_OFFSET..GICD_IIDR_END => {
-                let iidr = self.gicd.map(|g| g.iidr.read()).unwrap_or(0);
+                let iidr = self.dist_id.iidr;
                 slice_reg(iidr, offset - GICD_IIDR_OFFSET)?
             }
             GICD_IGROUPR_OFFSET..GICD_IGROUPR_END => {
@@ -741,7 +781,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                     return Err(GicError::InvalidOffset);
                 }
                 let reg_offset = (offset - GICD_PIDR_OFFSET) % 4;
-                let pidr = self.gicd.map(|g| g.pidr[reg as usize].read()).unwrap_or(0);
+                let pidr = self.dist_id.pidr[reg as usize];
                 slice_reg(pidr, reg_offset)?
             }
             GICD_CIDR_OFFSET..GICD_CIDR_END => {
@@ -750,7 +790,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                     return Err(GicError::InvalidOffset);
                 }
                 let reg_offset = (offset - GICD_CIDR_OFFSET) % 4;
-                let cidr = self.gicd.map(|g| g.cidr[reg as usize].read()).unwrap_or(0);
+                let cidr = self.dist_id.cidr[reg as usize];
                 slice_reg(cidr, reg_offset)?
             }
             _ => return Err(GicError::InvalidOffset),
@@ -1141,7 +1181,7 @@ mod tests {
     fn ctlr_write_and_read_roundtrip() {
         let mut model = FakeModel::new(2);
         let read_back = {
-            let mut frontend = Gicv2Frontend::new(&mut model);
+            let mut frontend = Gicv2Frontend::new(&mut model, Gicv2DistIdRegs::ZERO);
             let offset = offset_of!(GicV2Distributor, ctlr) as u32;
             let value = GICD_CTLR::new()
                 .set(GICD_CTLR::enable_grp0, 1)
@@ -1161,7 +1201,7 @@ mod tests {
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn sgir_write_injects_expected_targets() {
         let mut model = FakeModel::new(4);
-        let mut frontend = Gicv2Frontend::new(&mut model);
+        let mut frontend = Gicv2Frontend::new(&mut model, Gicv2DistIdRegs::ZERO);
         let offset = offset_of!(GicV2Distributor, sgir) as u32;
         let sgir = GICD_SGIR::new()
             .set(GICD_SGIR::sgi_int_id, 5)
