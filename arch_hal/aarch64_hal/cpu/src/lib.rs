@@ -85,6 +85,13 @@ pub struct Registers {
     pub x31: u64,
 }
 
+impl Registers {
+    pub fn as_array(&mut self) -> &mut [u64; 32] {
+        // SAFETY: Registers is repr(C) with 32 consecutive u64 fields (x0-x31).
+        unsafe { &mut *(self as *mut Registers as *mut [u64; 32]) }
+    }
+}
+
 fn dcache_line_size() -> usize {
     let ctr_el0: u64;
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };

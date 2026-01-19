@@ -63,9 +63,8 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                     let write_access: WriteNotRead = esr_el2.get_enum(ESR_EL2::wnr).unwrap();
                     let reg_num = esr_el2.get(ESR_EL2::srt);
 
-                    let register: &mut u64 =
-                        &mut unsafe { &mut *(reg as *mut _ as usize as *mut [u64; 32]) }
-                            [reg_num as usize];
+                    let register = reg.as_array();
+
                     let addr = HPFAR_EL2::from_bits(cpu::get_hpfar_el2()).get(HPFAR_EL2::fipa)
                         << registers::HPFAR_OFFSET
                         | (cpu::get_far_el2() & ((1 << registers::HPFAR_OFFSET) - 1));
@@ -73,7 +72,11 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                     unsafe { &*SYNCHRONOUS_HANDLER.get() }
                         .data_abort_func
                         .unwrap()(
-                        register, addr, reg_size, access_width, write_access
+                        &mut register[reg_num as usize],
+                        addr,
+                        reg_size,
+                        access_width,
+                        write_access,
                     );
                 }
                 ExceptionClass::SMCInstructionExecution => {

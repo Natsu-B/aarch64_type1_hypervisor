@@ -364,7 +364,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             return Err(TargetError::Recoverable(Aarch64GdbError::BufferTooSmall));
         }
 
-        let regs = regs_as_array(self.regs);
+        let regs = self.regs.as_array();
         let mut offset = 0usize;
         for idx in 0..=REG_X30 {
             dst[offset..offset + 8].copy_from_slice(&regs[idx].to_le_bytes());
@@ -407,7 +407,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
         let src = &src[..total];
 
-        let regs = regs_as_array(self.regs);
+        let regs = self.regs.as_array();
         let mut offset = 0usize;
         for idx in 0..=REG_X30 {
             regs[idx] = read_u64(&src[offset..offset + 8])?;
@@ -441,7 +441,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
     ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
         match regno as usize {
             REG_X0..=REG_X30 => {
-                let regs = regs_as_array(self.regs);
+                let regs = self.regs.as_array();
                 write_u64(dst, regs[regno as usize])
             }
             REG_XZR => write_u64(dst, 0),
@@ -469,7 +469,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
     ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
         match regno as usize {
             REG_X0..=REG_X30 => {
-                let regs = regs_as_array(self.regs);
+                let regs = self.regs.as_array();
                 regs[regno as usize] = read_u64(src)?;
             }
             REG_XZR => {
@@ -852,9 +852,4 @@ fn write_extra_regs_from<E>(
     let mdscr = MDSCR_EL1::from_bits(read_u64(&src[off..off + 8])?);
     cpu::set_mdscr_el1(mdscr);
     Ok(())
-}
-
-fn regs_as_array(regs: &mut Registers) -> &mut [u64; 32] {
-    // SAFETY: Registers is repr(C) with 32 consecutive u64 fields (x0-x31).
-    unsafe { &mut *(regs as *mut Registers as *mut [u64; 32]) }
 }
