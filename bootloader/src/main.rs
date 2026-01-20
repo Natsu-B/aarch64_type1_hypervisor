@@ -472,7 +472,7 @@ fn init_gicv2_for_gdb(
     let caps = gic.init_cpu_interface().map_err(|_| "gic: init cpu")?;
     let cfg = GicCpuConfig {
         priority_mask: 0xff,
-        enable_group0: false,
+        enable_group0: caps.supports_group0,
         enable_group1: true,
         binary_point: BinaryPoint::Common(caps.binary_points_min),
         eoi_mode: EoiMode::DropAndDeactivate,

@@ -124,5 +124,5 @@ The test plan is defined in `xtest.txt`:
 * `arch_hal`: AArch64 HAL (paging, exceptions, PL011, PSCI, timer, GIC)
 * `dtb`, `elf`: parsers/helpers used by boot paths
 * `file` + `virtio`: virtio-blk and FAT32 helper stack
-* `gdb_remote` + `byte_stream`: `no_std` GDB RSP server over a blocking byte stream
+* `gdb_remote`: `no_std` IRQ-driven GDB RSP engine
 * `allocator`, `mutex`, `typestate`, `intrusive_linked_list`: low-level runtime building blocks

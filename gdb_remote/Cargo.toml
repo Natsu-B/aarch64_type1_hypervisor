@@ -8,7 +8,6 @@ default = []
 gdb_monitor_debug = []
 
 [dependencies]
-byte_stream = { path = "../byte_stream" }
 
 [dev-dependencies]
 aarch64_test = { path = "../arch_hal/aarch64_hal/aarch64_test" }

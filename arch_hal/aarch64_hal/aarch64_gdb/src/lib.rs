@@ -1,7 +1,7 @@
 #![no_std]
 
 use aarch64_mutex::RawSpinLockIrqSave;
-use byte_stream::ByteStream;
+use core::hint::spin_loop;
 use cpu::Registers;
 use cpu::registers::MDSCR_EL1;
 use exceptions::registers::ExceptionClass;
@@ -11,6 +11,13 @@ use gdb_remote::ResumeAction;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
+
+#[derive(Clone, Copy)]
+pub struct DebugIo {
+    pub try_read: fn() -> Option<u8>,
+    pub try_write: fn(u8) -> bool,
+    pub flush: fn(),
+}
 
 pub const TARGET_XML: &[u8] = include_bytes!("xml/target.xml");
 pub const AARCH64_CORE_XML: &[u8] = include_bytes!("xml/aarch64-core.xml");
@@ -566,11 +573,22 @@ unsafe impl Send for DebugStubPtr {}
 unsafe impl Sync for DebugStubPtr {}
 
 static DEBUG_STUB: RawSpinLockIrqSave<Option<DebugStubPtr>> = RawSpinLockIrqSave::new(None);
+static DEBUG_IO: RawSpinLockIrqSave<Option<DebugIo>> = RawSpinLockIrqSave::new(None);
 
 pub fn register_debug_stub(stub: &'static mut dyn DebugStub) {
     let ptr: *mut dyn DebugStub = stub;
     let mut guard = DEBUG_STUB.lock_irqsave();
     *guard = Some(DebugStubPtr(ptr));
+}
+
+pub fn register_debug_io(io: DebugIo) {
+    let mut guard = DEBUG_IO.lock_irqsave();
+    *guard = Some(io);
+}
+
+fn debug_io() -> Option<DebugIo> {
+    let guard = DEBUG_IO.lock_irqsave();
+    *guard
 }
 
 pub fn debug_entry(regs: &mut Registers, cause: DebugEntryCause) {
@@ -612,22 +630,22 @@ struct PendingStep {
 }
 
 pub struct Aarch64GdbStub<
-    S: ByteStream,
     M,
     const MAX_PKT: usize = 2048,
+    const TX_CAP: usize = 4096,
     const N: usize = DEFAULT_SW_BREAKPOINTS,
 > {
-    server: GdbServer<S, MAX_PKT>,
+    server: GdbServer<MAX_PKT, TX_CAP>,
     state: Aarch64GdbState<M, N>,
     pending_step: Option<PendingStep>,
 }
 
-impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize>
-    Aarch64GdbStub<S, M, MAX_PKT, N>
+impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
+    Aarch64GdbStub<M, MAX_PKT, TX_CAP, N>
 {
-    pub fn new(stream: S, mem: M) -> Self {
+    pub fn new(mem: M) -> Self {
         Self {
-            server: GdbServer::new(stream),
+            server: GdbServer::new(),
             state: Aarch64GdbState::new(mem),
             pending_step: None,
         }
@@ -641,6 +659,9 @@ impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize>
         if self.handle_pending_step(ec) {
             return;
         }
+        let Some(io) = debug_io() else {
+            return;
+        };
 
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
@@ -659,13 +680,49 @@ impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize>
             }
         }
 
-        let action = loop {
+        let mut tx_hold = None;
+        let action = 'debug: loop {
             let mut target = self.state.target(regs);
-            match self.server.run_until_event(&mut target) {
-                Ok(ProcessResult::Resume(action)) => break action,
-                Ok(ProcessResult::MonitorExit) => return,
-                Ok(ProcessResult::None) => continue,
-                Err(_) => return,
+            let mut progress = false;
+
+            if let Some(byte) = tx_hold {
+                if (io.try_write)(byte) {
+                    tx_hold = None;
+                    progress = true;
+                }
+            }
+
+            while tx_hold.is_none() {
+                let Some(byte) = self.server.pop_tx_byte_irq() else {
+                    break;
+                };
+                if (io.try_write)(byte) {
+                    progress = true;
+                } else {
+                    tx_hold = Some(byte);
+                    break;
+                }
+            }
+
+            loop {
+                match (io.try_read)() {
+                    Some(byte) => {
+                        progress = true;
+                        match self.server.on_rx_byte_irq(&mut target, byte) {
+                            Ok(ProcessResult::Resume(action)) => break 'debug action,
+                            Ok(ProcessResult::MonitorExit) => return,
+                            Ok(ProcessResult::None) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            if progress {
+                (io.flush)();
+            } else {
+                spin_loop();
             }
         };
 
@@ -724,8 +781,8 @@ impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize>
     }
 }
 
-impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize> DebugStub
-    for Aarch64GdbStub<S, M, MAX_PKT, N>
+impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize> DebugStub
+    for Aarch64GdbStub<M, MAX_PKT, TX_CAP, N>
 {
     fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {
         Aarch64GdbStub::enter_debug(self, regs, cause);

@@ -1,8 +1,8 @@
 use crate::gdb_uart;
-use crate::gdb_uart::GdbUartStream;
 use arch_hal::aarch64_gdb;
 use arch_hal::aarch64_gdb::Aarch64GdbStub;
 use arch_hal::aarch64_gdb::DebugEntryCause;
+use arch_hal::aarch64_gdb::DebugIo;
 use arch_hal::aarch64_gdb::MemoryAccess;
 use arch_hal::cpu;
 use arch_hal::exceptions::registers::ExceptionClass;
@@ -47,15 +47,19 @@ impl MemoryAccess for Stage2Memory {
     }
 }
 
-static GDB_STUB: SyncUnsafeCell<
-    MaybeUninit<Aarch64GdbStub<GdbUartStream, Stage2Memory, MAX_GDB_PKT>>,
-> = SyncUnsafeCell::new(MaybeUninit::uninit());
+static GDB_STUB: SyncUnsafeCell<MaybeUninit<Aarch64GdbStub<Stage2Memory, MAX_GDB_PKT>>> =
+    SyncUnsafeCell::new(MaybeUninit::uninit());
 
 pub(crate) fn init_gdb_stub() {
     // SAFETY: called once during early boot, before debug exceptions are enabled.
     unsafe {
         let stub = &mut *GDB_STUB.get();
-        stub.write(Aarch64GdbStub::new(GdbUartStream, Stage2Memory));
+        aarch64_gdb::register_debug_io(DebugIo {
+            try_read: gdb_uart::try_read_byte,
+            try_write: gdb_uart::try_write_byte,
+            flush: gdb_uart::flush,
+        });
+        stub.write(Aarch64GdbStub::new(Stage2Memory));
         aarch64_gdb::register_debug_stub(stub.assume_init_mut());
     }
 }

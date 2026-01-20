@@ -7,13 +7,14 @@ compile_error!("This test is intended to run on aarch64 targets only");
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
 use core::convert::Infallible;
+use core::hint::spin_loop;
 use gdb_remote::GdbServer;
+use gdb_remote::ProcessResult;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
 use print::debug_uart;
 use print::pl011::Pl011Uart;
-use print::stream::Pl011Stream;
 
 // Use the 2nd PL011 (UART1) on QEMU virt for the RSP channel.
 // UART0 is typically used as the UEFI firmware console and can inject non-RSP output.
@@ -32,16 +33,44 @@ extern "C" fn efi_main() -> ! {
     uart.init(115200);
     // Drain any stale bytes (should be empty for UART1, but keep it defensive).
     uart.drain_rx();
-    let stream = Pl011Stream::new(&uart);
-    let mut server: GdbServer<_, 2048> = GdbServer::new(stream);
+    let mut server: GdbServer<2048, 4096> = GdbServer::new();
     let mut target = DummyTarget;
+    let mut tx_hold: Option<u8> = None;
 
-    match server.run_until_monitor_exit(&mut target) {
-        Ok(()) => {
-            exit_success();
+    loop {
+        let mut progress = false;
+
+        while let Some(byte) = uart.try_read_byte() {
+            progress = true;
+            match server.on_rx_byte_irq(&mut target, byte) {
+                Ok(ProcessResult::MonitorExit) => exit_success(),
+                Ok(ProcessResult::Resume(_)) => {}
+                Ok(ProcessResult::None) => {}
+                Err(_) => exit_failure(),
+            }
         }
-        Err(_) => {
-            exit_failure();
+
+        if let Some(byte) = tx_hold {
+            if uart.try_write_byte(byte) {
+                tx_hold = None;
+                progress = true;
+            }
+        }
+
+        while tx_hold.is_none() {
+            let Some(byte) = server.pop_tx_byte_irq() else {
+                break;
+            };
+            if uart.try_write_byte(byte) {
+                progress = true;
+            } else {
+                tx_hold = Some(byte);
+                break;
+            }
+        }
+
+        if !progress {
+            spin_loop();
         }
     }
 }

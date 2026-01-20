@@ -7,7 +7,6 @@
 #   uboot       <package> <testname> <testscript> [extra...]
 
 std allocator
-std byte_stream
 std dtb
 std intrusive_linked_list
 std mutex

@@ -6,9 +6,6 @@ compile_error!("This test is intended to run on aarch64 targets only");
 
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
-use byte_stream::ByteStream;
-use core::cell::Cell;
-use core::cell::UnsafeCell;
 use core::convert::Infallible;
 use gdb_remote::GdbServer;
 use gdb_remote::ProcessResult;
@@ -17,27 +14,31 @@ use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
+const RX_BUF: usize = 256;
+const TX_BUF: usize = 1024;
+const MAX_PKT: usize = 1024;
+const TX_CAP: usize = 1024;
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
-    let mut stream_default = MockStream::<128, 512>::new();
-    if !stream_default.push_packet(b"qSupported") {
+    let mut server_default: GdbServer<MAX_PKT, TX_CAP> = GdbServer::new();
+    let mut target = DummyTarget;
+
+    let mut rx = [0u8; RX_BUF];
+    let len = match encode_packet(&mut rx, b"qSupported") {
+        Some(len) => len,
+        None => exit_failure(),
+    };
+    if !feed_bytes(&mut server_default, &mut target, &rx[..len]) {
         exit_failure();
     }
 
-    let mut server_default: GdbServer<&MockStream<128, 512>, 1024> =
-        GdbServer::new(&stream_default);
-    let mut target = DummyTarget;
-    match server_default.process_one(&mut target) {
-        Ok(ProcessResult::None) => {}
-        _ => exit_failure(),
-    }
-
-    let tx = stream_default.tx_bytes();
+    let mut tx = [0u8; TX_BUF];
+    let tx_len = drain_tx(&mut server_default, &mut tx);
     let mut idx = 0usize;
     let mut payload = [0u8; 256];
 
-    let Some(len) = next_payload(tx, &mut idx, &mut payload) else {
+    let Some(len) = next_payload(&tx[..tx_len], &mut idx, &mut payload) else {
         exit_failure();
     };
     if !contains(&payload[..len], b"PacketSize=1024") {
@@ -47,23 +48,20 @@ extern "C" fn efi_main() -> ! {
         exit_failure();
     }
 
-    let mut stream_override = MockStream::<128, 512>::new();
-    if !stream_override.push_packet(b"qSupported") {
+    let mut server_override: GdbServer<MAX_PKT, TX_CAP> = GdbServer::new_with_packet_size(256);
+    let mut target = DummyTarget;
+    let len = match encode_packet(&mut rx, b"qSupported") {
+        Some(len) => len,
+        None => exit_failure(),
+    };
+    if !feed_bytes(&mut server_override, &mut target, &rx[..len]) {
         exit_failure();
     }
 
-    let mut server_override: GdbServer<&MockStream<128, 512>, 1024> =
-        GdbServer::new_with_packet_size(&stream_override, 256);
-    let mut target = DummyTarget;
-    match server_override.process_one(&mut target) {
-        Ok(ProcessResult::None) => {}
-        _ => exit_failure(),
-    }
-
-    let tx = stream_override.tx_bytes();
+    let tx_len = drain_tx(&mut server_override, &mut tx);
     let mut idx = 0usize;
 
-    let Some(len) = next_payload(tx, &mut idx, &mut payload) else {
+    let Some(len) = next_payload(&tx[..tx_len], &mut idx, &mut payload) else {
         exit_failure();
     };
     if !contains(&payload[..len], b"PacketSize=256") {
@@ -119,87 +117,55 @@ impl Target for DummyTarget {
     }
 }
 
-struct MockStream<const RX: usize, const TX: usize> {
-    rx: [u8; RX],
-    rx_len: Cell<usize>,
-    rx_pos: Cell<usize>,
-    tx: UnsafeCell<[u8; TX]>,
-    tx_len: Cell<usize>,
+fn encode_packet(buf: &mut [u8], payload: &[u8]) -> Option<usize> {
+    let needed = payload.len().saturating_add(4);
+    if needed > buf.len() {
+        return None;
+    }
+
+    let mut idx = 0usize;
+    buf[idx] = b'$';
+    idx += 1;
+    buf[idx..idx + payload.len()].copy_from_slice(payload);
+    idx += payload.len();
+    buf[idx] = b'#';
+    idx += 1;
+
+    let sum = checksum(payload);
+    buf[idx] = HEX[(sum >> 4) as usize];
+    buf[idx + 1] = HEX[(sum & 0xF) as usize];
+    idx += 2;
+
+    Some(idx)
 }
 
-impl<const RX: usize, const TX: usize> MockStream<RX, TX> {
-    const fn new() -> Self {
-        Self {
-            rx: [0u8; RX],
-            rx_len: Cell::new(0),
-            rx_pos: Cell::new(0),
-            tx: UnsafeCell::new([0u8; TX]),
-            tx_len: Cell::new(0),
+fn feed_bytes<T: Target, const MAX: usize, const TX: usize>(
+    server: &mut GdbServer<MAX, TX>,
+    target: &mut T,
+    bytes: &[u8],
+) -> bool {
+    for &byte in bytes {
+        match server.on_rx_byte_irq(target, byte) {
+            Ok(ProcessResult::None) => {}
+            Ok(_) | Err(_) => return false,
         }
     }
-
-    fn push_packet(&mut self, payload: &[u8]) -> bool {
-        let needed = 1 + payload.len() + 3;
-        let mut idx = self.rx_len.get();
-        if idx + needed > RX {
-            return false;
-        }
-
-        self.rx[idx] = b'$';
-        idx += 1;
-        self.rx[idx..idx + payload.len()].copy_from_slice(payload);
-        idx += payload.len();
-        self.rx[idx] = b'#';
-        idx += 1;
-
-        let sum = checksum(payload);
-        self.rx[idx] = HEX[(sum >> 4) as usize];
-        self.rx[idx + 1] = HEX[(sum & 0xF) as usize];
-        idx += 2;
-
-        self.rx_len.set(idx);
-        true
-    }
-
-    fn tx_bytes(&self) -> &[u8] {
-        let len = self.tx_len.get();
-        let ptr = self.tx.get() as *const u8;
-        // SAFETY: `tx` points to a TX-sized buffer, `len` never exceeds TX,
-        // and we only read after all writes finish in this single-threaded test.
-        unsafe { core::slice::from_raw_parts(ptr, len) }
-    }
+    true
 }
 
-impl<const RX: usize, const TX: usize> ByteStream for &MockStream<RX, TX> {
-    type Error = Infallible;
-
-    fn try_read(&self) -> Result<Option<u8>, Self::Error> {
-        let pos = self.rx_pos.get();
-        let len = self.rx_len.get();
-        if pos >= len {
-            return Ok(None);
+fn drain_tx<const MAX: usize, const TX: usize>(
+    server: &mut GdbServer<MAX, TX>,
+    out: &mut [u8],
+) -> usize {
+    let mut idx = 0usize;
+    while let Some(byte) = server.pop_tx_byte_irq() {
+        if idx >= out.len() {
+            break;
         }
-        self.rx_pos.set(pos + 1);
-        Ok(Some(self.rx[pos]))
+        out[idx] = byte;
+        idx += 1;
     }
-
-    fn try_write(&self, byte: u8) -> Result<bool, Self::Error> {
-        let len = self.tx_len.get();
-        if len >= TX {
-            return Ok(false);
-        }
-        // SAFETY: `tx_len` ensures we write within bounds, and the test
-        // executes single-threaded with no concurrent access.
-        unsafe {
-            (*self.tx.get())[len] = byte;
-        }
-        self.tx_len.set(len + 1);
-        Ok(true)
-    }
-
-    fn flush(&self) -> Result<(), Self::Error> {
-        Ok(())
-    }
+    idx
 }
 
 fn checksum(payload: &[u8]) -> u8 {

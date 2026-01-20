@@ -7,8 +7,6 @@ use typestate::Writable;
 use typestate::WriteOnly;
 use typestate::bitregs;
 
-use crate::pl011;
-
 bitregs! {
     /// UART Data Register (UARTDR)
     pub struct UARTDR: u32 {

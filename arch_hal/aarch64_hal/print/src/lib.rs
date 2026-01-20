@@ -1,8 +1,6 @@
 #![no_std]
 
 pub mod pl011;
-pub mod stream;
-
 use core::cell::OnceCell;
 use core::fmt::Write;
 use core::fmt::{self};

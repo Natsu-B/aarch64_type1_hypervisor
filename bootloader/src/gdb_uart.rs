@@ -2,8 +2,6 @@ use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::pl011::FifoLevel;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::timer;
-use byte_stream::ByteStream;
-use core::convert::Infallible;
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering;
 use gdb_remote::RspFrameAssembler;
@@ -18,8 +16,6 @@ const FLUSH_LIMIT: usize = RX_RING_SIZE;
 // Publish debug entry state without relying on higher-level locking.
 static DEBUG_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
 static ATTACH_REASON: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
-
-pub struct GdbUartStream;
 
 struct RxRing<const N: usize> {
     buf: [u8; N],
@@ -270,7 +266,11 @@ fn pop_prefetch_or_rx() -> Option<u8> {
     state.rx.pop()
 }
 
-fn try_write_byte(byte: u8) -> bool {
+pub fn try_read_byte() -> Option<u8> {
+    pop_prefetch_or_rx()
+}
+
+pub fn try_write_byte(byte: u8) -> bool {
     let mut guard = GDB_UART_STATE.lock_irqsave();
     let Some(state) = guard.as_mut() else {
         return false;
@@ -278,14 +278,4 @@ fn try_write_byte(byte: u8) -> bool {
     state.uart.try_write_byte(byte)
 }
 
-impl ByteStream for GdbUartStream {
-    type Error = Infallible;
-
-    fn try_read(&self) -> Result<Option<u8>, Self::Error> {
-        Ok(pop_prefetch_or_rx())
-    }
-
-    fn try_write(&self, byte: u8) -> Result<bool, Self::Error> {
-        Ok(try_write_byte(byte))
-    }
-}
+pub fn flush() {}

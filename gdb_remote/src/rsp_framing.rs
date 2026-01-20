@@ -8,6 +8,13 @@ pub enum RspFrameEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RspFrameByteKind {
+    None,
+    Payload,
+    Checksum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RspFrameState {
     Idle,
     InFrame,
@@ -30,40 +37,44 @@ impl RspFrameAssembler {
     }
 
     pub fn push(&mut self, byte: u8) -> RspFrameEvent {
+        self.push_with_kind(byte).0
+    }
+
+    pub(crate) fn push_with_kind(&mut self, byte: u8) -> (RspFrameEvent, RspFrameByteKind) {
         match self.state {
             RspFrameState::Idle => match byte {
                 b'$' => {
                     self.state = RspFrameState::InFrame;
-                    RspFrameEvent::NeedMore
+                    (RspFrameEvent::NeedMore, RspFrameByteKind::None)
                 }
                 0x03 => {
                     self.state = RspFrameState::Idle;
-                    RspFrameEvent::CtrlC
+                    (RspFrameEvent::CtrlC, RspFrameByteKind::None)
                 }
-                _ => RspFrameEvent::Ignore,
+                _ => (RspFrameEvent::Ignore, RspFrameByteKind::None),
             },
             RspFrameState::InFrame => match byte {
                 b'$' => {
                     self.state = RspFrameState::InFrame;
-                    RspFrameEvent::Resync
+                    (RspFrameEvent::Resync, RspFrameByteKind::None)
                 }
                 b'#' => {
                     self.state = RspFrameState::Checksum(0);
-                    RspFrameEvent::NeedMore
+                    (RspFrameEvent::NeedMore, RspFrameByteKind::None)
                 }
-                _ => RspFrameEvent::NeedMore,
+                _ => (RspFrameEvent::NeedMore, RspFrameByteKind::Payload),
             },
             RspFrameState::Checksum(count) => {
                 if byte == b'$' {
                     self.state = RspFrameState::InFrame;
-                    return RspFrameEvent::Resync;
+                    return (RspFrameEvent::Resync, RspFrameByteKind::None);
                 }
                 if count == 0 {
                     self.state = RspFrameState::Checksum(1);
-                    RspFrameEvent::NeedMore
+                    (RspFrameEvent::NeedMore, RspFrameByteKind::Checksum)
                 } else {
                     self.state = RspFrameState::Idle;
-                    RspFrameEvent::FrameComplete
+                    (RspFrameEvent::FrameComplete, RspFrameByteKind::Checksum)
                 }
             }
         }
