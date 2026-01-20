@@ -143,7 +143,7 @@ fn gic_access_size(access_width: SyndromeAccessSize) -> Option<Gicv2AccessSize> 
     }
 }
 
-fn irq_handler() {
+fn irq_handler(regs: &mut cpu::Registers) {
     // SAFETY: IRQ handler runs after GIC is initialized.
     println!("irq_handler called");
     let Some(gic) = (unsafe { &*GICV2.get() }) else {
@@ -152,8 +152,17 @@ fn irq_handler() {
     let Ok(Some(ack)) = gic.acknowledge() else {
         return;
     };
+    println!("irq_handler ack intid: {}", ack.intid);
     // SAFETY: GDB UART INTID is written once during boot and then read-only.
     let gdb_intid = unsafe { *GDB_UART_INTID.get() };
+    if gdb_uart::is_debug_active() {
+        if Some(ack.intid) == gdb_intid {
+            gdb_uart::handle_irq();
+        }
+        gic.end_of_interrupt(ack).unwrap();
+        return;
+    }
+
     if Some(ack.intid) == gdb_intid {
         gdb_uart::handle_irq();
     } else if Some(ack.intid) == vgic::maintenance_intid() {
@@ -162,6 +171,11 @@ fn irq_handler() {
         vgic::on_physical_irq(ack.intid).unwrap();
     }
     gic.end_of_interrupt(ack).unwrap();
+
+    let reason = gdb_uart::take_attach_reason();
+    if reason != 0 {
+        debug::enter_debug_from_irq(regs, reason);
+    }
 }
 
 fn deny_cpu_on_handler(regs: &mut cpu::Registers) {

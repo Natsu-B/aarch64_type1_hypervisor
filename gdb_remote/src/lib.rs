@@ -14,8 +14,11 @@ macro_rules! gdb_debug {
     };
 }
 
+mod rsp_framing;
 mod target;
 
+pub use rsp_framing::RspFrameAssembler;
+pub use rsp_framing::RspFrameEvent;
 pub use target::ResumeAction;
 pub use target::Target;
 pub use target::TargetCapabilities;

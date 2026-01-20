@@ -547,7 +547,14 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
 }
 
 pub trait DebugStub {
-    fn handle_debug_exception(&mut self, regs: &mut Registers, ec: ExceptionClass);
+    fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DebugEntryCause {
+    DebugException(ExceptionClass),
+    AttachDollar,
+    CtrlC,
 }
 
 #[derive(Clone, Copy)]
@@ -566,7 +573,7 @@ pub fn register_debug_stub(stub: &'static mut dyn DebugStub) {
     *guard = Some(DebugStubPtr(ptr));
 }
 
-pub fn debug_exception_entry(regs: &mut Registers, ec: ExceptionClass) {
+pub fn debug_entry(regs: &mut Registers, cause: DebugEntryCause) {
     let stub = {
         let guard = DEBUG_STUB.lock_irqsave();
         *guard
@@ -575,7 +582,11 @@ pub fn debug_exception_entry(regs: &mut Registers, ec: ExceptionClass) {
         return;
     };
     // SAFETY: pointer originates from a registered &mut DebugStub.
-    unsafe { &mut *stub.0 }.handle_debug_exception(regs, ec);
+    unsafe { &mut *stub.0 }.enter_debug(regs, cause);
+}
+
+pub fn debug_exception_entry(regs: &mut Registers, ec: ExceptionClass) {
+    debug_entry(regs, DebugEntryCause::DebugException(ec));
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -622,24 +633,18 @@ impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize>
         }
     }
 
-    pub fn handle_debug_exception(&mut self, regs: &mut Registers, ec: ExceptionClass) {
-        if let Some(pending) = self.pending_step.take() {
-            if let Some(restore) = pending.restore {
-                disable_single_step(restore);
-            }
-            if let Some(slot) = pending.slot {
-                let _ = self.state.reinstall_sw_breakpoint_slot(slot);
-            }
-            if matches!(pending.action, PendingStepAction::Continue)
-                && matches!(ec, ExceptionClass::SoftwareStepLowerLevel)
-            {
-                return;
-            }
+    pub fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {
+        let ec = match cause {
+            DebugEntryCause::DebugException(ec) => Some(ec),
+            _ => None,
+        };
+        if self.handle_pending_step(ec) {
+            return;
         }
 
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
-        if matches!(ec, ExceptionClass::BreakpointLowerLevel) {
+        if let DebugEntryCause::DebugException(ExceptionClass::BreakpointLowerLevel) = cause {
             let pc = cpu::get_elr_el2();
             if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
                 breakpoint_slot = Some(slot);
@@ -696,13 +701,34 @@ impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize>
             }
         }
     }
+
+    pub fn handle_debug_exception(&mut self, regs: &mut Registers, ec: ExceptionClass) {
+        self.enter_debug(regs, DebugEntryCause::DebugException(ec));
+    }
+
+    fn handle_pending_step(&mut self, ec: Option<ExceptionClass>) -> bool {
+        if let Some(pending) = self.pending_step.take() {
+            if let Some(restore) = pending.restore {
+                disable_single_step(restore);
+            }
+            if let Some(slot) = pending.slot {
+                let _ = self.state.reinstall_sw_breakpoint_slot(slot);
+            }
+            if matches!(pending.action, PendingStepAction::Continue)
+                && matches!(ec, Some(ExceptionClass::SoftwareStepLowerLevel))
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl<S: ByteStream, M: MemoryAccess, const MAX_PKT: usize, const N: usize> DebugStub
     for Aarch64GdbStub<S, M, MAX_PKT, N>
 {
-    fn handle_debug_exception(&mut self, regs: &mut Registers, ec: ExceptionClass) {
-        Aarch64GdbStub::handle_debug_exception(self, regs, ec);
+    fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {
+        Aarch64GdbStub::enter_debug(self, regs, cause);
     }
 }
 

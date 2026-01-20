@@ -1,10 +1,23 @@
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::pl011::FifoLevel;
 use arch_hal::pl011::Pl011Uart;
+use arch_hal::timer;
 use byte_stream::ByteStream;
 use core::convert::Infallible;
+use core::hint::spin_loop;
+use core::sync::atomic::Ordering;
+use gdb_remote::RspFrameAssembler;
+use gdb_remote::RspFrameEvent;
+use mutex::pod::RawAtomicPod;
 
 const RX_RING_SIZE: usize = 1024;
+const PREFETCH_CAP: usize = RX_RING_SIZE + 4;
+const NAK_ATTEMPTS: usize = 32;
+const FLUSH_LIMIT: usize = RX_RING_SIZE;
+
+// Publish debug entry state without relying on higher-level locking.
+static DEBUG_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static ATTACH_REASON: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
 
 pub struct GdbUartStream;
 
@@ -51,6 +64,9 @@ impl<const N: usize> RxRing<N> {
 struct GdbUartState<const N: usize> {
     uart: Pl011Uart,
     rx: RxRing<N>,
+    prefetch_buf: [u8; PREFETCH_CAP],
+    prefetch_len: usize,
+    prefetch_pos: usize,
 }
 
 static GDB_UART_STATE: RawSpinLockIrqSave<Option<GdbUartState<RX_RING_SIZE>>> =
@@ -63,6 +79,9 @@ pub fn init(base: usize, clock_hz: u64, baud: u32) {
     let state = GdbUartState {
         uart,
         rx: RxRing::new(),
+        prefetch_buf: [0; PREFETCH_CAP],
+        prefetch_len: 0,
+        prefetch_pos: 0,
     };
     let mut guard = GDB_UART_STATE.lock_irqsave();
     *guard = Some(state);
@@ -75,12 +94,180 @@ pub fn handle_irq() {
     };
     state.uart.handle_rx_irq(&mut |byte| {
         let _ = state.rx.push_drop_newest(byte);
+        if !DEBUG_ACTIVE.load(Ordering::Acquire) {
+            let reason = ATTACH_REASON.load(Ordering::Acquire);
+            if byte == 0x03 {
+                // Release publishes the attach request after RX buffering.
+                if reason != 2 {
+                    ATTACH_REASON.store(2, Ordering::Release);
+                }
+            } else if byte == b'$' && reason == 0 {
+                // Release publishes the attach request after RX buffering.
+                ATTACH_REASON.store(1, Ordering::Release);
+            }
+        }
     });
 }
 
-fn pop_once() -> Option<u8> {
+pub fn is_debug_active() -> bool {
+    // Acquire pairs with Release stores so debug entry sees any buffered bytes.
+    DEBUG_ACTIVE.load(Ordering::Acquire)
+}
+
+pub fn set_debug_active(active: bool) {
+    // Release publishes debug-active transitions to IRQ readers.
+    DEBUG_ACTIVE.store(active, Ordering::Release);
+}
+
+pub fn take_attach_reason() -> u8 {
+    // AcqRel ensures we observe any IRQ-side buffering before consuming the reason.
+    ATTACH_REASON.swap(0, Ordering::AcqRel)
+}
+
+pub fn clear_prefetch() {
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    state.prefetch_len = 0;
+    state.prefetch_pos = 0;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefetchResult {
+    Success,
+    Timeout,
+    Overflow,
+    Unavailable,
+}
+
+pub fn prefetch_first_rsp_frame(deadline_ticks: u64) -> PrefetchResult {
+    clear_prefetch();
+    {
+        let guard = GDB_UART_STATE.lock_irqsave();
+        if guard.is_none() {
+            return PrefetchResult::Unavailable;
+        }
+    }
+
+    let mut assembler = RspFrameAssembler::new();
+    let mut buf = [0u8; PREFETCH_CAP];
+    let mut len = 0usize;
+
+    loop {
+        if timer::read_counter() >= deadline_ticks {
+            return fail_prefetch(PrefetchResult::Timeout);
+        }
+
+        let Some(byte) = pop_rx_once() else {
+            spin_loop();
+            continue;
+        };
+
+        let event = assembler.push(byte);
+        match event {
+            RspFrameEvent::Ignore => {}
+            RspFrameEvent::Resync => {
+                len = 0;
+                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                    return fail_prefetch(PrefetchResult::Overflow);
+                }
+            }
+            RspFrameEvent::NeedMore => {
+                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                    return fail_prefetch(PrefetchResult::Overflow);
+                }
+            }
+            RspFrameEvent::CtrlC => {
+                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                    return fail_prefetch(PrefetchResult::Overflow);
+                }
+                if !store_prefetch(&buf[..len]) {
+                    return PrefetchResult::Unavailable;
+                }
+                return PrefetchResult::Success;
+            }
+            RspFrameEvent::FrameComplete => {
+                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                    return fail_prefetch(PrefetchResult::Overflow);
+                }
+                if !store_prefetch(&buf[..len]) {
+                    return PrefetchResult::Unavailable;
+                }
+                return PrefetchResult::Success;
+            }
+        }
+    }
+}
+
+fn push_prefetch_byte(buf: &mut [u8], len: &mut usize, byte: u8) -> bool {
+    if *len >= buf.len() {
+        return false;
+    }
+    buf[*len] = byte;
+    *len += 1;
+    true
+}
+
+fn store_prefetch(buf: &[u8]) -> bool {
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    if buf.len() > state.prefetch_buf.len() {
+        return false;
+    }
+    state.prefetch_buf[..buf.len()].copy_from_slice(buf);
+    state.prefetch_len = buf.len();
+    state.prefetch_pos = 0;
+    true
+}
+
+fn fail_prefetch(result: PrefetchResult) -> PrefetchResult {
+    if matches!(result, PrefetchResult::Timeout | PrefetchResult::Overflow) {
+        try_send_nak();
+        flush_rx_ring();
+        clear_prefetch();
+    }
+    result
+}
+
+fn try_send_nak() {
+    for _ in 0..NAK_ATTEMPTS {
+        if try_write_byte(b'-') {
+            break;
+        }
+    }
+}
+
+fn flush_rx_ring() {
+    for _ in 0..FLUSH_LIMIT {
+        if pop_rx_once().is_none() {
+            break;
+        }
+    }
+}
+
+fn pop_rx_once() -> Option<u8> {
     let mut guard = GDB_UART_STATE.lock_irqsave();
     guard.as_mut()?.rx.pop()
+}
+
+fn pop_prefetch_or_rx() -> Option<u8> {
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    let Some(state) = guard.as_mut() else {
+        return None;
+    };
+    if state.prefetch_pos < state.prefetch_len {
+        let byte = state.prefetch_buf[state.prefetch_pos];
+        state.prefetch_pos += 1;
+        if state.prefetch_pos >= state.prefetch_len {
+            state.prefetch_pos = 0;
+            state.prefetch_len = 0;
+        }
+        return Some(byte);
+    }
+    state.rx.pop()
 }
 
 fn try_write_byte(byte: u8) -> bool {
@@ -95,7 +282,7 @@ impl ByteStream for GdbUartStream {
     type Error = Infallible;
 
     fn try_read(&self) -> Result<Option<u8>, Self::Error> {
-        Ok(pop_once())
+        Ok(pop_prefetch_or_rx())
     }
 
     fn try_write(&self, byte: u8) -> Result<bool, Self::Error> {

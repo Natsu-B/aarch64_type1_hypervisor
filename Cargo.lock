@@ -121,6 +121,7 @@ dependencies = [
  "dtb",
  "elf",
  "file",
+ "gdb_remote",
  "mutex",
  "typestate",
 ]

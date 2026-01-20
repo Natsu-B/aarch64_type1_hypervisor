@@ -39,7 +39,7 @@ impl SystemTimer {
     }
 }
 
-fn read_counter_frequency() -> u64 {
+pub fn read_counter_frequency() -> u64 {
     let current_frequency;
     // SAFETY: Reading CNTFRQ_EL0 is permitted in EL2 in this project and has no side effects.
     unsafe {
@@ -48,7 +48,7 @@ fn read_counter_frequency() -> u64 {
     current_frequency
 }
 
-fn read_counter() -> u64 {
+pub fn read_counter() -> u64 {
     // Synchronize before sampling the counter.
     isb();
     let counter;

@@ -11,6 +11,7 @@ file = { path = "../file" }
 elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
 byte_stream = { path = "../byte_stream" }
+gdb_remote = { path = "../gdb_remote" }
 mutex = { path = "../mutex" }
 
 [profile.release]

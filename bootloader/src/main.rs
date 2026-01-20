@@ -11,8 +11,6 @@ mod gdb_uart;
 mod handler;
 mod irq_decode;
 mod vgic;
-use alloc::alloc::alloc;
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use allocator::define_global_allocator;
@@ -26,14 +24,12 @@ use arch_hal::gic::EoiMode;
 use arch_hal::gic::GicCpuConfig;
 use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::GicDistributor;
-use arch_hal::gic::GicPpi;
 use arch_hal::gic::IrqGroup;
 use arch_hal::gic::SpiRoute;
 use arch_hal::gic::TriggerMode;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
-use arch_hal::pl011;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::timer::SystemTimer;
@@ -135,8 +131,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                         let mut tmp = None;
                         view.for_each_interrupt_specifier(&mut |cells| {
                             tmp = Some(
-                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec")
-                                    + 32,
+                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"),
                             );
                             ControlFlow::Break(())
                         })
@@ -155,8 +150,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                         let mut tmp = None;
                         view.for_each_interrupt_specifier(&mut |cells| {
                             tmp = Some(
-                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec")
-                                    + 32,
+                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"),
                             );
                             ControlFlow::Break(())
                         })
@@ -256,7 +250,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     ];
     let (paging_data, paging_count) = build_stage2_identity_map(parange_bits, &excludes);
     Stage2Paging::init_stage2paging(&paging_data[..paging_count], &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation(false);
+    Stage2Paging::enable_stage2_translation(true);
     println!("paging success!!!");
     println!("setup exception");
     exceptions::setup_exception();
@@ -328,7 +322,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     }
 }
 
-extern "C" fn el1_main() {
+extern "C" fn el1_main() -> ! {
     let hello = "hello world from el1_main\n";
     for i in hello.as_bytes() {
         unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
@@ -475,12 +469,12 @@ fn init_gicv2_for_gdb(
     let gic =
         gic::gicv2::Gicv2::new(info.dist, info.cpu, virt, None).map_err(|_| "gic: init failed")?;
     gic.init_distributor().map_err(|_| "gic: init dist")?;
-    let _caps = gic.init_cpu_interface().map_err(|_| "gic: init cpu")?;
+    let caps = gic.init_cpu_interface().map_err(|_| "gic: init cpu")?;
     let cfg = GicCpuConfig {
         priority_mask: 0xff,
         enable_group0: false,
         enable_group1: true,
-        binary_point: BinaryPoint::Common(0),
+        binary_point: BinaryPoint::Common(caps.binary_points_min),
         eoi_mode: EoiMode::DropAndDeactivate,
     };
     gic.configure(&cfg).map_err(|_| "gic: configure")?;
