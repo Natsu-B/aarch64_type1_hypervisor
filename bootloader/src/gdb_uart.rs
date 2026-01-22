@@ -1,6 +1,8 @@
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::pl011::FifoLevel;
 use arch_hal::pl011::Pl011Uart;
+use arch_hal::pl011::UARTICR;
+use arch_hal::pl011::UARTIMSC;
 use arch_hal::timer;
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering;
@@ -8,13 +10,14 @@ use gdb_remote::RspFrameAssembler;
 use gdb_remote::RspFrameEvent;
 use mutex::pod::RawAtomicPod;
 
-const RX_RING_SIZE: usize = 1024;
-const PREFETCH_CAP: usize = RX_RING_SIZE + 4;
+const RX_RING_SIZE: usize = 4096;
+const PREFETCH_CAP: usize = 1024 + 4;
 const NAK_ATTEMPTS: usize = 32;
 const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
 // Publish debug entry state without relying on higher-level locking.
 static DEBUG_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
 static ATTACH_REASON: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
 
 struct RxRing<const N: usize> {
@@ -55,6 +58,11 @@ impl<const N: usize> RxRing<N> {
         self.tail = (self.tail + 1) % N;
         Some(byte)
     }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+    }
 }
 
 struct GdbUartState<const N: usize> {
@@ -83,11 +91,46 @@ pub fn init(base: usize, clock_hz: u64, baud: u32) {
     *guard = Some(state);
 }
 
+pub struct StopLoopGuard;
+
+pub fn begin_stop_loop() -> StopLoopGuard {
+    STOP_LOOP_ACTIVE.store(true, Ordering::Release);
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    if let Some(state) = guard.as_mut() {
+        let mask = UARTIMSC::new()
+            .set(UARTIMSC::rxim, 1)
+            .set(UARTIMSC::rtim, 1);
+        state.uart.disable_interrupts(mask);
+        let icr = UARTICR::new().set(UARTICR::rxic, 1).set(UARTICR::rtic, 1);
+        state.uart.clear_interrupts(icr);
+    }
+    StopLoopGuard
+}
+
+impl Drop for StopLoopGuard {
+    fn drop(&mut self) {
+        let mut guard = GDB_UART_STATE.lock_irqsave();
+        if let Some(state) = guard.as_mut() {
+            state.prefetch_len = 0;
+            state.prefetch_pos = 0;
+            state.rx.clear();
+            state.uart.enable_rx_interrupts(FifoLevel::OneQuarter, true);
+        }
+        STOP_LOOP_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 pub fn handle_irq() {
+    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     let Some(state) = guard.as_mut() else {
         return;
     };
+    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     state.uart.handle_rx_irq(&mut |byte| {
         let _ = state.rx.push_drop_newest(byte);
         if !DEBUG_ACTIVE.load(Ordering::Acquire) {
@@ -267,7 +310,7 @@ fn pop_rx_once() -> Option<u8> {
     guard.as_mut()?.rx.pop()
 }
 
-fn pop_prefetch_or_rx() -> Option<u8> {
+pub fn try_read_byte() -> Option<u8> {
     let mut guard = GDB_UART_STATE.lock_irqsave();
     let Some(state) = guard.as_mut() else {
         return None;
@@ -281,11 +324,13 @@ fn pop_prefetch_or_rx() -> Option<u8> {
         }
         return Some(byte);
     }
-    state.rx.pop()
-}
-
-pub fn try_read_byte() -> Option<u8> {
-    pop_prefetch_or_rx()
+    if let Some(byte) = state.rx.pop() {
+        return Some(byte);
+    }
+    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+        return state.uart.try_read_byte();
+    }
+    None
 }
 
 pub fn try_write_byte(byte: u8) -> bool {

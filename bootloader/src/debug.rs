@@ -17,7 +17,8 @@ use core::sync::atomic::Ordering;
 use mutex::pod::RawAtomicPod;
 
 const PAGE_SIZE: usize = 0x1000;
-const MAX_GDB_PKT: usize = 1024;
+const MAX_GDB_PKT: usize = 8192;
+const MAX_GDB_TX_CAP: usize = 16384;
 const ATTACH_DEADLINE_MS: u64 = 5000;
 // Set to 0 to disable the post-attach idle timeout.
 const IDLE_TIMEOUT_MS: u64 = 60000;
@@ -51,8 +52,9 @@ impl MemoryAccess for Stage2Memory {
     }
 }
 
-static GDB_STUB: SyncUnsafeCell<MaybeUninit<Aarch64GdbStub<Stage2Memory, MAX_GDB_PKT>>> =
-    SyncUnsafeCell::new(MaybeUninit::uninit());
+type GdbStub = Aarch64GdbStub<Stage2Memory, MAX_GDB_PKT, MAX_GDB_TX_CAP>;
+
+static GDB_STUB: SyncUnsafeCell<MaybeUninit<GdbStub>> = SyncUnsafeCell::new(MaybeUninit::uninit());
 static GUEST_IPA_BASE: RawAtomicPod<u64> = RawAtomicPod::new_raw(0);
 static GUEST_IPA_SIZE: RawAtomicPod<u64> = RawAtomicPod::new_raw(0);
 static MEMORY_MAP_BUF: SyncUnsafeCell<[u8; 1024]> = SyncUnsafeCell::new([0; 1024]);
@@ -107,7 +109,7 @@ pub(crate) fn init_gdb_stub() {
             try_write: gdb_uart::try_write_byte,
             flush: gdb_uart::flush,
         });
-        stub.write(Aarch64GdbStub::new(Stage2Memory));
+        stub.write(GdbStub::new(Stage2Memory));
         aarch64_gdb::register_debug_stub(stub.assume_init_mut());
     }
 }
@@ -148,6 +150,7 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
         return;
     }
 
+    let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_entry(regs, cause);
     cpu::irq_restore(saved_daif);
 }

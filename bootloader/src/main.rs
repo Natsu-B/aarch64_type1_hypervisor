@@ -359,6 +359,9 @@ extern "C" fn el1_main() -> ! {
     for i in hello.as_bytes() {
         unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
     }
+    unsafe {
+        core::arch::asm!("mov x1, {}", in(reg) *DTB_ADDR.get());
+    }
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
@@ -613,18 +616,20 @@ fn build_stage2_guest_map() -> ([Stage2PagingSetting; 1], usize, Option<(usize, 
 
     let mut reserved_raw = [Range { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
     let mut reserved_count = 0usize;
-    GLOBAL_ALLOCATOR.for_each_reserved_region(|base, size| {
-        if size == 0 || reserved_count >= reserved_raw.len() {
-            return;
-        }
-        let start = align_down(base, PAGE_SIZE);
-        let end = align_up(base.saturating_add(size), PAGE_SIZE);
-        if end <= start {
-            return;
-        }
-        reserved_raw[reserved_count] = Range { start, end };
-        reserved_count += 1;
-    });
+    GLOBAL_ALLOCATOR
+        .for_each_reserved_region(|base, size| {
+            if size == 0 || reserved_count >= reserved_raw.len() {
+                return;
+            }
+            let start = align_down(base, PAGE_SIZE);
+            let end = align_up(base.saturating_add(size), PAGE_SIZE);
+            if end <= start {
+                return;
+            }
+            reserved_raw[reserved_count] = Range { start, end };
+            reserved_count += 1;
+        })
+        .unwrap();
 
     for i in 0..reserved_count {
         for j in i + 1..reserved_count {
