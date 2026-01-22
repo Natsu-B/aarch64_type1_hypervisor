@@ -203,6 +203,7 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
     breakpoints: SwBreakpointTable<N>,
     desc: Aarch64TargetDesc,
     features_active: bool,
+    memory_map: Option<&'static [u8]>,
 }
 
 impl<M, const N: usize> Aarch64GdbState<M, N> {
@@ -212,11 +213,16 @@ impl<M, const N: usize> Aarch64GdbState<M, N> {
             breakpoints: SwBreakpointTable::new(),
             desc: Aarch64TargetDesc::new(),
             features_active: false,
+            memory_map: None,
         }
     }
 
     pub fn target<'a>(&'a mut self, regs: &'a mut Registers) -> Aarch64GdbTarget<'a, M, N> {
         Aarch64GdbTarget { regs, state: self }
+    }
+
+    pub fn set_memory_map(&mut self, data: Option<&'static [u8]>) {
+        self.memory_map = data;
     }
 }
 
@@ -337,7 +343,13 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
     type UnrecoverableError = core::convert::Infallible;
 
     fn capabilities(&self) -> TargetCapabilities {
-        TargetCapabilities::SW_BREAK | TargetCapabilities::VCONT | TargetCapabilities::XFER_FEATURES
+        let mut caps = TargetCapabilities::SW_BREAK
+            | TargetCapabilities::VCONT
+            | TargetCapabilities::XFER_FEATURES;
+        if self.state.memory_map.is_some() {
+            caps |= TargetCapabilities::XFER_MEMORY_MAP;
+        }
+        caps
     }
 
     fn recoverable_error_code(&self, e: &Self::RecoverableError) -> u8 {
@@ -357,6 +369,12 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             self.state.features_active = true;
         }
         Ok(data)
+    }
+
+    fn xfer_memory_map(
+        &mut self,
+    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        Ok(self.state.memory_map)
     }
 
     fn read_registers(
@@ -650,6 +668,10 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             state: Aarch64GdbState::new(mem),
             pending_step: None,
         }
+    }
+
+    pub fn set_memory_map(&mut self, data: Option<&'static [u8]>) {
+        self.state.set_memory_map(data);
     }
 
     pub fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {

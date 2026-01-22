@@ -232,23 +232,55 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         "gdb uart addr: 0x{:X}, size: 0x{:X}",
         gdb_uart.base, gdb_uart.size
     );
-    let parange_bits: u32 = match cpu::get_parange().unwrap() {
-        cpu::registers::PARange::PA32bits4GB => 32,
-        cpu::registers::PARange::PA36bits64GB => 36,
-        cpu::registers::PARange::PA40bits1TB => 40,
-        cpu::registers::PARange::PA42bits4TB => 42,
-        cpu::registers::PARange::PA44bits16TB => 44,
-        cpu::registers::PARange::PA48bits256TB => 48,
-        cpu::registers::PARange::PA52bits4PB => 52,
-        cpu::registers::PARange::PA56bits64PB => 56,
+    let (paging_data, paging_count, guest_window) = build_stage2_guest_map();
+    let (guest_ipa_base, guest_ipa_size) = if let Some((ipa_base, ipa_size)) = guest_window {
+        debug::set_guest_ipa_window(ipa_base as u64, ipa_size as u64);
+        (ipa_base, ipa_size)
+    } else {
+        debug::set_guest_ipa_window(0, 0);
+        (0, 0)
     };
-    let excludes = [
-        (guest_uart.base, guest_uart.size),
-        (gdb_uart.base, gdb_uart.size),
-        (gic_info.dist.base, gic_info.dist.size),
-        (gic_info.cpu.base, gic_info.cpu.size),
-    ];
-    let (paging_data, paging_count) = build_stage2_identity_map(parange_bits, &excludes);
+    if guest_ipa_size != 0 {
+        let mut rom_ranges = [(0u64, 0u64); 1];
+        let mut rom_count = 0usize;
+        if let Some(mem_base) = lowest_memory_base() {
+            if guest_ipa_base > mem_base {
+                rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
+                rom_count = 1;
+            }
+        }
+
+        let mut io_ranges = [(0u64, 0u64); 6];
+        let mut io_count = 0usize;
+        io_ranges[io_count] = (guest_uart.base as u64, guest_uart.size as u64);
+        io_count += 1;
+        io_ranges[io_count] = (gdb_uart.base as u64, gdb_uart.size as u64);
+        io_count += 1;
+        io_ranges[io_count] = (gic_info.dist.base as u64, gic_info.dist.size as u64);
+        io_count += 1;
+        io_ranges[io_count] = (gic_info.cpu.base as u64, gic_info.cpu.size as u64);
+        io_count += 1;
+        if let Some(gich) = gic_info.gich {
+            io_ranges[io_count] = (gich.base as u64, gich.size as u64);
+            io_count += 1;
+        }
+        if let Some(gicv) = gic_info.gicv {
+            io_ranges[io_count] = (gicv.base as u64, gicv.size as u64);
+            io_count += 1;
+        }
+
+        debug::set_memory_map(
+            guest_ipa_base as u64,
+            guest_ipa_size as u64,
+            &rom_ranges[..rom_count],
+            &io_ranges[..io_count],
+        );
+    } else {
+        debug::set_memory_map(0, 0, &[], &[]);
+    }
+    if paging_count == 0 {
+        panic!("stage2: no guest RAM to map");
+    }
     Stage2Paging::init_stage2paging(&paging_data[..paging_count], &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(true);
     println!("paging success!!!");
@@ -370,6 +402,26 @@ fn record_memory_region(base: usize, size: usize) {
         regions[*count] = MemoryRegion { base, size };
         *count += 1;
     }
+}
+
+fn lowest_memory_base() -> Option<usize> {
+    let mut min_base: Option<usize> = None;
+    // SAFETY: early boot records memory regions before secondary cores or interrupts are enabled.
+    unsafe {
+        let count = (*MEM_REGION_COUNT.get()).min(MAX_MEM_REGIONS);
+        let regions = &*MEM_REGIONS.get();
+        for idx in 0..count {
+            let region = regions[idx];
+            if region.size == 0 {
+                continue;
+            }
+            min_base = Some(match min_base {
+                Some(current) => current.min(region.base),
+                None => region.base,
+            });
+        }
+    }
+    min_base
 }
 
 fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
@@ -508,56 +560,147 @@ fn align_up(value: usize, align: usize) -> usize {
     value.checked_add(align - 1).unwrap_or(usize::MAX) & !(align - 1)
 }
 
-fn build_stage2_identity_map(
-    parange_bits: u32,
-    excludes: &[(usize, usize)],
-) -> ([Stage2PagingSetting; 5], usize) {
+fn build_stage2_guest_map() -> ([Stage2PagingSetting; 1], usize, Option<(usize, usize)>) {
     const PAGE_SIZE: usize = 0x1000;
-    const MAX_EXCLUDES: usize = 4;
-    const MAX_SEGMENTS: usize = 5;
+    const MAX_RESERVED_REGIONS: usize = 32;
 
-    let limit = 1usize
-        .checked_shl(parange_bits)
-        .expect("parange exceeds usize width");
-
-    let mut raw = [Range { start: 0, end: 0 }; MAX_EXCLUDES];
-    let mut raw_count = 0usize;
-    for &(base, size) in excludes.iter() {
-        if size == 0 || raw_count >= raw.len() {
-            continue;
+    let mut mem_raw = [Range { start: 0, end: 0 }; MAX_MEM_REGIONS];
+    let mut mem_count = 0usize;
+    // SAFETY: early boot records memory regions before secondary cores or interrupts are enabled.
+    unsafe {
+        let total = (*MEM_REGION_COUNT.get()).min(MAX_MEM_REGIONS);
+        let regions = &*MEM_REGIONS.get();
+        for idx in 0..total {
+            let region = regions[idx];
+            if region.size == 0 {
+                continue;
+            }
+            let start = align_down(region.base, PAGE_SIZE);
+            let end = align_up(region.base.saturating_add(region.size), PAGE_SIZE);
+            if end <= start {
+                continue;
+            }
+            mem_raw[mem_count] = Range { start, end };
+            mem_count += 1;
         }
-        let start = align_down(base, PAGE_SIZE);
-        let end = align_up(base.saturating_add(size), PAGE_SIZE).min(limit);
-        if start >= limit || end <= start {
-            continue;
-        }
-        raw[raw_count] = Range { start, end };
-        raw_count += 1;
     }
 
-    for i in 0..raw_count {
-        for j in i + 1..raw_count {
-            if raw[i].start > raw[j].start {
-                raw.swap(i, j);
+    for i in 0..mem_count {
+        for j in i + 1..mem_count {
+            if mem_raw[i].start > mem_raw[j].start {
+                mem_raw.swap(i, j);
             }
         }
     }
 
-    let mut merged = [Range { start: 0, end: 0 }; MAX_EXCLUDES];
-    let mut merged_count = 0usize;
-    for idx in 0..raw_count {
-        let r = raw[idx];
-        if merged_count == 0 {
-            merged[0] = r;
-            merged_count = 1;
+    let mut mem_ranges = [Range { start: 0, end: 0 }; MAX_MEM_REGIONS];
+    let mut mem_ranges_count = 0usize;
+    for idx in 0..mem_count {
+        let r = mem_raw[idx];
+        if mem_ranges_count == 0 {
+            mem_ranges[0] = r;
+            mem_ranges_count = 1;
             continue;
         }
-        let last = &mut merged[merged_count - 1];
+        let last = &mut mem_ranges[mem_ranges_count - 1];
         if r.start <= last.end {
             last.end = last.end.max(r.end);
         } else {
-            merged[merged_count] = r;
-            merged_count += 1;
+            mem_ranges[mem_ranges_count] = r;
+            mem_ranges_count += 1;
+        }
+    }
+
+    let mut reserved_raw = [Range { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
+    let mut reserved_count = 0usize;
+    GLOBAL_ALLOCATOR.for_each_reserved_region(|base, size| {
+        if size == 0 || reserved_count >= reserved_raw.len() {
+            return;
+        }
+        let start = align_down(base, PAGE_SIZE);
+        let end = align_up(base.saturating_add(size), PAGE_SIZE);
+        if end <= start {
+            return;
+        }
+        reserved_raw[reserved_count] = Range { start, end };
+        reserved_count += 1;
+    });
+
+    for i in 0..reserved_count {
+        for j in i + 1..reserved_count {
+            if reserved_raw[i].start > reserved_raw[j].start {
+                reserved_raw.swap(i, j);
+            }
+        }
+    }
+
+    let mut reserved = [Range { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
+    let mut reserved_merged_count = 0usize;
+    for idx in 0..reserved_count {
+        let r = reserved_raw[idx];
+        if reserved_merged_count == 0 {
+            reserved[0] = r;
+            reserved_merged_count = 1;
+            continue;
+        }
+        let last = &mut reserved[reserved_merged_count - 1];
+        if r.start <= last.end {
+            last.end = last.end.max(r.end);
+        } else {
+            reserved[reserved_merged_count] = r;
+            reserved_merged_count += 1;
+        }
+    }
+
+    let mut best: Option<Range> = None;
+    for idx in 0..mem_ranges_count {
+        let mem = mem_ranges[idx];
+        let mut cursor = mem.start;
+        for ridx in 0..reserved_merged_count {
+            let r = reserved[ridx];
+            if r.end <= cursor {
+                continue;
+            }
+            if r.start >= mem.end {
+                break;
+            }
+            let res_start = r.start.max(mem.start);
+            if res_start > cursor {
+                let seg = Range {
+                    start: cursor,
+                    end: res_start.min(mem.end),
+                };
+                best = match best {
+                    Some(current) => {
+                        if seg.end - seg.start > current.end - current.start {
+                            Some(seg)
+                        } else {
+                            Some(current)
+                        }
+                    }
+                    None => Some(seg),
+                };
+            }
+            cursor = r.end.max(cursor);
+            if cursor >= mem.end {
+                break;
+            }
+        }
+        if cursor < mem.end {
+            let seg = Range {
+                start: cursor,
+                end: mem.end,
+            };
+            best = match best {
+                Some(current) => {
+                    if seg.end - seg.start > current.end - current.start {
+                        Some(seg)
+                    } else {
+                        Some(current)
+                    }
+                }
+                None => Some(seg),
+            };
         }
     }
 
@@ -567,33 +710,19 @@ fn build_stage2_identity_map(
         size: 0,
         types: Stage2PageTypes::Normal,
     });
-    let mut seg_count = 0usize;
-    let mut cursor = 0usize;
-    for idx in 0..merged_count {
-        let r = merged[idx];
-        if cursor < r.start {
-            settings[seg_count] = Stage2PagingSetting {
-                ipa: cursor,
-                pa: cursor,
-                size: r.start - cursor,
-                types: Stage2PageTypes::Normal,
-            };
-            seg_count += 1;
-        }
-        cursor = r.end;
-    }
-    if cursor < limit {
-        settings[seg_count] = Stage2PagingSetting {
-            ipa: cursor,
-            pa: cursor,
-            size: limit - cursor,
+
+    if let Some(seg) = best {
+        let size = seg.end.saturating_sub(seg.start);
+        settings[0] = Stage2PagingSetting {
+            ipa: seg.start,
+            pa: seg.start,
+            size,
             types: Stage2PageTypes::Normal,
         };
-        seg_count += 1;
+        return (settings, 1, Some((seg.start, size)));
     }
 
-    debug_assert!(seg_count > 0 && seg_count <= MAX_SEGMENTS);
-    (settings, seg_count)
+    (settings, 0, None)
 }
 
 fn apply_guest_uart_dt_edit(

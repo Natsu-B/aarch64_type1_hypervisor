@@ -13,6 +13,8 @@ use core::cell::SyncUnsafeCell;
 use core::cmp::min;
 use core::mem::MaybeUninit;
 use core::ptr;
+use core::sync::atomic::Ordering;
+use mutex::pod::RawAtomicPod;
 
 const PAGE_SIZE: usize = 0x1000;
 const MAX_GDB_PKT: usize = 1024;
@@ -51,6 +53,50 @@ impl MemoryAccess for Stage2Memory {
 
 static GDB_STUB: SyncUnsafeCell<MaybeUninit<Aarch64GdbStub<Stage2Memory, MAX_GDB_PKT>>> =
     SyncUnsafeCell::new(MaybeUninit::uninit());
+static GUEST_IPA_BASE: RawAtomicPod<u64> = RawAtomicPod::new_raw(0);
+static GUEST_IPA_SIZE: RawAtomicPod<u64> = RawAtomicPod::new_raw(0);
+static MEMORY_MAP_BUF: SyncUnsafeCell<[u8; 1024]> = SyncUnsafeCell::new([0; 1024]);
+
+pub fn set_guest_ipa_window(ipa_base: u64, ipa_size: u64) {
+    GUEST_IPA_BASE.store(ipa_base, Ordering::Release);
+    GUEST_IPA_SIZE.store(ipa_size, Ordering::Release);
+}
+
+pub fn set_memory_map(
+    guest_ram_base: u64,
+    guest_ram_size: u64,
+    rom_ranges: &[(u64, u64)],
+    io_ranges: &[(u64, u64)],
+) {
+    if guest_ram_size == 0 {
+        set_stub_memory_map(None);
+        return;
+    }
+
+    let buf = unsafe { &mut *MEMORY_MAP_BUF.get() };
+    let mut idx = 0usize;
+    let mut ok = append_bytes(buf, &mut idx, b"<memory-map>\n");
+    for &(start, len) in rom_ranges {
+        if len == 0 {
+            continue;
+        }
+        ok &= append_memory_entry(buf, &mut idx, b"rom", start, len);
+    }
+    for &(start, len) in io_ranges {
+        if len == 0 {
+            continue;
+        }
+        ok &= append_memory_entry(buf, &mut idx, b"io", start, len);
+    }
+    ok &= append_memory_entry(buf, &mut idx, b"ram", guest_ram_base, guest_ram_size);
+    ok &= append_bytes(buf, &mut idx, b"</memory-map>\n");
+
+    if ok {
+        set_stub_memory_map(Some(&buf[..idx]));
+    } else {
+        set_stub_memory_map(None);
+    }
+}
 
 pub(crate) fn init_gdb_stub() {
     // SAFETY: called once during early boot, before debug exceptions are enabled.
@@ -106,7 +152,88 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
     cpu::irq_restore(saved_daif);
 }
 
+fn guest_ipa_contains(ipa: u64, len: usize) -> bool {
+    let base = GUEST_IPA_BASE.load(Ordering::Acquire);
+    let size = GUEST_IPA_SIZE.load(Ordering::Acquire);
+    if size == 0 {
+        return false;
+    }
+    let len = match u64::try_from(len) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let end = match ipa.checked_add(len) {
+        Some(value) => value,
+        None => return false,
+    };
+    let limit = match base.checked_add(size) {
+        Some(value) => value,
+        None => return false,
+    };
+    ipa >= base && end <= limit
+}
+
+fn set_stub_memory_map(data: Option<&'static [u8]>) {
+    // SAFETY: called during early boot before concurrent debug entry.
+    unsafe {
+        let stub = &mut *GDB_STUB.get();
+        let stub = stub.assume_init_mut();
+        stub.set_memory_map(data);
+    }
+}
+
+fn append_bytes(buf: &mut [u8], idx: &mut usize, bytes: &[u8]) -> bool {
+    if buf.len().saturating_sub(*idx) < bytes.len() {
+        return false;
+    }
+    let end = *idx + bytes.len();
+    buf[*idx..end].copy_from_slice(bytes);
+    *idx = end;
+    true
+}
+
+fn append_memory_entry(buf: &mut [u8], idx: &mut usize, kind: &[u8], start: u64, len: u64) -> bool {
+    let mut ok = append_bytes(buf, idx, b"<memory type=\"");
+    ok &= append_bytes(buf, idx, kind);
+    ok &= append_bytes(buf, idx, b"\" start=\"0x");
+    ok &= append_hex_u64(buf, idx, start);
+    ok &= append_bytes(buf, idx, b"\" length=\"0x");
+    ok &= append_hex_u64(buf, idx, len);
+    ok &= append_bytes(buf, idx, b"\"/>\n");
+    ok
+}
+
+fn append_hex_u64(buf: &mut [u8], idx: &mut usize, val: u64) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 16];
+    let mut len = 0usize;
+    let mut value = val;
+
+    if value == 0 {
+        tmp[0] = b'0';
+        len = 1;
+    } else {
+        while value != 0 {
+            tmp[len] = HEX[(value & 0xf) as usize];
+            len += 1;
+            value >>= 4;
+        }
+    }
+
+    if buf.len().saturating_sub(*idx) < len {
+        return false;
+    }
+    for i in 0..len {
+        buf[*idx + i] = tmp[len - 1 - i];
+    }
+    *idx += len;
+    true
+}
+
 fn copy_from_guest_ipa(ipa: u64, dst: &mut [u8]) -> Result<(), PagingErr> {
+    if !guest_ipa_contains(ipa, dst.len()) {
+        return Err(PagingErr::Stage2Fault);
+    }
     if ipa > usize::MAX as u64 {
         return Err(PagingErr::Corrupted);
     }
@@ -130,6 +257,9 @@ fn copy_from_guest_ipa(ipa: u64, dst: &mut [u8]) -> Result<(), PagingErr> {
 }
 
 fn copy_to_guest_ipa(ipa: u64, src: &[u8]) -> Result<(), PagingErr> {
+    if !guest_ipa_contains(ipa, src.len()) {
+        return Err(PagingErr::Stage2Fault);
+    }
     if ipa > usize::MAX as u64 {
         return Err(PagingErr::Corrupted);
     }

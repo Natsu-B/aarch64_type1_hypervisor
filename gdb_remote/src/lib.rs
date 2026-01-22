@@ -636,6 +636,9 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             if caps.contains(TargetCapabilities::XFER_FEATURES) {
                 append_bytes(&mut reply, &mut idx, b";qXfer:features:read+");
             }
+            if caps.contains(TargetCapabilities::XFER_MEMORY_MAP) {
+                append_bytes(&mut reply, &mut idx, b";qXfer:memory-map:read+");
+            }
             if wants_aarch64_xml {
                 append_bytes(&mut reply, &mut idx, b";xmlRegisters=aarch64");
             }
@@ -651,7 +654,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 self.send_empty::<T>()?;
                 return Ok(ProcessResult::None);
             }
-            let Some((annex, offset, length)) = parse_qxfer_features_read(rest) else {
+            let Some((annex, offset, length)) = parse_qxfer_read(rest, false) else {
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
             };
@@ -664,6 +667,82 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             };
 
             let data = match target.xfer_features(annex) {
+                Ok(Some(data)) => data,
+                Ok(None) | Err(TargetError::NotSupported) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+                Err(TargetError::Recoverable(e)) => {
+                    self.reply_recoverable(target, &e)?;
+                    return Ok(ProcessResult::None);
+                }
+                Err(TargetError::Unrecoverable(e)) => {
+                    return Err(GdbError::Target(TargetError::Unrecoverable(e)));
+                }
+            };
+
+            let offset = match usize::try_from(offset) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+            };
+            let length = match usize::try_from(length) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.send::<T>(b"E01")?;
+                    return Ok(ProcessResult::None);
+                }
+            };
+
+            if offset >= data.len() {
+                self.send::<T>(b"l")?;
+                return Ok(ProcessResult::None);
+            }
+
+            let max_len = core::cmp::min(length, data.len() - offset);
+            if max_len == 0 {
+                let prefix = if offset < data.len() { b'm' } else { b'l' };
+                let reply = [prefix];
+                self.send::<T>(&reply)?;
+                return Ok(ProcessResult::None);
+            }
+
+            let cap = self.out_payload_cap();
+            if cap < 1 {
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
+
+            let mut reply = [0u8; MAX_PKT];
+            let (consumed, encoded_len) =
+                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap]);
+            if consumed == 0 {
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
+
+            let more = offset + consumed < data.len();
+            reply[0] = if more { b'm' } else { b'l' };
+            self.send::<T>(&reply[..1 + encoded_len])?;
+            return Ok(ProcessResult::None);
+        }
+
+        if let Some(rest) = payload.strip_prefix(b"qXfer:memory-map:read:") {
+            if !target
+                .capabilities()
+                .contains(TargetCapabilities::XFER_MEMORY_MAP)
+            {
+                self.send_empty::<T>()?;
+                return Ok(ProcessResult::None);
+            }
+            let Some((_annex, offset, length)) = parse_qxfer_read(rest, true) else {
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            };
+
+            let data = match target.xfer_memory_map() {
                 Ok(Some(data)) => data,
                 Ok(None) | Err(TargetError::NotSupported) => {
                     self.send::<T>(b"E01")?;
@@ -1616,12 +1695,12 @@ fn parse_flash_header(buf: &[u8]) -> Option<(u64, u64)> {
     Some((addr, len))
 }
 
-fn parse_qxfer_features_read(buf: &[u8]) -> Option<(&[u8], u64, u64)> {
+fn parse_qxfer_read(buf: &[u8], allow_empty_annex: bool) -> Option<(&[u8], u64, u64)> {
     let mut parts = buf.splitn(2, |&b| b == b':');
     let annex = parts.next()?;
     let rest = parts.next()?;
 
-    if annex.is_empty() {
+    if annex.is_empty() && !allow_empty_annex {
         return None;
     }
 
