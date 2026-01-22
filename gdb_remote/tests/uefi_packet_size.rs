@@ -41,10 +41,10 @@ extern "C" fn efi_main() -> ! {
     let Some(len) = next_payload(&tx[..tx_len], &mut idx, &mut payload) else {
         exit_failure();
     };
-    if !contains(&payload[..len], b"PacketSize=1024") {
+    if !contains(&payload[..len], b"PacketSize=400") {
         exit_failure();
     }
-    if contains(&payload[..len], b"PacketSize=400") {
+    if contains(&payload[..len], b"PacketSize=1024") {
         exit_failure();
     }
 
@@ -64,7 +64,10 @@ extern "C" fn efi_main() -> ! {
     let Some(len) = next_payload(&tx[..tx_len], &mut idx, &mut payload) else {
         exit_failure();
     };
-    if !contains(&payload[..len], b"PacketSize=256") {
+    if !contains(&payload[..len], b"PacketSize=100") {
+        exit_failure();
+    }
+    if contains(&payload[..len], b"PacketSize=256") {
         exit_failure();
     }
 

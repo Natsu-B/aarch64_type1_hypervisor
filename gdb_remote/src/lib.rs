@@ -237,6 +237,11 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         self.rsp.reset();
     }
 
+    /// Reset framing/receive state to wait for the next '$' packet start.
+    pub fn resync(&mut self) {
+        self.reset_rx_full();
+    }
+
     fn push_payload_byte(&mut self, byte: u8) {
         self.rx_checksum = self.rx_checksum.wrapping_add(byte);
         if self.rx_len < self.rx_buf.len() {
@@ -610,8 +615,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             let mut reply = [0u8; 128];
             let mut idx = 0usize;
             append_bytes(&mut reply, &mut idx, b"PacketSize=");
-            // PacketSize is decimal per the RSP specification.
-            append_dec_u64(&mut reply, &mut idx, self.out_payload_cap() as u64);
+            // PacketSize is advertised as lowercase hex without a 0x prefix.
+            append_hex_u64(&mut reply, &mut idx, self.out_payload_cap() as u64);
             append_bytes(&mut reply, &mut idx, b";vMustReplyEmpty+;vFlash+");
             if caps.contains(TargetCapabilities::SW_BREAK) {
                 append_bytes(&mut reply, &mut idx, b";swbreak+");
@@ -1103,6 +1108,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         let header = &payload[..colon];
         let binary = &payload[colon + 1..];
 
+        // RSP "X" packet: X<addr_hex>,<len_hex>:<binary-data>.
+        // Addresses and lengths are hex per the GDB RSP overview.
         let (addr, len) = match parse_addr_len::<T::RecoverableError, T::UnrecoverableError>(header)
         {
             Ok(v) => v,
@@ -1119,25 +1126,46 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             len
         );
 
+        let len_usize = match usize::try_from(len) {
+            Ok(value) => value,
+            Err(_) => {
+                gdb_debug!(self, "handle_write_memory_binary: len overflow");
+                self.send::<T>(b"E03")?;
+                return Ok(ProcessResult::None);
+            }
+        };
+
+        // Decode RSP binary data after checksum validation. The on-wire payload uses 0x7d
+        // escaping (no RLE expansion for incoming data).
         let mut decoded = [0u8; MAX_PKT];
-        let Ok(decoded_len) = decode_rsp_binary(binary, &mut decoded) else {
+        if len_usize > decoded.len() {
+            gdb_debug!(
+                self,
+                "handle_write_memory_binary: len {} exceeds MAX_PKT {}",
+                len_usize,
+                decoded.len()
+            );
+            self.send::<T>(b"E03")?;
+            return Ok(ProcessResult::None);
+        }
+        let Ok(decoded_len) = decode_rsp_binary(binary, &mut decoded[..len_usize]) else {
             // Malformed escape or output buffer overflow.
             gdb_debug!(
                 self,
                 "handle_write_memory_binary: binary decode failed src_len={} dst_cap={}",
                 binary.len(),
-                decoded.len()
+                len_usize
             );
             self.send::<T>(b"E03")?;
             return Ok(ProcessResult::None);
         };
 
-        if decoded_len as u64 != len {
+        if decoded_len != len_usize {
             gdb_debug!(
                 self,
                 "handle_write_memory_binary: decoded_len {} != header_len {}",
                 decoded_len,
-                len
+                len_usize
             );
             self.send::<T>(b"E03")?;
             return Ok(ProcessResult::None);
@@ -1650,8 +1678,8 @@ fn append_bytes(buf: &mut [u8], idx: &mut usize, src: &[u8]) {
     *idx = end;
 }
 
-fn append_dec_u64(buf: &mut [u8], idx: &mut usize, mut val: u64) {
-    let mut tmp = [0u8; 20];
+fn append_hex_u64(buf: &mut [u8], idx: &mut usize, mut val: u64) {
+    let mut tmp = [0u8; 16];
     let mut len = 0usize;
 
     if val == 0 {
@@ -1659,10 +1687,10 @@ fn append_dec_u64(buf: &mut [u8], idx: &mut usize, mut val: u64) {
         len = 1;
     } else {
         while val != 0 {
-            let digit = (val % 10) as u8;
-            tmp[len] = b'0' + digit;
+            let digit = (val & 0xF) as usize;
+            tmp[len] = HEX[digit];
             len += 1;
-            val /= 10;
+            val >>= 4;
         }
     }
 
@@ -1710,24 +1738,31 @@ pub fn hex_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
 }
 
 /// Decode RSP binary data (with 0x7d escaping) into `dst`.
+/// Per the GDB RSP overview, '#' '$' '}' are escaped by prefixing '}' and XOR 0x20.
 /// Returns decoded length on success.
-fn decode_rsp_binary(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
+pub fn decode_rsp_binary(src: &[u8], dst: &mut [u8]) -> Result<usize, ()> {
     let mut in_idx = 0usize;
     let mut out_idx = 0usize;
 
     while in_idx < src.len() {
-        if out_idx >= dst.len() {
-            return Err(());
-        }
-
         let b = src[in_idx];
         if b == b'}' {
             in_idx += 1;
             if in_idx >= src.len() {
                 return Err(());
             }
-            dst[out_idx] = src[in_idx] ^ 0x20;
+            let val = src[in_idx] ^ 0x20;
+            if out_idx >= dst.len() {
+                return Err(());
+            }
+            dst[out_idx] = val;
+            in_idx += 1;
+            out_idx += 1;
+            continue;
         } else {
+            if out_idx >= dst.len() {
+                return Err(());
+            }
             dst[out_idx] = b;
         }
 
@@ -1746,7 +1781,8 @@ fn encode_rsp_binary(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
 
     while in_idx < src.len() {
         let b = src[in_idx];
-        let needs_escape = b == b'$' || b == b'#' || b == b'}';
+        // Escape '$', '#', '}' per RSP; escape '*' to avoid triggering GDB RLE parsing.
+        let needs_escape = b == b'$' || b == b'#' || b == b'}' || b == b'*';
         let needed = if needs_escape { 2 } else { 1 };
 
         if out_idx + needed > dst.len() {

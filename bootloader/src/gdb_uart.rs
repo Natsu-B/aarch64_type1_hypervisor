@@ -137,7 +137,12 @@ pub enum PrefetchResult {
     Unavailable,
 }
 
-pub fn prefetch_first_rsp_frame(deadline_ticks: u64) -> PrefetchResult {
+// Wait for the first byte within the attach deadline, then extend the timeout
+// on every subsequent byte to avoid tearing down slow-but-active transfers.
+pub fn prefetch_first_rsp_frame(
+    attach_deadline_ticks: u64,
+    idle_timeout_ticks: u64,
+) -> PrefetchResult {
     clear_prefetch();
     {
         let guard = GDB_UART_STATE.lock_irqsave();
@@ -150,8 +155,16 @@ pub fn prefetch_first_rsp_frame(deadline_ticks: u64) -> PrefetchResult {
     let mut buf = [0u8; PREFETCH_CAP];
     let mut len = 0usize;
 
+    let mut attached = false;
+    let mut deadline_ticks = attach_deadline_ticks;
+
     loop {
-        if timer::read_counter() >= deadline_ticks {
+        let now = timer::read_counter();
+        if !attached {
+            if now >= deadline_ticks {
+                return fail_prefetch(PrefetchResult::Timeout);
+            }
+        } else if idle_timeout_ticks != 0 && now >= deadline_ticks {
             return fail_prefetch(PrefetchResult::Timeout);
         }
 
@@ -159,6 +172,11 @@ pub fn prefetch_first_rsp_frame(deadline_ticks: u64) -> PrefetchResult {
             spin_loop();
             continue;
         };
+
+        attached = true;
+        if idle_timeout_ticks != 0 {
+            deadline_ticks = timer::read_counter().saturating_add(idle_timeout_ticks);
+        }
 
         let event = assembler.push(byte);
         match event {

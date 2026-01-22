@@ -16,7 +16,9 @@ use core::ptr;
 
 const PAGE_SIZE: usize = 0x1000;
 const MAX_GDB_PKT: usize = 1024;
-const ATTACH_DEADLINE_MS: u64 = 20;
+const ATTACH_DEADLINE_MS: u64 = 5000;
+// Set to 0 to disable the post-attach idle timeout.
+const IDLE_TIMEOUT_MS: u64 = 60000;
 
 struct DebugActiveGuard;
 
@@ -85,10 +87,16 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
 
     let now = timer::read_counter();
     let freq = timer::read_counter_frequency();
-    let ticks = (u128::from(freq) * u128::from(ATTACH_DEADLINE_MS)) / 1000;
-    let deadline = now.saturating_add(ticks as u64);
+    let attach_ticks = (u128::from(freq) * u128::from(ATTACH_DEADLINE_MS)) / 1000;
+    let attach_deadline = now.saturating_add(attach_ticks as u64);
+    let idle_ticks = if IDLE_TIMEOUT_MS == 0 {
+        0
+    } else {
+        let ticks = (u128::from(freq) * u128::from(IDLE_TIMEOUT_MS)) / 1000;
+        ticks.min(u128::from(u64::MAX)) as u64
+    };
 
-    let prefetch = gdb_uart::prefetch_first_rsp_frame(deadline);
+    let prefetch = gdb_uart::prefetch_first_rsp_frame(attach_deadline, idle_ticks);
     if prefetch != gdb_uart::PrefetchResult::Success {
         cpu::irq_restore(saved_daif);
         return;

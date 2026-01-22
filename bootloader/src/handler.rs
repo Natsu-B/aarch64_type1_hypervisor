@@ -145,14 +145,14 @@ fn gic_access_size(access_width: SyndromeAccessSize) -> Option<Gicv2AccessSize> 
 
 fn irq_handler(regs: &mut cpu::Registers) {
     // SAFETY: IRQ handler runs after GIC is initialized.
-    println!("irq_handler called");
+    // println!("irq_handler called");
     let Some(gic) = (unsafe { &*GICV2.get() }) else {
         return;
     };
     let Ok(Some(ack)) = gic.acknowledge() else {
         return;
     };
-    println!("irq_handler ack intid: {}", ack.intid);
+    // println!("irq_handler ack intid: {}", ack.intid);
     // SAFETY: GDB UART INTID is written once during boot and then read-only.
     let gdb_intid = unsafe { *GDB_UART_INTID.get() };
     if gdb_uart::is_debug_active() {

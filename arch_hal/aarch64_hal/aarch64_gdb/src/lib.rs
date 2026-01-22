@@ -5,6 +5,7 @@ use core::hint::spin_loop;
 use cpu::Registers;
 use cpu::registers::MDSCR_EL1;
 use exceptions::registers::ExceptionClass;
+use gdb_remote::GdbError;
 use gdb_remote::GdbServer;
 use gdb_remote::ProcessResult;
 use gdb_remote::ResumeAction;
@@ -712,6 +713,9 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                             Ok(ProcessResult::Resume(action)) => break 'debug action,
                             Ok(ProcessResult::MonitorExit) => return,
                             Ok(ProcessResult::None) => {}
+                            Err(GdbError::MalformedPacket | GdbError::PacketTooLong) => {
+                                self.server.resync();
+                            }
                             Err(_) => return,
                         }
                     }
