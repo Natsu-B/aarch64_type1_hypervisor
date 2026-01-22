@@ -106,7 +106,14 @@ pub const fn reg_offset(regnum: usize) -> Option<(usize, usize)> {
 }
 
 pub const DEFAULT_SW_BREAKPOINTS: usize = 8;
+pub const DEFAULT_HW_BREAKPOINTS: usize = 8;
 const BRK_INSN: u32 = 0xD420_0000;
+const DBGBCR_E: u64 = 1 << 0;
+const DBGBCR_PMC_SHIFT: u64 = 1;
+const DBGBCR_BAS_SHIFT: u64 = 5;
+const DBGBCR_PMC_EL0_EL1: u64 = 0b11 << DBGBCR_PMC_SHIFT;
+const DBGBCR_BAS_ALL: u64 = 0b1111 << DBGBCR_BAS_SHIFT;
+const DBGBCR_INSN: u64 = DBGBCR_E | DBGBCR_PMC_EL0_EL1 | DBGBCR_BAS_ALL;
 
 pub trait MemoryAccess {
     type Error;
@@ -155,6 +162,7 @@ pub enum Aarch64GdbError<E> {
     BufferTooSmall,
     UnalignedAddress,
     BreakpointTableFull,
+    InvalidBreakpointKind,
 }
 
 #[derive(Clone, Copy)]
@@ -198,9 +206,57 @@ impl<const N: usize> SwBreakpointTable<N> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HwBreakpoint {
+    addr: u64,
+    hw_index: usize,
+    used: bool,
+}
+
+impl HwBreakpoint {
+    const fn empty() -> Self {
+        Self {
+            addr: 0,
+            hw_index: 0,
+            used: false,
+        }
+    }
+}
+
+struct HwBreakpointTable<const N: usize> {
+    slots: [HwBreakpoint; N],
+}
+
+impl<const N: usize> HwBreakpointTable<N> {
+    const fn new() -> Self {
+        Self {
+            slots: [HwBreakpoint::empty(); N],
+        }
+    }
+
+    fn find(&self, addr: u64) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.used && slot.addr == addr)
+    }
+
+    fn find_free(&self, limit: usize) -> Option<usize> {
+        self.slots.iter().take(limit).position(|slot| !slot.used)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MdscrRestore {
+    kde: bool,
+    mde: bool,
+}
+
 pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
     mem: M,
     breakpoints: SwBreakpointTable<N>,
+    hw_breakpoints: HwBreakpointTable<DEFAULT_HW_BREAKPOINTS>,
+    hw_breakpoints_active: usize,
+    hw_mdscr_restore: Option<MdscrRestore>,
     desc: Aarch64TargetDesc,
     features_active: bool,
     memory_map: Option<&'static [u8]>,
@@ -211,6 +267,9 @@ impl<M, const N: usize> Aarch64GdbState<M, N> {
         Self {
             mem,
             breakpoints: SwBreakpointTable::new(),
+            hw_breakpoints: HwBreakpointTable::new(),
+            hw_breakpoints_active: 0,
+            hw_mdscr_restore: None,
             desc: Aarch64TargetDesc::new(),
             features_active: false,
             memory_map: None,
@@ -331,6 +390,105 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
         entry.installed = true;
         Ok(())
     }
+
+    fn hw_breakpoint_limit(&self) -> usize {
+        let available = cpu::breakpoint_count();
+        if available < DEFAULT_HW_BREAKPOINTS {
+            available
+        } else {
+            DEFAULT_HW_BREAKPOINTS
+        }
+    }
+
+    fn validate_hw_breakpoint_kind(&self, kind: u64) -> Result<(), Aarch64GdbError<M::Error>> {
+        if matches!(kind, 0 | 2 | 4) {
+            Ok(())
+        } else {
+            Err(Aarch64GdbError::InvalidBreakpointKind)
+        }
+    }
+
+    fn enable_hw_breakpoints(&mut self) {
+        if self.hw_breakpoints_active != 0 {
+            return;
+        }
+        let mdscr = cpu::get_mdscr_el1();
+        self.hw_mdscr_restore = Some(MdscrRestore {
+            kde: mdscr.get(MDSCR_EL1::kde) != 0,
+            mde: mdscr.get(MDSCR_EL1::mde) != 0,
+        });
+        let mdscr = mdscr.set(MDSCR_EL1::kde, 1).set(MDSCR_EL1::mde, 1);
+        cpu::set_mdscr_el1(mdscr);
+    }
+
+    fn restore_hw_breakpoints(&mut self) {
+        if self.hw_breakpoints_active != 0 {
+            return;
+        }
+        if let Some(restore) = self.hw_mdscr_restore.take() {
+            let mdscr = cpu::get_mdscr_el1()
+                .set(MDSCR_EL1::kde, restore.kde as u64)
+                .set(MDSCR_EL1::mde, restore.mde as u64);
+            cpu::set_mdscr_el1(mdscr);
+        }
+    }
+
+    fn insert_hw_breakpoint(
+        &mut self,
+        addr: u64,
+        kind: u64,
+    ) -> Result<(), Aarch64GdbError<M::Error>> {
+        if addr & 0x3 != 0 {
+            return Err(Aarch64GdbError::UnalignedAddress);
+        }
+        self.validate_hw_breakpoint_kind(kind)?;
+        if let Some(_) = self.hw_breakpoints.find(addr) {
+            return Ok(());
+        }
+
+        let limit = self.hw_breakpoint_limit();
+        let Some(slot) = self.hw_breakpoints.find_free(limit) else {
+            return Err(Aarch64GdbError::BreakpointTableFull);
+        };
+
+        self.enable_hw_breakpoints();
+
+        cpu::set_dbgbvr_el1(slot, addr).map_err(|_| Aarch64GdbError::BreakpointTableFull)?;
+        cpu::set_dbgbcr_el1(slot, DBGBCR_INSN).map_err(|_| Aarch64GdbError::BreakpointTableFull)?;
+
+        self.hw_breakpoints.slots[slot] = HwBreakpoint {
+            addr,
+            hw_index: slot,
+            used: true,
+        };
+        self.hw_breakpoints_active += 1;
+        Ok(())
+    }
+
+    fn remove_hw_breakpoint(
+        &mut self,
+        addr: u64,
+        kind: u64,
+    ) -> Result<(), Aarch64GdbError<M::Error>> {
+        if addr & 0x3 != 0 {
+            return Err(Aarch64GdbError::UnalignedAddress);
+        }
+        self.validate_hw_breakpoint_kind(kind)?;
+        let Some(slot) = self.hw_breakpoints.find(addr) else {
+            return Ok(());
+        };
+
+        let hw_index = self.hw_breakpoints.slots[slot].hw_index;
+        cpu::set_dbgbcr_el1(hw_index, 0).map_err(|_| Aarch64GdbError::BreakpointTableFull)?;
+        cpu::set_dbgbvr_el1(hw_index, 0).map_err(|_| Aarch64GdbError::BreakpointTableFull)?;
+
+        self.hw_breakpoints.slots[slot] = HwBreakpoint::empty();
+        if self.hw_breakpoints_active > 0 {
+            self.hw_breakpoints_active -= 1;
+        }
+        self.restore_hw_breakpoints();
+        Ok(())
+    }
 }
 
 pub struct Aarch64GdbTarget<'a, M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
@@ -344,6 +502,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
 
     fn capabilities(&self) -> TargetCapabilities {
         let mut caps = TargetCapabilities::SW_BREAK
+            | TargetCapabilities::HW_BREAK
             | TargetCapabilities::VCONT
             | TargetCapabilities::XFER_FEATURES;
         if self.state.memory_map.is_some() {
@@ -356,7 +515,9 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         match e {
             Aarch64GdbError::Memory(_) | Aarch64GdbError::UnalignedAddress => 14,
             Aarch64GdbError::BreakpointTableFull => 28,
-            Aarch64GdbError::InvalidRegister | Aarch64GdbError::BufferTooSmall => 22,
+            Aarch64GdbError::InvalidRegister
+            | Aarch64GdbError::BufferTooSmall
+            | Aarch64GdbError::InvalidBreakpointKind => 22,
         }
     }
 
@@ -570,6 +731,26 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             .remove_sw_breakpoint(addr)
             .map_err(TargetError::Recoverable)
     }
+
+    fn insert_hw_breakpoint(
+        &mut self,
+        addr: u64,
+        kind: u64,
+    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        self.state
+            .insert_hw_breakpoint(addr, kind)
+            .map_err(TargetError::Recoverable)
+    }
+
+    fn remove_hw_breakpoint(
+        &mut self,
+        addr: u64,
+        kind: u64,
+    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        self.state
+            .remove_hw_breakpoint(addr, kind)
+            .map_err(TargetError::Recoverable)
+    }
 }
 
 pub trait DebugStub {
@@ -688,17 +869,23 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
-        if let DebugEntryCause::DebugException(ExceptionClass::BreakpointLowerLevel) = cause {
-            let pc = cpu::get_elr_el2();
-            if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
-                breakpoint_slot = Some(slot);
-                breakpoint_addr = pc;
-            } else {
-                let pc_prev = pc.wrapping_sub(4);
-                if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
+        if let DebugEntryCause::DebugException(ec) = cause {
+            if matches!(
+                ec,
+                ExceptionClass::BreakpointLowerLevel
+                    | ExceptionClass::BrkInstructionAArch64LowerLevel
+            ) {
+                let pc = cpu::get_elr_el2();
+                if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
                     breakpoint_slot = Some(slot);
-                    breakpoint_addr = pc_prev;
-                    cpu::set_elr_el2(pc_prev);
+                    breakpoint_addr = pc;
+                } else {
+                    let pc_prev = pc.wrapping_sub(4);
+                    if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
+                        breakpoint_slot = Some(slot);
+                        breakpoint_addr = pc_prev;
+                        cpu::set_elr_el2(pc_prev);
+                    }
                 }
             }
         }

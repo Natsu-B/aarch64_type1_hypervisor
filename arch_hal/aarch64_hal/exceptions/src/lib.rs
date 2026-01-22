@@ -1,6 +1,16 @@
 #![no_std]
 #![feature(naked_functions_rustic_abi)]
 #![feature(sync_unsafe_cell)]
+#![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
 
 mod common_handler;
 mod el1;
@@ -213,3 +223,12 @@ pub fn setup_el1_exception() {
             .bits(),
     );
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn __unit_test_init() {
+    aarch64_unit_test::init_default_uart();
+    setup_exception();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);

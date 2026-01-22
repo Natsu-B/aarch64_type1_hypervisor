@@ -90,6 +90,7 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                     handle_secure_monitor_call(reg);
                 }
                 ExceptionClass::BreakpointLowerLevel
+                | ExceptionClass::BrkInstructionAArch64LowerLevel
                 | ExceptionClass::SoftwareStepLowerLevel
                 | ExceptionClass::WatchpointLowerLevel => {
                     unsafe { &*SYNCHRONOUS_HANDLER.get() }
