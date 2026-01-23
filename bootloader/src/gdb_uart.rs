@@ -2,6 +2,7 @@ use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::pl011::FifoLevel;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::pl011::UARTICR;
+use arch_hal::pl011::UARTIMSC;
 use arch_hal::timer;
 use core::hint::spin_loop;
 use core::mem::MaybeUninit;
@@ -121,10 +122,19 @@ pub fn begin_stop_loop() -> StopLoopGuard {
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
     let state = unsafe { (&mut *guard).assume_init_mut() };
-    state
-        .uart
-        .enable_rx_interrupts(FifoLevel::OneQuarter, false);
-    state.rx.clear();
+    // Disable RX/RT interrupts while the stop-loop is active (we will poll instead).
+    let mask = UARTIMSC::new()
+        .set(UARTIMSC::rxim, 1)
+        .set(UARTIMSC::rtim, 1);
+    state.uart.disable_interrupts(mask);
+
+    // Clear any pending RX/RT sources so we don't immediately retrigger.
+    let icr = UARTICR::new().set(UARTICR::rxic, 1).set(UARTICR::rtic, 1);
+    state.uart.clear_interrupts(icr);
+
+    // IMPORTANT: Do NOT clear `state.rx` here.
+    // The byte which triggered attach/Ctrl-C is buffered in `rx` by the IRQ handler and must be
+    // preserved for `prefetch_first_rsp_frame()`.
     state.prefetch_len = 0;
     state.prefetch_pos = 0;
     StopLoopGuard { restore: true }
@@ -149,9 +159,6 @@ impl Drop for StopLoopGuard {
 }
 
 pub fn handle_irq() {
-    if is_debug_active() {
-        return;
-    }
     if !GDB_UART_READY.load(Ordering::Acquire) {
         return;
     }
