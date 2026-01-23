@@ -20,6 +20,7 @@ const PAGE_SIZE: usize = 0x1000;
 const MAX_GDB_PKT: usize = 8192;
 const MAX_GDB_TX_CAP: usize = 16384;
 const ATTACH_DEADLINE_MS: u64 = 5000;
+const PREFETCH_IDLE_TIMEOUT_MS: u64 = 2000;
 // Set to 0 to disable the post-attach idle timeout.
 const IDLE_TIMEOUT_MS: u64 = 60000;
 
@@ -131,26 +132,27 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
 
     let _debug_active = DebugActiveGuard::new();
     let saved_daif = cpu::read_daif();
-    cpu::enable_irq();
+    let _stop_loop = gdb_uart::begin_stop_loop();
 
     let now = timer::read_counter();
     let freq = timer::read_counter_frequency();
     let attach_ticks = (u128::from(freq) * u128::from(ATTACH_DEADLINE_MS)) / 1000;
     let attach_deadline = now.saturating_add(attach_ticks as u64);
-    let idle_ticks = if IDLE_TIMEOUT_MS == 0 {
+    let prefetch_idle_ticks = if PREFETCH_IDLE_TIMEOUT_MS == 0 {
         0
     } else {
-        let ticks = (u128::from(freq) * u128::from(IDLE_TIMEOUT_MS)) / 1000;
+        let ticks = (u128::from(freq) * u128::from(PREFETCH_IDLE_TIMEOUT_MS)) / 1000;
         ticks.min(u128::from(u64::MAX)) as u64
     };
+    // Reserved for post-attach idle timeout wiring in the debug loop.
+    let _post_attach_idle_timeout_ms = IDLE_TIMEOUT_MS;
 
-    let prefetch = gdb_uart::prefetch_first_rsp_frame(attach_deadline, idle_ticks);
+    let prefetch = gdb_uart::prefetch_first_rsp_frame(attach_deadline, prefetch_idle_ticks);
     if prefetch != gdb_uart::PrefetchResult::Success {
         cpu::irq_restore(saved_daif);
         return;
     }
 
-    let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_entry(regs, cause);
     cpu::irq_restore(saved_daif);
 }

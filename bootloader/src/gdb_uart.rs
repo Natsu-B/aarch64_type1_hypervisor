@@ -39,11 +39,11 @@ impl<const N: usize> RxRing<N> {
         self.head == self.tail
     }
 
-    fn push_drop_newest(&mut self, byte: u8) -> bool {
+    fn push_drop_oldest(&mut self, byte: u8) -> bool {
         let next = (self.head + 1) % N;
         if next == self.tail {
-            // Drop newest when full to keep the oldest buffered data.
-            return false;
+            // Drop oldest to preserve the newest bytes for resync/attach.
+            self.tail = (self.tail + 1) % N;
         }
         self.buf[self.head] = byte;
         self.head = next;
@@ -111,6 +111,19 @@ impl Drop for StopLoopGuard {
     fn drop(&mut self) {
         let mut guard = GDB_UART_STATE.lock_irqsave();
         if let Some(state) = guard.as_mut() {
+            let mask = UARTIMSC::new()
+                .set(UARTIMSC::rxim, 1)
+                .set(UARTIMSC::rtim, 1);
+            state.uart.disable_interrupts(mask);
+            let icr = UARTICR::new()
+                .set(UARTICR::rxic, 1)
+                .set(UARTICR::rtic, 1)
+                .set(UARTICR::feic, 1)
+                .set(UARTICR::peic, 1)
+                .set(UARTICR::beic, 1)
+                .set(UARTICR::oeic, 1);
+            state.uart.clear_interrupts(icr);
+            state.uart.drain_rx();
             state.prefetch_len = 0;
             state.prefetch_pos = 0;
             state.rx.clear();
@@ -132,7 +145,7 @@ pub fn handle_irq() {
         return;
     }
     state.uart.handle_rx_irq(&mut |byte| {
-        let _ = state.rx.push_drop_newest(byte);
+        let _ = state.rx.push_drop_oldest(byte);
         if !DEBUG_ACTIVE.load(Ordering::Acquire) {
             let reason = ATTACH_REASON.load(Ordering::Acquire);
             if byte == 0x03 {
@@ -210,17 +223,18 @@ pub fn prefetch_first_rsp_frame(
             return fail_prefetch(PrefetchResult::Timeout);
         }
 
-        let Some(byte) = pop_rx_once() else {
+        let Some(byte) = try_read_byte() else {
             spin_loop();
             continue;
         };
 
-        attached = true;
-        if idle_timeout_ticks != 0 {
-            deadline_ticks = timer::read_counter().saturating_add(idle_timeout_ticks);
-        }
-
         let event = assembler.push(byte);
+        if !matches!(event, RspFrameEvent::Ignore) {
+            attached = true;
+            if idle_timeout_ticks != 0 {
+                deadline_ticks = timer::read_counter().saturating_add(idle_timeout_ticks);
+            }
+        }
         match event {
             RspFrameEvent::Ignore => {}
             RspFrameEvent::Resync => {
@@ -285,7 +299,7 @@ fn store_prefetch(len: usize) -> bool {
 fn fail_prefetch(result: PrefetchResult) -> PrefetchResult {
     if matches!(result, PrefetchResult::Timeout | PrefetchResult::Overflow) {
         try_send_nak();
-        flush_rx_ring();
+        flush_rx_input();
         clear_prefetch();
     }
     result
@@ -299,17 +313,25 @@ fn try_send_nak() {
     }
 }
 
-fn flush_rx_ring() {
+fn flush_rx_input() {
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
     for _ in 0..FLUSH_LIMIT {
-        if pop_rx_once().is_none() {
+        if state.rx.pop().is_none() {
             break;
         }
     }
-}
-
-fn pop_rx_once() -> Option<u8> {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    guard.as_mut()?.rx.pop()
+    state.uart.drain_rx();
+    let icr = UARTICR::new()
+        .set(UARTICR::rxic, 1)
+        .set(UARTICR::rtic, 1)
+        .set(UARTICR::feic, 1)
+        .set(UARTICR::peic, 1)
+        .set(UARTICR::beic, 1)
+        .set(UARTICR::oeic, 1);
+    state.uart.clear_interrupts(icr);
 }
 
 pub fn try_read_byte() -> Option<u8> {
