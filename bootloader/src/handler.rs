@@ -1,7 +1,7 @@
-use crate::GDB_UART;
 use crate::GUEST_UART;
 use crate::debug;
 use crate::gdb_uart;
+use crate::guest_mmio_allowlist_contains_range;
 use crate::vgic;
 use arch_hal::cpu;
 use arch_hal::exceptions;
@@ -21,6 +21,9 @@ use exceptions::registers::WriteNotRead;
 
 static GICV2: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 static GDB_UART_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
+static UNMAPPED_ABORT_COUNT: SyncUnsafeCell<u32> = SyncUnsafeCell::new(0);
+
+const UNMAPPED_ABORT_LOG_LIMIT: u32 = 16;
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
@@ -45,6 +48,25 @@ pub(crate) fn gic() -> Option<&'static Gicv2> {
     unsafe { &*GICV2.get() }.as_ref()
 }
 
+fn access_width_bytes(access_width: SyndromeAccessSize) -> usize {
+    match access_width {
+        SyndromeAccessSize::Byte => 1,
+        SyndromeAccessSize::HalfWord => 2,
+        SyndromeAccessSize::Word => 4,
+        SyndromeAccessSize::DoubleWord => 8,
+    }
+}
+
+fn should_log_unmapped_abort() -> bool {
+    // SAFETY: data abort handler is synchronous and non-preemptible for this counter.
+    unsafe {
+        let counter = &mut *UNMAPPED_ABORT_COUNT.get();
+        let next = counter.saturating_add(1);
+        *counter = next;
+        next <= UNMAPPED_ABORT_LOG_LIMIT || next.is_power_of_two()
+    }
+}
+
 fn data_abort_handler(
     register: &mut u64,
     address: u64,
@@ -52,65 +74,84 @@ fn data_abort_handler(
     access_width: SyndromeAccessSize,
     write_access: WriteNotRead,
 ) {
-    // SAFETY: Data abort emulation touches MMIO addresses explicitly filtered below.
-    unsafe {
-        let guest_uart = (*GUEST_UART.get()).map(|u| (u.base, u.size));
-        let gdb_uart = (*GDB_UART.get()).map(|u| (u.base, u.size));
-        let addr = address as usize;
+    let addr = address as usize;
+    let access_bytes = access_width_bytes(access_width);
+    let reg_bits = match reg_size {
+        InstructionRegisterSize::Instruction32bit => 32,
+        InstructionRegisterSize::Instruction64bit => 64,
+    };
+    let esr = cpu::get_esr_el2();
+    let elr = cpu::get_elr_el2();
 
+    if vgic::handles_gicd(addr) {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                if vgic::handles_gicd(addr) {
-                    if let Some(access) = gic_access_size(access_width) {
-                        if let Ok(value) = vgic::handle_gicd_read(addr, access) {
-                            *register = match reg_size {
-                                InstructionRegisterSize::Instruction32bit => {
-                                    value as u64 & (u32::MAX as u64)
-                                }
-                                InstructionRegisterSize::Instruction64bit => value as u64,
-                            };
-                        }
+                if let Some(access) = gic_access_size(access_width) {
+                    if let Ok(value) = vgic::handle_gicd_read(addr, access) {
+                        *register = match reg_size {
+                            InstructionRegisterSize::Instruction32bit => {
+                                value as u64 & (u32::MAX as u64)
+                            }
+                            InstructionRegisterSize::Instruction64bit => value as u64,
+                        };
                     }
-                    cpu::set_elr_el2(cpu::get_elr_el2() + 4);
-                    return;
-                }
-                if gdb_uart.is_some_and(|(base, size)| (base..base + size).contains(&addr)) {
-                    *register = 0;
-                } else {
-                    let v = match access_width {
-                        SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
-                        SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
-                        SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
-                        SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
-                    };
-
-                    *register = match reg_size {
-                        InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
-                        InstructionRegisterSize::Instruction64bit => v,
-                    };
                 }
             }
-
             WriteNotRead::WritingMemoryAbort => {
                 let reg_val = match reg_size {
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-
-                if vgic::handles_gicd(addr) {
-                    if let Some(access) = gic_access_size(access_width) {
-                        let _ = vgic::handle_gicd_write(addr, access, reg_val as u32);
-                    }
-                    cpu::set_elr_el2(cpu::get_elr_el2() + 4);
-                    return;
+                if let Some(access) = gic_access_size(access_width) {
+                    let _ = vgic::handle_gicd_write(addr, access, reg_val as u32);
                 }
-                if gdb_uart.is_some_and(|(base, size)| (base..base + size).contains(&addr)) {
-                    // Ignore guest writes to the GDB UART to keep it hypervisor-only.
-                } else if guest_uart.is_some_and(|(base, size)| (base..base + size).contains(&addr))
-                {
-                    if guest_uart.is_some_and(|(base, _)| base == addr) && reg_val == b'\n' as u64 {
-                        println!("\nhypervisor: alive");
+            }
+        }
+        cpu::set_elr_el2(elr + 4);
+        return;
+    }
+
+    let allowlisted = guest_mmio_allowlist_contains_range(addr, access_bytes);
+    let log_now = should_log_unmapped_abort();
+    if allowlisted {
+        if log_now {
+            println!(
+                "warning: unexpected abort on allowlisted MMIO {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                    "write"
+                } else {
+                    "read"
+                },
+                addr,
+                access_bytes,
+                reg_bits,
+                esr,
+                elr
+            );
+        }
+        match write_access {
+            WriteNotRead::ReadingMemoryAbort => {
+                // SAFETY: address is within a DTB-derived allowlisted MMIO range.
+                let v = unsafe {
+                    match access_width {
+                        SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
+                        SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
+                        SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
+                        SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
                     }
+                };
+                *register = match reg_size {
+                    InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => v,
+                };
+            }
+            WriteNotRead::WritingMemoryAbort => {
+                let reg_val = match reg_size {
+                    InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => *register,
+                };
+                // SAFETY: address is within a DTB-derived allowlisted MMIO range.
+                unsafe {
                     match access_width {
                         SyndromeAccessSize::Byte => {
                             write_volatile(address as *mut u8, reg_val as u8);
@@ -125,14 +166,37 @@ fn data_abort_handler(
                             write_volatile(address as *mut u64, reg_val as u64);
                         }
                     }
-                } else {
-                    panic!("invalid abort addr: 0x{:X}", address);
-                };
+                }
+                // SAFETY: guest UART is initialized before guests can generate aborts.
+                let guest_uart_base = unsafe { (*GUEST_UART.get()).map(|u| u.base) };
+                if guest_uart_base.is_some_and(|base| base == addr) && reg_val == b'\n' as u64 {
+                    println!("\nhypervisor: alive");
+                }
             }
         }
+        cpu::set_elr_el2(elr + 4);
+        return;
     }
-    // advance elr_el2
-    cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+
+    if log_now {
+        println!(
+            "warning: unmapped access {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+            if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                "write"
+            } else {
+                "read"
+            },
+            addr,
+            access_bytes,
+            reg_bits,
+            esr,
+            elr
+        );
+    }
+    if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
+        *register = 0;
+    }
+    cpu::set_elr_el2(elr + 4);
 }
 
 fn gic_access_size(access_width: SyndromeAccessSize) -> Option<Gicv2AccessSize> {

@@ -25,7 +25,7 @@ mod registers;
 pub struct Stage2Paging;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage2PageTypes {
     Normal = 0b0,
     Device = 0b1,
