@@ -1,5 +1,6 @@
 #![no_std]
 
+use core::convert::Infallible;
 use core::fmt;
 
 #[cfg(any(feature = "gdb_monitor_debug", test))]
@@ -144,6 +145,7 @@ impl<const N: usize> TxRing<N> {
 pub struct GdbServer<const MAX_PKT: usize, const TX_CAP: usize> {
     rsp: RspFrameAssembler,
     rx_buf: [u8; MAX_PKT],
+    work_buf: [u8; MAX_PKT],
     rx_len: usize,
     rx_checksum: u8,
     rx_checksum_bytes: [u8; 2],
@@ -167,6 +169,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self {
             rsp: RspFrameAssembler::new(),
             rx_buf: [0u8; MAX_PKT],
+            work_buf: [0u8; MAX_PKT],
             rx_len: 0,
             rx_checksum: 0,
             rx_checksum_bytes: [0u8; 2],
@@ -203,21 +206,9 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return;
         }
 
-        let mut msg_buf = [0u8; MAX_PKT];
-        let mut writer = DebugBufWriter {
-            buf: &mut msg_buf[..max_msg],
-            pos: 0,
-        };
-
+        let mut writer = DebugPacketWriter::new(self, out_cap);
         let _ = writer.write_fmt(args);
-        let msg = &msg_buf[..writer.pos];
-
-        let mut payload = [0u8; MAX_PKT];
-        payload[0] = b'O';
-        let hex_len = hex_encode(msg, &mut payload[1..out_cap]);
-        let total_len = 1usize.saturating_add(hex_len);
-
-        let _ = self.queue_packet(&payload[..total_len]);
+        writer.flush();
     }
 
     #[cfg(all(not(feature = "gdb_monitor_debug"), not(test)))]
@@ -298,6 +289,42 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         self.send::<T>(b"OK")
     }
 
+    fn send_from_ptr<T: Target>(
+        &mut self,
+        ptr: *const u8,
+        len: usize,
+    ) -> Result<(), GdbServerError<T>> {
+        // SAFETY: caller guarantees ptr is valid for len bytes and the backing storage
+        // remains immutable for the duration of send.
+        let payload = unsafe { core::slice::from_raw_parts(ptr, len) };
+        self.send::<T>(payload)
+    }
+
+    fn send_work_buf<T: Target>(&mut self, len: usize) -> Result<(), GdbServerError<T>> {
+        let ptr = self.work_buf.as_ptr();
+        self.send_from_ptr::<T>(ptr, len)
+    }
+
+    fn send_rx_buf<T: Target>(&mut self, len: usize) -> Result<(), GdbServerError<T>> {
+        let ptr = self.rx_buf.as_ptr();
+        self.send_from_ptr::<T>(ptr, len)
+    }
+
+    pub fn notify_stop_sigtrap(&mut self) -> Result<(), GdbError<Infallible, Infallible>> {
+        let out_cap = self.out_payload_cap();
+        let signal = 5u8;
+        let payload = [
+            b'S',
+            HEX[(signal >> 4) as usize],
+            HEX[(signal & 0xF) as usize],
+        ];
+        if payload.len() > out_cap {
+            return Err(GdbError::PacketTooLong);
+        }
+        self.queue_packet(&payload)
+            .map_err(|_| GdbError::TxOverflow)
+    }
+
     fn finish_frame<T: Target>(
         &mut self,
         target: &mut T,
@@ -347,10 +374,13 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.queue_ack(true).map_err(|_| GdbError::TxOverflow)?;
         }
 
-        let mut payload = [0u8; MAX_PKT];
         let payload_len = self.rx_len;
-        payload[..payload_len].copy_from_slice(&self.rx_buf[..payload_len]);
-        self.dispatch_payload(target, &payload[..payload_len])
+        let payload_ptr = self.rx_buf.as_ptr();
+        // SAFETY: payload_ptr points to rx_buf for payload_len bytes. dispatch_payload only
+        // reads the payload slice, and handlers are structured to avoid mutating rx_buf until
+        // after they finish parsing the incoming payload.
+        let payload = unsafe { core::slice::from_raw_parts(payload_ptr, payload_len) };
+        self.dispatch_payload(target, payload)
     }
 
     fn dispatch_payload<T: Target>(
@@ -406,6 +436,14 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             Some(b'G') => {
                 gdb_debug!(self, "dispatch: 'G' (write all registers)");
                 self.handle_write_all_registers(target, payload)
+            }
+            Some(b'H') => {
+                gdb_debug!(
+                    self,
+                    "dispatch: 'H' (set thread) payload=\"{}\"",
+                    debug_printable_prefix(payload)
+                );
+                self.handle_set_thread::<T>(payload)
             }
             Some(b'p') => {
                 gdb_debug!(
@@ -715,17 +753,18 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 return Ok(ProcessResult::None);
             }
 
-            let mut reply = [0u8; MAX_PKT];
-            let (consumed, encoded_len) =
-                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap]);
+            let (consumed, encoded_len) = {
+                let reply = &mut self.work_buf;
+                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
+            };
             if consumed == 0 {
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
             }
 
             let more = offset + consumed < data.len();
-            reply[0] = if more { b'm' } else { b'l' };
-            self.send::<T>(&reply[..1 + encoded_len])?;
+            self.work_buf[0] = if more { b'm' } else { b'l' };
+            self.send_work_buf::<T>(1 + encoded_len)?;
             return Ok(ProcessResult::None);
         }
 
@@ -791,17 +830,18 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 return Ok(ProcessResult::None);
             }
 
-            let mut reply = [0u8; MAX_PKT];
-            let (consumed, encoded_len) =
-                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap]);
+            let (consumed, encoded_len) = {
+                let reply = &mut self.work_buf;
+                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
+            };
             if consumed == 0 {
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
             }
 
             let more = offset + consumed < data.len();
-            reply[0] = if more { b'm' } else { b'l' };
-            self.send::<T>(&reply[..1 + encoded_len])?;
+            self.work_buf[0] = if more { b'm' } else { b'l' };
+            self.send_work_buf::<T>(1 + encoded_len)?;
             return Ok(ProcessResult::None);
         }
 
@@ -859,8 +899,10 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         &mut self,
         target: &mut T,
     ) -> Result<ProcessResult, GdbServerError<T>> {
-        let mut regs = [0u8; MAX_PKT];
-        let result = target.read_registers(&mut regs);
+        let result = {
+            let regs = &mut self.work_buf;
+            target.read_registers(regs)
+        };
         let len = match self.handle_target_err_core(target, result)? {
             Some(len) => len,
             None => return Ok(ProcessResult::None),
@@ -879,8 +921,11 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        let mut out = [0u8; MAX_PKT];
-        let hex_len = hex_encode(&regs[..len], &mut out);
+        let hex_len = {
+            let out = &mut self.rx_buf[..out_cap];
+            let regs = &self.work_buf[..len];
+            hex_encode(regs, out)
+        };
         if hex_len < expected_hex_len {
             gdb_debug!(
                 self,
@@ -891,7 +936,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        self.send::<T>(&out[..hex_len])?;
+        self.send_rx_buf::<T>(hex_len)?;
         Ok(ProcessResult::None)
     }
 
@@ -907,24 +952,50 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             payload.len(),
             data_hex.len()
         );
-        let mut regs = [0u8; MAX_PKT];
-        let Ok(len) = hex_decode(data_hex, &mut regs) else {
-            gdb_debug!(
-                self,
-                "handle_write_all_registers: hex decode failed src_len={} dst_cap={}",
-                data_hex.len(),
-                regs.len()
-            );
-            self.send::<T>(b"E01")?;
-            return Ok(ProcessResult::None);
+        let len = match {
+            let regs = &mut self.work_buf;
+            hex_decode(data_hex, regs)
+        } {
+            Ok(len) => len,
+            Err(_) => {
+                gdb_debug!(
+                    self,
+                    "handle_write_all_registers: hex decode failed src_len={} dst_cap={}",
+                    data_hex.len(),
+                    self.work_buf.len()
+                );
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
         };
         gdb_debug!(self, "handle_write_all_registers: decoded_len={}", len);
-        let result = target.write_registers(&regs[..len]);
+        let result = target.write_registers(&self.work_buf[..len]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
         self.send_ok::<T>()?;
         Ok(ProcessResult::None)
+    }
+
+    fn handle_set_thread<T: Target>(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<ProcessResult, GdbServerError<T>> {
+        let Some(kind) = payload.get(1).copied() else {
+            self.send_empty::<T>()?;
+            return Ok(ProcessResult::None);
+        };
+
+        match kind {
+            b'c' | b'g' => {
+                self.send_ok::<T>()?;
+                Ok(ProcessResult::None)
+            }
+            _ => {
+                self.send_empty::<T>()?;
+                Ok(ProcessResult::None)
+            }
+        }
     }
 
     fn handle_read_single_register<T: Target>(
@@ -943,8 +1014,10 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
 
         gdb_debug!(self, "handle_read_single_register: regno={}", regno);
 
-        let mut reg = [0u8; MAX_PKT];
-        let result = target.read_register(regno, &mut reg);
+        let result = {
+            let reg = &mut self.work_buf;
+            target.read_register(regno, reg)
+        };
         let len = match self.handle_target_err_core(target, result)? {
             Some(len) => len,
             None => return Ok(ProcessResult::None),
@@ -962,8 +1035,11 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        let mut out = [0u8; MAX_PKT];
-        let hex_len = hex_encode(&reg[..len], &mut out);
+        let hex_len = {
+            let out = &mut self.rx_buf[..out_cap];
+            let reg = &self.work_buf[..len];
+            hex_encode(reg, out)
+        };
         if hex_len < expected_hex_len {
             gdb_debug!(
                 self,
@@ -975,7 +1051,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        self.send::<T>(&out[..hex_len])?;
+        self.send_rx_buf::<T>(hex_len)?;
         Ok(ProcessResult::None)
     }
 
@@ -1013,16 +1089,21 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             val_hex.len()
         );
 
-        let mut reg = [0u8; MAX_PKT];
-        let Ok(len) = hex_decode(val_hex, &mut reg) else {
-            gdb_debug!(
-                self,
-                "handle_write_single_register: hex decode failed src_len={} dst_cap={}",
-                val_hex.len(),
-                reg.len()
-            );
-            self.send::<T>(b"E01")?;
-            return Ok(ProcessResult::None);
+        let len = match {
+            let reg = &mut self.work_buf;
+            hex_decode(val_hex, reg)
+        } {
+            Ok(len) => len,
+            Err(_) => {
+                gdb_debug!(
+                    self,
+                    "handle_write_single_register: hex decode failed src_len={} dst_cap={}",
+                    val_hex.len(),
+                    self.work_buf.len()
+                );
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
         };
 
         gdb_debug!(
@@ -1031,7 +1112,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             len,
             regno
         );
-        let result = target.write_register(regno, &reg[..len]);
+        let result = target.write_register(regno, &self.work_buf[..len]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1093,14 +1174,19 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
 
-        let mut data = [0u8; MAX_PKT];
-        let result = target.read_memory(addr, &mut data[..len_usize]);
+        let result = {
+            let data = &mut self.work_buf;
+            target.read_memory(addr, &mut data[..len_usize])
+        };
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
 
-        let mut out = [0u8; MAX_PKT];
-        let hex_len = hex_encode(&data[..len_usize], &mut out);
+        let hex_len = {
+            let out = &mut self.rx_buf[..out_cap];
+            let data = &self.work_buf[..len_usize];
+            hex_encode(data, out)
+        };
         if hex_len < expected_hex_len {
             gdb_debug!(
                 self,
@@ -1111,7 +1197,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        self.send::<T>(&out[..hex_len])?;
+        self.send_rx_buf::<T>(hex_len)?;
         Ok(ProcessResult::None)
     }
 
@@ -1144,16 +1230,21 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             len
         );
 
-        let mut data = [0u8; MAX_PKT];
-        let Ok(decoded) = hex_decode(data_hex, &mut data) else {
-            gdb_debug!(
-                self,
-                "handle_write_memory_hex: hex decode failed src_len={} dst_cap={}",
-                data_hex.len(),
-                data.len()
-            );
-            self.send::<T>(b"E03")?;
-            return Ok(ProcessResult::None);
+        let decoded = match {
+            let data = &mut self.work_buf;
+            hex_decode(data_hex, data)
+        } {
+            Ok(len) => len,
+            Err(_) => {
+                gdb_debug!(
+                    self,
+                    "handle_write_memory_hex: hex decode failed src_len={} dst_cap={}",
+                    data_hex.len(),
+                    self.work_buf.len()
+                );
+                self.send::<T>(b"E03")?;
+                return Ok(ProcessResult::None);
+            }
         };
         if decoded as u64 != len {
             gdb_debug!(
@@ -1166,7 +1257,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
 
-        let result = target.write_memory(addr, &data[..decoded]);
+        let result = target.write_memory(addr, &self.work_buf[..decoded]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1216,27 +1307,32 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
 
         // Decode RSP binary data after checksum validation. The on-wire payload uses 0x7d
         // escaping (no RLE expansion for incoming data).
-        let mut decoded = [0u8; MAX_PKT];
-        if len_usize > decoded.len() {
+        if len_usize > self.work_buf.len() {
             gdb_debug!(
                 self,
                 "handle_write_memory_binary: len {} exceeds MAX_PKT {}",
                 len_usize,
-                decoded.len()
+                self.work_buf.len()
             );
             self.send::<T>(b"E03")?;
             return Ok(ProcessResult::None);
         }
-        let Ok(decoded_len) = decode_rsp_binary(binary, &mut decoded[..len_usize]) else {
-            // Malformed escape or output buffer overflow.
-            gdb_debug!(
-                self,
-                "handle_write_memory_binary: binary decode failed src_len={} dst_cap={}",
-                binary.len(),
-                len_usize
-            );
-            self.send::<T>(b"E03")?;
-            return Ok(ProcessResult::None);
+        let decoded_len = match {
+            let decoded = &mut self.work_buf;
+            decode_rsp_binary(binary, &mut decoded[..len_usize])
+        } {
+            Ok(len) => len,
+            Err(_) => {
+                // Malformed escape or output buffer overflow.
+                gdb_debug!(
+                    self,
+                    "handle_write_memory_binary: binary decode failed src_len={} dst_cap={}",
+                    binary.len(),
+                    len_usize
+                );
+                self.send::<T>(b"E03")?;
+                return Ok(ProcessResult::None);
+            }
         };
 
         if decoded_len != len_usize {
@@ -1250,7 +1346,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
 
-        let result = target.write_memory(addr, &decoded[..decoded_len]);
+        let result = target.write_memory(addr, &self.work_buf[..decoded_len]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1513,16 +1609,21 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 return Ok(ProcessResult::None);
             }
 
-            let mut decoded = [0u8; MAX_PKT];
-            let Ok(decoded_len) = decode_rsp_binary(data, &mut decoded) else {
-                gdb_debug!(
-                    self,
-                    "handle_v_packet: vFlashWrite decode failed src_len={} dst_cap={}",
-                    data.len(),
-                    decoded.len()
-                );
-                self.send::<T>(b"E03")?;
-                return Ok(ProcessResult::None);
+            let decoded_len = match {
+                let decoded = &mut self.work_buf;
+                decode_rsp_binary(data, decoded)
+            } {
+                Ok(len) => len,
+                Err(_) => {
+                    gdb_debug!(
+                        self,
+                        "handle_v_packet: vFlashWrite decode failed src_len={} dst_cap={}",
+                        data.len(),
+                        self.work_buf.len()
+                    );
+                    self.send::<T>(b"E03")?;
+                    return Ok(ProcessResult::None);
+                }
             };
 
             if decoded_len as u64 != len {
@@ -1536,7 +1637,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 return Ok(ProcessResult::None);
             }
 
-            let result = target.write_memory(addr, &decoded[..decoded_len]);
+            let result = target.write_memory(addr, &self.work_buf[..decoded_len]);
             if self.handle_target_err_core(target, result)?.is_none() {
                 return Ok(ProcessResult::None);
             }
@@ -1570,22 +1671,71 @@ impl<T: Target, const MAX_PKT: usize, const TX_CAP: usize> RspIrqEndpoint<T>
 }
 
 #[cfg(any(feature = "gdb_monitor_debug", test))]
-struct DebugBufWriter<'a> {
-    buf: &'a mut [u8],
+const DEBUG_CONSOLE_CHUNK: usize = 256;
+
+#[cfg(any(feature = "gdb_monitor_debug", test))]
+struct DebugPacketWriter<'a, const MAX_PKT: usize, const TX_CAP: usize> {
+    server: &'a mut GdbServer<MAX_PKT, TX_CAP>,
+    buf: [u8; DEBUG_CONSOLE_CHUNK],
     pos: usize,
+    cap: usize,
+    out_cap: usize,
 }
 
 #[cfg(any(feature = "gdb_monitor_debug", test))]
-impl<'a> fmt::Write for DebugBufWriter<'a> {
+impl<'a, const MAX_PKT: usize, const TX_CAP: usize> DebugPacketWriter<'a, MAX_PKT, TX_CAP> {
+    fn new(server: &'a mut GdbServer<MAX_PKT, TX_CAP>, out_cap: usize) -> Self {
+        let max_msg = out_cap.saturating_sub(1) / 2;
+        let cap = core::cmp::min(DEBUG_CONSOLE_CHUNK, max_msg);
+        Self {
+            server,
+            buf: [0u8; DEBUG_CONSOLE_CHUNK],
+            pos: 0,
+            cap,
+            out_cap,
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pos == 0 || self.cap == 0 {
+            return;
+        }
+        let total_len = {
+            let payload = &mut self.server.work_buf;
+            payload[0] = b'O';
+            let hex_len = hex_encode(&self.buf[..self.pos], &mut payload[1..self.out_cap]);
+            1usize.saturating_add(hex_len)
+        };
+
+        let _ = self.server.queue_packet(&self.server.work_buf[..total_len]);
+        self.pos = 0;
+    }
+}
+
+#[cfg(any(feature = "gdb_monitor_debug", test))]
+impl<'a, const MAX_PKT: usize, const TX_CAP: usize> fmt::Write
+    for DebugPacketWriter<'a, MAX_PKT, TX_CAP>
+{
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = self.buf.len().saturating_sub(self.pos);
-        if remaining == 0 {
+        if self.cap == 0 {
             return Ok(());
         }
-        let to_copy = bytes.len().min(remaining);
-        self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.pos += to_copy;
+
+        let mut bytes = s.as_bytes();
+        while !bytes.is_empty() {
+            let remaining = self.cap.saturating_sub(self.pos);
+            if remaining == 0 {
+                self.flush();
+                continue;
+            }
+            let to_copy = bytes.len().min(remaining);
+            self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
+            self.pos += to_copy;
+            bytes = &bytes[to_copy..];
+            if self.pos == self.cap {
+                self.flush();
+            }
+        }
         Ok(())
     }
 }

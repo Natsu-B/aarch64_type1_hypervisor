@@ -890,10 +890,22 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             }
         }
 
+        let mut pending_stop_reply = matches!(cause, DebugEntryCause::DebugException(_));
         let mut tx_hold = None;
         let action = 'debug: loop {
             let mut target = self.state.target(regs);
             let mut progress = false;
+
+            if pending_stop_reply {
+                match self.server.notify_stop_sigtrap() {
+                    Ok(()) => {
+                        pending_stop_reply = false;
+                        progress = true;
+                    }
+                    Err(GdbError::TxOverflow) => {}
+                    Err(_) => return,
+                }
+            }
 
             if let Some(byte) = tx_hold {
                 if (io.try_write)(byte) {
