@@ -17,7 +17,8 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 const TARGET_XML: &[u8] = b"<?xml version=\"1.0\"?><target version=\"1.0\"></target>";
 const RX_BUF: usize = 512;
 const TX_BUF: usize = 2048;
-const MAX_PKT: usize = 256;
+const PAYLOAD_CAP: usize = 256;
+const MAX_PKT: usize = PAYLOAD_CAP;
 const TX_CAP: usize = 1024;
 
 #[unsafe(no_mangle)]
@@ -45,7 +46,7 @@ extern "C" fn efi_main() -> ! {
     let mut tx = [0u8; TX_BUF];
     let tx_len = drain_tx(&mut server, &mut tx);
     let mut idx = 0usize;
-    let mut payload = [0u8; MAX_PKT];
+    let mut payload = [0u8; PAYLOAD_CAP];
 
     let Some(len) = next_payload(&tx[..tx_len], &mut idx, &mut payload) else {
         exit_failure();

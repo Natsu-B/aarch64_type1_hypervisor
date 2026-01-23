@@ -195,7 +195,6 @@ pub fn prefetch_first_rsp_frame(
     }
 
     let mut assembler = RspFrameAssembler::new();
-    let mut buf = [0u8; PREFETCH_CAP];
     let mut len = 0usize;
 
     let mut attached = false;
@@ -226,29 +225,29 @@ pub fn prefetch_first_rsp_frame(
             RspFrameEvent::Ignore => {}
             RspFrameEvent::Resync => {
                 len = 0;
-                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                if !push_prefetch_byte_state(&mut len, byte) {
                     return fail_prefetch(PrefetchResult::Overflow);
                 }
             }
             RspFrameEvent::NeedMore => {
-                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                if !push_prefetch_byte_state(&mut len, byte) {
                     return fail_prefetch(PrefetchResult::Overflow);
                 }
             }
             RspFrameEvent::CtrlC => {
-                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                if !push_prefetch_byte_state(&mut len, byte) {
                     return fail_prefetch(PrefetchResult::Overflow);
                 }
-                if !store_prefetch(&buf[..len]) {
+                if !store_prefetch(len) {
                     return PrefetchResult::Unavailable;
                 }
                 return PrefetchResult::Success;
             }
             RspFrameEvent::FrameComplete => {
-                if !push_prefetch_byte(&mut buf, &mut len, byte) {
+                if !push_prefetch_byte_state(&mut len, byte) {
                     return fail_prefetch(PrefetchResult::Overflow);
                 }
-                if !store_prefetch(&buf[..len]) {
+                if !store_prefetch(len) {
                     return PrefetchResult::Unavailable;
                 }
                 return PrefetchResult::Success;
@@ -257,25 +256,28 @@ pub fn prefetch_first_rsp_frame(
     }
 }
 
-fn push_prefetch_byte(buf: &mut [u8], len: &mut usize, byte: u8) -> bool {
-    if *len >= buf.len() {
-        return false;
-    }
-    buf[*len] = byte;
-    *len += 1;
-    true
-}
-
-fn store_prefetch(buf: &[u8]) -> bool {
+fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
     let mut guard = GDB_UART_STATE.lock_irqsave();
     let Some(state) = guard.as_mut() else {
         return false;
     };
-    if buf.len() > state.prefetch_buf.len() {
+    if *len >= state.prefetch_buf.len() {
         return false;
     }
-    state.prefetch_buf[..buf.len()].copy_from_slice(buf);
-    state.prefetch_len = buf.len();
+    state.prefetch_buf[*len] = byte;
+    *len += 1;
+    true
+}
+
+fn store_prefetch(len: usize) -> bool {
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    if len > state.prefetch_buf.len() {
+        return false;
+    }
+    state.prefetch_len = len;
     state.prefetch_pos = 0;
     true
 }
