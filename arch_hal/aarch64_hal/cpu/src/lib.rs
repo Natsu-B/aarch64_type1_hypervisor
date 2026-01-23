@@ -8,7 +8,11 @@ use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::ID_AA64PFR0_EL1;
 use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
+pub mod cache;
 pub mod registers;
+pub use cache::clean_dcache_range;
+pub use cache::clean_invalidate_dcache_range;
+pub use cache::invalidate_dcache_range;
 
 /// Core affinity encoded as MPIDR style fields (Aff3:Aff2:Aff1:Aff0).
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]

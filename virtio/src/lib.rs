@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-pub mod cache;
 pub mod device_type;
 pub mod mmio;
 pub mod queue;

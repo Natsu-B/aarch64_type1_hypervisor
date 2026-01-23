@@ -60,6 +60,7 @@ version = "0.1.0"
 dependencies = [
  "arch_hal",
  "block-device-api",
+ "cpu",
  "mutex",
  "typestate",
  "typestate_macro",
@@ -288,6 +289,7 @@ name = "virtio"
 version = "0.1.0"
 dependencies = [
  "allocator",
+ "cpu",
  "intrusive_linked_list",
  "mutex",
  "typestate",
