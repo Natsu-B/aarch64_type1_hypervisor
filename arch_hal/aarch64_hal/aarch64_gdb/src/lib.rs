@@ -851,6 +851,36 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         }
     }
 
+    /// Initialize an uninitialized slot in-place.
+    ///
+    /// This avoids constructing `GdbServer` on the stack (which contains large fixed buffers),
+    /// preventing stack-smash / stack-overflow in very small stack configurations.
+    pub fn init_in_place(dst: &mut core::mem::MaybeUninit<Self>, mem: M) {
+        Self::init_in_place_with_packet_size(dst, mem, MAX_PKT);
+    }
+
+    pub fn init_in_place_with_packet_size(
+        dst: &mut core::mem::MaybeUninit<Self>,
+        mem: M,
+        packet_size: usize,
+    ) {
+        // SAFETY: caller provides an uninitialized slot which we fully initialize here.
+        unsafe {
+            let p = dst.as_mut_ptr();
+            // Zero everything first so Options are `None` and rings start empty.
+            core::ptr::write_bytes(p, 0u8, 1);
+
+            // Initialize embedded GdbServer in-place (no large stack temporaries).
+            let server_slot: &mut core::mem::MaybeUninit<GdbServer<MAX_PKT, TX_CAP>> =
+                &mut *(core::ptr::addr_of_mut!((*p).server) as *mut _
+                    as *mut core::mem::MaybeUninit<_>);
+            GdbServer::<MAX_PKT, TX_CAP>::init_in_place_with_packet_size(server_slot, packet_size);
+
+            core::ptr::addr_of_mut!((*p).state).write(Aarch64GdbState::new(mem));
+            core::ptr::addr_of_mut!((*p).pending_step).write(None);
+        }
+    }
+
     pub fn set_memory_map(&mut self, data: Option<&'static [u8]>) {
         self.state.set_memory_map(data);
     }

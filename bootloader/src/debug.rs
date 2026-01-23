@@ -24,18 +24,21 @@ const PREFETCH_IDLE_TIMEOUT_MS: u64 = 2000;
 // Set to 0 to disable the post-attach idle timeout.
 const IDLE_TIMEOUT_MS: u64 = 60000;
 
-struct DebugActiveGuard;
+struct DebugActiveGuard {
+    prev: bool,
+}
 
 impl DebugActiveGuard {
     fn new() -> Self {
+        let prev = gdb_uart::is_debug_active();
         gdb_uart::set_debug_active(true);
-        Self
+        Self { prev }
     }
 }
 
 impl Drop for DebugActiveGuard {
     fn drop(&mut self) {
-        gdb_uart::set_debug_active(false);
+        gdb_uart::set_debug_active(self.prev);
     }
 }
 
@@ -110,19 +113,18 @@ pub(crate) fn init_gdb_stub() {
             try_write: gdb_uart::try_write_byte,
             flush: gdb_uart::flush,
         });
-        stub.write(GdbStub::new(Stage2Memory));
+        // Avoid constructing large fixed-size buffers on the stack.
+        GdbStub::init_in_place(stub, Stage2Memory);
         aarch64_gdb::register_debug_stub(stub.assume_init_mut());
     }
 }
 
 pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionClass) {
-    // Exception entry masks IRQs (DAIF), so the RX ring may not advance; begin_stop_loop() enables
-    // the polling path in try_read_byte() so GDB stays responsive on brk/debug exceptions.
+    // Ensure the debug loop can make forward progress even if IRQ delivery is masked
+    // on exception entry (polling path via gdb_uart + RX interrupt suppression).
     let _debug_active = DebugActiveGuard::new();
-    let saved_daif = cpu::read_daif();
     let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_exception_entry(regs, ec);
-    cpu::irq_restore(saved_daif);
 }
 
 pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {

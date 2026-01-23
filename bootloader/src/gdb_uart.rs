@@ -2,9 +2,10 @@ use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::pl011::FifoLevel;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::pl011::UARTICR;
-use arch_hal::pl011::UARTIMSC;
 use arch_hal::timer;
 use core::hint::spin_loop;
+use core::mem::MaybeUninit;
+use core::ptr;
 use core::sync::atomic::Ordering;
 use gdb_remote::RspFrameAssembler;
 use gdb_remote::RspFrameEvent;
@@ -73,60 +74,74 @@ struct GdbUartState<const N: usize> {
     prefetch_pos: usize,
 }
 
-static GDB_UART_STATE: RawSpinLockIrqSave<Option<GdbUartState<RX_RING_SIZE>>> =
-    RawSpinLockIrqSave::new(None);
+// SAFETY: `GDB_UART_READY` publishes initialization completion with Release ordering.
+static GDB_UART_READY: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+// SAFETY: mutated only with interrupts disabled (IRQ-save lock).
+static GDB_UART_STATE: RawSpinLockIrqSave<MaybeUninit<GdbUartState<RX_RING_SIZE>>> =
+    RawSpinLockIrqSave::new(MaybeUninit::uninit());
 
 pub fn init(base: usize, clock_hz: u64, baud: u32) {
     let mut uart = Pl011Uart::new(base, clock_hz);
     uart.init(baud);
     uart.enable_rx_interrupts(FifoLevel::OneQuarter, true);
-    let state = GdbUartState {
-        uart,
-        rx: RxRing::new(),
-        prefetch_buf: [0; PREFETCH_CAP],
-        prefetch_len: 0,
-        prefetch_pos: 0,
-    };
+
+    // Fast-path: already initialized.
+    if GDB_UART_READY.load(Ordering::Acquire) {
+        return;
+    }
     let mut guard = GDB_UART_STATE.lock_irqsave();
-    *guard = Some(state);
+    if GDB_UART_READY.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: early boot init under IRQ-save lock; we fully initialize the state in-place.
+    unsafe {
+        let slot = &mut *guard;
+        let p = slot.as_mut_ptr();
+        ptr::write_bytes(p, 0u8, 1);
+        ptr::addr_of_mut!((*p).uart).write(uart);
+        // rx/prefetch fields are already zeroed by write_bytes.
+    }
+    GDB_UART_READY.store(true, Ordering::Release);
 }
 
-pub struct StopLoopGuard;
+pub struct StopLoopGuard {
+    restore: bool,
+}
 
 pub fn begin_stop_loop() -> StopLoopGuard {
-    STOP_LOOP_ACTIVE.store(true, Ordering::Release);
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    if let Some(state) = guard.as_mut() {
-        let mask = UARTIMSC::new()
-            .set(UARTIMSC::rxim, 1)
-            .set(UARTIMSC::rtim, 1);
-        state.uart.disable_interrupts(mask);
-        let icr = UARTICR::new().set(UARTICR::rxic, 1).set(UARTICR::rtic, 1);
-        state.uart.clear_interrupts(icr);
+    // Best-effort nesting avoidance using only load/store (RawAtomicPod portability).
+    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+        return StopLoopGuard { restore: false };
     }
-    StopLoopGuard
+    STOP_LOOP_ACTIVE.store(true, Ordering::Release);
+
+    if !GDB_UART_READY.load(Ordering::Acquire) {
+        return StopLoopGuard { restore: true };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
+    state
+        .uart
+        .enable_rx_interrupts(FifoLevel::OneQuarter, false);
+    state.rx.clear();
+    state.prefetch_len = 0;
+    state.prefetch_pos = 0;
+    StopLoopGuard { restore: true }
 }
 
 impl Drop for StopLoopGuard {
     fn drop(&mut self) {
-        let mut guard = GDB_UART_STATE.lock_irqsave();
-        if let Some(state) = guard.as_mut() {
-            let mask = UARTIMSC::new()
-                .set(UARTIMSC::rxim, 1)
-                .set(UARTIMSC::rtim, 1);
-            state.uart.disable_interrupts(mask);
-            let icr = UARTICR::new()
-                .set(UARTICR::rxic, 1)
-                .set(UARTICR::rtic, 1)
-                .set(UARTICR::feic, 1)
-                .set(UARTICR::peic, 1)
-                .set(UARTICR::beic, 1)
-                .set(UARTICR::oeic, 1);
-            state.uart.clear_interrupts(icr);
-            state.uart.drain_rx();
+        if !self.restore {
+            return;
+        }
+        if GDB_UART_READY.load(Ordering::Acquire) {
+            let mut guard = GDB_UART_STATE.lock_irqsave();
+            // SAFETY: READY is published after full initialization with Release ordering.
+            let state = unsafe { (&mut *guard).assume_init_mut() };
+            state.rx.clear();
             state.prefetch_len = 0;
             state.prefetch_pos = 0;
-            state.rx.clear();
             state.uart.enable_rx_interrupts(FifoLevel::OneQuarter, true);
         }
         STOP_LOOP_ACTIVE.store(false, Ordering::Release);
@@ -134,17 +149,20 @@ impl Drop for StopLoopGuard {
 }
 
 pub fn handle_irq() {
-    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+    if is_debug_active() {
+        return;
+    }
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return;
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
-        return;
-    };
-    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
-        return;
-    }
-    state.uart.handle_rx_irq(&mut |byte| {
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
+
+    loop {
+        let Some(byte) = state.uart.try_read_byte() else {
+            break;
+        };
         let _ = state.rx.push_drop_oldest(byte);
         if !DEBUG_ACTIVE.load(Ordering::Acquire) {
             let reason = ATTACH_REASON.load(Ordering::Acquire);
@@ -158,7 +176,7 @@ pub fn handle_irq() {
                 ATTACH_REASON.store(1, Ordering::Release);
             }
         }
-    });
+    }
 }
 
 pub fn is_debug_active() -> bool {
@@ -177,10 +195,12 @@ pub fn take_attach_reason() -> u8 {
 }
 
 pub fn clear_prefetch() {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return;
-    };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
     state.prefetch_len = 0;
     state.prefetch_pos = 0;
 }
@@ -200,11 +220,8 @@ pub fn prefetch_first_rsp_frame(
     idle_timeout_ticks: u64,
 ) -> PrefetchResult {
     clear_prefetch();
-    {
-        let guard = GDB_UART_STATE.lock_irqsave();
-        if guard.is_none() {
-            return PrefetchResult::Unavailable;
-        }
+    if !GDB_UART_READY.load(Ordering::Acquire) {
+        return PrefetchResult::Unavailable;
     }
 
     let mut assembler = RspFrameAssembler::new();
@@ -271,10 +288,12 @@ pub fn prefetch_first_rsp_frame(
 }
 
 fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return false;
-    };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
     if *len >= state.prefetch_buf.len() {
         return false;
     }
@@ -284,10 +303,12 @@ fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
 }
 
 fn store_prefetch(len: usize) -> bool {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return false;
-    };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
     if len > state.prefetch_buf.len() {
         return false;
     }
@@ -314,10 +335,12 @@ fn try_send_nak() {
 }
 
 fn flush_rx_input() {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return;
-    };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
     for _ in 0..FLUSH_LIMIT {
         if state.rx.pop().is_none() {
             break;
@@ -335,10 +358,13 @@ fn flush_rx_input() {
 }
 
 pub fn try_read_byte() -> Option<u8> {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return None;
-    };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
+
     if state.prefetch_pos < state.prefetch_len {
         let byte = state.prefetch_buf[state.prefetch_pos];
         state.prefetch_pos += 1;
@@ -351,18 +377,29 @@ pub fn try_read_byte() -> Option<u8> {
     if let Some(byte) = state.rx.pop() {
         return Some(byte);
     }
-    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+    // Poll UART directly when the debug loop is active or in a stop-loop section.
+    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) || is_debug_active() {
         return state.uart.try_read_byte();
     }
     None
 }
 
 pub fn try_write_byte(byte: u8) -> bool {
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    let Some(state) = guard.as_mut() else {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
         return false;
-    };
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
     state.uart.try_write_byte(byte)
 }
 
-pub fn flush() {}
+pub fn flush() {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
+    state.uart.flush();
+}

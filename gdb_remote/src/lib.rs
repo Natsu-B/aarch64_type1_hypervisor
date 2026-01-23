@@ -192,6 +192,31 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
     }
 
+    /// Initialize an uninitialized slot in-place without constructing large stack temporaries.
+    ///
+    /// NOTE: `new()` / `new_with_packet_size()` may require a large stack frame due to the
+    /// internal fixed-size buffers. Prefer this API for bare-metal / tiny-stack environments.
+    pub fn init_in_place(dst: &mut core::mem::MaybeUninit<Self>) {
+        Self::init_in_place_with_packet_size(dst, MAX_PKT);
+    }
+
+    pub fn init_in_place_with_packet_size(
+        dst: &mut core::mem::MaybeUninit<Self>,
+        packet_size: usize,
+    ) {
+        let advertised_packet_size = Self::clamp_packet_size(packet_size);
+        // SAFETY: caller provides an uninitialized slot which we fully initialize here.
+        unsafe {
+            let p = dst.as_mut_ptr();
+            // Zero everything first so rings/buffers start empty and Option/bool fields are sane.
+            core::ptr::write_bytes(p, 0u8, 1);
+            // Re-init fields that must not rely on "all-zero" being a valid state.
+            core::ptr::addr_of_mut!((*p).rsp).write(RspFrameAssembler::new());
+            core::ptr::addr_of_mut!((*p).advertised_packet_size).write(advertised_packet_size);
+            core::ptr::addr_of_mut!((*p).ack_mode).write(true);
+        }
+    }
+
     fn clamp_packet_size(packet_size: usize) -> usize {
         let mut size = packet_size;
         if size == 0 {
