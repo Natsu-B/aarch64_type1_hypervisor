@@ -30,6 +30,7 @@ TEXT_EXTENSIONS = {
     ".h",
     ".S",
     ".sh",
+    ".lds",
 }
 
 
