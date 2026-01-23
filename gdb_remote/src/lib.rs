@@ -145,9 +145,11 @@ impl<const N: usize> TxRing<N> {
 pub struct GdbServer<const MAX_PKT: usize, const TX_CAP: usize> {
     rsp: RspFrameAssembler,
     rx_buf: [u8; MAX_PKT],
-    work_raw: [u8; MAX_PKT],
-    work_out: [u8; MAX_PKT],
+    scratch_a: [u8; MAX_PKT],
+    scratch_b: [u8; MAX_PKT],
+    #[cfg(any(feature = "gdb_monitor_debug", test))]
     debug_in: [u8; 256],
+    #[cfg(any(feature = "gdb_monitor_debug", test))]
     debug_out: [u8; 1 + 256 * 2],
     rx_len: usize,
     rx_checksum: u8,
@@ -172,9 +174,11 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self {
             rsp: RspFrameAssembler::new(),
             rx_buf: [0; MAX_PKT],
-            work_raw: [0; MAX_PKT],
-            work_out: [0; MAX_PKT],
+            scratch_a: [0; MAX_PKT],
+            scratch_b: [0; MAX_PKT],
+            #[cfg(any(feature = "gdb_monitor_debug", test))]
             debug_in: [0; 256],
+            #[cfg(any(feature = "gdb_monitor_debug", test))]
             debug_out: [0; 1 + 256 * 2],
             rx_len: 0,
             rx_checksum: 0,
@@ -224,7 +228,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         if total_len > out_cap {
             return;
         }
-        let _ = self.queue_packet(&self.debug_out[..total_len]);
+        let _ = Self::queue_packet(&mut self.tx, &self.debug_out[..total_len]);
     }
 
     #[cfg(all(not(feature = "gdb_monitor_debug"), not(test)))]
@@ -266,14 +270,14 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
     }
 
-    fn queue_ack(&mut self, ok: bool) -> Result<(), TxOverflow> {
+    fn queue_ack(tx: &mut TxRing<TX_CAP>, ok: bool) -> Result<(), TxOverflow> {
         let byte = if ok { b'+' } else { b'-' };
-        self.tx.push(byte)
+        tx.push(byte)
     }
 
-    fn queue_packet(&mut self, payload: &[u8]) -> Result<(), TxOverflow> {
+    fn queue_packet(tx: &mut TxRing<TX_CAP>, payload: &[u8]) -> Result<(), TxOverflow> {
         let needed = payload.len().saturating_add(4);
-        if needed > self.tx.available() {
+        if needed > tx.available() {
             return Err(TxOverflow);
         }
 
@@ -282,11 +286,11 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             checksum = checksum.wrapping_add(b);
         }
 
-        self.tx.push(b'$')?;
-        self.tx.push_slice(payload)?;
-        self.tx.push(b'#')?;
-        self.tx.push(HEX[(checksum >> 4) as usize])?;
-        self.tx.push(HEX[(checksum & 0xF) as usize])?;
+        tx.push(b'$')?;
+        tx.push_slice(payload)?;
+        tx.push(b'#')?;
+        tx.push(HEX[(checksum >> 4) as usize])?;
+        tx.push(HEX[(checksum & 0xF) as usize])?;
         Ok(())
     }
 
@@ -294,7 +298,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         if payload.len() > self.out_payload_cap() {
             return Err(GdbError::PacketTooLong);
         }
-        self.queue_packet(payload).map_err(|_| GdbError::TxOverflow)
+        Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
     }
 
     fn send_empty<T: Target>(&mut self) -> Result<(), GdbServerError<T>> {
@@ -305,20 +309,9 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         self.send::<T>(b"OK")
     }
 
-    fn send_from_ptr<T: Target>(
-        &mut self,
-        ptr: *const u8,
-        len: usize,
-    ) -> Result<(), GdbServerError<T>> {
-        // SAFETY: caller guarantees ptr is valid for len bytes and the backing storage
-        // remains immutable for the duration of send.
-        let payload = unsafe { core::slice::from_raw_parts(ptr, len) };
-        self.send::<T>(payload)
-    }
-
-    fn send_work_out<T: Target>(&mut self, len: usize) -> Result<(), GdbServerError<T>> {
-        let ptr = self.work_out.as_ptr();
-        self.send_from_ptr::<T>(ptr, len)
+    fn send_scratch_b<T: Target>(&mut self, len: usize) -> Result<(), GdbServerError<T>> {
+        let payload = &self.scratch_b[..len];
+        Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
     }
 
     pub fn notify_stop_sigtrap(&mut self) -> Result<(), GdbError<Infallible, Infallible>> {
@@ -332,8 +325,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         if payload.len() > out_cap {
             return Err(GdbError::PacketTooLong);
         }
-        self.queue_packet(&payload)
-            .map_err(|_| GdbError::TxOverflow)
+        Self::queue_packet(&mut self.tx, &payload).map_err(|_| GdbError::TxOverflow)
     }
 
     fn finish_frame<T: Target>(
@@ -342,14 +334,14 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
     ) -> Result<ProcessResult, GdbServerError<T>> {
         if self.rx_overflow || self.rx_len > MAX_PKT {
             if self.ack_mode {
-                self.queue_ack(false).map_err(|_| GdbError::TxOverflow)?;
+                Self::queue_ack(&mut self.tx, false).map_err(|_| GdbError::TxOverflow)?;
             }
             return Err(GdbError::PacketTooLong);
         }
 
         if self.rx_checksum_len != self.rx_checksum_bytes.len() {
             if self.ack_mode {
-                self.queue_ack(false).map_err(|_| GdbError::TxOverflow)?;
+                Self::queue_ack(&mut self.tx, false).map_err(|_| GdbError::TxOverflow)?;
             }
             return Err(GdbError::MalformedPacket);
         }
@@ -358,7 +350,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             Ok(v) => v,
             Err(_) => {
                 if self.ack_mode {
-                    self.queue_ack(false).map_err(|_| GdbError::TxOverflow)?;
+                    Self::queue_ack(&mut self.tx, false).map_err(|_| GdbError::TxOverflow)?;
                 }
                 return Err(GdbError::MalformedPacket);
             }
@@ -367,7 +359,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             Ok(v) => v,
             Err(_) => {
                 if self.ack_mode {
-                    self.queue_ack(false).map_err(|_| GdbError::TxOverflow)?;
+                    Self::queue_ack(&mut self.tx, false).map_err(|_| GdbError::TxOverflow)?;
                 }
                 return Err(GdbError::MalformedPacket);
             }
@@ -376,19 +368,19 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
 
         if self.rx_checksum != checksum_recv {
             if self.ack_mode {
-                self.queue_ack(false).map_err(|_| GdbError::TxOverflow)?;
+                Self::queue_ack(&mut self.tx, false).map_err(|_| GdbError::TxOverflow)?;
             }
             return Err(GdbError::MalformedPacket);
         }
 
         if self.ack_mode {
-            self.queue_ack(true).map_err(|_| GdbError::TxOverflow)?;
+            Self::queue_ack(&mut self.tx, true).map_err(|_| GdbError::TxOverflow)?;
         }
 
         let payload_len = self.rx_len;
         let payload_ptr = self.rx_buf.as_ptr();
         // SAFETY: payload_ptr points to rx_buf for payload_len bytes. dispatch_payload only
-        // reads from the payload slice, and handlers use work_raw/work_out for decoding and
+        // reads from the payload slice, and handlers use scratch_a/scratch_b for decoding and
         // replies, so rx_buf is not mutated until dispatch completes.
         let payload = unsafe { core::slice::from_raw_parts(payload_ptr, payload_len) };
         self.dispatch_payload(target, payload)
@@ -765,7 +757,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             }
 
             let (consumed, encoded_len) = {
-                let reply = &mut self.work_out;
+                let reply = &mut self.scratch_b;
                 encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
             };
             if consumed == 0 {
@@ -774,8 +766,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             }
 
             let more = offset + consumed < data.len();
-            self.work_out[0] = if more { b'm' } else { b'l' };
-            self.send_work_out::<T>(1 + encoded_len)?;
+            self.scratch_b[0] = if more { b'm' } else { b'l' };
+            self.send_scratch_b::<T>(1 + encoded_len)?;
             return Ok(ProcessResult::None);
         }
 
@@ -842,7 +834,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             }
 
             let (consumed, encoded_len) = {
-                let reply = &mut self.work_out;
+                let reply = &mut self.scratch_b;
                 encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
             };
             if consumed == 0 {
@@ -851,8 +843,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             }
 
             let more = offset + consumed < data.len();
-            self.work_out[0] = if more { b'm' } else { b'l' };
-            self.send_work_out::<T>(1 + encoded_len)?;
+            self.scratch_b[0] = if more { b'm' } else { b'l' };
+            self.send_scratch_b::<T>(1 + encoded_len)?;
             return Ok(ProcessResult::None);
         }
 
@@ -911,7 +903,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         target: &mut T,
     ) -> Result<ProcessResult, GdbServerError<T>> {
         let result = {
-            let regs = &mut self.work_raw;
+            let regs = &mut self.scratch_a;
             target.read_registers(regs)
         };
         let len = match self.handle_target_err_core(target, result)? {
@@ -933,8 +925,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
         let hex_len = {
-            let out = &mut self.work_out[..out_cap];
-            let regs = &self.work_raw[..len];
+            let out = &mut self.scratch_b[..out_cap];
+            let regs = &self.scratch_a[..len];
             hex_encode(regs, out)
         };
         if hex_len < expected_hex_len {
@@ -947,7 +939,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        self.send_work_out::<T>(hex_len)?;
+        self.send_scratch_b::<T>(hex_len)?;
         Ok(ProcessResult::None)
     }
 
@@ -964,7 +956,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             data_hex.len()
         );
         let len = match {
-            let regs = &mut self.work_raw;
+            let regs = &mut self.scratch_a;
             hex_decode(data_hex, regs)
         } {
             Ok(len) => len,
@@ -973,14 +965,14 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                     self,
                     "handle_write_all_registers: hex decode failed src_len={} dst_cap={}",
                     data_hex.len(),
-                    self.work_raw.len()
+                    self.scratch_a.len()
                 );
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
             }
         };
         gdb_debug!(self, "handle_write_all_registers: decoded_len={}", len);
-        let result = target.write_registers(&self.work_raw[..len]);
+        let result = target.write_registers(&self.scratch_a[..len]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1026,7 +1018,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         gdb_debug!(self, "handle_read_single_register: regno={}", regno);
 
         let result = {
-            let reg = &mut self.work_raw;
+            let reg = &mut self.scratch_a;
             target.read_register(regno, reg)
         };
         let len = match self.handle_target_err_core(target, result)? {
@@ -1047,8 +1039,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
         let hex_len = {
-            let out = &mut self.work_out[..out_cap];
-            let reg = &self.work_raw[..len];
+            let out = &mut self.scratch_b[..out_cap];
+            let reg = &self.scratch_a[..len];
             hex_encode(reg, out)
         };
         if hex_len < expected_hex_len {
@@ -1062,7 +1054,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        self.send_work_out::<T>(hex_len)?;
+        self.send_scratch_b::<T>(hex_len)?;
         Ok(ProcessResult::None)
     }
 
@@ -1101,7 +1093,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         );
 
         let len = match {
-            let reg = &mut self.work_raw;
+            let reg = &mut self.scratch_a;
             hex_decode(val_hex, reg)
         } {
             Ok(len) => len,
@@ -1110,7 +1102,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                     self,
                     "handle_write_single_register: hex decode failed src_len={} dst_cap={}",
                     val_hex.len(),
-                    self.work_raw.len()
+                    self.scratch_a.len()
                 );
                 self.send::<T>(b"E01")?;
                 return Ok(ProcessResult::None);
@@ -1123,7 +1115,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             len,
             regno
         );
-        let result = target.write_register(regno, &self.work_raw[..len]);
+        let result = target.write_register(regno, &self.scratch_a[..len]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1186,7 +1178,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
 
         let result = {
-            let data = &mut self.work_raw;
+            let data = &mut self.scratch_a;
             target.read_memory(addr, &mut data[..len_usize])
         };
         if self.handle_target_err_core(target, result)?.is_none() {
@@ -1194,8 +1186,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
 
         let hex_len = {
-            let out = &mut self.work_out[..out_cap];
-            let data = &self.work_raw[..len_usize];
+            let out = &mut self.scratch_b[..out_cap];
+            let data = &self.scratch_a[..len_usize];
             hex_encode(data, out)
         };
         if hex_len < expected_hex_len {
@@ -1208,7 +1200,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             self.send::<T>(b"E01")?;
             return Ok(ProcessResult::None);
         }
-        self.send_work_out::<T>(hex_len)?;
+        self.send_scratch_b::<T>(hex_len)?;
         Ok(ProcessResult::None)
     }
 
@@ -1242,7 +1234,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         );
 
         let decoded = match {
-            let data = &mut self.work_raw;
+            let data = &mut self.scratch_a;
             hex_decode(data_hex, data)
         } {
             Ok(len) => len,
@@ -1251,7 +1243,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                     self,
                     "handle_write_memory_hex: hex decode failed src_len={} dst_cap={}",
                     data_hex.len(),
-                    self.work_raw.len()
+                    self.scratch_a.len()
                 );
                 self.send::<T>(b"E03")?;
                 return Ok(ProcessResult::None);
@@ -1268,7 +1260,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
 
-        let result = target.write_memory(addr, &self.work_raw[..decoded]);
+        let result = target.write_memory(addr, &self.scratch_a[..decoded]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1318,18 +1310,18 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
 
         // Decode RSP binary data after checksum validation. The on-wire payload uses 0x7d
         // escaping (no RLE expansion for incoming data).
-        if len_usize > self.work_raw.len() {
+        if len_usize > self.scratch_a.len() {
             gdb_debug!(
                 self,
                 "handle_write_memory_binary: len {} exceeds MAX_PKT {}",
                 len_usize,
-                self.work_raw.len()
+                self.scratch_a.len()
             );
             self.send::<T>(b"E03")?;
             return Ok(ProcessResult::None);
         }
         let decoded_len = match {
-            let decoded = &mut self.work_raw;
+            let decoded = &mut self.scratch_a;
             decode_rsp_binary(binary, &mut decoded[..len_usize])
         } {
             Ok(len) => len,
@@ -1357,7 +1349,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Ok(ProcessResult::None);
         }
 
-        let result = target.write_memory(addr, &self.work_raw[..decoded_len]);
+        let result = target.write_memory(addr, &self.scratch_a[..decoded_len]);
         if self.handle_target_err_core(target, result)?.is_none() {
             return Ok(ProcessResult::None);
         }
@@ -1621,7 +1613,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             }
 
             let decoded_len = match {
-                let decoded = &mut self.work_raw;
+                let decoded = &mut self.scratch_a;
                 decode_rsp_binary(data, decoded)
             } {
                 Ok(len) => len,
@@ -1630,7 +1622,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                         self,
                         "handle_v_packet: vFlashWrite decode failed src_len={} dst_cap={}",
                         data.len(),
-                        self.work_raw.len()
+                        self.scratch_a.len()
                     );
                     self.send::<T>(b"E03")?;
                     return Ok(ProcessResult::None);
@@ -1648,7 +1640,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 return Ok(ProcessResult::None);
             }
 
-            let result = target.write_memory(addr, &self.work_raw[..decoded_len]);
+            let result = target.write_memory(addr, &self.scratch_a[..decoded_len]);
             if self.handle_target_err_core(target, result)?.is_none() {
                 return Ok(ProcessResult::None);
             }
@@ -2019,6 +2011,151 @@ fn encode_rsp_binary(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use super::GdbServer;
+    use super::HEX;
+    use super::ProcessResult;
+    use super::Target;
+    use super::TargetError;
+    use core::convert::Infallible;
+    use std::vec::Vec;
+
+    const REG_BYTES: usize = 356;
+
+    struct DummyTarget;
+
+    type DummyError = TargetError<Infallible, Infallible>;
+
+    impl Target for DummyTarget {
+        type RecoverableError = Infallible;
+        type UnrecoverableError = Infallible;
+
+        fn read_registers(&mut self, dst: &mut [u8]) -> Result<usize, DummyError> {
+            if dst.len() < REG_BYTES {
+                return Err(TargetError::NotSupported);
+            }
+            for (idx, byte) in dst[..REG_BYTES].iter_mut().enumerate() {
+                *byte = (idx & 0xff) as u8;
+            }
+            Ok(REG_BYTES)
+        }
+
+        fn write_registers(&mut self, _src: &[u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn read_register(&mut self, _regno: u32, _dst: &mut [u8]) -> Result<usize, DummyError> {
+            Ok(0)
+        }
+
+        fn write_register(&mut self, _regno: u32, _src: &[u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn read_memory(&mut self, _addr: u64, _dst: &mut [u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn write_memory(&mut self, _addr: u64, _src: &[u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn insert_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
+            Ok(())
+        }
+    }
+
+    fn build_frame(payload: &[u8]) -> Vec<u8> {
+        let checksum = payload.iter().fold(0u8, |sum, &b| sum.wrapping_add(b));
+        let mut frame = Vec::new();
+        frame.push(b'$');
+        frame.extend_from_slice(payload);
+        frame.push(b'#');
+        frame.push(HEX[(checksum >> 4) as usize]);
+        frame.push(HEX[(checksum & 0xF) as usize]);
+        frame
+    }
+
+    fn is_hex(b: u8) -> bool {
+        matches!(b, b'0'..=b'9' | b'a'..=b'f')
+    }
+
+    struct Packet {
+        payload: Vec<u8>,
+        checksum: [u8; 2],
+    }
+
+    fn parse_packets(tx: &[u8]) -> Vec<Packet> {
+        let mut packets = Vec::new();
+        let mut idx = 0usize;
+        while idx < tx.len() {
+            if tx[idx] != b'$' {
+                idx += 1;
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            let start = idx;
+            while idx < tx.len() && tx[idx] != b'#' {
+                idx += 1;
+            }
+            if idx >= tx.len() {
+                panic!("unterminated packet in tx stream");
+            }
+            let payload = tx[start..idx].to_vec();
+            if idx + 2 >= tx.len() {
+                panic!("missing checksum in tx stream");
+            }
+            let checksum = [tx[idx + 1], tx[idx + 2]];
+            idx += 3;
+            packets.push(Packet { payload, checksum });
+        }
+        packets
+    }
+
+    #[test]
+    fn g_packet_queues_register_reply() {
+        let mut server: GdbServer<8192, 2048> = GdbServer::new();
+        let mut target = DummyTarget;
+        let frame = build_frame(b"g");
+
+        let mut last = ProcessResult::None;
+        for &byte in &frame {
+            last = server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+        assert!(matches!(last, ProcessResult::None));
+
+        let mut tx = Vec::new();
+        while let Some(byte) = server.pop_tx_byte_irq() {
+            tx.push(byte);
+        }
+
+        let packets = parse_packets(&tx);
+        let packet = packets
+            .iter()
+            .find(|packet| {
+                packet.payload.len() == REG_BYTES * 2 && packet.payload.iter().all(|&b| is_hex(b))
+            })
+            .expect("missing register response packet");
+
+        let expected = packet
+            .payload
+            .iter()
+            .fold(0u8, |sum, &b| sum.wrapping_add(b));
+        let expected_hex = [
+            HEX[(expected >> 4) as usize],
+            HEX[(expected & 0xF) as usize],
+        ];
+        assert!(packet.checksum.iter().all(|&b| is_hex(b)));
+        assert_eq!(packet.checksum, expected_hex);
+    }
+
     #[test]
     fn no_max_pkt_stack_buffers() {
         let src = include_str!("lib.rs");
