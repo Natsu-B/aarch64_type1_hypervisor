@@ -319,7 +319,18 @@ impl<const N: usize> HwWatchpointTable<N> {
     }
 }
 
+fn bas_is_contiguous(bas: u8) -> bool {
+    if bas == 0 {
+        return false;
+    }
+    let lsb = bas.trailing_zeros();
+    let shifted = (bas >> lsb) as u16;
+    (shifted & (shifted + 1)) == 0
+}
+
 fn encode_bwcr(kind: WatchpointKind, bas: u8) -> DBGWCR_EL1 {
+    debug_assert!(bas != 0, "BAS must be non-zero");
+    debug_assert!(bas_is_contiguous(bas), "BAS must be contiguous");
     let lsc = match kind {
         WatchpointKind::Read => 0b01,
         WatchpointKind::Write => 0b10,
@@ -330,8 +341,14 @@ fn encode_bwcr(kind: WatchpointKind, bas: u8) -> DBGWCR_EL1 {
         .set(DBGWCR_EL1::pac, 0b11)
         .set(DBGWCR_EL1::lsc, lsc as u64)
         .set(DBGWCR_EL1::bas, bas as u64)
-        // Match EL2 accesses as well (bootloader/hypervisor runs at EL2).
-        .set(DBGWCR_EL1::hmc, 1)
+        .set(DBGWCR_EL1::ssc, 0)
+        // Do not match EL2: the debugger runs at EL2 and can trip its own watchpoints
+        // during m/M packets, wedging the stop loop. Watchpoints should trap the guest.
+        .set(DBGWCR_EL1::hmc, 0)
+}
+
+fn encode_bwcr_disabled(kind: WatchpointKind, bas: u8) -> DBGWCR_EL1 {
+    encode_bwcr(kind, bas).set(DBGWCR_EL1::e, 0)
 }
 
 #[derive(Clone, Copy)]
@@ -345,6 +362,7 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
     breakpoints: SwBreakpointTable<N>,
     hw_breakpoints: HwBreakpointTable<DEFAULT_HW_BREAKPOINTS>,
     hw_watchpoints: HwWatchpointTable<DEFAULT_HW_BREAKPOINTS>,
+    watchpoints_suspended: bool,
     hw_breakpoints_active: usize,
     hw_mdscr_restore: Option<MdscrRestore>,
     desc: Aarch64TargetDesc,
@@ -359,6 +377,7 @@ impl<M, const N: usize> Aarch64GdbState<M, N> {
             breakpoints: SwBreakpointTable::new(),
             hw_breakpoints: HwBreakpointTable::new(),
             hw_watchpoints: HwWatchpointTable::new(),
+            watchpoints_suspended: false,
             hw_breakpoints_active: 0,
             hw_mdscr_restore: None,
             desc: Aarch64TargetDesc::new(),
@@ -532,6 +551,36 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
         }
     }
 
+    fn suspend_hw_watchpoints(&mut self) {
+        if self.watchpoints_suspended {
+            return;
+        }
+        for entry in self.hw_watchpoints.slots.iter() {
+            if !entry.used || !entry.installed {
+                continue;
+            }
+            let wcr = encode_bwcr_disabled(entry.req_kind, entry.seg_bas);
+            let _ = cpu::set_dbgwcr_el1(entry.slot, wcr);
+        }
+        cpu::isb();
+        self.watchpoints_suspended = true;
+    }
+
+    fn resume_hw_watchpoints(&mut self) {
+        if !self.watchpoints_suspended {
+            return;
+        }
+        for entry in self.hw_watchpoints.slots.iter() {
+            if !entry.used || !entry.installed {
+                continue;
+            }
+            let _ = cpu::set_dbgwvr_el1(entry.slot, DBGWVR_EL1::from_bits(entry.seg_base));
+            let _ = cpu::set_dbgwcr_el1(entry.slot, encode_bwcr(entry.req_kind, entry.seg_bas));
+        }
+        cpu::isb();
+        self.watchpoints_suspended = false;
+    }
+
     fn insert_hw_breakpoint(
         &mut self,
         addr: u64,
@@ -647,7 +696,12 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
                 .map_err(|_| Aarch64GdbError::HwBreakpointSlotsExhausted)?;
             cpu::set_dbgwvr_el1(hw_index, DBGWVR_EL1::from_bits(base))
                 .map_err(|_| Aarch64GdbError::HwBreakpointSlotsExhausted)?;
-            cpu::set_dbgwcr_el1(hw_index, encode_bwcr(kind, bas))
+            let wcr = if self.watchpoints_suspended {
+                encode_bwcr_disabled(kind, bas)
+            } else {
+                encode_bwcr(kind, bas)
+            };
+            cpu::set_dbgwcr_el1(hw_index, wcr)
                 .map_err(|_| Aarch64GdbError::HwBreakpointSlotsExhausted)?;
 
             self.hw_watchpoints.slots[entry_slot] = HwWatchpoint {
@@ -1173,6 +1227,12 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         let Some(io) = debug_io() else {
             return;
         };
+        self.state.suspend_hw_watchpoints();
+
+        enum DebugOutcome {
+            Resume(ResumeAction),
+            Exit,
+        }
 
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
@@ -1199,7 +1259,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
         let mut pending_stop_reply = matches!(cause, DebugEntryCause::DebugException(_));
         let mut tx_hold = None;
-        let action = 'debug: loop {
+        let outcome = 'debug: loop {
             let mut target = self.state.target(regs);
             let mut progress = false;
 
@@ -1210,7 +1270,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                         progress = true;
                     }
                     Err(GdbError::TxOverflow) => {}
-                    Err(_) => return,
+                    Err(_) => break 'debug DebugOutcome::Exit,
                 }
             }
 
@@ -1238,13 +1298,15 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                     Some(byte) => {
                         progress = true;
                         match self.server.on_rx_byte_irq(&mut target, byte) {
-                            Ok(ProcessResult::Resume(action)) => break 'debug action,
-                            Ok(ProcessResult::MonitorExit) => return,
+                            Ok(ProcessResult::Resume(action)) => {
+                                break 'debug DebugOutcome::Resume(action);
+                            }
+                            Ok(ProcessResult::MonitorExit) => break 'debug DebugOutcome::Exit,
                             Ok(ProcessResult::None) => {}
                             Err(GdbError::MalformedPacket | GdbError::PacketTooLong) => {
                                 self.server.resync();
                             }
-                            Err(_) => return,
+                            Err(_) => break 'debug DebugOutcome::Exit,
                         }
                     }
                     None => break,
@@ -1258,9 +1320,15 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             }
         };
 
-        let (resume_action, new_pc) = match action {
-            ResumeAction::Continue(pc) => (PendingStepAction::Continue, pc),
-            ResumeAction::Step(pc) => (PendingStepAction::Step, pc),
+        let (resume_action, new_pc) = match outcome {
+            DebugOutcome::Resume(action) => match action {
+                ResumeAction::Continue(pc) => (PendingStepAction::Continue, pc),
+                ResumeAction::Step(pc) => (PendingStepAction::Step, pc),
+            },
+            DebugOutcome::Exit => {
+                self.state.resume_hw_watchpoints();
+                return;
+            }
         };
 
         if let Some(pc) = new_pc {
@@ -1275,6 +1343,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                     action: resume_action,
                     restore: enable_single_step(),
                 });
+                self.state.resume_hw_watchpoints();
                 return;
             }
             let _ = self.state.reinstall_sw_breakpoint_slot(slot);
@@ -1289,6 +1358,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 });
             }
         }
+        self.state.resume_hw_watchpoints();
     }
 
     pub fn handle_debug_exception(&mut self, regs: &mut Registers, ec: ExceptionClass) {
