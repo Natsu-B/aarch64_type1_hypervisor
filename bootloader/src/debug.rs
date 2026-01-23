@@ -116,7 +116,13 @@ pub(crate) fn init_gdb_stub() {
 }
 
 pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionClass) {
+    // Exception entry masks IRQs (DAIF), so the RX ring may not advance; begin_stop_loop() enables
+    // the polling path in try_read_byte() so GDB stays responsive on brk/debug exceptions.
+    let _debug_active = DebugActiveGuard::new();
+    let saved_daif = cpu::read_daif();
+    let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_exception_entry(regs, ec);
+    cpu::irq_restore(saved_daif);
 }
 
 pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
