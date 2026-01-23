@@ -40,6 +40,12 @@ SECTIONS {
   }
   _PROGRAM_END = .;
 
+  _STACK_BOTTOM = _PROGRAM_END;
   . = 0x50000000;
   _STACK_TOP = .;
+
+  ASSERT(_PROGRAM_START < _PROGRAM_END, "PROGRAM range invalid")
+  ASSERT(_BSS_START <= _BSS_END, "BSS range invalid")
+  ASSERT(_PROGRAM_END <= _STACK_BOTTOM, "PROGRAM overlaps STACK")
+  ASSERT((_STACK_TOP & 0xF) == 0, "STACK_TOP not 16-byte aligned")
 }
