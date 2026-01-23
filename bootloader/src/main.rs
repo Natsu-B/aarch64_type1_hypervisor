@@ -296,6 +296,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         cpu::set_mdcr_el2(mdcr | (1 << 8));
     }
     cpu::enable_irq();
+    cpu::enable_debug_exceptions();
     let modified = {
         let mut dtb_bytes = AlignedSliceBox::new_uninit_with_align(dtb.get_size(), 32).unwrap();
         dtb_bytes.copy_from_slice(unsafe {

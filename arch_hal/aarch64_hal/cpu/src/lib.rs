@@ -160,6 +160,28 @@ pub unsafe fn write_daif(daif: u64) {
     }
 }
 
+/// Unmask debug exceptions (PSTATE.D / DAIF.D = 0) at the current exception level.
+///
+/// This enables Watchpoint/Breakpoint/Software Step exceptions targeted at the current EL.
+#[inline(always)]
+pub fn enable_debug_exceptions() {
+    // SAFETY: This only modifies PSTATE.D (DAIF.D) at the current EL.
+    // The caller must ensure that unmasking debug exceptions is safe in the current context.
+    unsafe { asm!("msr daifclr, #8", options(nostack, preserves_flags)) };
+    isb();
+}
+
+/// Mask debug exceptions (PSTATE.D / DAIF.D = 1) at the current exception level.
+#[inline(always)]
+pub fn disable_debug_exceptions() {
+    // SAFETY: This only modifies PSTATE.D (DAIF.D) at the current EL.
+    // The caller must ensure that masking debug exceptions is safe in the current context.
+    unsafe { asm!("msr daifset, #8", options(nostack, preserves_flags)) };
+    isb();
+}
+
+/// Mask the IRQ bit and return the previous DAIF value.
+#[inline(always)]
 pub fn irq_save() -> u64 {
     let flags = read_daif();
     // Mask IRQs.
