@@ -3,6 +3,8 @@
 use aarch64_mutex::RawSpinLockIrqSave;
 use core::hint::spin_loop;
 use cpu::Registers;
+use cpu::registers::DBGWCR_EL1;
+use cpu::registers::DBGWVR_EL1;
 use cpu::registers::MDSCR_EL1;
 use exceptions::registers::ExceptionClass;
 use gdb_remote::GdbError;
@@ -12,6 +14,7 @@ use gdb_remote::ResumeAction;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
+use gdb_remote::WatchpointKind;
 
 #[derive(Clone, Copy)]
 pub struct DebugIo {
@@ -162,6 +165,7 @@ pub enum Aarch64GdbError<E> {
     BufferTooSmall,
     UnalignedAddress,
     BreakpointTableFull,
+    HwBreakpointSlotsExhausted,
     InvalidBreakpointKind,
 }
 
@@ -246,6 +250,91 @@ impl<const N: usize> HwBreakpointTable<N> {
 }
 
 #[derive(Clone, Copy)]
+struct HwWatchpoint {
+    used: bool,
+    installed: bool,
+    req_addr: u64,
+    req_len: u8,
+    req_kind: WatchpointKind,
+    seg_base: u64,
+    seg_bas: u8,
+    slot: usize,
+}
+
+impl HwWatchpoint {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            installed: false,
+            req_addr: 0,
+            req_len: 0,
+            req_kind: WatchpointKind::Write,
+            seg_base: 0,
+            seg_bas: 0,
+            slot: 0,
+        }
+    }
+}
+
+struct HwWatchpointTable<const N: usize> {
+    slots: [HwWatchpoint; N],
+}
+
+impl<const N: usize> HwWatchpointTable<N> {
+    const fn new() -> Self {
+        Self {
+            slots: [HwWatchpoint::empty(); N],
+        }
+    }
+
+    fn find_segment(
+        &self,
+        req_addr: u64,
+        req_len: u8,
+        req_kind: WatchpointKind,
+        seg_base: u64,
+        seg_bas: u8,
+    ) -> Option<usize> {
+        for (i, e) in self.slots.iter().enumerate() {
+            if e.used
+                && e.req_addr == req_addr
+                && e.req_len == req_len
+                && e.req_kind == req_kind
+                && e.seg_base == seg_base
+                && e.seg_bas == seg_bas
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn alloc(&mut self) -> Option<usize> {
+        for (i, e) in self.slots.iter().enumerate() {
+            if !e.used {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+fn encode_bwcr(kind: WatchpointKind, bas: u8) -> DBGWCR_EL1 {
+    let lsc = match kind {
+        WatchpointKind::Read => 0b01,
+        WatchpointKind::Write => 0b10,
+        WatchpointKind::Access => 0b11,
+    };
+    DBGWCR_EL1::from_bits(0)
+        .set(DBGWCR_EL1::e, 1)
+        .set(DBGWCR_EL1::pac, 0b11)
+        .set(DBGWCR_EL1::lsc, lsc as u64)
+        .set(DBGWCR_EL1::bas, bas as u64)
+        // Match EL2 accesses as well (bootloader/hypervisor runs at EL2).
+        .set(DBGWCR_EL1::hmc, 1)
+}
+
+#[derive(Clone, Copy)]
 struct MdscrRestore {
     kde: bool,
     mde: bool,
@@ -255,6 +344,7 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
     mem: M,
     breakpoints: SwBreakpointTable<N>,
     hw_breakpoints: HwBreakpointTable<DEFAULT_HW_BREAKPOINTS>,
+    hw_watchpoints: HwWatchpointTable<DEFAULT_HW_BREAKPOINTS>,
     hw_breakpoints_active: usize,
     hw_mdscr_restore: Option<MdscrRestore>,
     desc: Aarch64TargetDesc,
@@ -264,16 +354,25 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
 
 impl<M, const N: usize> Aarch64GdbState<M, N> {
     pub fn new(mem: M) -> Self {
-        Self {
+        let mut state = Self {
             mem,
             breakpoints: SwBreakpointTable::new(),
             hw_breakpoints: HwBreakpointTable::new(),
+            hw_watchpoints: HwWatchpointTable::new(),
             hw_breakpoints_active: 0,
             hw_mdscr_restore: None,
             desc: Aarch64TargetDesc::new(),
             features_active: false,
             memory_map: None,
+        };
+
+        let wp_slots = core::cmp::min(cpu::watchpoint_count(), DEFAULT_HW_BREAKPOINTS);
+        for i in 0..wp_slots {
+            let _ = cpu::set_dbgwcr_el1(i, DBGWCR_EL1::from_bits(0));
+            let _ = cpu::set_dbgwvr_el1(i, DBGWVR_EL1::from_bits(0));
         }
+
+        state
     }
 
     pub fn target<'a>(&'a mut self, regs: &'a mut Registers) -> Aarch64GdbTarget<'a, M, N> {
@@ -465,6 +564,112 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
         Ok(())
     }
 
+    fn rollback_watchpoint_segments(
+        &mut self,
+        installed: &[Option<usize>; DEFAULT_HW_BREAKPOINTS],
+        installed_n: usize,
+    ) {
+        for i in 0..installed_n {
+            if let Some(es) = installed[i] {
+                let e = self.hw_watchpoints.slots[es];
+                let _ = cpu::set_dbgwcr_el1(e.slot, DBGWCR_EL1::from_bits(0));
+                let _ = cpu::set_dbgwvr_el1(e.slot, DBGWVR_EL1::from_bits(0));
+                self.hw_watchpoints.slots[es] = HwWatchpoint::empty();
+            }
+        }
+        self.hw_breakpoints_active = self.hw_breakpoints_active.saturating_sub(installed_n);
+        self.restore_hw_breakpoints();
+    }
+
+    fn insert_watchpoint(
+        &mut self,
+        addr: u64,
+        len: u64,
+        kind: WatchpointKind,
+    ) -> Result<(), Aarch64GdbError<M::Error>> {
+        if len == 0 || len > 8 {
+            return Err(Aarch64GdbError::UnalignedAddress);
+        }
+        let len_u8 = len as u8;
+
+        let mut seg_addr = addr;
+        let mut remaining = len_u8;
+
+        let mut installed: [Option<usize>; DEFAULT_HW_BREAKPOINTS] = [None; DEFAULT_HW_BREAKPOINTS];
+        let mut installed_n = 0usize;
+
+        while remaining != 0 {
+            let off = (seg_addr & 0x7) as u8;
+            let chunk = core::cmp::min(remaining, 8 - off);
+
+            let base = seg_addr & !0x7;
+            let bas = (((1u16 << chunk) - 1) << off) as u8;
+
+            if self
+                .hw_watchpoints
+                .find_segment(addr, len_u8, kind, base, bas)
+                .is_some()
+            {
+                seg_addr = seg_addr.wrapping_add(chunk as u64);
+                remaining -= chunk;
+                continue;
+            }
+
+            let Some(entry_slot) = self.hw_watchpoints.alloc() else {
+                self.rollback_watchpoint_segments(&installed, installed_n);
+                return Err(Aarch64GdbError::HwBreakpointSlotsExhausted);
+            };
+
+            let hw_slots = core::cmp::min(cpu::watchpoint_count(), DEFAULT_HW_BREAKPOINTS);
+            let mut hw_index = None;
+            'hw: for i in 0..hw_slots {
+                let mut used = false;
+                for e in self.hw_watchpoints.slots.iter() {
+                    if e.used && e.slot == i {
+                        used = true;
+                        break;
+                    }
+                }
+                if !used {
+                    hw_index = Some(i);
+                    break 'hw;
+                }
+            }
+            let Some(hw_index) = hw_index else {
+                self.rollback_watchpoint_segments(&installed, installed_n);
+                return Err(Aarch64GdbError::HwBreakpointSlotsExhausted);
+            };
+
+            self.enable_hw_breakpoints();
+            self.hw_breakpoints_active += 1;
+
+            cpu::set_dbgwcr_el1(hw_index, DBGWCR_EL1::from_bits(0))
+                .map_err(|_| Aarch64GdbError::HwBreakpointSlotsExhausted)?;
+            cpu::set_dbgwvr_el1(hw_index, DBGWVR_EL1::from_bits(base))
+                .map_err(|_| Aarch64GdbError::HwBreakpointSlotsExhausted)?;
+            cpu::set_dbgwcr_el1(hw_index, encode_bwcr(kind, bas))
+                .map_err(|_| Aarch64GdbError::HwBreakpointSlotsExhausted)?;
+
+            self.hw_watchpoints.slots[entry_slot] = HwWatchpoint {
+                used: true,
+                installed: true,
+                req_addr: addr,
+                req_len: len_u8,
+                req_kind: kind,
+                seg_base: base,
+                seg_bas: bas,
+                slot: hw_index,
+            };
+            installed[installed_n] = Some(entry_slot);
+            installed_n += 1;
+
+            seg_addr = seg_addr.wrapping_add(chunk as u64);
+            remaining -= chunk;
+        }
+
+        Ok(())
+    }
+
     fn remove_hw_breakpoint(
         &mut self,
         addr: u64,
@@ -489,6 +694,51 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
         self.restore_hw_breakpoints();
         Ok(())
     }
+
+    fn remove_watchpoint(
+        &mut self,
+        addr: u64,
+        len: u64,
+        kind: WatchpointKind,
+    ) -> Result<(), Aarch64GdbError<M::Error>> {
+        if len == 0 || len > 8 {
+            return Ok(());
+        }
+        let len_u8 = len as u8;
+
+        let mut seg_addr = addr;
+        let mut remaining = len_u8;
+
+        while remaining != 0 {
+            let off = (seg_addr & 0x7) as u8;
+            let chunk = core::cmp::min(remaining, 8 - off);
+
+            let base = seg_addr & !0x7;
+            let bas = (((1u16 << chunk) - 1) << off) as u8;
+
+            if let Some(es) = self
+                .hw_watchpoints
+                .find_segment(addr, len_u8, kind, base, bas)
+            {
+                let e = self.hw_watchpoints.slots[es];
+                if e.installed {
+                    let _ = cpu::set_dbgwcr_el1(e.slot, DBGWCR_EL1::from_bits(0));
+                    let _ = cpu::set_dbgwvr_el1(e.slot, DBGWVR_EL1::from_bits(0));
+                    self.hw_watchpoints.slots[es] = HwWatchpoint::empty();
+
+                    if self.hw_breakpoints_active > 0 {
+                        self.hw_breakpoints_active -= 1;
+                    }
+                    self.restore_hw_breakpoints();
+                }
+            }
+
+            seg_addr = seg_addr.wrapping_add(chunk as u64);
+            remaining -= chunk;
+        }
+
+        Ok(())
+    }
 }
 
 pub struct Aarch64GdbTarget<'a, M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
@@ -503,6 +753,9 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
     fn capabilities(&self) -> TargetCapabilities {
         let mut caps = TargetCapabilities::SW_BREAK
             | TargetCapabilities::HW_BREAK
+            | TargetCapabilities::WATCH_W
+            | TargetCapabilities::WATCH_R
+            | TargetCapabilities::WATCH_A
             | TargetCapabilities::VCONT
             | TargetCapabilities::XFER_FEATURES;
         if self.state.memory_map.is_some() {
@@ -514,7 +767,9 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
     fn recoverable_error_code(&self, e: &Self::RecoverableError) -> u8 {
         match e {
             Aarch64GdbError::Memory(_) | Aarch64GdbError::UnalignedAddress => 14,
-            Aarch64GdbError::BreakpointTableFull => 28,
+            Aarch64GdbError::BreakpointTableFull | Aarch64GdbError::HwBreakpointSlotsExhausted => {
+                28
+            }
             Aarch64GdbError::InvalidRegister
             | Aarch64GdbError::BufferTooSmall
             | Aarch64GdbError::InvalidBreakpointKind => 22,
@@ -749,6 +1004,28 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
     ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
         self.state
             .remove_hw_breakpoint(addr, kind)
+            .map_err(TargetError::Recoverable)
+    }
+
+    fn insert_watchpoint(
+        &mut self,
+        kind: WatchpointKind,
+        addr: u64,
+        len: u64,
+    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        self.state
+            .insert_watchpoint(addr, len, kind)
+            .map_err(TargetError::Recoverable)
+    }
+
+    fn remove_watchpoint(
+        &mut self,
+        kind: WatchpointKind,
+        addr: u64,
+        len: u64,
+    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        self.state
+            .remove_watchpoint(addr, len, kind)
             .map_err(TargetError::Recoverable)
     }
 }

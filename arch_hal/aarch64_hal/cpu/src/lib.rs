@@ -4,6 +4,8 @@ use core::arch::asm;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
 
+use crate::registers::DBGWCR_EL1;
+use crate::registers::DBGWVR_EL1;
 use crate::registers::ID_AA64DFR0_EL1;
 use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::ID_AA64PFR0_EL1;
@@ -190,6 +192,93 @@ pub fn enable_irq() {
 pub fn breakpoint_count() -> usize {
     let id = ID_AA64DFR0_EL1::from_bits(get_id_aa64dfr0_el1());
     (id.get(ID_AA64DFR0_EL1::brps) as usize) + 1
+}
+
+pub fn watchpoint_count() -> usize {
+    let id = ID_AA64DFR0_EL1::from_bits(get_id_aa64dfr0_el1());
+    (id.get(ID_AA64DFR0_EL1::wrps) as usize) + 1
+}
+
+pub fn set_dbgwvr_el1(index: usize, value: DBGWVR_EL1) -> Result<(), ()> {
+    let value = value.bits();
+    match index {
+        0 => {
+            // SAFETY: Writing DBGWVR0_EL1 programs watchpoint value register 0.
+            unsafe { asm!("msr dbgwvr0_el1, {}", in(reg) value) };
+        }
+        1 => {
+            // SAFETY: Writing DBGWVR1_EL1 programs watchpoint value register 1.
+            unsafe { asm!("msr dbgwvr1_el1, {}", in(reg) value) };
+        }
+        2 => {
+            // SAFETY: Writing DBGWVR2_EL1 programs watchpoint value register 2.
+            unsafe { asm!("msr dbgwvr2_el1, {}", in(reg) value) };
+        }
+        3 => {
+            // SAFETY: Writing DBGWVR3_EL1 programs watchpoint value register 3.
+            unsafe { asm!("msr dbgwvr3_el1, {}", in(reg) value) };
+        }
+        4 => {
+            // SAFETY: Writing DBGWVR4_EL1 programs watchpoint value register 4.
+            unsafe { asm!("msr dbgwvr4_el1, {}", in(reg) value) };
+        }
+        5 => {
+            // SAFETY: Writing DBGWVR5_EL1 programs watchpoint value register 5.
+            unsafe { asm!("msr dbgwvr5_el1, {}", in(reg) value) };
+        }
+        6 => {
+            // SAFETY: Writing DBGWVR6_EL1 programs watchpoint value register 6.
+            unsafe { asm!("msr dbgwvr6_el1, {}", in(reg) value) };
+        }
+        7 => {
+            // SAFETY: Writing DBGWVR7_EL1 programs watchpoint value register 7.
+            unsafe { asm!("msr dbgwvr7_el1, {}", in(reg) value) };
+        }
+        _ => return Err(()),
+    }
+    isb();
+    Ok(())
+}
+
+pub fn set_dbgwcr_el1(index: usize, value: DBGWCR_EL1) -> Result<(), ()> {
+    let value = value.bits();
+    match index {
+        0 => {
+            // SAFETY: Writing DBGWCR0_EL1 programs watchpoint control register 0.
+            unsafe { asm!("msr dbgwcr0_el1, {}", in(reg) value) };
+        }
+        1 => {
+            // SAFETY: Writing DBGWCR1_EL1 programs watchpoint control register 1.
+            unsafe { asm!("msr dbgwcr1_el1, {}", in(reg) value) };
+        }
+        2 => {
+            // SAFETY: Writing DBGWCR2_EL1 programs watchpoint control register 2.
+            unsafe { asm!("msr dbgwcr2_el1, {}", in(reg) value) };
+        }
+        3 => {
+            // SAFETY: Writing DBGWCR3_EL1 programs watchpoint control register 3.
+            unsafe { asm!("msr dbgwcr3_el1, {}", in(reg) value) };
+        }
+        4 => {
+            // SAFETY: Writing DBGWCR4_EL1 programs watchpoint control register 4.
+            unsafe { asm!("msr dbgwcr4_el1, {}", in(reg) value) };
+        }
+        5 => {
+            // SAFETY: Writing DBGWCR5_EL1 programs watchpoint control register 5.
+            unsafe { asm!("msr dbgwcr5_el1, {}", in(reg) value) };
+        }
+        6 => {
+            // SAFETY: Writing DBGWCR6_EL1 programs watchpoint control register 6.
+            unsafe { asm!("msr dbgwcr6_el1, {}", in(reg) value) };
+        }
+        7 => {
+            // SAFETY: Writing DBGWCR7_EL1 programs watchpoint control register 7.
+            unsafe { asm!("msr dbgwcr7_el1, {}", in(reg) value) };
+        }
+        _ => return Err(()),
+    }
+    isb();
+    Ok(())
 }
 
 pub fn set_dbgbvr_el1(index: usize, value: u64) -> Result<(), ()> {

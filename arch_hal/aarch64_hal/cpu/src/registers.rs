@@ -187,3 +187,30 @@ bitregs! {
         reserved@[63:16] [ignore],
     }
 }
+
+bitregs! {
+    /// DBGWVR<n>_EL1 — Debug Watchpoint Value Register n.
+    /// Holds the address value used by watchpoint comparison.
+    pub struct DBGWVR_EL1: u64 {
+        pub va@[63:0],
+    }
+}
+
+bitregs! {
+    /// DBGWCR<n>_EL1 — Debug Watchpoint Control Register n.
+    /// Field positions follow Arm's public register definition (AArch64).
+    pub struct DBGWCR_EL1: u64 {
+        pub e@[0:0],
+        pub pac@[2:1],
+        pub lsc@[4:3],
+        pub bas@[12:5],
+        pub hmc@[13:13],
+        pub ssc@[15:14],
+        pub lbn@[19:16],
+        pub wt@[20:20],
+        reserved@[23:21] [ignore],
+        pub mask@[28:24],
+        pub ssce@[29:29],
+        reserved@[63:30] [ignore],
+    }
+}
