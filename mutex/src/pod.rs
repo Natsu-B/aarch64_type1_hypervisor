@@ -51,7 +51,7 @@ where
 
     #[inline]
     pub const fn new_raw(init: T::Raw) -> Self {
-        let _ = Self::_LAYOUT_OK;
+        Self::_LAYOUT_OK;
         Self {
             raw: UnsafeCell::new(init),
             _phantom: PhantomData,
@@ -60,7 +60,7 @@ where
 
     #[inline]
     pub fn new(init: T) -> Self {
-        let _ = Self::_LAYOUT_OK;
+        Self::_LAYOUT_OK;
         Self {
             raw: UnsafeCell::new(init.to_raw()),
             _phantom: PhantomData,

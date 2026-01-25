@@ -346,10 +346,8 @@ fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
         exited = wait_for_exit(Instant::now() + Duration::from_secs(2));
     }
 
-    if !exited {
-        if let Ok(Some(_)) = child.try_wait() {
-            exited = true;
-        }
+    if !exited && let Ok(Some(_)) = child.try_wait() {
+        exited = true;
     }
 
     if !exited {
@@ -544,11 +542,11 @@ where
             Ok(n) => {
                 filtered.clear();
                 filter.push_filtered(&buf[..n], &mut filtered);
-                if !filtered.is_empty() {
-                    if let Err(e) = writer.write_all(&filtered) {
-                        eprintln!("Warning: failed to write child output: {}", e);
-                        break;
-                    }
+                if !filtered.is_empty()
+                    && let Err(e) = writer.write_all(&filtered)
+                {
+                    eprintln!("Warning: failed to write child output: {}", e);
+                    break;
                 }
                 let _ = writer.flush();
             }

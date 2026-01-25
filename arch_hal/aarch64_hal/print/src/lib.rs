@@ -15,6 +15,12 @@ pub struct DebugUart {
     uart: OnceCell<Pl011Uart>,
 }
 
+impl Default for DebugUart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DebugUart {
     pub const fn new() -> DebugUart {
         DebugUart {

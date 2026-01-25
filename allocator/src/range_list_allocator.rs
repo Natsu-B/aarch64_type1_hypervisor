@@ -160,10 +160,10 @@ impl MemoryBlock {
         // Check for overlap with pre_region
         if x > 0 {
             let _pre_region = &regions_slice[x - 1];
-            if let Some(pre_end) = pre_region_end {
-                if region.address <= pre_end {
-                    pre_region_overlaps = true;
-                }
+            if let Some(pre_end) = pre_region_end
+                && region.address <= pre_end
+            {
+                pre_region_overlaps = true;
             }
         }
 
