@@ -30,6 +30,7 @@ unsafe impl Sync for DataAbortHandlerEntry {}
 
 pub type DataAbortHandler =
     fn(*mut c_void, &mut Registers, &DataAbortInfo, Option<&emulation::MmioDecoded>);
+pub type DebugExceptionHandler = fn(&mut Registers, ExceptionClass);
 
 #[derive(Copy, Clone, Debug)]
 pub enum DataAbortAccessSource {
@@ -67,10 +68,12 @@ impl DataAbortInfo {
 static SYNCHRONOUS_HANDLER: SyncUnsafeCell<SynchronousHandler> =
     SyncUnsafeCell::new(SynchronousHandler {
         data_abort_func: None,
+        debug_func: None,
     });
 
 struct SynchronousHandler {
     data_abort_func: Option<DataAbortHandlerEntry>,
+    debug_func: Option<DebugExceptionHandler>,
 }
 
 pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
@@ -112,6 +115,14 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                         return;
                     }
                     handle_secure_monitor_call(reg);
+                }
+                ExceptionClass::BreakpointLowerLevel
+                | ExceptionClass::BrkInstructionAArch64LowerLevel
+                | ExceptionClass::SoftwareStepLowerLevel
+                | ExceptionClass::WatchpointLowerLevel => {
+                    unsafe { &*SYNCHRONOUS_HANDLER.get() }
+                        .debug_func
+                        .expect("debug handler not registered")(reg, ec);
                 }
                 _ => panic!("unexpected ESR_EL2 EC value: {:?}", ec),
             }

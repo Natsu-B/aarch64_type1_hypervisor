@@ -10,3 +10,10 @@ typestate = { path = "../typestate" }
 file = { path = "../file" }
 elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
+gdb_remote = { path = "../gdb_remote" }
+mutex = { path = "../mutex" }
+
+[profile.release]
+panic = 'abort'
+[profile.dev]
+panic = 'abort'

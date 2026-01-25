@@ -21,6 +21,7 @@ TEXT_EXTENSIONS = {
     ".txt",
     ".yml",
     ".yaml",
+    ".xml",
     ".json",
     ".lock",
     ".cfg",
@@ -29,6 +30,7 @@ TEXT_EXTENSIONS = {
     ".h",
     ".S",
     ".sh",
+    ".lds",
 }
 
 
@@ -90,6 +92,36 @@ def is_text_file(path: pathlib.Path) -> bool:
     return path.suffix in TEXT_EXTENSIONS
 
 
+DOT_PREFIX = "__dot__"
+
+def sanitize_rel_path(rel: pathlib.Path) -> pathlib.Path:
+    """
+    Rewrite dot-leading path segments so they survive GitHub Pages deploy.
+
+    Some deploy pipelines (e.g. upload-pages-artifact) exclude .git/.github,
+    and Pages hosting often does not serve dot-directories. We therefore map:
+      .github/foo -> __dot__github/foo
+    """
+    parts: List[str] = []
+    for p in rel.parts:
+        if p.startswith("."):
+            parts.append(DOT_PREFIX + p[1:])
+        else:
+            parts.append(p)
+    return pathlib.Path(*parts)
+
+
+def unsanitize_rel_path(rel: pathlib.Path) -> pathlib.Path:
+    """Reverse sanitize_rel_path for display text in indexes."""
+    parts: List[str] = []
+    for p in rel.parts:
+        if p.startswith(DOT_PREFIX):
+            parts.append("." + p[len(DOT_PREFIX):])
+        else:
+            parts.append(p)
+    return pathlib.Path(*parts)
+
+
 def export_tree(src_root: pathlib.Path, dest_root: pathlib.Path) -> None:
     """
     Export a single branch worktree to dest_root.
@@ -101,9 +133,11 @@ def export_tree(src_root: pathlib.Path, dest_root: pathlib.Path) -> None:
             continue
 
         rel = src_path.relative_to(src_root)
+        site_rel = sanitize_rel_path(rel)
 
         if is_text_file(src_path):
-            dest_file = dest_root / (str(rel) + ".html")
+            dest_file = dest_root / site_rel
+            dest_file = dest_file.parent / (dest_file.name + ".html")
             dest_file.parent.mkdir(parents=True, exist_ok=True)
 
             with src_path.open("r", encoding="utf-8", errors="replace") as f:
@@ -197,9 +231,10 @@ def write_branch_index(dest_root: pathlib.Path, branch: str) -> None:
         if rel == pathlib.Path("index.html"):
             continue
 
-        href = rel.as_posix()
+        href = html.escape(rel.as_posix(), quote=True)
+        display_rel = unsanitize_rel_path(rel).as_posix()
         items.append(
-            f'<li><a href="{href}">{html.escape(str(rel))}</a></li>'
+            f'<li><a href="{href}">{html.escape(display_rel)}</a></li>'
         )
 
     lines = [

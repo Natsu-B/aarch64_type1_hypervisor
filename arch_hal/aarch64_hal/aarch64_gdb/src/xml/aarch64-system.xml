@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<feature name="org.natsu-b.aarch64.system">
+  <reg name="tpidr_el0" bitsize="64" type="uint64" regnum="35" group="system"/>
+  <reg name="tpidrro_el0" bitsize="64" type="uint64" regnum="36" group="system"/>
+  <reg name="tpidr_el1" bitsize="64" type="uint64" regnum="37" group="system"/>
+  <reg name="mpidr_el1" bitsize="64" type="uint64" regnum="38" group="system"/>
+  <reg name="sctlr_el1" bitsize="64" type="uint64" regnum="39" group="system"/>
+  <reg name="ttbr0_el1" bitsize="64" type="uint64" regnum="40" group="system"/>
+  <reg name="ttbr1_el1" bitsize="64" type="uint64" regnum="41" group="system"/>
+  <reg name="tcr_el1" bitsize="64" type="uint64" regnum="42" group="system"/>
+  <reg name="mair_el1" bitsize="64" type="uint64" regnum="43" group="system"/>
+  <reg name="mdscr_el1" bitsize="64" type="uint64" regnum="44" group="system"/>
+</feature>

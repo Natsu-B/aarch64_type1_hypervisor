@@ -3,9 +3,21 @@
 version = 4
 
 [[package]]
+name = "aarch64_gdb"
+version = "0.1.0"
+dependencies = [
+ "aarch64_mutex",
+ "cpu",
+ "exceptions",
+ "gdb_remote",
+]
+
+[[package]]
 name = "aarch64_hal"
 version = "0.1.0"
 dependencies = [
+ "aarch64_gdb",
+ "aarch64_mutex",
  "aarch64_test",
  "cpu",
  "exceptions",
@@ -72,10 +84,6 @@ name = "block-device-api"
 version = "0.1.0"
 
 [[package]]
-name = "byte_stream"
-version = "0.1.0"
-
-[[package]]
 name = "cpu"
 version = "0.1.0"
 dependencies = [
@@ -108,6 +116,8 @@ dependencies = [
  "dtb",
  "elf",
  "file",
+ "gdb_remote",
+ "mutex",
  "typestate",
 ]
 
@@ -154,7 +164,6 @@ name = "gdb_remote"
 version = "0.1.0"
 dependencies = [
  "aarch64_test",
- "byte_stream",
  "print",
 ]
 
@@ -201,7 +210,6 @@ dependencies = [
 name = "print"
 version = "0.1.0"
 dependencies = [
- "byte_stream",
  "mutex",
  "typestate",
  "typestate_macro",

@@ -12,15 +12,6 @@
 )]
 #![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
 
-#[cfg(all(test, target_arch = "aarch64"))]
-fn __unit_test_init() {
-    aarch64_unit_test::init_default_uart();
-    setup_exception();
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
-aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);
-
 mod common_handler;
 mod el1;
 pub mod emulation;
@@ -237,3 +228,12 @@ pub fn setup_el1_exception() {
             .bits(),
     );
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn __unit_test_init() {
+    aarch64_unit_test::init_default_uart();
+    setup_exception();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);

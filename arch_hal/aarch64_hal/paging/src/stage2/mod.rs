@@ -1,4 +1,7 @@
+use alloc::boxed::Box;
 use core::alloc::Layout;
+use core::cell::SyncUnsafeCell;
+use core::mem;
 use core::slice;
 
 use cpu::registers::PARange;
@@ -22,19 +25,29 @@ mod registers;
 pub struct Stage2Paging;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage2PageTypes {
     Normal = 0b0,
     Device = 0b1,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Stage2PagingSetting {
     pub ipa: usize,
     pub pa: usize,
     pub size: usize,
     pub types: Stage2PageTypes,
 }
+
+#[derive(Clone)]
+struct Stage2Context {
+    table_addr: usize,
+    top_table_level: i8,
+    num_of_tables: usize,
+    settings: Box<[Stage2PagingSetting]>,
+}
+
+static STAGE2_CONTEXT: SyncUnsafeCell<Option<Stage2Context>> = SyncUnsafeCell::new(None);
 
 impl Stage2Paging {
     /// initialize stage2 paging
@@ -132,6 +145,14 @@ impl Stage2Paging {
             allocator,
         )?;
         cpu::set_vttbr_el2(table as u64);
+        unsafe {
+            (*STAGE2_CONTEXT.get()) = Some(Stage2Context {
+                table_addr: table,
+                top_table_level: initial_lookup_level_i8,
+                num_of_tables,
+                settings: Box::from(data),
+            });
+        }
 
         let vtcr_el2 = VTCR_EL2::new()
             .set(VTCR_EL2::t0sz, t0sz)
@@ -254,6 +275,7 @@ impl Stage2Paging {
         let table_limit = start_ipa + table_level_size * 512;
 
         while *i < data.len() && *ipa < table_limit {
+            let setting = &data[*i];
             // is block descriptor
             if table_level == 3
                 || ((*pa | *ipa) & (table_level_size - 1) == 0 && *size >= table_level_size)
@@ -348,6 +370,54 @@ impl Stage2Paging {
                 .set(HCR_EL2::amo, 0b1);
         }
         cpu::set_hcr_el2(hcr.bits());
+    }
+
+    /// Translate a guest IPA to a physical address using the installed Stage-2 tables.
+    ///
+    /// Stage-2 translation must already be configured and enabled before calling this helper.
+    /// The returned physical address is expected to be directly accessible from EL2 (the current
+    /// boot flow installs an identity mapping for RAM).
+    pub fn ipa_to_pa(ipa: usize) -> Result<usize, PagingErr> {
+        cpu::ipa_to_pa_el2(ipa as u64)
+            .map(|pa| pa as usize)
+            .ok_or(PagingErr::Stage2Fault)
+    }
+
+    /// Clear AF/DBM bits on every mapped leaf so subsequent accesses trap.
+    pub fn dirty_bit_remove_all() -> Result<(), PagingErr> {
+        let ctx = unsafe { &*STAGE2_CONTEXT.get() }
+            .as_ref()
+            .ok_or(PagingErr::Corrupted)?;
+        let mut table = unsafe {
+            slice::from_raw_parts_mut(ctx.table_addr as *mut u64, ctx.num_of_tables * 512)
+        };
+        Self::clear_dirty_bits_recursive(ctx.top_table_level, &mut table)?;
+        cpu::flush_tlb_el2_el1();
+        Ok(())
+    }
+
+    fn clear_dirty_bits_recursive(table_level: i8, table: &mut [u64]) -> Result<(), PagingErr> {
+        let table_bytes = table.len() * mem::size_of::<u64>();
+        for desc in table.iter_mut() {
+            match *desc & 0b11 {
+                0b01 => {
+                    *desc = Stage2_48bitLeafDescriptor::clear_access_and_dirty(*desc);
+                }
+                0b11 => {
+                    if table_level == 3 {
+                        *desc = Stage2_48bitLeafDescriptor::clear_access_and_dirty(*desc);
+                    } else {
+                        let next_table_addr = (*desc as usize) & !(PAGE_TABLE_SIZE - 1);
+                        let next_table =
+                            unsafe { slice::from_raw_parts_mut(next_table_addr as *mut u64, 512) };
+                        Self::clear_dirty_bits_recursive(table_level + 1, next_table)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        cpu::clean_dcache_poc(table.as_ptr() as usize, table_bytes);
+        Ok(())
     }
 }
 

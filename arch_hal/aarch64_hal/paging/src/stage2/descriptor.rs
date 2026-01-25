@@ -217,6 +217,7 @@ impl Stage2_48bitLeafDescriptor {
             }
             Stage2PageTypes::Device => (MemAttr::Device_nGnRnE, Shareability::NonSharable),
         };
+        let executable = matches!(types, Stage2PageTypes::Normal);
 
         Self::new()
             .set_enum(Self::mem_attr, mem_attr)
@@ -225,6 +226,7 @@ impl Stage2_48bitLeafDescriptor {
             .set_enum(Self::ty, DescriptorType::Block)
             .set_raw(Self::block_oab, pa)
             .set(Self::af, 0b1)
+            .set(Self::xn, xn_field(executable))
             .bits()
     }
 
@@ -237,6 +239,7 @@ impl Stage2_48bitLeafDescriptor {
             }
             Stage2PageTypes::Device => (MemAttr::Device_nGnRnE, Shareability::NonSharable),
         };
+        let executable = matches!(types, Stage2PageTypes::Normal);
 
         Self::new()
             .set_enum(Self::mem_attr, mem_attr)
@@ -245,6 +248,20 @@ impl Stage2_48bitLeafDescriptor {
             .set_enum(Self::ty, DescriptorType::Page)
             .set_raw(Self::page_oab, pa)
             .set(Self::af, 0b1)
+            .set(Self::xn, xn_field(executable))
             .bits()
     }
+
+    #[inline]
+    pub(crate) fn clear_access_and_dirty(desc: u64) -> u64 {
+        Self::from_bits(desc)
+            .set(Self::af, 0)
+            .set(Self::dbm, 0)
+            .bits()
+    }
+}
+
+#[inline]
+fn xn_field(executable: bool) -> u64 {
+    if executable { 0b00 } else { 0b10 }
 }

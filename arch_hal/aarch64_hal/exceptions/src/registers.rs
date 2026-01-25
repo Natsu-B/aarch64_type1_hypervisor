@@ -224,7 +224,7 @@ bitregs! {
             }
         }
         pub(crate) il@[25:25],
-        pub(crate) ec@[31:26] as ExceptionClass {
+        pub ec@[31:26] as ExceptionClass {
             // unknown reason
             UnknownReason                  = 0b00_0000,
             TrappedWFInstruction           = 0b00_0001,
@@ -232,6 +232,14 @@ bitregs! {
             DataAbortFormLowerLevel        = 0b10_0100,
             // SMC Instruction Exception in Aarch64 state
             SMCInstructionExecution        = 0b01_0111,
+            // BRK Instruction Exception in AArch64 state from lower EL
+            BrkInstructionAArch64LowerLevel = 0b11_1100,
+            // Breakpoint from lower EL (AArch64)
+            BreakpointLowerLevel           = 0b11_0000,
+            // Software step from lower EL (AArch64)
+            SoftwareStepLowerLevel         = 0b11_0010,
+            // Watchpoint from lower EL (AArch64)
+            WatchpointLowerLevel           = 0b11_0100,
         },
         pub(crate) iss2@[55:32],
         reserved@[63:56] [res0],
@@ -266,5 +274,17 @@ bitregs! {
     pub(crate) struct FAR_EL2: u64 {
         // Faulting Virtual Address
         pub(crate) va@[63:0],
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn esr_el2_brk_ec_decodes() {
+        let esr = ESR_EL2::from_bits((0x3c_u64) << 26);
+        let ec = esr.get_enum::<_, ExceptionClass>(ESR_EL2::ec);
+        assert_eq!(ec, Some(ExceptionClass::BrkInstructionAArch64LowerLevel));
     }
 }

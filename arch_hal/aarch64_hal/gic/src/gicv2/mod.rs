@@ -63,6 +63,10 @@ pub struct Gicv2 {
 unsafe impl Sync for Gicv2 {}
 
 impl Gicv2 {
+    pub fn distributor(&self) -> &GicV2Distributor {
+        self.gicd
+    }
+
     pub fn new(
         gicd_reg: MmioRegion,
         gicc_reg: MmioRegion,

@@ -4,8 +4,12 @@ use core::arch::asm;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
 
+use crate::registers::DBGWCR_EL1;
+use crate::registers::DBGWVR_EL1;
+use crate::registers::ID_AA64DFR0_EL1;
 use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::ID_AA64PFR0_EL1;
+use crate::registers::MDSCR_EL1;
 use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
 pub mod cache;
@@ -130,6 +134,13 @@ fn dcache_line_size() -> usize {
     4usize << dminline
 }
 
+fn icache_line_size() -> usize {
+    let ctr_el0: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
+    let iminline = (ctr_el0 & 0xf) as usize;
+    4usize << iminline
+}
+
 pub fn get_current_el() -> u64 {
     let current_el: u64;
     unsafe { asm!("mrs {}, currentel", out(reg) current_el) };
@@ -146,6 +157,13 @@ pub fn get_id_aa64pfr0_el1() -> u64 {
     let id: u64;
     // SAFETY: Reads the read-only ID_AA64PFR0_EL1 system register.
     unsafe { asm!("mrs {}, id_aa64pfr0_el1", out(reg) id) };
+    id
+}
+
+pub fn get_id_aa64dfr0_el1() -> u64 {
+    let id: u64;
+    // SAFETY: Reads the read-only ID_AA64DFR0_EL1 system register.
+    unsafe { asm!("mrs {}, id_aa64dfr0_el1", out(reg) id) };
     id
 }
 
@@ -175,6 +193,28 @@ pub unsafe fn write_daif(daif: u64) {
     }
 }
 
+/// Unmask debug exceptions (PSTATE.D / DAIF.D = 0) at the current exception level.
+///
+/// This enables Watchpoint/Breakpoint/Software Step exceptions targeted at the current EL.
+#[inline(always)]
+pub fn enable_debug_exceptions() {
+    // SAFETY: This only modifies PSTATE.D (DAIF.D) at the current EL.
+    // The caller must ensure that unmasking debug exceptions is safe in the current context.
+    unsafe { asm!("msr daifclr, #8", options(nostack, preserves_flags)) };
+    isb();
+}
+
+/// Mask debug exceptions (PSTATE.D / DAIF.D = 1) at the current exception level.
+#[inline(always)]
+pub fn disable_debug_exceptions() {
+    // SAFETY: This only modifies PSTATE.D (DAIF.D) at the current EL.
+    // The caller must ensure that masking debug exceptions is safe in the current context.
+    unsafe { asm!("msr daifset, #8", options(nostack, preserves_flags)) };
+    isb();
+}
+
+/// Mask the IRQ bit and return the previous DAIF value.
+#[inline(always)]
 pub fn irq_save() -> u64 {
     let flags = read_daif();
     // Mask IRQs.
@@ -194,6 +234,186 @@ pub fn irq_restore(saved: u64) {
         write_daif(saved);
     }
     isb();
+}
+
+pub fn enable_irq() {
+    // SAFETY: Caller ensures IRQ handlers are installed before unmasking IRQs.
+    unsafe {
+        asm!("msr daifclr, #2", options(nostack));
+    }
+    isb();
+}
+
+pub fn breakpoint_count() -> usize {
+    let id = ID_AA64DFR0_EL1::from_bits(get_id_aa64dfr0_el1());
+    (id.get(ID_AA64DFR0_EL1::brps) as usize) + 1
+}
+
+pub fn watchpoint_count() -> usize {
+    let id = ID_AA64DFR0_EL1::from_bits(get_id_aa64dfr0_el1());
+    (id.get(ID_AA64DFR0_EL1::wrps) as usize) + 1
+}
+
+pub fn set_dbgwvr_el1(index: usize, value: DBGWVR_EL1) -> Result<(), ()> {
+    let value = value.bits();
+    match index {
+        0 => {
+            // SAFETY: Writing DBGWVR0_EL1 programs watchpoint value register 0.
+            unsafe { asm!("msr dbgwvr0_el1, {}", in(reg) value) };
+        }
+        1 => {
+            // SAFETY: Writing DBGWVR1_EL1 programs watchpoint value register 1.
+            unsafe { asm!("msr dbgwvr1_el1, {}", in(reg) value) };
+        }
+        2 => {
+            // SAFETY: Writing DBGWVR2_EL1 programs watchpoint value register 2.
+            unsafe { asm!("msr dbgwvr2_el1, {}", in(reg) value) };
+        }
+        3 => {
+            // SAFETY: Writing DBGWVR3_EL1 programs watchpoint value register 3.
+            unsafe { asm!("msr dbgwvr3_el1, {}", in(reg) value) };
+        }
+        4 => {
+            // SAFETY: Writing DBGWVR4_EL1 programs watchpoint value register 4.
+            unsafe { asm!("msr dbgwvr4_el1, {}", in(reg) value) };
+        }
+        5 => {
+            // SAFETY: Writing DBGWVR5_EL1 programs watchpoint value register 5.
+            unsafe { asm!("msr dbgwvr5_el1, {}", in(reg) value) };
+        }
+        6 => {
+            // SAFETY: Writing DBGWVR6_EL1 programs watchpoint value register 6.
+            unsafe { asm!("msr dbgwvr6_el1, {}", in(reg) value) };
+        }
+        7 => {
+            // SAFETY: Writing DBGWVR7_EL1 programs watchpoint value register 7.
+            unsafe { asm!("msr dbgwvr7_el1, {}", in(reg) value) };
+        }
+        _ => return Err(()),
+    }
+    isb();
+    Ok(())
+}
+
+pub fn set_dbgwcr_el1(index: usize, value: DBGWCR_EL1) -> Result<(), ()> {
+    let value = value.bits();
+    match index {
+        0 => {
+            // SAFETY: Writing DBGWCR0_EL1 programs watchpoint control register 0.
+            unsafe { asm!("msr dbgwcr0_el1, {}", in(reg) value) };
+        }
+        1 => {
+            // SAFETY: Writing DBGWCR1_EL1 programs watchpoint control register 1.
+            unsafe { asm!("msr dbgwcr1_el1, {}", in(reg) value) };
+        }
+        2 => {
+            // SAFETY: Writing DBGWCR2_EL1 programs watchpoint control register 2.
+            unsafe { asm!("msr dbgwcr2_el1, {}", in(reg) value) };
+        }
+        3 => {
+            // SAFETY: Writing DBGWCR3_EL1 programs watchpoint control register 3.
+            unsafe { asm!("msr dbgwcr3_el1, {}", in(reg) value) };
+        }
+        4 => {
+            // SAFETY: Writing DBGWCR4_EL1 programs watchpoint control register 4.
+            unsafe { asm!("msr dbgwcr4_el1, {}", in(reg) value) };
+        }
+        5 => {
+            // SAFETY: Writing DBGWCR5_EL1 programs watchpoint control register 5.
+            unsafe { asm!("msr dbgwcr5_el1, {}", in(reg) value) };
+        }
+        6 => {
+            // SAFETY: Writing DBGWCR6_EL1 programs watchpoint control register 6.
+            unsafe { asm!("msr dbgwcr6_el1, {}", in(reg) value) };
+        }
+        7 => {
+            // SAFETY: Writing DBGWCR7_EL1 programs watchpoint control register 7.
+            unsafe { asm!("msr dbgwcr7_el1, {}", in(reg) value) };
+        }
+        _ => return Err(()),
+    }
+    isb();
+    Ok(())
+}
+
+pub fn set_dbgbvr_el1(index: usize, value: u64) -> Result<(), ()> {
+    match index {
+        0 => {
+            // SAFETY: Writing DBGBVR0_EL1 programs breakpoint value register 0.
+            unsafe { asm!("msr dbgbvr0_el1, {}", in(reg) value) };
+        }
+        1 => {
+            // SAFETY: Writing DBGBVR1_EL1 programs breakpoint value register 1.
+            unsafe { asm!("msr dbgbvr1_el1, {}", in(reg) value) };
+        }
+        2 => {
+            // SAFETY: Writing DBGBVR2_EL1 programs breakpoint value register 2.
+            unsafe { asm!("msr dbgbvr2_el1, {}", in(reg) value) };
+        }
+        3 => {
+            // SAFETY: Writing DBGBVR3_EL1 programs breakpoint value register 3.
+            unsafe { asm!("msr dbgbvr3_el1, {}", in(reg) value) };
+        }
+        4 => {
+            // SAFETY: Writing DBGBVR4_EL1 programs breakpoint value register 4.
+            unsafe { asm!("msr dbgbvr4_el1, {}", in(reg) value) };
+        }
+        5 => {
+            // SAFETY: Writing DBGBVR5_EL1 programs breakpoint value register 5.
+            unsafe { asm!("msr dbgbvr5_el1, {}", in(reg) value) };
+        }
+        6 => {
+            // SAFETY: Writing DBGBVR6_EL1 programs breakpoint value register 6.
+            unsafe { asm!("msr dbgbvr6_el1, {}", in(reg) value) };
+        }
+        7 => {
+            // SAFETY: Writing DBGBVR7_EL1 programs breakpoint value register 7.
+            unsafe { asm!("msr dbgbvr7_el1, {}", in(reg) value) };
+        }
+        _ => return Err(()),
+    }
+    isb();
+    Ok(())
+}
+
+pub fn set_dbgbcr_el1(index: usize, value: u64) -> Result<(), ()> {
+    match index {
+        0 => {
+            // SAFETY: Writing DBGBCR0_EL1 programs breakpoint control register 0.
+            unsafe { asm!("msr dbgbcr0_el1, {}", in(reg) value) };
+        }
+        1 => {
+            // SAFETY: Writing DBGBCR1_EL1 programs breakpoint control register 1.
+            unsafe { asm!("msr dbgbcr1_el1, {}", in(reg) value) };
+        }
+        2 => {
+            // SAFETY: Writing DBGBCR2_EL1 programs breakpoint control register 2.
+            unsafe { asm!("msr dbgbcr2_el1, {}", in(reg) value) };
+        }
+        3 => {
+            // SAFETY: Writing DBGBCR3_EL1 programs breakpoint control register 3.
+            unsafe { asm!("msr dbgbcr3_el1, {}", in(reg) value) };
+        }
+        4 => {
+            // SAFETY: Writing DBGBCR4_EL1 programs breakpoint control register 4.
+            unsafe { asm!("msr dbgbcr4_el1, {}", in(reg) value) };
+        }
+        5 => {
+            // SAFETY: Writing DBGBCR5_EL1 programs breakpoint control register 5.
+            unsafe { asm!("msr dbgbcr5_el1, {}", in(reg) value) };
+        }
+        6 => {
+            // SAFETY: Writing DBGBCR6_EL1 programs breakpoint control register 6.
+            unsafe { asm!("msr dbgbcr6_el1, {}", in(reg) value) };
+        }
+        7 => {
+            // SAFETY: Writing DBGBCR7_EL1 programs breakpoint control register 7.
+            unsafe { asm!("msr dbgbcr7_el1, {}", in(reg) value) };
+        }
+        _ => return Err(()),
+    }
+    isb();
+    Ok(())
 }
 
 pub fn get_hpfar_el2() -> u64 {
@@ -219,19 +439,137 @@ pub fn get_elr_el2() -> u64 {
 }
 
 pub fn get_sp_el1() -> u64 {
-    let val: u64;
-    unsafe { asm!("mrs {val}, sp_el1", val = out(reg) val) };
-    val
+    let sp_el1: u64;
+    // SAFETY: Reads the current SP_EL1 value.
+    unsafe { asm!("mrs {}, sp_el1", out(reg) sp_el1) };
+    sp_el1
 }
 
-pub fn set_sp_el1(val: u64) {
-    unsafe { asm!("msr sp_el1, {}", in(reg) val) };
+pub fn set_sp_el1(sp_el1: u64) {
+    // SAFETY: Caller ensures the provided SP is valid for EL1 execution.
+    unsafe { asm!("msr sp_el1, {}", in(reg) sp_el1) };
+}
+
+pub fn get_mdscr_el1() -> MDSCR_EL1 {
+    let mdscr_el1: u64;
+    // SAFETY: Reads the current MDSCR_EL1 value.
+    unsafe { asm!("mrs {}, mdscr_el1", out(reg) mdscr_el1) };
+    MDSCR_EL1::from_bits(mdscr_el1)
+}
+
+pub fn set_mdscr_el1(mdscr_el1: MDSCR_EL1) {
+    let bits = mdscr_el1.bits();
+    // SAFETY: Caller ensures the debug control settings are valid for EL1 execution.
+    unsafe { asm!("msr mdscr_el1, {}", in(reg) bits) };
+}
+
+pub fn get_spsr_el2() -> u64 {
+    let spsr_el2: u64;
+    // SAFETY: Reads the current SPSR_EL2 value.
+    unsafe { asm!("mrs {}, spsr_el2", out(reg) spsr_el2) };
+    spsr_el2
+}
+
+pub fn set_spsr_el2(spsr_el2: u64) {
+    // SAFETY: Caller ensures the provided SPSR is valid for EL1 return.
+    unsafe { asm!("msr spsr_el2, {}", in(reg) spsr_el2) };
 }
 
 pub fn get_mpidr_el1() -> u64 {
     let val: u64;
     unsafe { asm!("mrs {val}, mpidr_el1", val = out(reg) val) };
     val
+}
+
+pub fn get_tpidr_el0() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDR_EL0 value.
+    unsafe { asm!("mrs {val}, tpidr_el0", val = out(reg) val) };
+    val
+}
+
+pub fn set_tpidr_el0(val: u64) {
+    // SAFETY: Caller ensures the TPIDR_EL0 value is valid for the running context.
+    unsafe { asm!("msr tpidr_el0, {}", in(reg) val) };
+}
+
+pub fn get_tpidrro_el0() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDRRO_EL0 value.
+    unsafe { asm!("mrs {val}, tpidrro_el0", val = out(reg) val) };
+    val
+}
+
+pub fn get_tpidr_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDR_EL1 value.
+    unsafe { asm!("mrs {val}, tpidr_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_tpidr_el1(val: u64) {
+    // SAFETY: Caller ensures the TPIDR_EL1 value is valid for the running context.
+    unsafe { asm!("msr tpidr_el1, {}", in(reg) val) };
+}
+
+pub fn get_sctlr_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current SCTLR_EL1 value.
+    unsafe { asm!("mrs {val}, sctlr_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_sctlr_el1(val: u64) {
+    // SAFETY: Caller ensures the SCTLR_EL1 value is valid for the running context.
+    unsafe { asm!("msr sctlr_el1, {}", in(reg) val) };
+}
+
+pub fn get_ttbr0_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TTBR0_EL1 value.
+    unsafe { asm!("mrs {val}, ttbr0_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_ttbr0_el1(val: u64) {
+    // SAFETY: Caller ensures the TTBR0_EL1 value is valid for the running context.
+    unsafe { asm!("msr ttbr0_el1, {}", in(reg) val) };
+}
+
+pub fn get_ttbr1_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TTBR1_EL1 value.
+    unsafe { asm!("mrs {val}, ttbr1_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_ttbr1_el1(val: u64) {
+    // SAFETY: Caller ensures the TTBR1_EL1 value is valid for the running context.
+    unsafe { asm!("msr ttbr1_el1, {}", in(reg) val) };
+}
+
+pub fn get_tcr_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TCR_EL1 value.
+    unsafe { asm!("mrs {val}, tcr_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_tcr_el1(val: u64) {
+    // SAFETY: Caller ensures the TCR_EL1 value is valid for the running context.
+    unsafe { asm!("msr tcr_el1, {}", in(reg) val) };
+}
+
+pub fn get_mair_el1() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current MAIR_EL1 value.
+    unsafe { asm!("mrs {val}, mair_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_mair_el1(val: u64) {
+    // SAFETY: Caller ensures the MAIR_EL1 value is valid for the running context.
+    unsafe { asm!("msr mair_el1, {}", in(reg) val) };
 }
 
 pub fn get_hcr_el2() -> u64 {
@@ -423,6 +761,31 @@ pub fn invalidate_icache_all() {
             "isb",
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// Invalidate instruction cache for a virtual address range to PoU.
+///
+/// This is intended for self-modifying code / breakpoint patching:
+/// - Ensure the modified data has been cleaned to PoU/PoC as required before calling.
+/// - This function performs the required barriers for the I-cache invalidate sequence.
+pub fn invalidate_icache_range(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = icache_line_size();
+    let start = addr & !(line - 1);
+    let end = addr.saturating_add(len).saturating_add(line - 1) & !(line - 1);
+
+    // SAFETY: `ic ivau` operates on the current EL VA space; callers must provide a valid mapped range.
+    unsafe {
+        let mut p = start;
+        while p < end {
+            asm!("ic ivau, {}", in(reg) p);
+            p += line;
+        }
+        asm!("dsb ish");
+        asm!("isb");
     }
 }
 
@@ -624,4 +987,32 @@ pub fn clean_data_cache_all() {
         // Restore CSSELR_EL1 (L1 Data/unified by convention).
         asm!("msr csselr_el1, {0}", in(reg) 0u64);
     }
+}
+
+/// Translate a guest IPA to a physical address using Stage-2 translation.
+///
+/// Stage-2 must already be configured and enabled. The returned physical address is expected to be
+/// directly accessible from EL2 in the current boot flow (identity mapping).
+pub fn ipa_to_pa_el2(ipa: u64) -> Option<u64> {
+    let par_after: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, par_el1",
+            "at S12E1R, {ipa}",
+            "isb",
+            "mrs {par_after}, par_el1",
+            "msr par_el1, {tmp}",
+            tmp        = lateout(reg) _,
+            par_after  = out(reg) par_after,
+            ipa        = in(reg) ipa,
+            options(nostack)
+        );
+    }
+
+    if (par_after & 1) != 0 {
+        return None;
+    }
+
+    let pa = par_after & 0x0000_FFFF_FFFF_F000;
+    Some(pa | (ipa & 0xFFF))
 }
