@@ -11,6 +11,7 @@ mod gdb_uart;
 mod handler;
 mod irq_decode;
 mod vgic;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use allocator::define_global_allocator;
@@ -49,6 +50,7 @@ use core::usize;
 use dtb::DeviceTree;
 use dtb::DeviceTreeEditExt;
 use dtb::DeviceTreeQueryExt;
+use dtb::DtbNodeView;
 use dtb::DtbParser;
 use dtb::NameRef;
 use dtb::NodeEditExt;
@@ -71,17 +73,12 @@ pub(crate) static GDB_UART: SyncUnsafeCell<Option<UartNode>> = SyncUnsafeCell::n
 static DEBUG_UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
 
 const MAX_MEM_REGIONS: usize = 8;
-const MAX_GUEST_MMIO_RANGES: usize = 32;
-const MAX_STAGE2_SETTINGS: usize = 1 + MAX_GUEST_MMIO_RANGES;
-const MAX_DEBUG_IO_RANGES: usize = MAX_GUEST_MMIO_RANGES + 4;
 const PAGE_SIZE: usize = 0x1000;
 static MEM_REGION_COUNT: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static MEM_REGIONS: SyncUnsafeCell<[MemoryRegion; MAX_MEM_REGIONS]> =
     SyncUnsafeCell::new([MemoryRegion { base: 0, size: 0 }; MAX_MEM_REGIONS]);
-static GUEST_MMIO_RANGE_COUNT: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
-static GUEST_MMIO_RANGES: SyncUnsafeCell<[GuestMmioRange; MAX_GUEST_MMIO_RANGES]> =
-    SyncUnsafeCell::new([GuestMmioRange { base: 0, size: 0 }; MAX_GUEST_MMIO_RANGES]);
-static GUEST_MMIO_RANGE_OVERFLOWED: SyncUnsafeCell<bool> = SyncUnsafeCell::new(false);
+static GUEST_MMIO_ALLOWLIST: SyncUnsafeCell<Option<Box<[GuestMmioRange]>>> =
+    SyncUnsafeCell::new(None);
 
 const PL011_UART_ADDR: usize = 0x900_0000;
 const UART_CLOCK_HZ: u64 = 48 * 1_000_000;
@@ -246,7 +243,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         .unwrap();
     GLOBAL_ALLOCATOR.finalize().unwrap();
     println!("allocator setup success!!!");
-    record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, &gdb_uart, &gic_info);
+    record_guest_mmio_allowlist_from_dtb(&dtb, &gdb_uart, &gic_info);
     dump_guest_mmio_allowlist();
     // setup paging
     println!("start paging...");
@@ -258,7 +255,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         "gdb uart addr: 0x{:X}, size: 0x{:X}",
         gdb_uart.base, gdb_uart.size
     );
-    let (paging_data, paging_count, guest_window) = build_stage2_guest_map();
+    let (paging_data, guest_window) = build_stage2_guest_map();
     let (guest_ipa_base, guest_ipa_size) = if let Some((ipa_base, ipa_size)) = guest_window {
         debug::set_guest_ipa_window(ipa_base as u64, ipa_size as u64);
         (ipa_base, ipa_size)
@@ -276,58 +273,36 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             }
         }
 
-        let mut io_ranges = [(0u64, 0u64); MAX_DEBUG_IO_RANGES];
-        let mut io_count = 0usize;
-        push_debug_io_range(
-            &mut io_ranges,
-            &mut io_count,
-            guest_uart.base,
-            guest_uart.size,
-        );
-        // SAFETY: allowlist is populated before Stage-2 setup and remains read-only afterward.
-        unsafe {
-            let count = (*GUEST_MMIO_RANGE_COUNT.get()).min(MAX_GUEST_MMIO_RANGES);
-            let ranges = &*GUEST_MMIO_RANGES.get();
-            for idx in 0..count {
-                let range = ranges[idx];
-                if range.size == 0 {
-                    continue;
-                }
-                push_debug_io_range(&mut io_ranges, &mut io_count, range.base, range.size);
+        let mut io_ranges: Vec<(u64, u64)> = Vec::new();
+        push_debug_io_range(&mut io_ranges, guest_uart.base, guest_uart.size);
+        for range in guest_mmio_allowlist_slice() {
+            if range.size == 0 {
+                continue;
             }
+            push_debug_io_range(&mut io_ranges, range.base, range.size);
         }
-        push_debug_io_range(
-            &mut io_ranges,
-            &mut io_count,
-            gic_info.dist.base,
-            gic_info.dist.size,
-        );
-        push_debug_io_range(
-            &mut io_ranges,
-            &mut io_count,
-            gic_info.cpu.base,
-            gic_info.cpu.size,
-        );
+        push_debug_io_range(&mut io_ranges, gic_info.dist.base, gic_info.dist.size);
+        push_debug_io_range(&mut io_ranges, gic_info.cpu.base, gic_info.cpu.size);
         if let Some(gich) = gic_info.gich {
-            push_debug_io_range(&mut io_ranges, &mut io_count, gich.base, gich.size);
+            push_debug_io_range(&mut io_ranges, gich.base, gich.size);
         }
         if let Some(gicv) = gic_info.gicv {
-            push_debug_io_range(&mut io_ranges, &mut io_count, gicv.base, gicv.size);
+            push_debug_io_range(&mut io_ranges, gicv.base, gicv.size);
         }
 
         debug::set_memory_map(
             guest_ipa_base as u64,
             guest_ipa_size as u64,
             &rom_ranges[..rom_count],
-            &io_ranges[..io_count],
+            io_ranges.as_slice(),
         );
     } else {
         debug::set_memory_map(0, 0, &[], &[]);
     }
-    if paging_count == 0 {
+    if paging_data.is_empty() {
         panic!("stage2: no guest RAM to map");
     }
-    Stage2Paging::init_stage2paging(&paging_data[..paging_count], &GLOBAL_ALLOCATOR).unwrap();
+    Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(true);
     println!("paging success!!!");
     println!("setup exception");
@@ -474,6 +449,11 @@ fn lowest_memory_base() -> Option<usize> {
     min_base
 }
 
+fn guest_mmio_allowlist_slice() -> &'static [GuestMmioRange] {
+    // SAFETY: allowlist is populated before the guest is started and then read-only.
+    unsafe { (*GUEST_MMIO_ALLOWLIST.get()).as_deref().unwrap_or(&[]) }
+}
+
 pub(crate) fn guest_mmio_allowlist_contains(addr: usize) -> bool {
     guest_mmio_allowlist_contains_range(addr, 1)
 }
@@ -486,18 +466,12 @@ pub(crate) fn guest_mmio_allowlist_contains_range(addr: usize, size: usize) -> b
         Some(end) => end,
         None => return false,
     };
-    // SAFETY: allowlist is populated before the guest is started and then read-only.
-    unsafe {
-        let count = (*GUEST_MMIO_RANGE_COUNT.get()).min(MAX_GUEST_MMIO_RANGES);
-        let ranges = &*GUEST_MMIO_RANGES.get();
-        for idx in 0..count {
-            let range = ranges[idx];
-            if range.size == 0 {
-                continue;
-            }
-            if addr >= range.base && end <= range.end() {
-                return true;
-            }
+    for range in guest_mmio_allowlist_slice() {
+        if range.size == 0 {
+            continue;
+        }
+        if addr >= range.base && end <= range.end() {
+            return true;
         }
     }
     false
@@ -519,19 +493,13 @@ fn normalize_guest_mmio_range(base: usize, size: usize) -> Option<GuestMmioRange
     })
 }
 
-fn normalize_guest_mmio_allowlist(
-    ranges: &mut [GuestMmioRange; MAX_GUEST_MMIO_RANGES],
-    count: &mut usize,
-) {
-    for i in 0..*count {
-        for j in i + 1..*count {
-            if ranges[i].base > ranges[j].base {
-                ranges.swap(i, j);
-            }
-        }
-    }
+fn normalize_guest_mmio_allowlist(ranges: &mut Vec<GuestMmioRange>) {
+    ranges.retain(|range| range.size != 0);
+    ranges.sort_by(|a, b| a.base.cmp(&b.base));
+
     let mut write = 0usize;
-    for idx in 0..*count {
+    let total = ranges.len();
+    for idx in 0..total {
         let range = ranges[idx];
         if range.size == 0 {
             continue;
@@ -551,61 +519,18 @@ fn normalize_guest_mmio_allowlist(
             write += 1;
         }
     }
-    *count = write;
+    ranges.truncate(write);
 }
 
-fn insert_guest_mmio_allowlist(base: usize, size: usize) {
-    let Some(range) = normalize_guest_mmio_range(base, size) else {
-        return;
-    };
-
+fn set_guest_mmio_allowlist(ranges: Vec<GuestMmioRange>) {
     // SAFETY: allowlist is populated during single-core boot before interrupts are enabled.
     unsafe {
-        let overflowed = &mut *GUEST_MMIO_RANGE_OVERFLOWED.get();
-        if *overflowed {
+        let slot = &mut *GUEST_MMIO_ALLOWLIST.get();
+        if slot.is_some() {
+            println!("warning: guest MMIO allowlist already initialized");
             return;
         }
-        let count = (*GUEST_MMIO_RANGE_COUNT.get()).min(MAX_GUEST_MMIO_RANGES);
-        let ranges_snapshot = *GUEST_MMIO_RANGES.get();
-        let mut working = [GuestMmioRange { base: 0, size: 0 }; MAX_GUEST_MMIO_RANGES];
-        let mut working_count = 0usize;
-        let mut merged_base = range.base;
-        let mut merged_end = range.end();
-
-        for idx in 0..count {
-            let existing = ranges_snapshot[idx];
-            if existing.size == 0 {
-                continue;
-            }
-            let existing_end = existing.end();
-            if existing_end >= merged_base && existing.base <= merged_end {
-                merged_base = merged_base.min(existing.base);
-                merged_end = merged_end.max(existing_end);
-            } else {
-                working[working_count] = existing;
-                working_count += 1;
-            }
-        }
-
-        let merged_size = merged_end.saturating_sub(merged_base);
-        if merged_size == 0 {
-            return;
-        }
-        if working_count >= working.len() {
-            if !*overflowed {
-                println!("warning: guest MMIO allowlist overflow, dropping extra ranges");
-                *overflowed = true;
-            }
-            return;
-        }
-        working[working_count] = GuestMmioRange {
-            base: merged_base,
-            size: merged_size,
-        };
-        working_count += 1;
-        normalize_guest_mmio_allowlist(&mut working, &mut working_count);
-        *GUEST_MMIO_RANGES.get() = working;
-        *GUEST_MMIO_RANGE_COUNT.get() = working_count;
+        *slot = Some(ranges.into_boxed_slice());
     }
 }
 
@@ -613,136 +538,282 @@ fn ranges_overlap(a: GuestMmioRange, b: GuestMmioRange) -> bool {
     a.base < b.end() && b.base < a.end()
 }
 
-fn record_guest_mmio_allowlist_from_dtb(
-    dtb: &DtbParser,
-    guest_uart: &UartNode,
-    gdb_uart: &UartNode,
-    gic_info: &Gicv2Info,
-) {
-    const COMPATS: [&str; 4] = [
-        "virtio,mmio",
-        "snps,designware-i2c",
-        "i2c-designware",
-        "arm,pl031",
-    ];
-    let gdb_range = GuestMmioRange {
-        base: gdb_uart.base,
-        size: gdb_uart.size,
-    };
+#[derive(Debug)]
+struct GuestMmioDenyList {
+    gdb_range: Option<GuestMmioRange>,
+    deny: Vec<GuestMmioRange>,
+}
 
-    // SAFETY: allowlist is populated during single-core boot before interrupts are enabled.
-    unsafe {
-        *GUEST_MMIO_RANGE_COUNT.get() = 0;
-        *GUEST_MMIO_RANGE_OVERFLOWED.get() = false;
+impl GuestMmioDenyList {
+    fn contains_overlap(&self, range: GuestMmioRange) -> bool {
+        self.deny
+            .iter()
+            .copied()
+            .any(|deny| ranges_overlap(deny, range))
     }
 
-    insert_guest_mmio_allowlist(guest_uart.base, guest_uart.size);
-    if let Some(gicv) = gic_info.gicv {
-        insert_guest_mmio_allowlist(gicv.base, gicv.size);
+    fn push_deny(&mut self, base: usize, size: usize) {
+        if let Some(range) = normalize_guest_mmio_range(base, size) {
+            self.deny.push(range);
+        }
     }
 
-    for compat in COMPATS {
-        let mut warn = None;
-        if let Err(err) = dtb.find_nodes_by_compatible_view(compat, &mut |view, name| {
-            let mut regs = match view.reg_iter() {
-                Ok(it) => it,
-                Err(e) => {
-                    warn = Some((name, e));
-                    return ControlFlow::Continue(());
-                }
-            };
-            let mut node_ranges = [GuestMmioRange { base: 0, size: 0 }; MAX_GUEST_MMIO_RANGES];
-            let mut node_count = 0usize;
-            while let Some(entry) = regs.next() {
-                let (base, size) = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        warn = Some((name, e));
-                        return ControlFlow::Continue(());
-                    }
-                };
-                if node_count >= node_ranges.len() {
-                    println!(
-                        "warning: guest MMIO allowlist node {} has too many regs",
-                        name
-                    );
-                    return ControlFlow::Continue(());
-                }
-                node_ranges[node_count] = GuestMmioRange { base, size };
-                node_count += 1;
-            }
-            for idx in 0..node_count {
-                let range = match normalize_guest_mmio_range(
-                    node_ranges[idx].base,
-                    node_ranges[idx].size,
-                ) {
-                    Some(range) => range,
-                    None => continue,
-                };
-                if ranges_overlap(range, gdb_range) {
-                    continue;
-                }
-                insert_guest_mmio_allowlist(range.base, range.size);
-            }
-            ControlFlow::Continue(())
-        }) {
-            println!(
-                "warning: guest MMIO allowlist scan failed for {}: {}",
-                compat, err
-            );
-        }
-        if let Some((name, err)) = warn {
-            println!(
-                "warning: guest MMIO allowlist skipping node {}: {}",
-                name, err
-            );
-        }
+    fn finalize(&mut self) {
+        normalize_guest_mmio_allowlist(&mut self.deny);
     }
 }
 
-fn dump_guest_mmio_allowlist() {
-    // SAFETY: allowlist is populated before the guest is started and then read-only.
-    unsafe {
-        let count = (*GUEST_MMIO_RANGE_COUNT.get()).min(MAX_GUEST_MMIO_RANGES);
-        let ranges = &*GUEST_MMIO_RANGES.get();
-        for idx in 0..count {
-            let range = ranges[idx];
-            if range.size == 0 {
-                continue;
-            }
-            println!(
-                "guest mmio allowlist[{}]: base=0x{:X} size=0x{:X}",
-                idx, range.base, range.size
-            );
-        }
+#[derive(Default, Debug)]
+struct GuestMmioScanStats {
+    candidates: usize,
+    dropped_reserved: usize,
+    dropped_cpu: usize,
+    dropped_deny: usize,
+    dropped_gdb: usize,
+}
+
+fn node_property_eq(node: &DtbNodeView<'_, '_>, key: &str, value: &str) -> bool {
+    match node.property_bytes(key) {
+        Ok(Some(bytes)) => decode_cstr(bytes).is_some_and(|entry| entry == value),
+        _ => false,
     }
 }
 
-fn push_debug_io_range(
-    io_ranges: &mut [(u64, u64)],
-    io_count: &mut usize,
+fn node_is_memory(node: &DtbNodeView<'_, '_>) -> bool {
+    if node.name().starts_with("memory") {
+        return true;
+    }
+    node_property_eq(node, "device_type", "memory")
+}
+
+fn node_is_disabled(node: &DtbNodeView<'_, '_>) -> bool {
+    node_property_eq(node, "status", "disabled")
+}
+
+fn node_has_no_map(node: &DtbNodeView<'_, '_>) -> bool {
+    matches!(node.property_bytes("no-map"), Ok(Some(_)))
+}
+
+fn node_is_cpu(node: &DtbNodeView<'_, '_>) -> bool {
+    if node_property_eq(node, "device_type", "cpu") {
+        return true;
+    }
+    node.name().starts_with("cpu@")
+}
+
+fn push_guest_mmio_range(
+    ranges: &mut Vec<GuestMmioRange>,
+    denylist: &GuestMmioDenyList,
     base: usize,
     size: usize,
+    stats: &mut GuestMmioScanStats,
 ) {
-    if size == 0 {
+    let Some(range) = normalize_guest_mmio_range(base, size) else {
         return;
-    }
-    if *io_count >= io_ranges.len() {
-        println!(
-            "warning: debug io range list full, dropping 0x{:X}..0x{:X}",
-            base,
-            base.saturating_add(size)
-        );
-        return;
-    }
-    let entry = (base as u64, size as u64);
-    for idx in 0..*io_count {
-        if io_ranges[idx] == entry {
+    };
+    if let Some(gdb_range) = denylist.gdb_range {
+        if ranges_overlap(range, gdb_range) {
+            stats.dropped_gdb += 1;
             return;
         }
     }
-    io_ranges[*io_count] = entry;
-    *io_count += 1;
+    if denylist.contains_overlap(range) {
+        stats.dropped_deny += 1;
+        return;
+    }
+    ranges.push(range);
+}
+
+fn record_guest_mmio_allowlist_from_dtb(
+    dtb: &DtbParser,
+    gdb_uart: &UartNode,
+    gic_info: &Gicv2Info,
+) {
+    let mut denylist = GuestMmioDenyList {
+        gdb_range: normalize_guest_mmio_range(gdb_uart.base, gdb_uart.size),
+        deny: Vec::new(),
+    };
+    denylist.push_deny(gic_info.dist.base, gic_info.dist.size);
+    denylist.push_deny(gic_info.cpu.base, gic_info.cpu.size);
+    if let Some(gich) = gic_info.gich {
+        denylist.push_deny(gich.base, gich.size);
+    }
+    // SAFETY: memory regions are recorded during single-core boot before interrupts are enabled.
+    unsafe {
+        let count = (*MEM_REGION_COUNT.get()).min(MAX_MEM_REGIONS);
+        let regions = &*MEM_REGIONS.get();
+        for idx in 0..count {
+            let region = regions[idx];
+            if region.size == 0 {
+                continue;
+            }
+            denylist.push_deny(region.base, region.size);
+        }
+    }
+    let _ = GLOBAL_ALLOCATOR.for_each_reserved_region(|base, size| {
+        if size == 0 {
+            return;
+        }
+        denylist.push_deny(base, size);
+    });
+    denylist.finalize();
+
+    let mut ranges: Vec<GuestMmioRange> = Vec::new();
+    let mut stats = GuestMmioScanStats::default();
+
+    fn walk<'dtb, 's>(
+        node: DtbNodeView<'dtb, 's>,
+        in_reserved: bool,
+        in_cpus: bool,
+        denylist: &GuestMmioDenyList,
+        ranges: &mut Vec<GuestMmioRange>,
+        stats: &mut GuestMmioScanStats,
+    ) -> Result<ControlFlow<()>, &'static str> {
+        let name = node.name();
+        let in_reserved = in_reserved || name == "reserved-memory";
+        if in_reserved {
+            stats.dropped_reserved += 1;
+            return Ok(ControlFlow::Continue(()));
+        }
+        let in_cpus = in_cpus || name == "cpus";
+        if in_cpus {
+            stats.dropped_cpu += 1;
+            return Ok(ControlFlow::Continue(()));
+        }
+        if node_is_cpu(&node) {
+            stats.dropped_cpu += 1;
+            return Ok(ControlFlow::Continue(()));
+        }
+
+        let skip_collect =
+            node_is_memory(&node) || node_is_disabled(&node) || node_has_no_map(&node);
+        if !skip_collect {
+            if let Ok(mut regs) = node.reg_iter() {
+                while let Some(entry) = regs.next() {
+                    let (base, size) = match entry {
+                        Ok(entry) => entry,
+                        Err(_) => break,
+                    };
+                    if size == 0 {
+                        continue;
+                    }
+                    stats.candidates += 1;
+                    push_guest_mmio_range(ranges, denylist, base, size, stats);
+                }
+            }
+
+            match node.ranges_iter() {
+                Ok(Some(mut iter)) => {
+                    while let Some(entry) = iter.next() {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(_) => break,
+                        };
+                        if entry.len == 0 {
+                            continue;
+                        }
+                        stats.candidates += 1;
+                        push_guest_mmio_range(
+                            ranges,
+                            denylist,
+                            entry.parent_base,
+                            entry.len,
+                            stats,
+                        );
+                    }
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        let mut result: Result<ControlFlow<()>, &'static str> = Ok(ControlFlow::Continue(()));
+        let mut should_break = false;
+        node.for_each_child_view(&mut |child| match walk(
+            child,
+            in_reserved,
+            in_cpus,
+            denylist,
+            ranges,
+            stats,
+        ) {
+            Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
+            Ok(ControlFlow::Break(())) => {
+                should_break = true;
+                ControlFlow::Break(())
+            }
+            Err(err) => {
+                result = Err(err);
+                ControlFlow::Break(())
+            }
+        })?;
+        let _ = result?;
+        if should_break {
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    let result = (|| -> Result<(), &'static str> {
+        let root = dtb.root_node_view()?;
+        let mut error: Option<&'static str> = None;
+        root.for_each_child_view(&mut |child| match walk(
+            child,
+            false,
+            false,
+            &denylist,
+            &mut ranges,
+            &mut stats,
+        ) {
+            Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
+            Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
+            Err(err) => {
+                error = Some(err);
+                ControlFlow::Break(())
+            }
+        })?;
+        if let Some(err) = error {
+            return Err(err);
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        println!("warning: guest MMIO allowlist scan failed: {}", err);
+    }
+    println!(
+        "mmio scan: candidates={} dropped reserved-subtree={} dropped cpu-subtree={} dropped deny-overlap={} dropped gdb-overlap={}",
+        stats.candidates,
+        stats.dropped_reserved,
+        stats.dropped_cpu,
+        stats.dropped_deny,
+        stats.dropped_gdb
+    );
+
+    normalize_guest_mmio_allowlist(&mut ranges);
+    set_guest_mmio_allowlist(ranges);
+}
+
+fn dump_guest_mmio_allowlist() {
+    for (idx, range) in guest_mmio_allowlist_slice().iter().enumerate() {
+        if range.size == 0 {
+            continue;
+        }
+        println!(
+            "guest mmio allowlist[{}]: base=0x{:X} size=0x{:X}",
+            idx, range.base, range.size
+        );
+    }
+}
+
+fn push_debug_io_range(io_ranges: &mut Vec<(u64, u64)>, base: usize, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let entry = (base as u64, size as u64);
+    if io_ranges.iter().any(|&existing| existing == entry) {
+        return;
+    }
+    io_ranges.push(entry);
 }
 
 fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
@@ -946,11 +1017,7 @@ fn normalize_stage2_settings(settings: &mut [Stage2PagingSetting], count: usize)
     write
 }
 
-fn build_stage2_guest_map() -> (
-    [Stage2PagingSetting; MAX_STAGE2_SETTINGS],
-    usize,
-    Option<(usize, usize)>,
-) {
+fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>) {
     const MAX_RESERVED_REGIONS: usize = 32;
 
     let mut mem_raw = [Range { start: 0, end: 0 }; MAX_MEM_REGIONS];
@@ -1095,66 +1162,75 @@ fn build_stage2_guest_map() -> (
         }
     }
 
-    let mut settings: [Stage2PagingSetting; MAX_STAGE2_SETTINGS] =
-        core::array::from_fn(|_| Stage2PagingSetting {
-            ipa: 0,
-            pa: 0,
-            size: 0,
-            types: Stage2PageTypes::Normal,
-        });
+    let mut settings: Vec<Stage2PagingSetting> = Vec::new();
 
     if let Some(seg) = best {
         let size = seg.end.saturating_sub(seg.start);
-        let mut count = 0usize;
-        // SAFETY: allowlist is populated before Stage-2 setup and remains read-only afterward.
-        unsafe {
-            let mmio_count = (*GUEST_MMIO_RANGE_COUNT.get()).min(MAX_GUEST_MMIO_RANGES);
-            let ranges = &*GUEST_MMIO_RANGES.get();
-            for idx in 0..mmio_count {
-                let range = ranges[idx];
-                if range.size == 0 {
-                    continue;
-                }
-                if (range.base | range.size) & (PAGE_SIZE - 1) != 0 {
-                    println!(
-                        "warning: stage2 MMIO range unaligned 0x{:X} size 0x{:X}",
-                        range.base, range.size
-                    );
-                    continue;
-                }
-                if count >= settings.len() {
-                    println!(
-                        "warning: stage2 settings full, dropping MMIO 0x{:X}",
-                        range.base
-                    );
-                    break;
-                }
-                settings[count] = Stage2PagingSetting {
-                    ipa: range.base,
-                    pa: range.base,
-                    size: range.size,
-                    types: Stage2PageTypes::Device,
-                };
-                count += 1;
+        let guest_window = Range {
+            start: seg.start,
+            end: seg.start.saturating_add(size),
+        };
+        let mut warned_overlap = false;
+        for range in guest_mmio_allowlist_slice() {
+            if range.size == 0 {
+                continue;
             }
+            if (range.base | range.size) & (PAGE_SIZE - 1) != 0 {
+                println!(
+                    "warning: stage2 MMIO range unaligned 0x{:X} size 0x{:X}",
+                    range.base, range.size
+                );
+                continue;
+            }
+            if range.base < guest_window.end && range.end() > guest_window.start {
+                if !warned_overlap {
+                    println!(
+                        "warning: stage2 MMIO overlaps guest RAM, skipping overlapping ranges"
+                    );
+                    warned_overlap = true;
+                }
+                continue;
+            }
+            settings.push(Stage2PagingSetting {
+                ipa: range.base,
+                pa: range.base,
+                size: range.size,
+                types: Stage2PageTypes::Device,
+            });
         }
 
-        if count < settings.len() {
-            settings[count] = Stage2PagingSetting {
-                ipa: seg.start,
-                pa: seg.start,
-                size,
-                types: Stage2PageTypes::Normal,
-            };
-            count += 1;
-        }
+        settings.push(Stage2PagingSetting {
+            ipa: seg.start,
+            pa: seg.start,
+            size,
+            types: Stage2PageTypes::Normal,
+        });
 
-        sort_stage2_settings(&mut settings, count);
-        let count = normalize_stage2_settings(&mut settings, count);
-        return (settings, count, Some((seg.start, size)));
+        let mut count = settings.len();
+        sort_stage2_settings(settings.as_mut_slice(), count);
+        count = normalize_stage2_settings(settings.as_mut_slice(), count);
+        settings.truncate(count);
+
+        let mut write = 0usize;
+        let total = settings.len();
+        for idx in 0..total {
+            let setting = settings[idx];
+            if (setting.ipa | setting.pa | setting.size) & (PAGE_SIZE - 1) != 0 {
+                println!(
+                    "warning: stage2 setting unaligned 0x{:X} size 0x{:X}",
+                    setting.ipa, setting.size
+                );
+                continue;
+            }
+            settings[write] = setting;
+            write += 1;
+        }
+        settings.truncate(write);
+
+        return (settings, Some((seg.start, size)));
     }
 
-    (settings, 0, None)
+    (settings, None)
 }
 
 fn apply_guest_uart_dt_edit(
