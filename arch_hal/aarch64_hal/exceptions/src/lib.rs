@@ -91,8 +91,7 @@ s_error_current_el_stack_pointer_0:
 
 .balign 0x080
 synchronous_current_el_stack_pointer_x:
-    SAVE_CALL_RESTORE
-    CALL_COMMON_HANDLER name_sync_current_x
+    b el2_sync_current_x_handler
 
 .balign 0x080
 irq_current_el_stack_pointer_x:
@@ -151,6 +150,11 @@ fiq_lower_el_aarch32:
 s_error_lower_el_aarch32:
     SAVE_CALL_RESTORE
     CALL_COMMON_HANDLER name_s_error_lower_aarch32
+
+.weak el2_sync_current_x_handler
+el2_sync_current_x_handler:
+    SAVE_CALL_RESTORE
+    CALL_COMMON_HANDLER name_sync_current_x
 
 
     .section .rodata

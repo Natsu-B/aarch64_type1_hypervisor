@@ -11,6 +11,7 @@ mod gdb_uart;
 mod handler;
 mod irq_decode;
 mod monitor;
+mod stack_overflow;
 mod vgic;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -32,6 +33,9 @@ use arch_hal::gic::TriggerMode;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
+use arch_hal::paging::stage1::EL2Stage1PageTypes;
+use arch_hal::paging::stage1::EL2Stage1Paging;
+use arch_hal::paging::stage1::EL2Stage1PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::timer::SystemTimer;
@@ -128,7 +132,13 @@ define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
-    naked_asm!("ldr x9, =_STACK_TOP\n", "mov sp, x9\n", "b main\n",)
+    naked_asm!(
+        "msr spsel, #1\n",
+        "isb\n",
+        "ldr x9, =_STACK_TOP\n",
+        "mov sp, x9\n",
+        "b main\n",
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -246,6 +256,20 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     println!("allocator setup success!!!");
     record_guest_mmio_allowlist_from_dtb(&dtb, &gdb_uart, &gic_info);
     dump_guest_mmio_allowlist();
+
+    println!("setup EL2 Stage-1 paging with stack guard...");
+    let stage1_settings = build_stage1_el2_map();
+    EL2Stage1Paging::init_stage1paging(&stage1_settings)
+        .expect("EL2 Stage-1 paging initialization failed");
+    println!("EL2 Stage-1 paging enabled");
+
+    // SAFETY: emergency stack is initialized after Stage-1 is enabled.
+    // The stack is mapped as Normal memory with identity mapping.
+    unsafe {
+        stack_overflow::init_emergency_stack();
+    }
+    println!("Emergency stack initialized");
+
     // setup paging
     println!("start paging...");
     println!(
@@ -1016,6 +1040,97 @@ fn normalize_stage2_settings(settings: &mut [Stage2PagingSetting], count: usize)
         write += 1;
     }
     write
+}
+
+fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
+    unsafe extern "C" {
+        static _STACK_BOTTOM: usize;
+    }
+
+    let stack_bottom = &raw const _STACK_BOTTOM as usize;
+    let guard_page_start = stack_bottom;
+    let guard_page_end = stack_bottom + PAGE_SIZE;
+
+    let mut settings = Vec::new();
+
+    // SAFETY: memory regions are recorded during early boot before secondary cores start
+    let mem_count = unsafe { *MEM_REGION_COUNT.get() };
+    let mem_regions = unsafe { &*MEM_REGIONS.get() };
+
+    for i in 0..mem_count.min(MAX_MEM_REGIONS) {
+        let region = mem_regions[i];
+        if region.size == 0 {
+            continue;
+        }
+
+        let start = align_down(region.base, PAGE_SIZE);
+        let end = align_up(region.base.saturating_add(region.size), PAGE_SIZE);
+        if end <= start {
+            continue;
+        }
+
+        if guard_page_end <= start || guard_page_start >= end {
+            settings.push(EL2Stage1PagingSetting {
+                va: start,
+                pa: start,
+                size: end - start,
+                types: EL2Stage1PageTypes::Normal,
+            });
+        } else {
+            if start < guard_page_start {
+                settings.push(EL2Stage1PagingSetting {
+                    va: start,
+                    pa: start,
+                    size: guard_page_start - start,
+                    types: EL2Stage1PageTypes::Normal,
+                });
+            }
+            if guard_page_end < end {
+                settings.push(EL2Stage1PagingSetting {
+                    va: guard_page_end,
+                    pa: guard_page_end,
+                    size: end - guard_page_end,
+                    types: EL2Stage1PageTypes::Normal,
+                });
+            }
+        }
+    }
+
+    // map other memory regions as mmio
+    settings.sort_by(|a, b| a.va.cmp(&b.va));
+
+    if settings[0].va != 0 {
+        settings.insert(
+            0,
+            EL2Stage1PagingSetting {
+                va: 0,
+                pa: 0,
+                size: settings[0].va,
+                types: EL2Stage1PageTypes::Device,
+            },
+        );
+    }
+
+    let last = settings.last().unwrap();
+    let parange = match cpu::get_parange().unwrap() {
+        cpu::registers::PARange::PA32bits4GB => 32,
+        cpu::registers::PARange::PA36bits64GB => 36,
+        cpu::registers::PARange::PA40bits1TB => 40,
+        cpu::registers::PARange::PA42bits4TB => 42,
+        cpu::registers::PARange::PA44bits16TB => 44,
+        cpu::registers::PARange::PA48bits256TB => 48,
+        cpu::registers::PARange::PA52bits4PB => 52,
+        cpu::registers::PARange::PA56bits64PB => 56,
+    };
+    let ipa_space = 1usize << parange;
+    settings.push(EL2Stage1PagingSetting {
+        va: last.va + last.size,
+        pa: last.pa + last.size,
+        size: ipa_space - (last.va + last.size),
+        types: EL2Stage1PageTypes::Device,
+    });
+
+    settings
 }
 
 fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>) {
