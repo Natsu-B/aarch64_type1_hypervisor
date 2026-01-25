@@ -14,7 +14,7 @@ use gdb_remote::ResumeAction;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
-use gdb_remote::WatchpointKind;
+pub use gdb_remote::WatchpointKind;
 
 #[derive(Clone, Copy)]
 pub struct DebugIo {
@@ -22,6 +22,8 @@ pub struct DebugIo {
     pub try_write: fn(u8) -> bool,
     pub flush: fn(),
 }
+
+pub type MonitorHandler = fn(cmd: &[u8], out: &mut [u8]) -> Option<usize>;
 
 pub const TARGET_XML: &[u8] = include_bytes!("xml/target.xml");
 pub const AARCH64_CORE_XML: &[u8] = include_bytes!("xml/aarch64-core.xml");
@@ -368,6 +370,7 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
     desc: Aarch64TargetDesc,
     features_active: bool,
     memory_map: Option<&'static [u8]>,
+    monitor_handler: Option<MonitorHandler>,
 }
 
 impl<M, const N: usize> Aarch64GdbState<M, N> {
@@ -383,6 +386,7 @@ impl<M, const N: usize> Aarch64GdbState<M, N> {
             desc: Aarch64TargetDesc::new(),
             features_active: false,
             memory_map: None,
+            monitor_handler: None,
         };
 
         let wp_slots = core::cmp::min(cpu::watchpoint_count(), DEFAULT_HW_BREAKPOINTS);
@@ -400,6 +404,10 @@ impl<M, const N: usize> Aarch64GdbState<M, N> {
 
     pub fn set_memory_map(&mut self, data: Option<&'static [u8]>) {
         self.memory_map = data;
+    }
+
+    pub fn set_monitor_handler(&mut self, handler: Option<MonitorHandler>) {
+        self.monitor_handler = handler;
     }
 }
 
@@ -847,6 +855,26 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(self.state.memory_map)
     }
 
+    fn monitor_command(
+        &mut self,
+        cmd: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        let Some(handler) = self.state.monitor_handler else {
+            return Err(TargetError::NotSupported);
+        };
+        match handler(cmd, out) {
+            Some(len) => {
+                if len > out.len() {
+                    Err(TargetError::Recoverable(Aarch64GdbError::BufferTooSmall))
+                } else {
+                    Ok(len)
+                }
+            }
+            None => Err(TargetError::NotSupported),
+        }
+    }
+
     fn read_registers(
         &mut self,
         dst: &mut [u8],
@@ -1093,6 +1121,7 @@ pub enum DebugEntryCause {
     DebugException(ExceptionClass),
     AttachDollar,
     CtrlC,
+    Watchpoint { kind: WatchpointKind, addr: u64 },
 }
 
 #[derive(Clone, Copy)]
@@ -1136,6 +1165,10 @@ pub fn debug_entry(regs: &mut Registers, cause: DebugEntryCause) {
 
 pub fn debug_exception_entry(regs: &mut Registers, ec: ExceptionClass) {
     debug_entry(regs, DebugEntryCause::DebugException(ec));
+}
+
+pub fn debug_watchpoint_entry(regs: &mut Registers, kind: WatchpointKind, addr: u64) {
+    debug_entry(regs, DebugEntryCause::Watchpoint { kind, addr });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1216,6 +1249,10 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         self.state.set_memory_map(data);
     }
 
+    pub fn set_monitor_handler(&mut self, handler: Option<MonitorHandler>) {
+        self.state.set_monitor_handler(handler);
+    }
+
     pub fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {
         let ec = match cause {
             DebugEntryCause::DebugException(ec) => Some(ec),
@@ -1232,6 +1269,12 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         enum DebugOutcome {
             Resume(ResumeAction),
             Exit,
+        }
+
+        #[derive(Clone, Copy)]
+        enum StopReply {
+            Sigtrap,
+            Watchpoint { kind: WatchpointKind, addr: u64 },
         }
 
         let mut breakpoint_slot = None;
@@ -1257,16 +1300,28 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             }
         }
 
-        let mut pending_stop_reply = matches!(cause, DebugEntryCause::DebugException(_));
+        let mut pending_stop_reply = match cause {
+            DebugEntryCause::DebugException(_) => Some(StopReply::Sigtrap),
+            DebugEntryCause::Watchpoint { kind, addr } => {
+                Some(StopReply::Watchpoint { kind, addr })
+            }
+            _ => None,
+        };
         let mut tx_hold = None;
         let outcome = 'debug: loop {
             let mut target = self.state.target(regs);
             let mut progress = false;
 
-            if pending_stop_reply {
-                match self.server.notify_stop_sigtrap() {
+            if let Some(reply) = pending_stop_reply {
+                let send_result = match reply {
+                    StopReply::Sigtrap => self.server.notify_stop_sigtrap(),
+                    StopReply::Watchpoint { kind, addr } => {
+                        self.server.notify_stop_watch(kind, addr)
+                    }
+                };
+                match send_result {
                     Ok(()) => {
-                        pending_stop_reply = false;
+                        pending_stop_reply = None;
                         progress = true;
                     }
                     Err(GdbError::TxOverflow) => {}

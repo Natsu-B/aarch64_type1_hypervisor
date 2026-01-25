@@ -2,6 +2,7 @@ use crate::GUEST_UART;
 use crate::debug;
 use crate::gdb_uart;
 use crate::guest_mmio_allowlist_contains_range;
+use crate::monitor;
 use crate::vgic;
 use arch_hal::cpu;
 use arch_hal::exceptions;
@@ -29,6 +30,7 @@ use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
 use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
+use gdb_remote::WatchpointKind;
 
 static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
     ctx: core::ptr::null(),
@@ -153,17 +155,12 @@ fn data_abort_handler(
         );
     };
 
-    let Some(register) = info.register_mut(regs) else {
-        panic!(
-            "data abort at IPA 0x{:X} with invalid register {}",
-            address, access.reg_num
-        );
-    };
-
     let reg_size: InstructionRegisterSize = access.reg_size;
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
+    let reg_num = access.reg_num;
 
+    let addr_u64 = address;
     let addr = address as usize;
     let access_bytes = access_width_bytes(access_width);
     let reg_bits = match reg_size {
@@ -174,6 +171,12 @@ fn data_abort_handler(
     let elr = cpu::get_elr_el2();
 
     if vgic::handles_gicd(addr) {
+        let Some(register) = info.register_mut(regs) else {
+            panic!(
+                "data abort at IPA 0x{:X} with invalid register {}",
+                address, reg_num
+            );
+        };
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
                 if let Some(access) = gic_access_size(access_width) {
@@ -204,6 +207,12 @@ fn data_abort_handler(
     let allowlisted = guest_mmio_allowlist_contains_range(addr, access_bytes);
     let log_now = should_log_unmapped_abort();
     if allowlisted {
+        let Some(register) = info.register_mut(regs) else {
+            panic!(
+                "data abort at IPA 0x{:X} with invalid register {}",
+                address, reg_num
+            );
+        };
         if log_now {
             println!(
                 "warning: unexpected abort on allowlisted MMIO {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
@@ -268,6 +277,27 @@ fn data_abort_handler(
         return;
     }
 
+    let memfault_info = monitor::MemfaultInfo {
+        addr: addr_u64,
+        pc: elr,
+        access: if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+            monitor::MemfaultAccess::Write
+        } else {
+            monitor::MemfaultAccess::Read
+        },
+        size: access_bytes as u8,
+        esr,
+        far: info.far_el2,
+    };
+    let decision = monitor::record_memfault(memfault_info, !gdb_uart::is_debug_active());
+    if decision.should_trap {
+        let kind = match write_access {
+            WriteNotRead::WritingMemoryAbort => WatchpointKind::Write,
+            WriteNotRead::ReadingMemoryAbort => WatchpointKind::Read,
+        };
+        debug::enter_debug_from_memfault(regs, kind, addr_u64);
+    }
+
     if log_now {
         println!(
             "warning: unmapped access {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
@@ -284,6 +314,12 @@ fn data_abort_handler(
         );
     }
     if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
+        let Some(register) = info.register_mut(regs) else {
+            panic!(
+                "data abort at IPA 0x{:X} with invalid register {}",
+                address, reg_num
+            );
+        };
         *register = 0;
     }
     cpu::set_elr_el2(elr + 4);

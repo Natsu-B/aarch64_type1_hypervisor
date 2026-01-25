@@ -10,6 +10,7 @@ mod debug;
 mod gdb_uart;
 mod handler;
 mod irq_decode;
+mod monitor;
 mod vgic;
 use alloc::boxed::Box;
 use alloc::string::String;

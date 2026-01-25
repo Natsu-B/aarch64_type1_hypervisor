@@ -90,6 +90,20 @@ pub trait Target {
         Ok(None)
     }
 
+    /// Handle a `qRcmd` monitor command.
+    ///
+    /// `cmd` contains decoded bytes from `qRcmd` (typically ASCII).
+    /// Return `Ok(0)` for "handled, no output" (server replies `OK`).
+    /// Return `Ok(n > 0)` for "handled, output in `out[..n]`" (server replies with hex-encoded output).
+    /// Return `Err(TargetError::NotSupported)` to indicate the command is unrecognized (server replies empty).
+    fn monitor_command(
+        &mut self,
+        _cmd: &[u8],
+        _out: &mut [u8],
+    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        Err(TargetError::NotSupported)
+    }
+
     /// Read all registers into `dst`, returning bytes written.
     fn read_registers(
         &mut self,

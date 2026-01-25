@@ -353,6 +353,37 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, &payload).map_err(|_| GdbError::TxOverflow)
     }
 
+    pub fn notify_stop_watch(
+        &mut self,
+        kind: WatchpointKind,
+        addr: u64,
+    ) -> Result<(), GdbError<Infallible, Infallible>> {
+        let out_cap = self.out_payload_cap();
+        let mut payload = [0u8; 32];
+        let mut idx = 0usize;
+        payload[idx] = b'T';
+        idx += 1;
+        payload[idx] = b'0';
+        idx += 1;
+        payload[idx] = b'5';
+        idx += 1;
+        let kind_bytes: &[u8] = match kind {
+            WatchpointKind::Write => b"watch",
+            WatchpointKind::Read => b"rwatch",
+            WatchpointKind::Access => b"awatch",
+        };
+        append_bytes(&mut payload, &mut idx, kind_bytes);
+        payload[idx] = b':';
+        idx += 1;
+        append_hex_u64(&mut payload, &mut idx, addr);
+        payload[idx] = b';';
+        idx += 1;
+        if idx > out_cap {
+            return Err(GdbError::PacketTooLong);
+        }
+        Self::queue_packet(&mut self.tx, &payload[..idx]).map_err(|_| GdbError::TxOverflow)
+    }
+
     fn finish_frame<T: Target>(
         &mut self,
         target: &mut T,
@@ -879,42 +910,109 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 "handle_query: qRcmd raw=\"{}\"",
                 debug_printable_prefix(rest)
             );
-            let mut decoded = [0u8; 64];
-            let decoded_len = match hex_decode(rest, &mut decoded) {
+            if rest.len() / 2 > self.scratch_a.len() {
+                gdb_debug!(
+                    self,
+                    "handle_query: qRcmd hex decode failed src_len={} dst_cap={}",
+                    rest.len(),
+                    self.scratch_a.len()
+                );
+                self.send::<T>(b"E01")?;
+                return Ok(ProcessResult::None);
+            }
+            let decoded_len = match hex_decode(rest, &mut self.scratch_a) {
                 Ok(len) => len,
                 Err(_) => {
                     gdb_debug!(
                         self,
                         "handle_query: qRcmd hex decode failed src_len={} dst_cap={}",
                         rest.len(),
-                        decoded.len()
+                        self.scratch_a.len()
                     );
                     self.send::<T>(b"E01")?;
                     return Ok(ProcessResult::None);
                 }
             };
-            let text = match core::str::from_utf8(&decoded[..decoded_len]) {
-                Ok(t) => t,
-                Err(_) => {
-                    gdb_debug!(self, "handle_query: qRcmd utf8 decode failed");
-                    self.send::<T>(b"E01")?;
+            let decoded_print = debug_printable_prefix(&self.scratch_a[..decoded_len]);
+            gdb_debug!(self, "handle_query: qRcmd decoded=\"{}\"", decoded_print);
+            let decoded_cmd = &self.scratch_a[..decoded_len];
+            if let Ok(text) = core::str::from_utf8(decoded_cmd) {
+                if text.trim() == "exit 0" {
+                    self.send_ok::<T>()?;
+                    // Do NOT terminate immediately: GDB typically sends `vKill` (or `D`)
+                    // after this command as part of its shutdown path. Exiting here makes
+                    // the transport disappear mid-teardown (Broken pipe).
+                    self.monitor_exit_armed = true;
                     return Ok(ProcessResult::None);
                 }
-            };
-            gdb_debug!(
-                self,
-                "handle_query: qRcmd decoded=\"{}\"",
-                debug_printable_prefix(text.as_bytes())
-            );
-            if text.trim() == "exit 0" {
-                self.send_ok::<T>()?;
-                // Do NOT terminate immediately: GDB typically sends `vKill` (or `D`)
-                // after this command as part of its shutdown path. Exiting here makes
-                // the transport disappear mid-teardown (Broken pipe).
-                self.monitor_exit_armed = true;
-                return Ok(ProcessResult::None);
             }
-            self.send::<T>(b"E01")?;
+
+            let out_cap = self.out_payload_cap();
+            let reply_cap = out_cap;
+            let result = {
+                let out_buf = &mut self.scratch_b[..out_cap];
+                target.monitor_command(decoded_cmd, out_buf)
+            };
+            match result {
+                Err(TargetError::NotSupported) => {
+                    self.send_empty::<T>()?;
+                }
+                Err(TargetError::Recoverable(e)) => {
+                    self.reply_recoverable(target, &e)?;
+                }
+                Err(TargetError::Unrecoverable(e)) => {
+                    return Err(GdbError::Target(TargetError::Unrecoverable(e)));
+                }
+                Ok(0) => {
+                    self.send_ok::<T>()?;
+                }
+                Ok(n) => {
+                    const TRUNCATED_SUFFIX: &[u8] = b"\n(truncated)\n";
+                    if reply_cap < 2 {
+                        self.send::<T>(b"E01")?;
+                        return Ok(ProcessResult::None);
+                    }
+
+                    let out_buf = &self.scratch_b[..out_cap];
+                    let out_len = n.min(out_buf.len());
+                    let expected_hex_len = out_len.saturating_mul(2);
+                    let mut reply_error = false;
+                    let reply_len = {
+                        let reply = &mut self.scratch_a[..reply_cap];
+                        if expected_hex_len <= reply_cap {
+                            let reply_len = hex_encode(&out_buf[..out_len], reply);
+                            if reply_len < expected_hex_len {
+                                reply_error = true;
+                            }
+                            reply_len
+                        } else {
+                            let suffix_hex_len = TRUNCATED_SUFFIX.len().saturating_mul(2);
+                            let mut prefix_len = out_len;
+                            let mut append_suffix = false;
+                            if reply_cap > suffix_hex_len {
+                                let max_prefix = (reply_cap - suffix_hex_len) / 2;
+                                prefix_len = prefix_len.min(max_prefix);
+                                append_suffix = true;
+                            } else {
+                                prefix_len = reply_cap / 2;
+                            }
+
+                            let mut reply_len = hex_encode(&out_buf[..prefix_len], reply);
+                            if append_suffix {
+                                reply_len +=
+                                    hex_encode(TRUNCATED_SUFFIX, &mut reply[reply_len..reply_cap]);
+                            }
+                            reply_len
+                        }
+                    };
+                    if reply_error {
+                        self.send::<T>(b"E01")?;
+                        return Ok(ProcessResult::None);
+                    }
+                    let payload = &self.scratch_a[..reply_len];
+                    Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)?;
+                }
+            }
             return Ok(ProcessResult::None);
         }
 
@@ -2043,6 +2141,7 @@ mod tests {
     use super::ProcessResult;
     use super::Target;
     use super::TargetError;
+    use super::WatchpointKind;
     use core::convert::Infallible;
     use std::vec::Vec;
 
@@ -2142,6 +2241,26 @@ mod tests {
         packets
     }
 
+    fn drain_tx<const MAX: usize, const TX: usize>(server: &mut GdbServer<MAX, TX>) -> Vec<u8> {
+        let mut tx = Vec::new();
+        while let Some(byte) = server.pop_tx_byte_irq() {
+            tx.push(byte);
+        }
+        tx
+    }
+
+    fn build_qrcmd_frame(cmd: &[u8]) -> Vec<u8> {
+        let mut hex = Vec::new();
+        hex.resize(cmd.len().saturating_mul(2), 0u8);
+        let hex_len = super::hex_encode(cmd, &mut hex);
+        hex.truncate(hex_len);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"qRcmd,");
+        payload.extend_from_slice(&hex);
+        build_frame(&payload)
+    }
+
     #[test]
     fn g_packet_queues_register_reply() {
         let mut server: GdbServer<8192, 2048> = GdbServer::new();
@@ -2179,6 +2298,121 @@ mod tests {
         ];
         assert!(packet.checksum.iter().all(|&b| is_hex(b)));
         assert_eq!(packet.checksum, expected_hex);
+    }
+
+    enum MonitorReply {
+        NotSupported,
+        Output(&'static [u8]),
+    }
+
+    struct MonitorTarget {
+        reply: MonitorReply,
+    }
+
+    impl MonitorTarget {
+        fn new(reply: MonitorReply) -> Self {
+            Self { reply }
+        }
+    }
+
+    impl Target for MonitorTarget {
+        type RecoverableError = Infallible;
+        type UnrecoverableError = Infallible;
+
+        fn read_registers(&mut self, _dst: &mut [u8]) -> Result<usize, DummyError> {
+            Ok(0)
+        }
+
+        fn write_registers(&mut self, _src: &[u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn read_register(&mut self, _regno: u32, _dst: &mut [u8]) -> Result<usize, DummyError> {
+            Ok(0)
+        }
+
+        fn write_register(&mut self, _regno: u32, _src: &[u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn read_memory(&mut self, _addr: u64, _dst: &mut [u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn write_memory(&mut self, _addr: u64, _src: &[u8]) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn insert_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
+            Ok(())
+        }
+
+        fn monitor_command(&mut self, _cmd: &[u8], out: &mut [u8]) -> Result<usize, DummyError> {
+            match self.reply {
+                MonitorReply::NotSupported => Err(TargetError::NotSupported),
+                MonitorReply::Output(data) => {
+                    let len = data.len().min(out.len());
+                    out[..len].copy_from_slice(&data[..len]);
+                    Ok(len)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qrcmd_not_supported_replies_empty() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = MonitorTarget::new(MonitorReply::NotSupported);
+        let frame = build_qrcmd_frame(b"hp memfault?");
+
+        let mut last = ProcessResult::None;
+        for &byte in &frame {
+            last = server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+        assert!(matches!(last, ProcessResult::None));
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx);
+        assert!(packets.iter().any(|packet| packet.payload.is_empty()));
+    }
+
+    #[test]
+    fn qrcmd_output_is_hex_encoded() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = MonitorTarget::new(MonitorReply::Output(b"hi\n"));
+        let frame = build_qrcmd_frame(b"hp memfault?");
+
+        for &byte in &frame {
+            server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx);
+        assert!(
+            packets.iter().any(|packet| packet.payload == b"68690a"),
+            "missing qRcmd output reply"
+        );
+    }
+
+    #[test]
+    fn stop_reply_watchpoint_format() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        server
+            .notify_stop_watch(WatchpointKind::Write, 0x1a2b)
+            .expect("stop reply failed");
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload, b"T05watch:1a2b;");
     }
 
     #[test]

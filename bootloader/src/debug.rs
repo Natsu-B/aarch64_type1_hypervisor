@@ -1,9 +1,11 @@
 use crate::gdb_uart;
+use crate::monitor;
 use arch_hal::aarch64_gdb;
 use arch_hal::aarch64_gdb::Aarch64GdbStub;
 use arch_hal::aarch64_gdb::DebugEntryCause;
 use arch_hal::aarch64_gdb::DebugIo;
 use arch_hal::aarch64_gdb::MemoryAccess;
+use arch_hal::aarch64_gdb::WatchpointKind;
 use arch_hal::cpu;
 use arch_hal::exceptions::registers::ExceptionClass;
 use arch_hal::paging::PagingErr;
@@ -115,7 +117,9 @@ pub(crate) fn init_gdb_stub() {
         });
         // Avoid constructing large fixed-size buffers on the stack.
         GdbStub::init_in_place(stub, Stage2Memory);
-        aarch64_gdb::register_debug_stub(stub.assume_init_mut());
+        let stub = stub.assume_init_mut();
+        stub.set_monitor_handler(Some(monitor::bootloader_monitor_handler));
+        aarch64_gdb::register_debug_stub(stub);
     }
 }
 
@@ -163,6 +167,20 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
 
     aarch64_gdb::debug_entry(regs, cause);
     cpu::irq_restore(saved_daif);
+}
+
+pub(crate) fn enter_debug_from_memfault(
+    regs: &mut cpu::Registers,
+    kind: WatchpointKind,
+    addr: u64,
+) {
+    if gdb_uart::is_debug_active() {
+        return;
+    }
+
+    let _debug_active = DebugActiveGuard::new();
+    let _stop_loop = gdb_uart::begin_stop_loop();
+    aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
 }
 
 fn guest_ipa_contains(ipa: u64, len: usize) -> bool {
