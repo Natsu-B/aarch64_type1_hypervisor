@@ -1,15 +1,33 @@
 #![no_std]
 #![feature(naked_functions_rustic_abi)]
 #![feature(sync_unsafe_cell)]
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
+#![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn __unit_test_init() {
+    aarch64_unit_test::init_default_uart();
+    setup_exception();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);
 
 mod common_handler;
 mod el1;
+pub mod emulation;
 mod irq_handler;
+pub mod memory_hook;
 pub mod registers;
 pub mod synchronous_handler;
-
-use cpu::set_vbar_el1;
-use cpu::set_vbar_el2;
 
 use crate::common_handler::common_handler;
 use crate::irq_handler::irq_handler;
@@ -18,7 +36,13 @@ use crate::registers::VBAR_EL2;
 use crate::synchronous_handler::synchronous_handler;
 use core::arch::global_asm;
 use core::arch::naked_asm;
+use cpu::set_vbar_el1;
+use cpu::set_vbar_el2;
 
+pub use memory_hook::AccessClass;
+pub use memory_hook::MmioError;
+pub use memory_hook::MmioHandler;
+pub use memory_hook::SplitPolicy;
 global_asm!(
 r#"
     .macro SAVE_CALL_RESTORE

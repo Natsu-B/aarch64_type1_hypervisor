@@ -111,7 +111,7 @@ impl GicDistributor for Gicv2 {
         cpu::isb();
 
         let max_intid = self.max_intid();
-        let num_words = ((max_intid as usize) + 31) / 32;
+        let num_words = (max_intid as usize).div_ceil(32);
 
         // Program interrupt groups so SGIs/PPIs/SPIs are visible to the Non-secure interface.
         // If IGROUPR is Secure-only, these writes are RAZ/WI and firmware must configure groups.
@@ -179,9 +179,9 @@ impl GicDistributor for Gicv2 {
             return Err(GicError::UnsupportedIntId);
         }
         if enable {
-            self.gicd.isenabler[intid as usize / 32].write(1 << intid as usize % 32);
+            self.gicd.isenabler[intid as usize / 32].write(1 << (intid as usize % 32));
         } else {
-            self.gicd.icenabler[intid as usize / 32].write(1 << intid as usize % 32);
+            self.gicd.icenabler[intid as usize / 32].write(1 << (intid as usize % 32));
         }
 
         // Ensure the enable change is visible before callers proceed (tests may wait immediately).

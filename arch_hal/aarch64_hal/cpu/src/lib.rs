@@ -81,6 +81,42 @@ pub struct Registers {
     pub x31: u64,
 }
 
+impl Registers {
+    /// Returns the value of a general-purpose register. x31 reads as zero.
+    #[inline]
+    pub fn gpr(&self, idx: u8) -> u64 {
+        if idx >= 31 {
+            return 0;
+        }
+        self.gprs()[idx as usize]
+    }
+
+    /// Returns a mutable reference to a general-purpose register.
+    /// x31 is the zero register and cannot be written.
+    #[inline]
+    pub fn gpr_mut(&mut self, idx: u8) -> Option<&mut u64> {
+        if idx >= 31 {
+            return None;
+        }
+        Some(&mut self.gprs_mut()[idx as usize])
+    }
+
+    /// Returns a mutable view of the 32 general-purpose registers (x0..x31).
+    #[inline]
+    pub fn gprs_mut(&mut self) -> &mut [u64; 32] {
+        // SAFETY: Registers is #[repr(C)] with 32 consecutive u64 fields,
+        // so it is layout-compatible with [u64; 32].
+        unsafe { &mut *(self as *mut _ as *mut [u64; 32]) }
+    }
+
+    /// Returns an immutable view of the 32 general-purpose registers (x0..x31).
+    #[inline]
+    pub fn gprs(&self) -> &[u64; 32] {
+        // SAFETY: See the comment in gprs_mut().
+        unsafe { &*(self as *const _ as *const [u64; 32]) }
+    }
+}
+
 fn dcache_line_size() -> usize {
     let ctr_el0: u64;
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
@@ -125,10 +161,30 @@ pub fn get_hpfar_el2() -> u64 {
     hpfar_el2
 }
 
+/// Offset of the page within the IPA when reconstructing HPFAR_EL2.FIPA + FAR_EL2.
+pub const HPFAR_EL2_OFFSET: usize = 12;
+
+/// Reconstruct the faulting IPA from HPFAR_EL2 and FAR_EL2.
+pub fn fault_ipa_el2() -> u64 {
+    let far = get_far_el2();
+    let fipa = (get_hpfar_el2() >> 4) & ((1u64 << 44) - 1);
+    (fipa << HPFAR_EL2_OFFSET) | (far & ((1 << HPFAR_EL2_OFFSET) - 1))
+}
+
 pub fn get_elr_el2() -> u64 {
     let elr_el2: u64;
     unsafe { asm!("mrs {}, elr_el2", out(reg) elr_el2) };
     elr_el2
+}
+
+pub fn get_sp_el1() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, sp_el1", val = out(reg) val) };
+    val
+}
+
+pub fn set_sp_el1(val: u64) {
+    unsafe { asm!("msr sp_el1, {}", in(reg) val) };
 }
 
 pub fn get_mpidr_el1() -> u64 {
@@ -351,21 +407,43 @@ pub fn get_current_core_id() -> CoreAffinity {
     CoreAffinity::new(aff0, aff1 as u8, aff2 as u8, aff3 as u8)
 }
 
+/// Translate an EL1/EL0 VA to an IPA using AT S1E1*.
+///
+/// The returned address is an IPA (or physical address after stage-1),
+/// not necessarily an EL2 VA that can be dereferenced directly.
 pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
+    va_to_ipa_el2_read(va)
+}
+
+fn va_to_ipa_el2_common(va: u64, is_write: bool) -> Option<u64> {
     let par_after: u64;
 
     unsafe {
-        core::arch::asm!(
-            "mrs {tmp}, par_el1",
-            "at S1E1R, {va}",
-            "isb",
-            "mrs {par_after}, par_el1",
-            "msr par_el1, {tmp}",
-            tmp        = lateout(reg) _,
-            par_after  = out(reg) par_after,
-            va         = in(reg) va,
-            options(nostack)
-        );
+        if is_write {
+            core::arch::asm!(
+                "mrs {tmp}, par_el1",
+                "at S1E1W, {va}",
+                "isb",
+                "mrs {par_after}, par_el1",
+                "msr par_el1, {tmp}",
+                tmp        = lateout(reg) _,
+                par_after  = out(reg) par_after,
+                va         = in(reg) va,
+                options(nostack)
+            );
+        } else {
+            core::arch::asm!(
+                "mrs {tmp}, par_el1",
+                "at S1E1R, {va}",
+                "isb",
+                "mrs {par_after}, par_el1",
+                "msr par_el1, {tmp}",
+                tmp        = lateout(reg) _,
+                par_after  = out(reg) par_after,
+                va         = in(reg) va,
+                options(nostack)
+            );
+        }
     }
 
     if (par_after & 1) != 0 {
@@ -374,6 +452,46 @@ pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
 
     let ipa = par_after & 0x0000_FFFF_FFFF_F000;
     Some(ipa | (va & 0xFFF))
+}
+
+/// Translate an address for a potential read.
+///
+/// The returned value is an IPA produced by AT S1E1R. Callers must ensure
+/// that this IPA is mapped into the EL2 address space before dereferencing
+/// it (e.g., via `core::ptr::read_volatile`). The pointer must be properly
+/// aligned for the target type (e.g., 4-byte alignment for `read_volatile<u32>`)
+/// and the mapping must permit the access to avoid a further fault.
+pub fn va_to_ipa_el2_read(va: u64) -> Option<u64> {
+    va_to_ipa_el2_common(va, false)
+}
+
+/// Fetch the guest instruction at ELR_EL2 (an EL1/EL0 VA) as a u32.
+///
+/// Returns `None` if the address translation fails or if the VA/IPA is not
+/// 4-byte aligned as required for `read_volatile::<u32>()`.
+pub fn read_guest_insn_u32_at_el1_pc(elr_va: u64) -> Option<u32> {
+    if (elr_va & 0b11) != 0 {
+        return None;
+    }
+    let ipa = va_to_ipa_el2_read(elr_va)?;
+    if (ipa & 0b11) != 0 {
+        return None;
+    }
+    let ptr = ipa as *const u32;
+    // SAFETY: The caller ensures the translated IPA is mapped into the EL2
+    // address space with at least 4 bytes readable, and alignment is checked
+    // above to satisfy Rust's volatile read requirements.
+    Some(unsafe { core::ptr::read_volatile(ptr) })
+}
+
+/// Translate an address for a potential write.
+///
+/// The returned value is an IPA produced by AT S1E1W. As with
+/// `va_to_ipa_el2_read`, the caller is responsible for ensuring that the IPA
+/// is accessible at EL2 before performing any volatile access, and that the
+/// pointer meets the alignment requirements of the typed access.
+pub fn va_to_ipa_el2_write(va: u64) -> Option<u64> {
+    va_to_ipa_el2_common(va, true)
 }
 
 pub fn clean_data_cache_all() {

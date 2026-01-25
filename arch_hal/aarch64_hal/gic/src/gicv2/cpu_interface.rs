@@ -274,13 +274,13 @@ impl GicCpuInterface for Gicv2 {
                 return Err(GicError::InvalidState);
             }
             // expect non-secure world
-            return self.ack_via_iar(|| Ok(None));
+            self.ack_via_iar(|| Ok(None))
         } else {
             match (enable_group.0, enable_group.1) {
-                (true, true) => return self.ack_via_iar(|| self.ack_via_aiar(|| Ok(None))),
-                (true, false) => return self.ack_via_iar(|| Ok(None)),
-                (false, true) => return self.ack_via_aiar(|| self.ack_via_iar(|| Ok(None))),
-                (false, false) => return Ok(None),
+                (true, true) => self.ack_via_iar(|| self.ack_via_aiar(|| Ok(None))),
+                (true, false) => self.ack_via_iar(|| Ok(None)),
+                (false, true) => self.ack_via_aiar(|| self.ack_via_iar(|| Ok(None))),
+                (false, false) => Ok(None),
             }
         }
     }
@@ -340,10 +340,8 @@ impl Gicv2 {
                     group,
                 }))
             }
-            x if x == 1022 || x == 1023 => {
-                return sprious_action();
-            }
-            _ => return Err(GicError::UnsupportedIntId),
+            x if x == 1022 || x == 1023 => sprious_action(),
+            _ => Err(GicError::UnsupportedIntId),
         }
     }
 
@@ -364,10 +362,8 @@ impl Gicv2 {
                     group,
                 }))
             }
-            x if x == 1022 || x == 1023 => {
-                return sprious_action();
-            }
-            _ => return Err(GicError::UnsupportedIntId),
+            x if x == 1022 || x == 1023 => sprious_action(),
+            _ => Err(GicError::UnsupportedIntId),
         }
     }
 

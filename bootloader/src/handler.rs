@@ -1,31 +1,122 @@
 use crate::UART_ADDR;
 use arch_hal::cpu;
 use arch_hal::exceptions;
+use arch_hal::exceptions::emulation::EmulationOutcome;
+use arch_hal::exceptions::emulation::MmioDecoded;
+use arch_hal::exceptions::emulation::{self};
+use arch_hal::exceptions::memory_hook::AccessClass;
+use arch_hal::exceptions::memory_hook::MmioError;
+use arch_hal::exceptions::memory_hook::MmioHandler;
+use arch_hal::exceptions::memory_hook::SplitPolicy;
 use arch_hal::println;
 use arch_hal::psci;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
+use core::ffi::c_void;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
+use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
+use exceptions::synchronous_handler::DataAbortHandlerEntry;
+use exceptions::synchronous_handler::DataAbortInfo;
+
+static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
+    ctx: core::ptr::null(),
+    read: passthrough_read,
+    write: passthrough_write,
+    probe: Some(passthrough_probe),
+    read_pair: None,
+    write_pair: None,
+    access_class: AccessClass::DeviceMmio,
+    split_policy: SplitPolicy::Never,
+};
+
+static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
+    ctx: core::ptr::null_mut(),
+    handler: data_abort_handler,
+};
 
 pub(crate) fn setup_handler() {
-    exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
+    exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
 
     // deny guest PSCI CPU_ON.
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, deny_cpu_on_handler);
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, deny_cpu_on_handler);
 }
 
+fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
+    unsafe {
+        Ok(match size {
+            1 => read_volatile(ipa as *const u8) as u64,
+            2 => read_volatile(ipa as *const u16) as u64,
+            4 => read_volatile(ipa as *const u32) as u64,
+            8 => read_volatile(ipa as *const u64),
+            _ => return Err(MmioError::Unhandled),
+        })
+    }
+}
+
+fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
+    unsafe {
+        match size {
+            1 => write_volatile(ipa as *mut u8, value as u8),
+            2 => write_volatile(ipa as *mut u16, value as u16),
+            4 => write_volatile(ipa as *mut u32, value as u32),
+            8 => write_volatile(ipa as *mut u64, value as u64),
+            _ => return Err(MmioError::Unhandled),
+        }
+    }
+    Ok(())
+}
+
+fn passthrough_probe(_ctx: *const (), _ipa: u64, size: u8, _is_write: bool) -> bool {
+    matches!(size, 1 | 2 | 4 | 8)
+}
+
 fn data_abort_handler(
-    register: &mut u64,
-    address: u64,
-    reg_size: InstructionRegisterSize,
-    access_width: SyndromeAccessSize,
-    write_access: WriteNotRead,
+    _ctx: *mut c_void,
+    regs: &mut cpu::Registers,
+    info: &DataAbortInfo,
+    decoded: Option<&MmioDecoded>,
 ) {
+    if let Some(plan) = decoded {
+        log_uart_write(plan, regs);
+        match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
+            EmulationOutcome::Handled => return,
+            EmulationOutcome::NotHandled => {
+                panic!("decoded MMIO request was not handled: {:?}", plan)
+            }
+        }
+    }
+
+    let Some(address) = info.fault_ipa else {
+        panic!(
+            "data abort without IPA (FnV={}, FAR_EL2={:#X})",
+            info.esr_el2.get(ESR_EL2::fnv),
+            info.far_el2
+        );
+    };
+
+    let Some(access) = info.access else {
+        panic!(
+            "data abort at IPA 0x{:X} without access info (ISV decode failed)",
+            address
+        );
+    };
+
+    let Some(register) = info.register_mut(regs) else {
+        panic!(
+            "data abort at IPA 0x{:X} with invalid register {}",
+            address, access.reg_num
+        );
+    };
+
+    let reg_size: InstructionRegisterSize = access.reg_size;
+    let access_width: SyndromeAccessSize = access.access_width;
+    let write_access: WriteNotRead = access.write_access;
+
     unsafe {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
@@ -47,9 +138,10 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-                if let Some(uart) = *UART_ADDR.get()
-                    && (uart..uart + 0x1000).contains(&(address as usize))
-                {
+                let Some(uart) = (unsafe { *UART_ADDR.get() }) else {
+                    panic!("invalid abort addr: 0x{:X}", address);
+                };
+                if (uart..uart + 0x1000).contains(&(address as usize)) {
                     if uart == address as usize && reg_val == b'\n' as u64 {
                         println!("\nhypervisor: alive");
                     }
@@ -79,4 +171,41 @@ fn data_abort_handler(
 
 fn deny_cpu_on_handler(regs: &mut cpu::Registers) {
     regs.x0 = PsciReturnCode::Denied.to_x0();
+}
+
+fn log_uart_write(plan: &MmioDecoded, regs: &cpu::Registers) {
+    let Some(uart) = (unsafe { *UART_ADDR.get() }) else {
+        return;
+    };
+    let (ipa, desc) = match plan {
+        MmioDecoded::Single {
+            desc,
+            ipa,
+            split: _,
+            ..
+        } if desc.is_store => (*ipa as usize, desc),
+        _ => return,
+    };
+    if !(uart..uart + 0x1000).contains(&ipa) {
+        return;
+    }
+    let value = store_value(desc, regs);
+    if ipa == uart && value == b'\n' as u64 {
+        println!("\nhypervisor: alive");
+    }
+}
+
+fn store_value(desc: &emulation::SingleDesc, regs: &cpu::Registers) -> u64 {
+    let regs_view = regs.gprs();
+    let raw = if desc.rt == 31 {
+        0
+    } else {
+        regs_view[desc.rt as usize]
+    };
+    match desc.size {
+        1 => raw & 0xff,
+        2 => raw & 0xffff,
+        4 => raw & 0xffff_ffff,
+        _ => raw,
+    }
 }

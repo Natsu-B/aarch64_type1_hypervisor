@@ -20,7 +20,7 @@ bitregs! {
 
 bitregs! {
     /// Exception Syndrome Register(EL2)
-    pub(crate) struct ESR_EL2: u64 {
+    pub struct ESR_EL2: u64 {
         union iss@[24:0] {
             view unknown {
                 reserved@[24:0] [res0],
@@ -128,7 +128,7 @@ bitregs! {
                 // Implementation Defined
                 pub(crate) ea@[9:9],
                 // Fault Address Register Not Valid
-                pub(crate) fnv@[10:10] as FARNotValid {
+                pub fnv@[10:10] as FARNotValid {
                     Valid = 0b0,
                     // FAR is not valid, holds UNKNOWN value
                     NotValid = 0b1,
@@ -244,8 +244,6 @@ bitregs! {
         pub(crate) resturn_addr@[63:0],
     }
 }
-
-pub(crate) const HPFAR_OFFSET: usize = 12;
 
 bitregs! {
     pub(crate) struct HPFAR_EL2: u64 {

@@ -91,7 +91,7 @@ impl Gicv2 {
             {
                 return Err(GicError::InvalidSize);
             }
-            if interrupt_id < 16 || 32 <= interrupt_id {
+            if !(16..32).contains(&interrupt_id) {
                 return Err(GicError::UnsupportedIntId);
             }
         }
