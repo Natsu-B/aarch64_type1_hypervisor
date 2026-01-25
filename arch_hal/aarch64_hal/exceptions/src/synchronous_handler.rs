@@ -80,6 +80,10 @@ pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
     unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.data_abort_func = Some(entry);
 }
 
+pub fn set_debug_handler(handler: DebugExceptionHandler) {
+    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.debug_func = Some(handler);
+}
+
 pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
     let reg = unsafe { &mut *reg };
     let esr_el2 = ESR_EL2::from_bits(cpu::get_esr_el2());

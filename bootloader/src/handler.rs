@@ -130,7 +130,6 @@ fn data_abort_handler(
     decoded: Option<&MmioDecoded>,
 ) {
     if let Some(plan) = decoded {
-        log_uart_write(plan, regs);
         match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
             EmulationOutcome::Handled => return,
             EmulationOutcome::NotHandled => {
@@ -335,41 +334,4 @@ fn irq_handler(regs: &mut cpu::Registers) {
 
 fn deny_cpu_on_handler(regs: &mut cpu::Registers) {
     regs.x0 = PsciReturnCode::Denied.to_x0();
-}
-
-fn log_uart_write(plan: &MmioDecoded, regs: &cpu::Registers) {
-    let Some(uart) = (unsafe { *UART_ADDR.get() }) else {
-        return;
-    };
-    let (ipa, desc) = match plan {
-        MmioDecoded::Single {
-            desc,
-            ipa,
-            split: _,
-            ..
-        } if desc.is_store => (*ipa as usize, desc),
-        _ => return,
-    };
-    if !(uart..uart + 0x1000).contains(&ipa) {
-        return;
-    }
-    let value = store_value(desc, regs);
-    if ipa == uart && value == b'\n' as u64 {
-        println!("\nhypervisor: alive");
-    }
-}
-
-fn store_value(desc: &emulation::SingleDesc, regs: &cpu::Registers) -> u64 {
-    let regs_view = regs.gprs();
-    let raw = if desc.rt == 31 {
-        0
-    } else {
-        regs_view[desc.rt as usize]
-    };
-    match desc.size {
-        1 => raw & 0xff,
-        2 => raw & 0xffff,
-        4 => raw & 0xffff_ffff,
-        _ => raw,
-    }
 }
