@@ -13,8 +13,8 @@ This workspace provides cargo aliases:
 ```sh
 cargo xbuild  # build (copies artifacts into ./bin)
 cargo xrun    # run on QEMU (build + run.sh)
-cargo xtest   # run all tests (std + UEFI/QEMU)
-````
+cargo xtest   # run all tests (std + UEFI/QEMU + U-Boot/QEMU)
+```
 
 ## Toolchain
 
@@ -71,15 +71,14 @@ This dumps QEMU’s DTB and writes a modified DTB:
 ### 4) Run the hypervisor
 
 ```sh
-cargo xrun --release
+cargo xrun
 ```
 
 What happens:
 
 * `cargo xrun` builds the `elf-hypervisor` package and copies `elf-hypervisor.elf` into `./bin/`
 * `run.sh` creates `./bin/disk.img` with:
-
-  * p1: FAT32 (contains `elf-hypervisor.elf`, `u-boot.bin`, `boot.scr`, `Image`, `qemu_mod.dtb`)
+  * p1: FAT32 (contains `elf-hypervisor.elf`, `u-boot.bin`, `boot.scr`, `Image`, `qemu.dtb`)
   * p2: raw rootfs written from `./bin/DISK0`
 * QEMU is launched with GICv3 enabled and GDB stub on `tcp::1234`
 
@@ -94,7 +93,7 @@ QEMU is started with:
 ## Raspberry Pi 5
 
 ```sh
-cargo xrun rpi5 --release
+cargo xrun rpi5
 ```
 
 This builds `rpi_boot.elf` and converts it to `kernel_2712.img` using `rust-objcopy`.
@@ -110,13 +109,15 @@ The test plan is defined in `xtest.txt`:
 
 * `std` unit tests for selected crates
 * UEFI/QEMU tests for:
-
   * virtio-blk
-  * FAT32
-  * paging stage-1 / stage-2 translation
+  * FAT32(sudo required)
   * `gdb_remote` handshake
 
-## Workspace layout (selected crates)
+* U-Boot/QEMU tests for:
+  * paging stage-1 / stage-2 translation
+  * gic v2
+
+## Workspace layout
 
 * `bootloader` (`elf-hypervisor`): QEMU path entry; sets up EL2 and boots Linux at EL1
 * `rpi_boot`: Raspberry Pi 5 entry

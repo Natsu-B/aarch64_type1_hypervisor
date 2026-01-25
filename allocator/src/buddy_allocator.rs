@@ -32,6 +32,10 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     const MINIMUM_ALLOCATABLE_BYTES_LEVELS: usize =
         MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize;
 
+    fn required_size(layout: Layout) -> usize {
+        max(layout.size(), layout.align()).max(MINIMUM_ALLOCATABLE_BYTES)
+    }
+
     fn level2size(level: usize) -> usize {
         1 << (level + Self::MINIMUM_ALLOCATABLE_BYTES_LEVELS)
     }
@@ -77,7 +81,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         alloc_heap: Option<&dyn Fn() -> Option<usize>>,
     ) -> Result<usize, &'static str> {
         pr_debug!("buddy_allocator: alloc before: {:#?}", self);
-        let required_size = max(layout.size(), layout.align()).max(MINIMUM_ALLOCATABLE_BYTES);
+        let required_size = Self::required_size(layout);
         let level = Self::size2level_next_power(required_size);
 
         let mut free_level = level;
@@ -117,12 +121,13 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     pub(crate) fn dealloc(&mut self, ptr: usize, layout: Layout) {
         pr_debug!("buddy_allocator: dealloc before: {:#?}", self);
         pr_debug!(
-            "buddy_allocator: dealloc ptr: 0x{:x}, size: 0x{:x}",
+            "buddy_allocator: dealloc ptr: 0x{:x}, size: 0x{:x}, align: 0x{:x}",
             ptr,
-            layout.size()
+            layout.size(),
+            layout.align()
         );
         let mut ptr = ptr;
-        let required_size = layout.size().max(MINIMUM_ALLOCATABLE_BYTES);
+        let required_size = Self::required_size(layout);
         let mut level = Self::size2level_next_power(required_size);
 
         self.allocated = self
@@ -429,5 +434,30 @@ mod tests {
         assert_eq!(allocator.allocated, MINIMUM_ALLOCATABLE_BYTES);
         allocator.dealloc(ptr, layout);
         assert_eq!(allocator.allocated, 0);
+    }
+
+    #[test]
+    fn test_alloc_dealloc_alignment_greater_than_size() {
+        const HEAP_SIZE: usize = MAX_ALLOC * 4;
+        #[repr(align(4096))]
+        struct AlignedHeap([u8; HEAP_SIZE]);
+        let mut heap = AlignedHeap([0; HEAP_SIZE]);
+        let heap_addr = &raw mut heap.0 as usize;
+
+        let mut allocator = TestAlloc::<MAX_ALLOC>::new();
+        allocator.set_memory(heap_addr, HEAP_SIZE);
+
+        let layout = Layout::from_size_align(1, 64).unwrap();
+        let ptr = allocator.alloc(layout, None).expect("allocation failed");
+        assert!(ptr != 0);
+        allocator.dealloc(ptr, layout);
+
+        assert_eq!(allocator.allocated, 0);
+        let top_level = levels!(MAX_ALLOC) - 1;
+        assert_eq!(
+            allocator.free_list[top_level].size(),
+            HEAP_SIZE / MAX_ALLOC,
+            "all blocks should return to the top-level free list"
+        );
     }
 }

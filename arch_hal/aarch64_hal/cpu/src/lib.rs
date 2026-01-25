@@ -1,12 +1,18 @@
 #![no_std]
 
 use core::arch::asm;
+use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
 
 use crate::registers::ID_AA64MMFR0_EL1;
 use crate::registers::ID_AA64PFR0_EL1;
 use crate::registers::MPIDR_EL1;
 use crate::registers::PARange;
+pub mod cache;
 pub mod registers;
+pub use cache::clean_dcache_range;
+pub use cache::clean_invalidate_dcache_range;
+pub use cache::invalidate_dcache_range;
 
 /// Core affinity encoded as MPIDR style fields (Aff3:Aff2:Aff1:Aff0).
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
@@ -153,6 +159,41 @@ pub fn get_far_el2() -> u64 {
     let far_el2: u64;
     unsafe { asm!("mrs {}, far_el2", out(reg) far_el2) };
     far_el2
+}
+
+pub fn read_daif() -> u64 {
+    let daif: u64;
+    // SAFETY: Reads the DAIF mask bits; does not modify processor state.
+    unsafe { asm!("mrs {0}, daif", out(reg) daif, options(nostack)) };
+    daif
+}
+
+pub unsafe fn write_daif(daif: u64) {
+    // SAFETY: Caller must ensure restoring DAIF is appropriate for the current context.
+    unsafe {
+        asm!("msr daif, {0}", in(reg) daif, options(nostack));
+    }
+}
+
+pub fn irq_save() -> u64 {
+    let flags = read_daif();
+    // Mask IRQs.
+    unsafe {
+        asm!("msr daifset, #2", options(nostack));
+    }
+    // Prevent compiler/CPU reordering across the mask boundary.
+    isb();
+    compiler_fence(Ordering::SeqCst);
+    flags
+}
+
+pub fn irq_restore(saved: u64) {
+    compiler_fence(Ordering::SeqCst);
+    // Restore full DAIF state.
+    unsafe {
+        write_daif(saved);
+    }
+    isb();
 }
 
 pub fn get_hpfar_el2() -> u64 {
@@ -399,12 +440,12 @@ pub fn el3_is_implemented() -> bool {
 /// The returned ID layout is compatible with the PSCI CPU_ON `target_cpu` argument.
 pub fn get_current_core_id() -> CoreAffinity {
     let mpidr_el1 = MPIDR_EL1::from_bits(get_mpidr_el1());
-    let aff0 = 0;
+    let aff0 = mpidr_el1.get(MPIDR_EL1::aff0);
     let aff1 = mpidr_el1.get(MPIDR_EL1::aff1);
     let aff2 = mpidr_el1.get(MPIDR_EL1::aff2);
     let aff3 = mpidr_el1.get(MPIDR_EL1::aff3);
 
-    CoreAffinity::new(aff0, aff1 as u8, aff2 as u8, aff3 as u8)
+    CoreAffinity::new(aff0 as u8, aff1 as u8, aff2 as u8, aff3 as u8)
 }
 
 /// Translate an EL1/EL0 VA to an IPA using AT S1E1*.

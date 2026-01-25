@@ -84,12 +84,13 @@ bitregs! {
     pub(crate) struct GICD_SGIR: u32 {
         pub(crate) sgi_int_id@[3:0],
         reserved@[14:4] [ignore],
-        pub(crate) ns_att@[15:14],
+        pub(crate) ns_att@[15:15],
         pub(crate) cpu_target_list@[23:16],
         pub(crate) target_list_filter@[25:24] as TargetListFilter {
             CpuTargetListFieldSpecified = 0b00,
             InterruptAllCpuExceptRequestedCpu = 0b01,
-            InterruptAllCpu = 0b10,
+            // 0b10 targets only the requesting CPU interface (self).
+            InterruptSelfOnly = 0b10,
         },
         reserved@[31:26] [ignore],
     }
@@ -265,15 +266,143 @@ bitregs! {
     }
 }
 
+bitregs! {
+    /// Virtualization Type Register, GICH_VTR (ARM IHI 0048B Table 5-3).
+    pub(crate) struct GICH_VTR: u32 {
+        // ListRegs[5:0] (number of implemented List registers is ListRegs + 1).
+        pub(crate) list_regs@[5:0],
+        reserved@[25:6] [res0],
+        // PreBits[28:26] (actual number of preemption bits is PreBits + 1).
+        pub(crate) prebits@[28:26],
+        // Pribits[24:23] (actual number of priority bits is Pribits + 1).
+        pub(crate) pribits@[31:29],
+    }
+}
+
+bitregs! {
+    /// Virtual Machine Control Register, GICH_VMCR (ARM IHI 0048B Table 5-4).
+    pub(crate) struct GICH_VMCR: u32 {
+        // VMGrp0En[0]
+        pub(crate) vm_grp0_en@[0:0],
+        // VMGrp1En[1]
+        pub(crate) vm_grp1_en@[1:1],
+        // AckCtl[2]
+        pub(crate) ack_ctl@[2:2],
+        // FIQEn[3]
+        pub(crate) fiq_en@[3:3],
+        // CBPR[4]
+        pub(crate) cbpr@[4:4],
+        reserved@[8:5] [res0],
+        // EOImode[9]
+        pub(crate) eoi_mode@[9:9],
+        reserved@[17:10] [res0],
+        // BPR[20:18]
+        pub(crate) bpr@[20:18],
+        // ABPR[23:21]
+        pub(crate) abpr@[23:21],
+        reserved@[31:24] [res0],
+    }
+}
+
+bitregs! {
+    /// Maintenance Interrupt Status Register, GICH_MISR (ARM IHI 0048B Table 5-5).
+    pub(crate) struct GICH_MISR: u32 {
+        // EOI[0]
+        pub(crate) eoi@[0:0],
+        // U[1]
+        pub(crate) u@[1:1],
+        // LRENP[2]
+        pub(crate) lrenp@[2:2],
+        // NP[3]
+        pub(crate) np@[3:3],
+        // VGrp0E[4]
+        pub(crate) vgrp0e@[4:4],
+        // VGrp0D[5]
+        pub(crate) vgrp0d@[5:5],
+        // VGrp1E[6]
+        pub(crate) vgrp1e@[6:6],
+        // VGrp1D[7]
+        pub(crate) vgrp1d@[7:7],
+        reserved@[31:8] [res0],
+    }
+}
+
+bitregs! {
+    /// End of Interrupt Status Register, GICH_EISR0/1 (ARM IHI 0048B Table 5-6).
+    pub(crate) struct GICH_EISR: u32 {
+        // EOI status bits [31:0]
+        pub(crate) eoi_status@[31:0],
+    }
+}
+
+bitregs! {
+    /// Empty List Register Status Register, GICH_ELRSR0/1 (ARM IHI 0048B Table 5-7).
+    pub(crate) struct GICH_ELRSR: u32 {
+        // List register status bits [31:0]
+        pub(crate) lr_status@[31:0],
+    }
+}
+
+bitregs! {
+    /// Active Priorities Register, GICH_APR (ARM IHI 0048B Table 5-8).
+    pub(crate) struct GICH_APR: u32 {
+        pub(crate) active_prio@[31:0],
+    }
+}
+
+bitregs! {
+    /// List Register n, GICH_LRn (ARM IHI 0048B Table 5-9).
+    pub struct GICH_LR: u32 {
+        // Virtual interrupt ID [9:0]
+        pub virtual_id@[9:0],
+
+        // PhysID / CPUID+EOI overlay [19:10]
+        union phys@[19:10] {
+            // HW == 0 interpretation.
+            view Sw {
+                // CPUID[12:10] (source CPU for virtual SGI)
+                pub cpuid@[12:10],
+                reserved@[18:13] [res0],
+                // EOI[19]
+                pub eoi@[19:19],
+            },
+            // HW == 1 interpretation.
+            view Hw {
+                // Physical interrupt ID [19:10]
+                pub physical_id@[19:10],
+            },
+        }
+
+        reserved@[22:20] [res0],
+
+        // Priority[27:23] (uses implemented priority bits; see GICH_VTR.Pribits)
+        pub priority@[27:23],
+
+        // State[29:28]
+        pub(crate) state@[29:28] as LrState {
+            Invalid = 0b00,
+            Pending = 0b01,
+            Active = 0b10,
+            PendingAndActive = 0b11,
+        },
+
+        // Grp1[30]
+        pub grp1@[30:30],
+
+        // HW[31]
+        pub hw@[31:31],
+    }
+}
+
 /// GICv2 Distributor register frame (0x1000 bytes) per ARM IHI 0048B Table 4-1;
 /// GIC-400 TRM maps this block at 0x1000-0x1FFF in the integrated memory map.
 #[repr(C)]
-pub(crate) struct GicV2Distributor {
+pub struct GicV2Distributor {
     /// Distributor Control Register; enables forwarding for Group0/Group1.
-    pub ctlr: ReadWrite<GICD_CTLR>, // 0x000
-    pub typer: ReadOnly<GICD_TYPER>, // 0x004
-    pub iidr: ReadOnly<u32>,         // 0x008
-    _rsvd_00c_007f: [u8; 0x74],      // 0x00C-0x07F
+    pub(crate) ctlr: ReadWrite<GICD_CTLR>, // 0x000
+    pub(crate) typer: ReadOnly<GICD_TYPER>, // 0x004
+    pub(crate) iidr: ReadOnly<u32>,         // 0x008
+    _rsvd_00c_007f: [u8; 0x74],             // 0x00C-0x07F
 
     /// Interrupt Group Registers; register n covers interrupts 32*n..32*n+31 (Group0 vs Group1 selection).
     ///
@@ -283,23 +412,23 @@ pub(crate) struct GicV2Distributor {
     ///
     /// Group interpretation depends on whether Security Extensions are implemented and which copy
     /// of the register bank is visible (Secure vs Non-secure).
-    pub igroupr: [ReadWrite<u32>; 32], // 0x080-0x0FC
+    pub(crate) igroupr: [ReadWrite<u32>; 32], // 0x080-0x0FC
     /// Interrupt Set-Enable Registers; register n covers interrupts 32*n..32*n+31.
-    pub isenabler: [ReadWrite<u32>; 32], // 0x100-0x17C
+    pub(crate) isenabler: [ReadWrite<u32>; 32], // 0x100-0x17C
     /// Interrupt Clear-Enable Registers; register n covers interrupts 32*n..32*n+31.
-    pub icenabler: [ReadWrite<u32>; 32], // 0x180-0x1FC
+    pub(crate) icenabler: [ReadWrite<u32>; 32], // 0x180-0x1FC
     /// Interrupt Set-Pending Registers; register n covers interrupts 32*n..32*n+31.
-    pub ispendr: [ReadWrite<u32>; 32], // 0x200-0x27C
+    pub(crate) ispendr: [ReadWrite<u32>; 32], // 0x200-0x27C
     /// Interrupt Clear-Pending Registers; register n covers interrupts 32*n..32*n+31.
-    pub icpendr: [ReadWrite<u32>; 32], // 0x280-0x2FC
+    pub(crate) icpendr: [ReadWrite<u32>; 32], // 0x280-0x2FC
     /// Interrupt Set-Active Registers; register n covers interrupts 32*n..32*n+31.
-    pub isactiver: [ReadWrite<u32>; 32], // 0x300-0x37C
+    pub(crate) isactiver: [ReadWrite<u32>; 32], // 0x300-0x37C
     /// Interrupt Clear-Active Registers; register n covers interrupts 32*n..32*n+31.
-    pub icactiver: [ReadWrite<u32>; 32], // 0x380-0x3FC
+    pub(crate) icactiver: [ReadWrite<u32>; 32], // 0x380-0x3FC
 
     // Priority window: 0x0400..0x07FF (Table 4-1)
     /// Interrupt Priority Registers; four 8-bit priority fields per word.
-    pub ipriorityr: [[ReadWrite<u8>; 4]; 255],
+    pub(crate) ipriorityr: [[ReadWrite<u8>; 4]; 255],
     _rsvd_07fc_07ff: [u8; 4],
 
     // ITARGETSR window: 0x0800..0x0BFF
@@ -309,28 +438,28 @@ pub(crate) struct GicV2Distributor {
     /// In particular, ITARGETSR0-7 readback is banked/RO and returns a value corresponding only
     /// to the reading CPU interface (commonly a one-hot CPU target mask).
     /// 0x820-0xBF8 (SPIs) are RW, one byte per interrupt (byte accesses permitted); 0xBFC reserved.
-    pub itargetsr0_7: [[ReadOnly<u8>; 4]; 8],
-    pub itargetsr: [[ReadWrite<u8>; 4]; 247],
+    pub(crate) itargetsr0_7: [[ReadOnly<u8>; 4]; 8],
+    pub(crate) itargetsr: [[ReadWrite<u8>; 4]; 247],
     _rsvd_0bfc_0bff: [u8; 4],
 
     /// Interrupt Configuration Registers; register n covers interrupts 16*n..16*n+15.
     /// For interrupt m, field F = m mod 16 uses bits [2F+1:2F] (edge vs level).
-    pub icfgr: [ReadWrite<u32>; 64], // 0x0C00-0x0CFC
+    pub(crate) icfgr: [ReadWrite<u32>; 64], // 0x0C00-0x0CFC
     _rsvd_0d00_0dff: [u8; 0x100], // 0x0D00-0x0DFF
     /// Non-Secure Access Control Registers; register n covers interrupts 16*n..16*n+15.
-    pub nsacr: [ReadWrite<u32>; 64], // 0x0E00-0x0EFC
+    pub(crate) nsacr: [ReadWrite<u32>; 64], // 0x0E00-0x0EFC
 
     /// Software Generated Interrupt Register; issues SGIs (effect when Distributor forwarding disabled is IMPLEMENTATION DEFINED; NSATT depends on Security Extensions).
-    pub sgir: WriteOnly<GICD_SGIR>, // 0x0F00
-    _rsvd_0f04_0f0f: [u8; 0x0C],        // 0x0F04-0x0F0F
-    pub cpendsgir: [ReadWrite<u32>; 4], // 0x0F10-0x0F1C
-    pub spendsgir: [ReadWrite<u32>; 4], // 0x0F20-0x0F2C
-    _rsvd_0f30_0fcf: [u8; 0xA0],        // 0x0F30-0x0FCF
+    pub(crate) sgir: WriteOnly<GICD_SGIR>, // 0x0F00
+    _rsvd_0f04_0f0f: [u8; 0x0C],               // 0x0F04-0x0F0F
+    pub(crate) cpendsgir: [ReadWrite<u32>; 4], // 0x0F10-0x0F1C
+    pub(crate) spendsgir: [ReadWrite<u32>; 4], // 0x0F20-0x0F2C
+    _rsvd_0f30_0fcf: [u8; 0xA0],               // 0x0F30-0x0FCF
 
     /// Peripheral ID registers (RO).
-    pub pidr: [ReadOnly<u32>; 8], // 0x0FD0-0x0FEC
+    pub(crate) pidr: [ReadOnly<u32>; 8], // 0x0FD0-0x0FEC
     /// Component ID registers (RO).
-    pub cidr: [ReadOnly<u32>; 4], // 0x0FF0-0x0FFC
+    pub(crate) cidr: [ReadOnly<u32>; 4], // 0x0FF0-0x0FFC
 }
 
 /// GICv2 CPU interface register frame (0x2000 bytes including DIR at 0x1000) per ARM IHI 0048B Table 4-2;
@@ -338,28 +467,28 @@ pub(crate) struct GicV2Distributor {
 #[repr(C)]
 pub(crate) struct GicV2CpuInterface {
     /// CPU Interface Control Register; enables signaling for Group0/Group1 (bit assignments vary with Security Extensions/Secure copy).
-    pub ctlr: ReadWrite<GICC_CTLR>, // 0x0000
-    pub pmr: ReadWrite<GICC_PMR>, // 0x0004
-    pub bpr: ReadWrite<GICC_BPR>, // 0x0008
+    pub(crate) ctlr: ReadWrite<GICC_CTLR>, // 0x0000
+    pub(crate) pmr: ReadWrite<GICC_PMR>, // 0x0004
+    pub(crate) bpr: ReadWrite<GICC_BPR>, // 0x0008
     /// Interrupt Acknowledge Register; returns interrupt ID to be serviced.
-    pub iar: ReadOnly<GICC_IAR>, // 0x000C
+    pub(crate) iar: ReadOnly<GICC_IAR>, // 0x000C
     /// End of Interrupt Register; EOImode=0 drops priority and deactivates, EOImode=1 drops only.
-    pub eoir: WriteOnly<GICC_EOIR>, // 0x0010
-    pub rpr: ReadOnly<u32>,       // 0x0014
-    pub hppir: ReadOnly<GICC_HPPIR>, // 0x0018
-    pub abpr: ReadWrite<GICC_ABPR>, // 0x001C
-    pub aiar: ReadOnly<GICC_IAR>, // 0x0020
-    pub aeoir: WriteOnly<u32>,    // 0x0024
-    pub ahppir: ReadOnly<GICC_AHPPIR>, // 0x0028
-    _rsvd_002c_00cf: [u8; 0xA4],  // 0x002C-0x00CF
-    pub apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
-    pub nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC
-    _rsvd_00f0_00fb: [u8; 0x0C],  // 0x00F0-0x00FB
-    pub iidr: ReadOnly<u32>,      // 0x00FC
-    _rsvd_0100_0fff: [u8; 0xF00], // 0x0100-0x0FFF
+    pub(crate) eoir: WriteOnly<GICC_EOIR>, // 0x0010
+    pub(crate) rpr: ReadOnly<u32>,       // 0x0014
+    pub(crate) hppir: ReadOnly<GICC_HPPIR>, // 0x0018
+    pub(crate) abpr: ReadWrite<GICC_ABPR>, // 0x001C
+    pub(crate) aiar: ReadOnly<GICC_IAR>, // 0x0020
+    pub(crate) aeoir: WriteOnly<u32>,    // 0x0024
+    pub(crate) ahppir: ReadOnly<GICC_AHPPIR>, // 0x0028
+    _rsvd_002c_00cf: [u8; 0xA4],         // 0x002C-0x00CF
+    pub(crate) apr: [ReadWrite<u32>; 4], // 0x00D0-0x00DC
+    pub(crate) nsapr: [ReadWrite<u32>; 4], // 0x00E0-0x00EC
+    _rsvd_00f0_00fb: [u8; 0x0C],         // 0x00F0-0x00FB
+    pub(crate) iidr: ReadOnly<u32>,      // 0x00FC
+    _rsvd_0100_0fff: [u8; 0xF00],        // 0x0100-0x0FFF
     /// Deactivate Interrupt Register; valid when priority drop/deactivate are split (EOImode=1), UNPREDICTABLE otherwise.
-    pub dir: WriteOnly<GICC_DIR>, // 0x1000
-    _rsvd_1004_1fff: [u8; 0x0FFC], // 0x1004-0x1FFF
+    pub(crate) dir: WriteOnly<GICC_DIR>, // 0x1000
+    _rsvd_1004_1fff: [u8; 0x0FFC],       // 0x1004-0x1FFF
 }
 
 /// GICv2 Virtual Interface Control block (0x1000 bytes) per ARM IHI 0048B Table 5-1;
@@ -371,20 +500,20 @@ pub(crate) struct GicV2VirtualInterfaceControl {
     /// Virtualization Type Register.
     ///
     /// `ListRegs` is encoded as `VTR[5:0] + 1` (number of implemented list registers).
-    pub vtr: ReadOnly<u32>, // 0x04
+    pub vtr: ReadOnly<GICH_VTR>, // 0x04
     /// VMCR alias; bundles virtual CPU view state for save/restore.
-    pub vmcr: ReadWrite<u32>, // 0x08
-    _rsvd_0c_0f: [u8; 0x04],       // 0x0C-0x0F
-    pub misr: ReadOnly<u32>,       // 0x10
-    _rsvd_14_1f: [u8; 0x0C],       // 0x14-0x1F
-    pub eisr: [ReadOnly<u32>; 2],  // 0x20-0x24
-    _rsvd_028_02f: [u8; 0x08],     // 0x028-0x02F
-    pub elrsr: [ReadOnly<u32>; 2], // 0x30-0x34
-    _rsvd_038_0ef: [u8; 0xB8],     // 0x038-0x0EF
-    pub apr: ReadWrite<u32>,       // 0x0F0
-    _rsvd_0f4_0ff: [u8; 0x0C],     // 0x0F4-0x0FF
-    pub lr: [ReadWrite<u32>; 64],  // 0x100-0x1FC
-    _rsvd_200_fff: [u8; 0xE00],    // 0x200-0xFFF
+    pub vmcr: ReadWrite<GICH_VMCR>, // 0x08
+    _rsvd_0c_0f: [u8; 0x04],              // 0x0C-0x0F
+    pub misr: ReadOnly<GICH_MISR>,        // 0x10
+    _rsvd_14_1f: [u8; 0x0C],              // 0x14-0x1F
+    pub eisr: [ReadOnly<GICH_EISR>; 2],   // 0x20-0x24
+    _rsvd_028_02f: [u8; 0x08],            // 0x028-0x02F
+    pub elrsr: [ReadOnly<GICH_ELRSR>; 2], // 0x30-0x34
+    _rsvd_038_0ef: [u8; 0xB8],            // 0x038-0x0EF
+    pub apr: ReadWrite<GICH_APR>,         // 0x0F0
+    _rsvd_0f4_0ff: [u8; 0x0C],            // 0x0F4-0x0FF
+    pub lr: [ReadWrite<GICH_LR>; 64],     // 0x100-0x1FC
+    _rsvd_200_fff: [u8; 0xE00],           // 0x200-0xFFF
 }
 
 /// GICv2 Virtual CPU interface (0x2000 bytes including DIR) per ARM IHI 0048B Table 5-10;

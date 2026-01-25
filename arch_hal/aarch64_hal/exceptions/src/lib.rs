@@ -24,7 +24,7 @@ aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);
 mod common_handler;
 mod el1;
 pub mod emulation;
-mod irq_handler;
+pub mod irq_handler;
 pub mod memory_hook;
 pub mod registers;
 pub mod synchronous_handler;

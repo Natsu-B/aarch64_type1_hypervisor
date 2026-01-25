@@ -32,6 +32,7 @@
 #[cfg(test)]
 extern crate self as typestate;
 
+pub mod atomic_raw;
 pub mod bitflags;
 mod endianness;
 mod read_write;
@@ -76,6 +77,37 @@ macro_rules! impl_raw { ($($t:ty),* $(,)?) => {$(
 impl_raw!(
     u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
 );
+
+unsafe impl RawReg for bool {
+    type Raw = bool;
+
+    fn to_raw(self) -> Self::Raw {
+        self
+    }
+
+    fn from_raw(raw: Self::Raw) -> Self {
+        raw
+    }
+
+    fn to_le(self) -> Self {
+        self
+    }
+
+    fn from_le(self) -> Self {
+        self
+    }
+
+    fn to_be(self) -> Self {
+        self
+    }
+
+    fn from_be(self) -> Self {
+        self
+    }
+
+    // NOTE: Do NOT implement BytePod for bool.
+    // bool does not allow arbitrary bit patterns (only 0/1 are valid).
+}
 
 unsafe impl<T: BytePod> BytePod for Le<T> {}
 unsafe impl<T: BytePod> BytePod for Be<T> {}

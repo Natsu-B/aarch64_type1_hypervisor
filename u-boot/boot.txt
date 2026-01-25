@@ -18,7 +18,7 @@ if load virtio 0:1 ${kernel_addr_r} elf-hypervisor.elf; then
     echo "[boot] fileaddr=${fileaddr} filesize=${filesize}"
     echo "[boot] bootelf -p ${kernel_addr_r}"
     md.b ${fileaddr} 0x10
-    bootelf -p ${kernel_addr_r} $fdt_addr $kernel_addr_rg
+    bootelf -p ${kernel_addr_r} $fdt_addr $kernel_addr_r
     echo "[boot] bootelf returned rc=$?"
 else
     echo "[boot] Unable to read elf-hypervisor.elf"

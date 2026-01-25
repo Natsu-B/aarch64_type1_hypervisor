@@ -3,6 +3,7 @@ use core::alloc::Layout;
 use core::cmp::max;
 use core::cmp::min;
 use core::fmt;
+use core::mem::size_of;
 use core::ops::Deref;
 use core::ops::DerefMut;
 use core::ptr::copy_nonoverlapping;
@@ -10,6 +11,18 @@ use core::slice;
 use intrusive_linked_list::IntrusiveLinkedList;
 
 pub(crate) const MINIMUM_ALLOCATABLE_BYTES: usize = size_of::<IntrusiveLinkedList>();
+
+fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
+    if alignment == 0 {
+        return None;
+    }
+    let rem = value % alignment;
+    if rem == 0 {
+        Some(value)
+    } else {
+        value.checked_add(alignment - rem)
+    }
+}
 
 enum RegionData {
     Global([MemoryRegions; 128]),
@@ -102,22 +115,26 @@ impl MemoryBlock {
         size_ref: &mut u32,
         insertion_point: usize,
         region_to_insert: &MemoryRegions,
-    ) {
-        #[cfg(debug_assertions)]
-        {
-            if insertion_point > 0 {
-                let pre_region = &regions_slice[insertion_point - 1];
-                assert!(pre_region.end() <= region_to_insert.address);
+    ) -> Result<(), &'static str> {
+        if insertion_point > 0 {
+            let pre_region = &regions_slice[insertion_point - 1];
+            let pre_end = pre_region.end_checked()?;
+            if pre_end > region_to_insert.address {
+                return Err("region overlap");
             }
-            if insertion_point < *size_ref as usize {
-                let next_region = &regions_slice[insertion_point];
-                assert!(region_to_insert.end() <= next_region.address);
+        }
+        let ins_end = region_to_insert.end_checked()?;
+        if insertion_point < *size_ref as usize {
+            let next_region = &regions_slice[insertion_point];
+            if ins_end > next_region.address {
+                return Err("region overlap");
             }
         }
 
         regions_slice.copy_within(insertion_point..*size_ref as usize, insertion_point + 1);
         regions_slice[insertion_point] = *region_to_insert;
         *size_ref += 1;
+        Ok(())
     }
 
     fn add_and_merge_region(
@@ -125,22 +142,35 @@ impl MemoryBlock {
         size_ref: &mut u32,
         x: usize, // insertion_point
         region: &MemoryRegions,
-    ) {
+    ) -> Result<(), &'static str> {
         let mut pre_region_overlaps = false;
         let mut next_region_overlaps = false;
 
+        let pre_region_end = if x > 0 {
+            Some(regions_slice[x - 1].end_checked()?)
+        } else {
+            None
+        };
+        let next_region_end = if x < *size_ref as usize {
+            Some(regions_slice[x].end_checked()?)
+        } else {
+            None
+        };
+
         // Check for overlap with pre_region
         if x > 0 {
-            let pre_region = &regions_slice[x - 1];
-            if region.address <= pre_region.end() {
-                pre_region_overlaps = true;
+            let _pre_region = &regions_slice[x - 1];
+            if let Some(pre_end) = pre_region_end {
+                if region.address <= pre_end {
+                    pre_region_overlaps = true;
+                }
             }
         }
 
         // Check for overlap with next_region
         if x < *size_ref as usize {
             let next_region = &regions_slice[x];
-            if region.end() >= next_region.address {
+            if region.end_checked()? >= next_region.address {
                 next_region_overlaps = true;
             }
         }
@@ -148,35 +178,45 @@ impl MemoryBlock {
         match (pre_region_overlaps, next_region_overlaps) {
             (false, false) => {
                 // No overlap, just insert the new region
-                MemoryBlock::insert_region(regions_slice, size_ref, x, region);
+                MemoryBlock::insert_region(regions_slice, size_ref, x, region)?;
             }
             (true, false) => {
                 // Overlap with pre_region only
                 let pre_region = &mut regions_slice[x - 1];
-                let new_end = region.end();
-                let pre_region_end = pre_region.end();
+                let new_end = region.end_checked()?;
+                let pre_region_end = pre_region_end.ok_or("region end overflow")?;
 
                 if new_end > pre_region_end {
-                    pre_region.size = new_end - pre_region.address;
+                    pre_region.size = new_end
+                        .checked_sub(pre_region.address)
+                        .ok_or("region size underflow")?;
                 }
             }
             (false, true) => {
                 // Overlap with next_region only
                 let next_region = &mut regions_slice[x];
-                let old_end = next_region.end();
-                let new_end = region.end();
+                let old_end = next_region_end.ok_or("region end overflow")?;
+                let new_end = region.end_checked()?;
 
                 next_region.address = region.address;
-                next_region.size = old_end.max(new_end) - region.address;
+                next_region.size = old_end
+                    .max(new_end)
+                    .checked_sub(region.address)
+                    .ok_or("region end overflow")?;
             }
             (true, true) => {
                 // Overlap with both pre_region and next_region
                 let next_region = regions_slice[x];
                 let pre_region = &mut regions_slice[x - 1];
 
-                let new_end = pre_region.end().max(region.end()).max(next_region.end());
+                let new_end = pre_region
+                    .end_checked()?
+                    .max(region.end_checked()?)
+                    .max(next_region.end_checked()?);
 
-                pre_region.size = new_end - pre_region.address;
+                pre_region.size = new_end
+                    .checked_sub(pre_region.address)
+                    .ok_or("region size underflow")?;
 
                 regions_slice.copy_within(x + 1..*size_ref as usize, x);
                 regions_slice[*size_ref as usize - 1] = MemoryRegions {
@@ -186,6 +226,7 @@ impl MemoryBlock {
                 *size_ref -= 1;
             }
         }
+        Ok(())
     }
 
     fn add_region_internal(
@@ -193,6 +234,10 @@ impl MemoryBlock {
         is_reserved: bool,
         region: &MemoryRegions,
     ) -> Result<(), &'static str> {
+        if region.size == 0 {
+            return Ok(());
+        }
+        region.end_checked()?;
         // Get mutable slices and references to sizes
         let (regions_slice, size_ref, capacity) = if is_reserved {
             (
@@ -247,11 +292,21 @@ impl MemoryBlock {
                     };
 
                     if let Some(next_region) = next_region_data {
-                        if region.address + new_size >= next_region.address {
+                        let new_end = region
+                            .address
+                            .checked_add(new_size)
+                            .ok_or("region end overflow")?;
+                        if new_end >= next_region.address {
                             // Overlaps with next, so merge.
-                            let merged_end = (region.address + new_size)
-                                .max(next_region.address + next_region.size);
-                            regions_slice[x].size = merged_end - regions_slice[x].address;
+                            let merged_end = new_end.max(
+                                next_region
+                                    .address
+                                    .checked_add(next_region.size)
+                                    .ok_or("region end overflow")?,
+                            );
+                            regions_slice[x].size = merged_end
+                                .checked_sub(regions_slice[x].address)
+                                .ok_or("region end overflow")?;
 
                             // Remove the next_region
                             regions_slice.copy_within(x + 2..*size_ref as usize, x + 1);
@@ -272,10 +327,7 @@ impl MemoryBlock {
                 // If new_size <= old_size, do nothing.
                 Ok(())
             }
-            Err(x) => {
-                MemoryBlock::add_and_merge_region(regions_slice, size_ref, x, region);
-                Ok(())
-            }
+            Err(x) => MemoryBlock::add_and_merge_region(regions_slice, size_ref, x, region),
         }
     }
 
@@ -299,27 +351,45 @@ impl MemoryBlock {
         let regions_len = self.region_size as usize;
         'regions: for i in 0..regions_len {
             let mut reg_addr = self.regions[i].address;
-            let mut reg_end = self.regions[i].end();
+            let mut reg_end = self.regions[i]
+                .address
+                .checked_add(self.regions[i].size)
+                .ok_or("region end overflow")?;
 
             let region_start = loop {
                 // Check if the region is suitable
                 let region_start = if let Some((range_start, range_size)) = alloc_range {
-                    let range_end = range_start + range_size;
+                    let range_end = range_start
+                        .checked_add(range_size)
+                        .ok_or("alloc_range overflow")?;
                     if range_end < reg_addr {
                         return Ok(None);
                     }
                     if reg_end < range_start {
                         continue 'regions;
                     }
-                    let region_start = max(reg_addr, range_start).next_multiple_of(alignment);
-                    if region_start + size > range_end {
+                    let region_start = match checked_align_up(max(reg_addr, range_start), alignment)
+                    {
+                        Some(addr) => addr,
+                        None => continue 'regions,
+                    };
+                    let end = region_start
+                        .checked_add(size)
+                        .ok_or("requested size overflow")?;
+                    if end > range_end {
                         continue 'regions;
                     }
                     region_start
                 } else {
-                    reg_addr.next_multiple_of(alignment)
+                    match checked_align_up(reg_addr, alignment) {
+                        Some(addr) => addr,
+                        None => continue 'regions,
+                    }
                 };
-                if region_start + size > reg_end {
+                let alloc_end = region_start
+                    .checked_add(size)
+                    .ok_or("requested size overflow")?;
+                if alloc_end > reg_end {
                     continue 'regions;
                 }
 
@@ -328,7 +398,10 @@ impl MemoryBlock {
                 let (prev_end, next_start) =
                     match slice.binary_search_by_key(&region_start, |x| x.address) {
                         Ok(i) => {
-                            let prev_end = slice[i].end();
+                            let prev_end = slice[i]
+                                .address
+                                .checked_add(slice[i].size)
+                                .ok_or("region end overflow")?;
                             let next_start = if i + 1 < slice.len() {
                                 slice[i + 1].address
                             } else {
@@ -337,7 +410,14 @@ impl MemoryBlock {
                             (prev_end, next_start)
                         }
                         Err(i) => {
-                            let prev_end = if i > 0 { slice[i - 1].end() } else { 0 };
+                            let prev_end = if i > 0 {
+                                slice[i - 1]
+                                    .address
+                                    .checked_add(slice[i - 1].size)
+                                    .ok_or("region end overflow")?
+                            } else {
+                                0
+                            };
                             let next_start = if i < slice.len() {
                                 slice[i].address
                             } else {
@@ -346,7 +426,7 @@ impl MemoryBlock {
                             (prev_end, next_start)
                         }
                     };
-                if prev_end > region_start || region_start + size > next_start {
+                if prev_end > region_start || alloc_end > next_start {
                     reg_addr = max(reg_addr, prev_end);
                     reg_end = min(reg_end, next_start);
                     if reg_addr >= reg_end {
@@ -392,12 +472,12 @@ impl MemoryBlock {
         for i in 0..self.reserved_region_size as usize {
             let reserved_region = self.reserved_regions[i];
             let mut cursor = reserved_region.address;
-            let reserved_end = reserved_region.end();
+            let reserved_end = reserved_region.end_checked()?;
             let mut processed = false;
 
             while cursor < reserved_end {
                 while region_idx < self.region_size as usize
-                    && self.regions[region_idx].end() <= cursor
+                    && self.regions[region_idx].end_checked()? <= cursor
                 {
                     region_idx += 1;
                 }
@@ -416,7 +496,7 @@ impl MemoryBlock {
                 }
 
                 let clipped_start = max(cursor, self.regions[region_idx].address);
-                let clipped_end = min(reserved_end, self.regions[region_idx].end());
+                let clipped_end = min(reserved_end, self.regions[region_idx].end_checked()?);
 
                 if clipped_start >= clipped_end {
                     cursor = clipped_end;
@@ -457,7 +537,7 @@ impl MemoryBlock {
         let idx = *region_idx;
         let regions = &mut self.regions;
         let region_address = regions[idx].address;
-        let region_end = regions[idx].end();
+        let region_end = regions[idx].end_checked()?;
 
         debug_assert!(start >= region_address);
         debug_assert!(end <= region_end);
@@ -508,31 +588,44 @@ impl MemoryBlock {
     }
 
     fn allocate_region_internal(&mut self, size: usize, alignment: usize) -> Option<usize> {
-        let regions = &mut self.regions;
+        if alignment == 0 {
+            return None;
+        }
         for mut i in 0..self.region_size as usize {
-            let address = regions[i].address;
-            let address_multiple_of = address.next_multiple_of(alignment);
-            let end_addr = regions[i].end();
-            if address_multiple_of + size <= regions[i].end() {
+            let (address, region_size) = {
+                let region = self.regions[i];
+                (region.address, region.size)
+            };
+            let end_addr = address.checked_add(region_size)?;
+            let address_multiple_of = checked_align_up(address, alignment)?;
+            let alloc_end = address_multiple_of.checked_add(size)?;
+            if alloc_end <= end_addr {
+                if self
+                    .add_reserved_alloc_record(address_multiple_of, size)
+                    .is_err()
+                {
+                    return None;
+                }
                 if !address.is_multiple_of(alignment) {
                     let size = address_multiple_of - address;
-                    regions.copy_within(i..self.region_size as usize, i + 1);
-                    regions[i] = MemoryRegions { address, size };
-                    regions[i + 1].address = address_multiple_of;
-                    regions[i + 1].size -= size;
+                    self.regions
+                        .copy_within(i..self.region_size as usize, i + 1);
+                    self.regions[i] = MemoryRegions { address, size };
+                    self.regions[i + 1].address = address_multiple_of;
+                    self.regions[i + 1].size -= size;
                     i += 1;
                     self.region_size += 1;
                 }
-                let new_addr = address_multiple_of + size;
-                if new_addr == regions[i].end() {
+                let new_addr = alloc_end;
+                if new_addr == end_addr {
                     // The region is consumed completely.
-                    regions.copy_within(i + 1..self.region_size as usize, i);
+                    self.regions
+                        .copy_within(i + 1..self.region_size as usize, i);
                     self.region_size -= 1;
                 } else {
-                    regions[i].address = new_addr;
-                    regions[i].size = end_addr - new_addr;
+                    self.regions[i].address = new_addr;
+                    self.regions[i].size = end_addr - new_addr;
                 }
-                self.add_reserved_alloc_record(address_multiple_of, size);
                 return Some(address_multiple_of);
             }
         }
@@ -548,7 +641,11 @@ impl MemoryBlock {
     }
 
     // Record allocation into reserved list: reserved := reserved ∪ [addr, addr+size)
-    fn add_reserved_alloc_record(&mut self, address: usize, size: usize) {
+    fn add_reserved_alloc_record(
+        &mut self,
+        address: usize,
+        size: usize,
+    ) -> Result<(), &'static str> {
         let insertion_point = self.reserved_regions[0..self.reserved_region_size as usize]
             .binary_search_by_key(&address, |r| r.address)
             .unwrap_or_else(|x| x);
@@ -557,13 +654,17 @@ impl MemoryBlock {
             &mut self.reserved_region_size,
             insertion_point,
             &MemoryRegions { address, size },
-        );
+        )
     }
 
     // Remove allocation range from reserved list: reserved := reserved \ [addr, addr+size)
-    fn remove_reserved_alloc_record(&mut self, addr: usize, size: usize) {
+    fn remove_reserved_alloc_record(
+        &mut self,
+        addr: usize,
+        size: usize,
+    ) -> Result<(), &'static str> {
         if size == 0 {
-            return;
+            return Ok(());
         }
         let reserved = &mut self.reserved_regions;
         let rsize = &mut self.reserved_region_size;
@@ -574,8 +675,11 @@ impl MemoryBlock {
                 let region = &mut reserved[i];
                 match size.cmp(&region.size) {
                     core::cmp::Ordering::Less => {
-                        region.address += size;
-                        region.size -= size;
+                        region.address = region
+                            .address
+                            .checked_add(size)
+                            .ok_or("region end overflow")?;
+                        region.size = region.size.checked_sub(size).ok_or("region end overflow")?;
                     }
                     core::cmp::Ordering::Equal => {
                         reserved.copy_within(i + 1..*rsize as usize, i);
@@ -597,12 +701,12 @@ impl MemoryBlock {
             }
             Err(x) => {
                 if x == 0 {
-                    return;
+                    return Ok(());
                 }
                 let i = x - 1;
                 let region = &mut reserved[i];
-                let region_end = region.end();
-                let dealloc_end = addr + size;
+                let region_end = region.end_checked()?;
+                let dealloc_end = addr.checked_add(size).ok_or("dealloc end overflow")?;
                 if addr >= region.address && dealloc_end <= region_end {
                     let starts_at_same = addr == region.address;
                     let ends_at_same = dealloc_end == region_end;
@@ -616,8 +720,12 @@ impl MemoryBlock {
                             *rsize -= 1;
                         }
                         (true, false) => {
-                            region.address += size;
-                            region.size -= size;
+                            region.address = region
+                                .address
+                                .checked_add(size)
+                                .ok_or("region end overflow")?;
+                            region.size =
+                                region.size.checked_sub(size).ok_or("region end overflow")?;
                         }
                         (false, true) => {
                             region.size = addr - region.address;
@@ -637,9 +745,10 @@ impl MemoryBlock {
                 }
             }
         }
+        Ok(())
     }
 
-    fn add_free_region_merge(&mut self, address: usize, size: usize) {
+    fn add_free_region_merge(&mut self, address: usize, size: usize) -> Result<(), &'static str> {
         let insertion_point = self.regions[0..self.region_size as usize]
             .binary_search_by_key(&address, |r| r.address)
             .unwrap_or_else(|x| x);
@@ -648,7 +757,7 @@ impl MemoryBlock {
             &mut self.region_size,
             insertion_point,
             &MemoryRegions { address, size },
-        );
+        )
     }
 
     fn overflow_wrapping(&mut self) {
@@ -700,23 +809,40 @@ impl MemoryBlock {
         self.allocate_region_internal(size, align)
     }
 
-    pub fn deallocate_region(&mut self, ptr: usize, layout: Layout) {
+    pub fn try_deallocate_region(
+        &mut self,
+        ptr: usize,
+        layout: Layout,
+    ) -> Result<(), &'static str> {
         if !self.allocatable {
-            return;
+            return Ok(());
         }
         let addr = ptr;
         let size = layout.size();
         if size == 0 {
-            return; // Nothing to do
+            return Ok(()); // Nothing to do
         }
         // Ensure headroom for metadata operations
         self.ensure_overflow_headroom();
 
         // Remove from reserved list and return to free list
-        self.remove_reserved_alloc_record(addr, size);
-        self.add_free_region_merge(addr, size);
+        self.remove_reserved_alloc_record(addr, size)?;
+        self.add_free_region_merge(addr, size)?;
+        Ok(())
     }
 
+    pub fn deallocate_region(&mut self, ptr: usize, layout: Layout) {
+        let _ = self.try_deallocate_region(ptr, layout);
+    }
+
+    /// Trims the allocator metadata and returns reserved regions for boot handoff.
+    ///
+    /// # Safety
+    /// Allocates a `Vec` while `self` is exclusively borrowed under the allocator
+    /// lock; callers must ensure this path only runs before `enable_raw_atomics`
+    /// (when `RawSpinLock::lock()` is a no-op) and while execution is
+    /// single-threaded. After atomic locking is enabled, re-entering the global
+    /// allocator here may deadlock or spin forever.
     pub fn trim_for_boot(
         &mut self,
         reserve_bytes: usize,
@@ -730,6 +856,7 @@ impl MemoryBlock {
             .allocate_region_internal(reserve_bytes, 1)
             .ok_or("allocation failed")?;
 
+        // Allocates while holding the guard; only valid in the pre-atomic/no-op lock phase.
         let mut vec = Vec::with_capacity(self.reserved_region_size as usize);
 
         self.allocatable = false;
@@ -764,8 +891,8 @@ impl MemoryBlock {
 
         self.allocatable = true;
 
-        self.remove_reserved_alloc_record(allocate, reserve_bytes);
-        self.add_free_region_merge(allocate, reserve_bytes);
+        self.remove_reserved_alloc_record(allocate, reserve_bytes)?;
+        self.add_free_region_merge(allocate, reserve_bytes)?;
         Ok(vec)
     }
 
@@ -794,8 +921,10 @@ impl MemoryRegions {
         Self { address, size }
     }
 
-    fn end(&self) -> usize {
-        self.address + self.size
+    fn end_checked(&self) -> Result<usize, &'static str> {
+        self.address
+            .checked_add(self.size)
+            .ok_or("region end overflow")
     }
 }
 
@@ -1781,5 +1910,110 @@ mod tests {
                 size: 0xF80
             }
         );
+    }
+
+    #[test]
+    fn allocate_region_alignment_overflow_returns_none() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: usize::MAX - 0xF,
+                size: 0x8,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let addr = allocator.allocate_region(0x4, 0x20);
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn add_reserved_region_dynamic_alloc_range_overflow_returns_err() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+
+        let res = allocator.add_reserved_region_dynamic(
+            0x10,
+            Some(0x10),
+            Some((usize::MAX - 0x10, 0x20)),
+        );
+        assert_eq!(res, Err("alloc_range overflow"));
+    }
+
+    #[test]
+    fn add_reserved_region_dynamic_align_up_overflow_returns_none() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: usize::MAX - 0xF,
+                size: 0x8,
+            })
+            .unwrap();
+
+        let res = allocator.add_reserved_region_dynamic(0x8, Some(0x20), None);
+        assert_eq!(res, Ok(None));
+        assert_eq!(allocator.reserved_region_size, 0);
+    }
+
+    #[test]
+    fn add_region_rejects_end_overflow() {
+        let mut allocator = MemoryBlock::init();
+        let res = allocator.add_region(&MemoryRegions::from_parts(usize::MAX - 0x10, 0x20));
+        assert_eq!(res, Err("region end overflow"));
+    }
+
+    #[test]
+    fn check_regions_returns_err_on_corrupt_reserved_region_end_overflow() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions::from_parts(0x1000, 0x1000))
+            .unwrap();
+        allocator.reserved_regions[0] = MemoryRegions::from_parts(usize::MAX - 0x10, 0x20);
+        allocator.reserved_region_size = 1;
+
+        let res = allocator.check_regions();
+        assert_eq!(res, Err("region end overflow"));
+    }
+
+    #[test]
+    fn try_deallocate_region_err_on_dealloc_end_overflow_no_mutation() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions::from_parts(0x1000, 0x1000))
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let _alloc_layout = Layout::from_size_align(0x100, 0x10).unwrap();
+        let alloc_ptr = allocator
+            .allocate_region(0x100, 0x10)
+            .expect("allocation should succeed");
+
+        let pre_region_size = allocator.region_size;
+        let pre_reserved_size = allocator.reserved_region_size;
+
+        let res = allocator
+            .try_deallocate_region(usize::MAX - 0x8, Layout::from_size_align(0x20, 1).unwrap());
+        assert_eq!(res, Err("dealloc end overflow"));
+        assert_eq!(allocator.region_size, pre_region_size);
+        assert_eq!(allocator.reserved_region_size, pre_reserved_size);
+        assert_eq!(
+            allocator.reserved_regions[0],
+            MemoryRegions::from_parts(alloc_ptr, 0x100)
+        );
+    }
+
+    #[test]
+    fn add_and_merge_region_err_on_preexisting_region_end_overflow() {
+        let mut allocator = MemoryBlock::init();
+        allocator.regions[0] = MemoryRegions::from_parts(usize::MAX - 0x10, 0x20);
+        allocator.region_size = 1;
+
+        let res = allocator.add_region(&MemoryRegions::from_parts(0x1000, 0x1000));
+        assert_eq!(res, Err("region end overflow"));
     }
 }

@@ -9,6 +9,7 @@ virtio = { path = "../../virtio" }
 typestate = { path = "../../typestate" }
 mutex = { path = "../../mutex" }
 typestate_macro = { path = "../../typestate_macro" }
+cpu = { path = "../../arch_hal/aarch64_hal/cpu" }
 
 [dev-dependencies]
 arch_hal = { path = "../../arch_hal", default-features = false, features = ["uefi-test"] }

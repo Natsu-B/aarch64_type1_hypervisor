@@ -20,7 +20,7 @@ use crate::gicv2::registers::GICC_IAR;
 use crate::gicv2::registers::GICC_PMR;
 
 impl GicCpuInterface for Gicv2 {
-    fn init(&self) -> Result<GicCpuCaps, GicError> {
+    fn init_cpu_interface(&self) -> Result<GicCpuCaps, GicError> {
         let security_ext = self.is_security_extension_implemented();
         // disable cpu interface
         if security_ext {
@@ -138,10 +138,11 @@ impl GicCpuInterface for Gicv2 {
         if security_ext {
             // binary point
             match cfg.binary_point {
-                BinaryPoint::Common(binary_point) => self
+                BinaryPoint::Common(binary_point) if binary_point < 0x8 => self
                     .gicc
                     .bpr
                     .write(GICC_BPR::new().set(GICC_BPR::binary_point, binary_point as u32)),
+                BinaryPoint::Common(_) => return Err(GicError::InvalidState),
                 BinaryPoint::Separate {
                     group0: _,
                     group1: _,
@@ -175,7 +176,7 @@ impl GicCpuInterface for Gicv2 {
         } else {
             // binary point
             match cfg.binary_point {
-                BinaryPoint::Common(binary_point) => {
+                BinaryPoint::Common(binary_point) if binary_point < 0x8 => {
                     self.gicc
                         .ctlr
                         .set_bits(GICC_CTLR::new().set(GICC_CTLR::cbpr, 1));
@@ -183,7 +184,7 @@ impl GicCpuInterface for Gicv2 {
                         .bpr
                         .write(GICC_BPR::new().set(GICC_BPR::binary_point, binary_point as u32));
                 }
-                BinaryPoint::Separate { group0, group1 } => {
+                BinaryPoint::Separate { group0, group1 } if group0 < 0x8 && group1 < 0x8 => {
                     self.gicc
                         .ctlr
                         .clear_bits(GICC_CTLR::new().set(GICC_CTLR::cbpr, 1));
@@ -194,6 +195,7 @@ impl GicCpuInterface for Gicv2 {
                         .abpr
                         .write(GICC_ABPR::new().set(GICC_ABPR::binary_point, group1 as u32));
                 }
+                _ => return Err(GicError::InvalidState),
             }
 
             match cfg.eoi_mode {
@@ -294,12 +296,15 @@ impl GicCpuInterface for Gicv2 {
     }
 
     fn deactivate(&self, ack: crate::AckedIrq) -> Result<(), crate::GicError> {
+        let ctlr = self.gicc.ctlr.read();
         if self.is_security_extension_implemented() {
+            if ctlr.get(GICC_CTLR::eoi_mode_ns_non_secure) == 0 {
+                return Ok(());
+            }
             self.gicc.dir.write(GICC_DIR::from_bits(ack.raw));
             return Ok(());
         }
 
-        let ctlr = self.gicc.ctlr.read();
         let separate = match ack.group {
             IrqGroup::Group0 => ctlr.get(GICC_CTLR::eoi_mode_s) != 0,
             IrqGroup::Group1 => ctlr.get(GICC_CTLR::eoi_mode_ns) != 0,
@@ -323,7 +328,7 @@ impl Gicv2 {
         }
     }
 
-    fn ack_via_iar<F>(&self, sprious_action: F) -> Result<Option<AckedIrq>, GicError>
+    fn ack_via_iar<F>(&self, spurious_action: F) -> Result<Option<AckedIrq>, GicError>
     where
         F: FnOnce() -> Result<Option<AckedIrq>, GicError>,
     {
@@ -340,12 +345,12 @@ impl Gicv2 {
                     group,
                 }))
             }
-            x if x == 1022 || x == 1023 => sprious_action(),
+            x if x == 1022 || x == 1023 => spurious_action(),
             _ => Err(GicError::UnsupportedIntId),
         }
     }
 
-    fn ack_via_aiar<F>(&self, sprious_action: F) -> Result<Option<AckedIrq>, GicError>
+    fn ack_via_aiar<F>(&self, spurious_action: F) -> Result<Option<AckedIrq>, GicError>
     where
         F: FnOnce() -> Result<Option<AckedIrq>, GicError>,
     {
@@ -362,7 +367,7 @@ impl Gicv2 {
                     group,
                 }))
             }
-            x if x == 1022 || x == 1023 => sprious_action(),
+            x if x == 1022 || x == 1023 => spurious_action(),
             _ => Err(GicError::UnsupportedIntId),
         }
     }

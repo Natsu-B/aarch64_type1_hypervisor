@@ -1,10 +1,10 @@
-#![no_std]
-#![no_main]
-
-extern crate alloc;
+#![cfg_attr(target_arch = "aarch64", no_std)]
+#![cfg_attr(target_arch = "aarch64", no_main)]
 
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("This test is intended to run on aarch64 targets only");
+
+extern crate alloc;
 
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
@@ -50,7 +50,7 @@ struct Case {
 }
 
 fn entry() -> ! {
-    debug_uart::init(UART_BASE, UART_CLOCK_HZ);
+    debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
 
     match run() {
         Ok(()) => {
@@ -103,9 +103,11 @@ fn run() -> Result<(), &'static str> {
     )
     .map_err(|err| map_err("gic_new", err))?;
 
-    gic.enable_atomic();
-    GicDistributor::init(&gic).map_err(|err| map_err("gicd_init", err))?;
-    let caps = GicCpuInterface::init(&gic).map_err(|err| map_err("gicc_init", err))?;
+    gic.init_distributor()
+        .map_err(|err| map_err("gicd_init", err))?;
+    let caps = gic
+        .init_cpu_interface()
+        .map_err(|err| map_err("gicc_init", err))?;
     if security_extension_implemented {
         if !caps.supports_group1 {
             return Err("group1_not_supported");
@@ -130,9 +132,12 @@ fn run() -> Result<(), &'static str> {
         });
     }
 
+    let eoi_modes = [EoiMode::DropAndDeactivate, EoiMode::DropOnly];
     for case in cases.iter() {
-        println!("=== running case {} ===", case.label);
-        run_case(&gic, case, security_extension_implemented)?;
+        for &eoi_mode in eoi_modes.iter() {
+            println!("=== running case {} mode {:?} ===", case.label, eoi_mode);
+            run_case(&gic, case, security_extension_implemented, eoi_mode)?;
+        }
     }
 
     Ok(())
@@ -142,6 +147,7 @@ fn run_case(
     gic: &Gicv2,
     case: &Case,
     security_extension_implemented: bool,
+    eoi_mode: EoiMode,
 ) -> Result<(), &'static str> {
     unsafe { asm!("msr daifset, #0b1111",) };
 
@@ -173,15 +179,15 @@ fn run_case(
         enable_group0: case.enable_group0,
         enable_group1: case.enable_group1,
         binary_point: BinaryPoint::Common(1),
-        eoi_mode: EoiMode::DropAndDeactivate,
+        eoi_mode,
     };
     GicCpuInterface::configure(gic, &cfg).map_err(|err| map_err("gicc_configure", err))?;
 
     let gicd_ctlr = read_mmio32(GICD_BASE, 0x000);
     let gicc_ctlr = read_mmio32(GICC_BASE, 0x000);
     println!(
-        "case {}: GICD_CTLR=0x{:08x} GICC_CTLR=0x{:08x}",
-        case.label, gicd_ctlr, gicc_ctlr
+        "case {} mode {:?}: GICD_CTLR=0x{:08x} GICC_CTLR=0x{:08x}",
+        case.label, eoi_mode, gicd_ctlr, gicc_ctlr
     );
 
     unsafe { asm!("msr daifclr, #0b1111") };
@@ -240,7 +246,7 @@ fn run_case(
         read_mmio32(GICC_BASE, 0x028)
     );
 
-    wait_for_spi(gic, case.group)?;
+    wait_for_spi(gic, case.group, eoi_mode)?;
 
     cpu::dsb_sy();
     cpu::isb();
@@ -253,7 +259,7 @@ fn run_case(
     Ok(())
 }
 
-fn wait_for_spi(gic: &Gicv2, group: IrqGroup) -> Result<(), &'static str> {
+fn wait_for_spi(gic: &Gicv2, group: IrqGroup, eoi_mode: EoiMode) -> Result<(), &'static str> {
     for _ in 0..200_000 {
         if let Some(ack) =
             GicCpuInterface::acknowledge(gic).map_err(|err| map_err("ack_wait", err))?
@@ -264,11 +270,18 @@ fn wait_for_spi(gic: &Gicv2, group: IrqGroup) -> Result<(), &'static str> {
                     return Err("ack_group_mismatch");
                 }
                 GicCpuInterface::end_of_interrupt(gic, ack).map_err(|err| map_err("eoi", err))?;
+                if matches!(eoi_mode, EoiMode::DropOnly) {
+                    GicCpuInterface::deactivate(gic, ack).map_err(|err| map_err("dir", err))?;
+                }
                 return Ok(());
             }
 
             GicCpuInterface::end_of_interrupt(gic, ack)
                 .map_err(|err| map_err("eoi_unexpected", err))?;
+            if matches!(eoi_mode, EoiMode::DropOnly) {
+                GicCpuInterface::deactivate(gic, ack)
+                    .map_err(|err| map_err("dir_unexpected", err))?;
+            }
         } else {
             cpu::isb();
         }

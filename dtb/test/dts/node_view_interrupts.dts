@@ -1,0 +1,18 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    interrupt-parent = <&gic>;
+
+    gic: interrupt-controller@0 {
+        interrupt-controller;
+        #interrupt-cells = <3>;
+        phandle = <1>;
+    };
+
+    uart@1000 {
+        compatible = "arm,pl011";
+        interrupts = <0 0x79 4>;
+    };
+};

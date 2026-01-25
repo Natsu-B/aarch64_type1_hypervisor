@@ -24,23 +24,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+
+      # Disable GHA cache uploads on push/PR to avoid slow post-job waits.
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
       - name: Cachix pull (PRs)
         if: github.event_name != 'push'
         uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           skipPush: true
+
       - name: Cachix push (push)
         if: github.event_name == 'push'
         uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - uses: actions/cache@v4
         with:
           path: |
@@ -49,6 +58,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
       - run: nix develop --accept-flake-config --command cargo fmt --all -- --check
 
   test:
@@ -59,23 +69,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
       - name: Cachix pull (PRs)
         if: github.event_name != 'push'
         uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           skipPush: true
+
       - name: Cachix push (push)
         if: github.event_name == 'push'
         uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - uses: actions/cache@v4
         with:
           path: |
@@ -84,6 +102,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
       - run: git submodule update --init --recursive
       - run: cd u-boot && nix develop --accept-flake-config --command ./init.sh && cd ..
       - run: nix develop --accept-flake-config --command cargo xtest
@@ -96,23 +115,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
       - name: Cachix pull (PRs)
         if: github.event_name != 'push'
         uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           skipPush: true
+
       - name: Cachix push (push)
         if: github.event_name == 'push'
         uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - uses: actions/cache@v4
         with:
           path: |
@@ -121,6 +148,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
       - run: nix develop --accept-flake-config --command bash -c 'cargo xbuild && cargo xrun rpi5'
 
   canary_latest_cargo:
@@ -130,20 +158,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+
+      # Only scheduled workflow uploads to GHA cache (build once per day).
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: true
+          use-flakehub: false
+
       - uses: cachix/cachix-action@v16
         with:
           name: ${{ env.CACHIX_CACHE_NAME }}
           skipPush: true
+
       - id: toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rust-src,rustfmt
+          components: rust-src,rustfmt,llvm-tools-preview
           targets: aarch64-unknown-none-softfloat,aarch64-unknown-uefi
+
       - uses: actions/cache@v4
         with:
           path: |
@@ -154,6 +191,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
             ${{ runner.os }}-cargo-
+
       - name: Build and test with latest Cargo
         run: |
           nix develop --accept-flake-config --command bash -lc '
@@ -164,5 +202,5 @@ jobs:
             (cd u-boot && nix develop --accept-flake-config --command ./init.sh)
             cargo xtest
             cargo xbuild
-            cargo xrun rpi5
+            cargo xbuild rpi5
           '
