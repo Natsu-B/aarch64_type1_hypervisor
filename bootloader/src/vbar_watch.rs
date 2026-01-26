@@ -1,3 +1,4 @@
+use crate::vbar::BRK_SLOT_TAG;
 use crate::vbar::VBAR_VECTOR_OFFSETS;
 use crate::vbar::brk_insn;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
@@ -14,17 +15,83 @@ const PAGE_SIZE: u64 = 0x1000;
 const VBAR_ALIGN: u64 = 0x800;
 const VBAR_ALIGN_MASK: u64 = VBAR_ALIGN - 1;
 const VBAR_PATCH_OFFSETS: [u16; 16] = VBAR_VECTOR_OFFSETS;
+const BRK_SLOT_BITS: u16 = 0x000f;
 
 const SPSR_DAIF_D: u64 = 1 << 9;
 const SPSR_SS: u64 = 1 << 21;
+const SPSR_M_MASK: u64 = 0b1111;
+const SPSR_M_EL0T: u64 = 0b0000;
+const SPSR_M_EL1T: u64 = 0b0100;
+const SPSR_M_EL1H: u64 = 0b0101;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VbarWatchMode {
+    Fgt,
+    Poll,
+}
+
+impl VbarWatchMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            VbarWatchMode::Fgt => "fgt",
+            VbarWatchMode::Poll => "poll",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VbarChangeReason {
+    Init,
+    Trap,
+    Poll,
+}
+
+impl VbarChangeReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            VbarChangeReason::Init => "init",
+            VbarChangeReason::Trap => "trap",
+            VbarChangeReason::Poll => "poll",
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
-struct VbarTrapSnapshot {
-    gprs: [u64; 32],
-    esr: u64,
-    elr: u64,
-    slot_index: u8,
-    offset: u16,
+pub(crate) struct VbarErrorInfo {
+    pub(crate) vbar_va: u64,
+    pub(crate) reason: &'static str,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct VbarStatusSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) mode: VbarWatchMode,
+    pub(crate) current_vbar_va: u64,
+    pub(crate) current_vbar_ipa: u64,
+    pub(crate) pending_repatch: bool,
+    pub(crate) last_change_seq: u64,
+    pub(crate) last_change_reason: VbarChangeReason,
+    pub(crate) last_error: Option<VbarErrorInfo>,
+    pub(crate) in_vector_entry_window: bool,
+    pub(crate) nested_count: u8,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct VbarTrapSnapshot {
+    pub(crate) gprs: [u64; 32],
+    pub(crate) esr: u64,
+    pub(crate) elr: u64,
+    pub(crate) slot_index: u8,
+    pub(crate) offset: u16,
+    pub(crate) origin_elr_el1: u64,
+    pub(crate) origin_spsr_el1: u64,
+    pub(crate) origin_esr_el1: u64,
+    pub(crate) origin_far_el1: u64,
+    pub(crate) origin_sp_el0: u64,
+    pub(crate) origin_sp_el1: u64,
+    pub(crate) origin_pre_sp: Option<u64>,
+    pub(crate) origin_pre_pc: u64,
+    pub(crate) nested: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -44,9 +111,17 @@ struct InternalStep {
 
 struct VbarWatchState {
     enabled: bool,
+    mode: VbarWatchMode,
     current_vbar_va: u64,
     current_vbar_ipa: u64,
     current_vbar_ipa_page: u64,
+    pending_repatch: bool,
+    last_change_seq: u64,
+    last_change_reason: VbarChangeReason,
+    last_error: Option<VbarErrorInfo>,
+    unknown_brk_logged: bool,
+    in_vector_entry_window: bool,
+    nested_count: u8,
     shadow_insn: [Option<u32>; VBAR_PATCH_OFFSETS.len()],
     is_patched: [bool; VBAR_PATCH_OFFSETS.len()],
     internal_step: Option<InternalStep>,
@@ -57,9 +132,17 @@ impl VbarWatchState {
     const fn new() -> Self {
         Self {
             enabled: false,
+            mode: VbarWatchMode::Fgt,
             current_vbar_va: 0,
             current_vbar_ipa: 0,
             current_vbar_ipa_page: 0,
+            pending_repatch: false,
+            last_change_seq: 0,
+            last_change_reason: VbarChangeReason::Init,
+            last_error: None,
+            unknown_brk_logged: false,
+            in_vector_entry_window: false,
+            nested_count: 0,
             shadow_insn: [None; VBAR_PATCH_OFFSETS.len()],
             is_patched: [false; VBAR_PATCH_OFFSETS.len()],
             internal_step: None,
@@ -76,27 +159,112 @@ impl VbarWatchState {
 static VBAR_STATE: RawSpinLockIrqSave<VbarWatchState> =
     RawSpinLockIrqSave::new(VbarWatchState::new());
 
+const fn pre_exception_sp(spsr_el1: u64, sp_el0: u64, sp_el1: u64) -> Option<u64> {
+    match spsr_el1 & SPSR_M_MASK {
+        SPSR_M_EL0T => Some(sp_el0),
+        SPSR_M_EL1T => Some(sp_el0),
+        SPSR_M_EL1H => Some(sp_el1),
+        _ => None,
+    }
+}
+
+pub(crate) fn spsr_el1_mode_label(spsr_el1: u64) -> &'static str {
+    match spsr_el1 & SPSR_M_MASK {
+        SPSR_M_EL0T => "el0t",
+        SPSR_M_EL1T => "el1t",
+        SPSR_M_EL1H => "el1h",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn snapshot_status() -> VbarStatusSnapshot {
+    let state = VBAR_STATE.lock_irqsave();
+    VbarStatusSnapshot {
+        enabled: state.enabled,
+        mode: state.mode,
+        current_vbar_va: state.current_vbar_va,
+        current_vbar_ipa: state.current_vbar_ipa,
+        pending_repatch: state.pending_repatch,
+        last_change_seq: state.last_change_seq,
+        last_change_reason: state.last_change_reason,
+        last_error: state.last_error,
+        in_vector_entry_window: state.in_vector_entry_window,
+        nested_count: state.nested_count,
+    }
+}
+
+pub(crate) fn last_hit_snapshot() -> Option<VbarTrapSnapshot> {
+    let state = VBAR_STATE.lock_irqsave();
+    state.last_hit
+}
+
+pub(crate) fn clear_last_hit() {
+    let mut state = VBAR_STATE.lock_irqsave();
+    state.last_hit = None;
+}
+
 pub(crate) fn init_vbar_watch() {
     let mut state = VBAR_STATE.lock_irqsave();
-    if !cpu::has_feat_fgt() {
-        state.enabled = false;
-        return;
-    }
+    let has_fgt = cpu::has_feat_fgt();
+    state.enabled = true;
+    state.mode = if has_fgt {
+        VbarWatchMode::Fgt
+    } else {
+        VbarWatchMode::Poll
+    };
 
-    cpu::enable_fgt_vbar_el1_write_trap();
+    if has_fgt {
+        cpu::enable_fgt_vbar_el1_write_trap();
+    }
     let vbar = cpu::get_vbar_el1();
     if (vbar & VBAR_ALIGN_MASK) != 0 {
         println!("vbar_watch: VBAR_EL1 misaligned: 0x{:X}", vbar);
-        state.enabled = false;
+        record_vbar_error(
+            &mut state,
+            vbar,
+            "vbar_el1_misaligned",
+            VbarChangeReason::Init,
+        );
         return;
     }
     if let Err(err) = protect_and_patch_vbar_locked(vbar, &mut state) {
         println!("vbar_watch: init failed ({})", err);
-        state.enabled = false;
+        record_vbar_error(&mut state, vbar, err, VbarChangeReason::Init);
         return;
     }
 
-    state.enabled = true;
+    record_vbar_change(&mut state, VbarChangeReason::Init);
+}
+
+pub fn poll_vbar_el1_change() {
+    let vbar = cpu::get_vbar_el1();
+    let mut state = VBAR_STATE.lock_irqsave();
+    if !state.enabled {
+        return;
+    }
+    if state.internal_step.is_some() {
+        state.pending_repatch = true;
+        return;
+    }
+    if state.pending_repatch {
+        state.pending_repatch = false;
+    }
+    if vbar == state.current_vbar_va {
+        return;
+    }
+    if (vbar & VBAR_ALIGN_MASK) != 0 {
+        record_vbar_error(
+            &mut state,
+            vbar,
+            "vbar_el1_misaligned",
+            VbarChangeReason::Poll,
+        );
+        return;
+    }
+    match protect_and_patch_vbar_locked(vbar, &mut state) {
+        Ok(()) => record_vbar_change(&mut state, VbarChangeReason::Poll),
+        Err(err) => record_vbar_error(&mut state, vbar, err, VbarChangeReason::Poll),
+    }
 }
 
 pub(crate) fn sysreg_trap_handler(
@@ -135,6 +303,7 @@ pub(crate) fn sysreg_trap_handler(
             println!("sysreg trap: protect failed ({})", err);
             panic!("vbar watch failure");
         }
+        record_vbar_change(&mut state, VbarChangeReason::Trap);
     }
 
     cpu::set_elr_el2(cpu::get_elr_el2().wrapping_add(4));
@@ -185,6 +354,24 @@ pub(crate) fn write_vbar_value(ipa: u64, size: usize, value: u64) -> Option<()> 
     Some(())
 }
 
+fn record_vbar_change(state: &mut VbarWatchState, reason: VbarChangeReason) {
+    state.last_change_seq = state.last_change_seq.saturating_add(1);
+    state.last_change_reason = reason;
+    state.last_error = None;
+    state.pending_repatch = false;
+    state.unknown_brk_logged = false;
+}
+
+fn record_vbar_error(
+    state: &mut VbarWatchState,
+    vbar_va: u64,
+    reason: &'static str,
+    change_reason: VbarChangeReason,
+) {
+    state.last_error = Some(VbarErrorInfo { vbar_va, reason });
+    state.last_change_reason = change_reason;
+}
+
 fn protect_and_patch_vbar_locked(
     vbar_el1_va: u64,
     state: &mut VbarWatchState,
@@ -210,6 +397,7 @@ fn protect_and_patch_vbar_locked(
         }
         state.clear_patches();
         state.internal_step = None;
+        state.in_vector_entry_window = false;
     }
 
     if state.current_vbar_ipa_page != ipa_page {
@@ -270,21 +458,48 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
 
     let (slot, offset) = match slot_for_brk(&state, elr, imm16) {
         Some(hit) => hit,
-        None => return false,
+        None => {
+            log_unknown_brk(&mut state, elr, imm16);
+            return false;
+        }
     };
 
     let Some(original) = state.shadow_insn[slot] else {
         panic!("vbar brk hit without shadow for slot {}", slot);
     };
 
+    let origin_elr_el1 = cpu::get_elr_el1();
+    let origin_spsr_el1 = cpu::get_spsr_el1();
+    let origin_esr_el1 = cpu::get_esr_el1();
+    let origin_far_el1 = cpu::get_far_el1();
+    let origin_sp_el0 = cpu::get_sp_el0();
+    let origin_sp_el1 = cpu::get_sp_el1();
+    let origin_pre_sp = pre_exception_sp(origin_spsr_el1, origin_sp_el0, origin_sp_el1);
+    let origin_pre_pc = origin_elr_el1;
+
     let mut gprs = [0u64; 32];
     gprs.copy_from_slice(regs.gprs());
+    let nested = state.in_vector_entry_window;
+    if nested {
+        state.nested_count = state.nested_count.saturating_add(1);
+    } else {
+        state.in_vector_entry_window = true;
+    }
     state.last_hit = Some(VbarTrapSnapshot {
         gprs,
         esr,
         elr,
         slot_index: slot as u8,
         offset,
+        origin_elr_el1,
+        origin_spsr_el1,
+        origin_esr_el1,
+        origin_far_el1,
+        origin_sp_el0,
+        origin_sp_el1,
+        origin_pre_sp,
+        origin_pre_pc,
+        nested,
     });
 
     let addr = state.current_vbar_ipa + offset as u64;
@@ -305,6 +520,7 @@ fn handle_internal_step() -> bool {
     };
 
     disable_internal_single_step(pending.restore);
+    state.in_vector_entry_window = false;
 
     let Some(original) = state.shadow_insn[pending.slot] else {
         panic!("vbar single-step without shadow for slot {}", pending.slot);
@@ -318,9 +534,39 @@ fn handle_internal_step() -> bool {
     true
 }
 
-fn slot_for_brk(state: &VbarWatchState, elr: u64, imm16: u16) -> Option<(usize, u16)> {
+fn decode_brk_slot(imm16: u16) -> Option<usize> {
+    if (imm16 & BRK_SLOT_TAG) == BRK_SLOT_TAG {
+        let slot = (imm16 & BRK_SLOT_BITS) as usize;
+        if slot < VBAR_PATCH_OFFSETS.len() {
+            return Some(slot);
+        }
+    }
     if imm16 < VBAR_PATCH_OFFSETS.len() as u16 {
-        let slot = imm16 as usize;
+        return Some(imm16 as usize);
+    }
+    None
+}
+
+fn elr_in_vbar_range(state: &VbarWatchState, elr: u64) -> bool {
+    let base = state.current_vbar_va;
+    base != 0 && elr >= base && elr < base + PAGE_SIZE
+}
+
+fn log_unknown_brk(state: &mut VbarWatchState, elr: u64, imm16: u16) {
+    if state.unknown_brk_logged {
+        return;
+    }
+    if elr_in_vbar_range(state, elr) {
+        println!(
+            "vbar brk: unexpected imm16=0x{:x} elr_el2=0x{:x}",
+            imm16, elr
+        );
+        state.unknown_brk_logged = true;
+    }
+}
+
+fn slot_for_brk(state: &VbarWatchState, elr: u64, imm16: u16) -> Option<(usize, u16)> {
+    if let Some(slot) = decode_brk_slot(imm16) {
         let offset = VBAR_PATCH_OFFSETS[slot] as u64;
         if state.is_patched[slot] && elr == state.current_vbar_va + offset {
             return Some((slot, VBAR_PATCH_OFFSETS[slot]));

@@ -443,6 +443,27 @@ pub fn get_elr_el2() -> u64 {
     elr_el2
 }
 
+pub fn get_elr_el1() -> u64 {
+    let elr_el1: u64;
+    // SAFETY: Reads the current ELR_EL1 value.
+    unsafe { asm!("mrs {}, elr_el1", out(reg) elr_el1) };
+    elr_el1
+}
+
+pub fn get_spsr_el1() -> u64 {
+    let spsr_el1: u64;
+    // SAFETY: Reads the current SPSR_EL1 value.
+    unsafe { asm!("mrs {}, spsr_el1", out(reg) spsr_el1) };
+    spsr_el1
+}
+
+pub fn get_sp_el0() -> u64 {
+    let sp_el0: u64;
+    // SAFETY: Reads the current SP_EL0 value.
+    unsafe { asm!("mrs {}, sp_el0", out(reg) sp_el0) };
+    sp_el0
+}
+
 pub fn get_sp_el1() -> u64 {
     let sp_el1: u64;
     // SAFETY: Reads the current SP_EL1 value.
@@ -473,6 +494,20 @@ pub fn get_spsr_el2() -> u64 {
     // SAFETY: Reads the current SPSR_EL2 value.
     unsafe { asm!("mrs {}, spsr_el2", out(reg) spsr_el2) };
     spsr_el2
+}
+
+pub fn get_esr_el1() -> u64 {
+    let esr_el1: u64;
+    // SAFETY: Reads the current ESR_EL1 value.
+    unsafe { asm!("mrs {}, esr_el1", out(reg) esr_el1) };
+    esr_el1
+}
+
+pub fn get_far_el1() -> u64 {
+    let far_el1: u64;
+    // SAFETY: Reads the current FAR_EL1 value.
+    unsafe { asm!("mrs {}, far_el1", out(reg) far_el1) };
+    far_el1
 }
 
 pub fn set_spsr_el2(spsr_el2: u64) {

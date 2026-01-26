@@ -1,4 +1,6 @@
+use crate::vbar_watch;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
+use arch_hal::cpu;
 use core::fmt;
 use core::fmt::Write;
 
@@ -271,6 +273,77 @@ fn write_ignore_list(out: &mut OutBuf<'_>, ignores: &[IgnoreEntry; MAX_IGNORES])
     }
 }
 
+fn write_vbar_usage(out: &mut OutBuf<'_>) {
+    let _ = write!(out, "usage=hp vbar <status|last|clear|check>");
+}
+
+fn write_vbar_status(out: &mut OutBuf<'_>) {
+    let snapshot = vbar_watch::snapshot_status();
+    let live_vbar = cpu::get_vbar_el1();
+
+    let _ = write!(
+        out,
+        "enabled={} mode={} current_vbar_va=0x{:x} current_vbar_ipa=0x{:x} live_vbar=0x{:x}",
+        snapshot.enabled as u8,
+        snapshot.mode.as_str(),
+        snapshot.current_vbar_va,
+        snapshot.current_vbar_ipa,
+        live_vbar
+    );
+    let _ = write!(
+        out,
+        " pending_repatch={} change_seq={} change_reason={}",
+        snapshot.pending_repatch as u8,
+        snapshot.last_change_seq,
+        snapshot.last_change_reason.as_str()
+    );
+    if live_vbar != snapshot.current_vbar_va {
+        let _ = write!(
+            out,
+            " warning=vbar_changed pending_repatch={}",
+            snapshot.pending_repatch as u8
+        );
+    }
+    if let Some(err) = snapshot.last_error {
+        let _ = write!(out, " error={} err_vbar=0x{:x}", err.reason, err.vbar_va);
+    }
+}
+
+fn write_vbar_last(out: &mut OutBuf<'_>) {
+    let Some(hit) = vbar_watch::last_hit_snapshot() else {
+        let _ = write!(out, "none");
+        return;
+    };
+    let mode = vbar_watch::spsr_el1_mode_label(hit.origin_spsr_el1);
+    let _ = write!(
+        out,
+        "slot={} offset=0x{:x} brk_pc=0x{:x} esr_el2=0x{:x} elr_el2=0x{:x}",
+        hit.slot_index, hit.offset, hit.elr, hit.esr, hit.elr
+    );
+    let _ = write!(
+        out,
+        " origin_pc=0x{:x} origin_spsr_el1=0x{:x} origin_mode={}",
+        hit.origin_pre_pc, hit.origin_spsr_el1, mode
+    );
+    match hit.origin_pre_sp {
+        Some(sp) => {
+            let _ = write!(out, " origin_pre_sp=0x{:x}", sp);
+        }
+        None => {
+            let _ = write!(out, " origin_pre_sp=unknown");
+        }
+    }
+    let _ = write!(
+        out,
+        " origin_sp_el0=0x{:x} origin_sp_el1=0x{:x} origin_esr_el1=0x{:x} origin_far_el1=0x{:x} nested={}",
+        hit.origin_sp_el0,
+        hit.origin_sp_el1,
+        hit.origin_esr_el1,
+        hit.origin_far_el1,
+        hit.nested as u8
+    );
+}
+
 fn parse_u64_token(token: &str) -> Option<u64> {
     let token = token.trim();
     if token.is_empty() {
@@ -495,6 +568,52 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                 }
                 _ => {
                     write_error(&mut out, "bad_args");
+                    Some(out.len())
+                }
+            }
+        }
+        "vbar" => {
+            let Some(cmd) = parts.next() else {
+                write_vbar_usage(&mut out);
+                return Some(out.len());
+            };
+            match cmd {
+                "status" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    write_vbar_status(&mut out);
+                    Some(out.len())
+                }
+                "last" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    write_vbar_last(&mut out);
+                    Some(out.len())
+                }
+                "clear" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    vbar_watch::clear_last_hit();
+                    let _ = write!(out, "ok");
+                    Some(out.len())
+                }
+                "check" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    vbar_watch::poll_vbar_el1_change();
+                    write_vbar_status(&mut out);
+                    Some(out.len())
+                }
+                _ => {
+                    write_vbar_usage(&mut out);
                     Some(out.len())
                 }
             }

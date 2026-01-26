@@ -1,4 +1,5 @@
 const BRK_BASE_INSN: u32 = 0xD420_0000;
+pub(crate) const BRK_SLOT_TAG: u16 = 0xF000;
 
 /// Vector entry offsets within a 2 KiB-aligned VBAR_EL1 table.
 pub(crate) const VBAR_VECTOR_OFFSETS: [u16; 16] = [
@@ -7,6 +8,7 @@ pub(crate) const VBAR_VECTOR_OFFSETS: [u16; 16] = [
 ];
 
 /// Encode `brk #imm16` (imm16 in bits [20:5]).
-pub(crate) const fn brk_insn(imm16: u16) -> u32 {
+pub(crate) const fn brk_insn(slot: u16) -> u32 {
+    let imm16 = BRK_SLOT_TAG | (slot & 0x000f);
     BRK_BASE_INSN | ((imm16 as u32) << 5)
 }

@@ -1,3 +1,4 @@
+use crate::vbar_watch;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::print;
 use arch_hal::println;
@@ -195,6 +196,7 @@ pub fn handle_physical_timer_irq() {
         return;
     };
     poll_timeouts_at(now);
+    vbar_watch::poll_vbar_el1_change();
 }
 
 pub fn record_ack(intid: u32, count_for_storm: bool) {
