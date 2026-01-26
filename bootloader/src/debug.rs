@@ -147,8 +147,9 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
     let saved_daif = cpu::read_daif();
     let _stop_loop = gdb_uart::begin_stop_loop();
 
-    let now = timer::read_counter();
-    let freq = timer::read_counter_frequency();
+    let el2_timer = timer::El2PhysicalTimer::new();
+    let now = el2_timer.now();
+    let freq = el2_timer.counter_frequency_hz().get();
     let attach_ticks = (u128::from(freq) * u128::from(ATTACH_DEADLINE_MS)) / 1000;
     let attach_deadline = now.saturating_add(attach_ticks as u64);
     let prefetch_idle_ticks = if PREFETCH_IDLE_TIMEOUT_MS == 0 {

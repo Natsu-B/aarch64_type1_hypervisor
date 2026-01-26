@@ -108,17 +108,25 @@ pub fn init(base: usize, clock_hz: u64, baud: u32) {
 
 pub struct StopLoopGuard {
     restore: bool,
+    pause_start_ticks: u64,
 }
 
 pub fn begin_stop_loop() -> StopLoopGuard {
     // Best-effort nesting avoidance using only load/store (RawAtomicPod portability).
     if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
-        return StopLoopGuard { restore: false };
+        return StopLoopGuard {
+            restore: false,
+            pause_start_ticks: 0,
+        };
     }
     STOP_LOOP_ACTIVE.store(true, Ordering::Release);
+    let pause_start_ticks = timer::El2PhysicalTimer::new().now();
 
     if !GDB_UART_READY.load(Ordering::Acquire) {
-        return StopLoopGuard { restore: true };
+        return StopLoopGuard {
+            restore: true,
+            pause_start_ticks,
+        };
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
@@ -138,7 +146,10 @@ pub fn begin_stop_loop() -> StopLoopGuard {
     // preserved for `prefetch_first_rsp_frame()`.
     state.prefetch_len = 0;
     state.prefetch_pos = 0;
-    StopLoopGuard { restore: true }
+    StopLoopGuard {
+        restore: true,
+        pause_start_ticks,
+    }
 }
 
 impl Drop for StopLoopGuard {
@@ -146,6 +157,13 @@ impl Drop for StopLoopGuard {
         if !self.restore {
             return;
         }
+        let el2_timer = timer::El2PhysicalTimer::new();
+        let now = el2_timer.now();
+        let delta = now.wrapping_sub(self.pause_start_ticks);
+        let old = el2_timer.lower_el_virtual_offset();
+        // Compensate CNTVOFF_EL2 by the stop-loop duration so guest CNTVCT does not advance.
+        let new = old.wrapping_add(delta);
+        el2_timer.set_lower_el_virtual_offset(new);
         if GDB_UART_READY.load(Ordering::Acquire) {
             let mut guard = GDB_UART_STATE.lock_irqsave();
             // SAFETY: READY is published after full initialization with Release ordering.
@@ -243,11 +261,12 @@ pub fn prefetch_first_rsp_frame(
     let mut assembler = RspFrameAssembler::new();
     let mut len = 0usize;
 
+    let el2_timer = timer::El2PhysicalTimer::new();
     let mut attached = false;
     let mut deadline_ticks = attach_deadline_ticks;
 
     loop {
-        let now = timer::read_counter();
+        let now = el2_timer.now();
         if !attached {
             if now >= deadline_ticks {
                 return fail_prefetch(PrefetchResult::Timeout);
@@ -265,7 +284,7 @@ pub fn prefetch_first_rsp_frame(
         if !matches!(event, RspFrameEvent::Ignore) {
             attached = true;
             if idle_timeout_ticks != 0 {
-                deadline_ticks = timer::read_counter().saturating_add(idle_timeout_ticks);
+                deadline_ticks = el2_timer.now().saturating_add(idle_timeout_ticks);
             }
         }
         match event {
