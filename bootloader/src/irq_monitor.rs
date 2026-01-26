@@ -2,6 +2,7 @@ use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::print;
 use arch_hal::println;
 use arch_hal::timer;
+use core::time::Duration;
 
 const STORM_WINDOW_MS: u64 = 100;
 const STORM_WARN_INTERVAL_MS: u64 = 1000;
@@ -89,13 +90,6 @@ impl IrqMonitorState {
         }
     }
 
-    fn freq_hz(&mut self) -> u64 {
-        if self.counter_freq_hz == 0 {
-            self.counter_freq_hz = timer::read_counter_frequency();
-        }
-        self.counter_freq_hz
-    }
-
     fn reset_window(&mut self, now: u64) {
         self.window_start_ticks = now;
         self.total_in_window = 0;
@@ -174,16 +168,46 @@ impl TimeoutWarn {
 
 static IRQ_MONITOR: RawSpinLockIrqSave<IrqMonitorState> =
     RawSpinLockIrqSave::new(IrqMonitorState::new());
+static EL2_TIMER: RawSpinLockIrqSave<Option<timer::El2PhysicalTimer>> =
+    RawSpinLockIrqSave::new(None);
+
+pub fn init_physical_timer_poll() {
+    let timer = timer::El2PhysicalTimer::new();
+    let counter_freq_hz = timer.counter_frequency_hz().get();
+    let now = timer.now();
+    timer.set_timeout(Duration::from_millis(TIMEOUT_POLL_INTERVAL_MS));
+    {
+        let mut guard = IRQ_MONITOR.lock_irqsave();
+        guard.counter_freq_hz = counter_freq_hz;
+        guard.window_start_ticks = now;
+        guard.last_storm_warn_ticks = now;
+        guard.last_timeout_poll_ticks = now;
+    }
+    let mut guard = EL2_TIMER.lock_irqsave();
+    *guard = Some(timer);
+}
+
+pub fn handle_physical_timer_irq() {
+    let Some(now) = with_timer(|timer| {
+        timer.handle_irq_and_rearm(Duration::from_millis(TIMEOUT_POLL_INTERVAL_MS));
+        timer.now()
+    }) else {
+        return;
+    };
+    poll_timeouts_at(now);
+}
 
 pub fn record_ack(intid: u32, count_for_storm: bool) {
     if !count_for_storm {
         return;
     }
-    let now = timer::read_counter();
+    let Some(now) = timer_now_ticks() else {
+        return;
+    };
     let mut snapshot = None;
     {
         let mut guard = IRQ_MONITOR.lock_irqsave();
-        let freq = guard.freq_hz();
+        let freq = guard.counter_freq_hz;
         let window_ticks = ticks_from_ms(STORM_WINDOW_MS, freq);
         if window_ticks == 0 {
             return;
@@ -226,7 +250,9 @@ pub fn record_injected_pirq(pintid: u32, injection_hint: bool) {
     if !injection_hint {
         return;
     }
-    let now = timer::read_counter();
+    let Some(now) = timer_now_ticks() else {
+        return;
+    };
     let mut guard = IRQ_MONITOR.lock_irqsave();
     if guard
         .inflight
@@ -255,14 +281,13 @@ pub fn record_pirq_deactivate(pintid: u32) {
     clear_inflight(pintid);
 }
 
-pub fn poll_timeouts() {
-    let now = timer::read_counter();
+fn poll_timeouts_at(now: u64) {
     let mut warns = [TimeoutWarn::empty(); MAX_TIMEOUT_WARNINGS_PER_POLL];
     let mut warn_len = 0usize;
     let mut freq_hz = 0u64;
     {
         let mut guard = IRQ_MONITOR.lock_irqsave();
-        freq_hz = guard.freq_hz();
+        freq_hz = guard.counter_freq_hz;
         if freq_hz == 0 {
             return;
         }
@@ -313,6 +338,18 @@ fn clear_inflight(pintid: u32) {
             break;
         }
     }
+}
+
+fn with_timer<R>(f: impl FnOnce(&timer::El2PhysicalTimer) -> R) -> Option<R> {
+    let guard = EL2_TIMER.lock_irqsave();
+    let Some(timer) = guard.as_ref() else {
+        return None;
+    };
+    Some(f(timer))
+}
+
+fn timer_now_ticks() -> Option<u64> {
+    with_timer(|timer| timer.now())
 }
 
 fn print_storm_warning(warn: &StormWarnSnapshot) {

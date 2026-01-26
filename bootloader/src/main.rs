@@ -28,6 +28,7 @@ use arch_hal::gic::EoiMode;
 use arch_hal::gic::GicCpuConfig;
 use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::GicDistributor;
+use arch_hal::gic::GicPpi;
 use arch_hal::gic::IrqGroup;
 use arch_hal::gic::SpiRoute;
 use arch_hal::gic::TriggerMode;
@@ -39,6 +40,7 @@ use arch_hal::paging::stage1::EL2Stage1Paging;
 use arch_hal::paging::stage1::EL2Stage1PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::naked_asm;
@@ -89,6 +91,7 @@ static GUEST_MMIO_ALLOWLIST: SyncUnsafeCell<Option<Box<[GuestMmioRange]>>> =
 const PL011_UART_ADDR: usize = 0x900_0000;
 const UART_CLOCK_HZ: u64 = 48 * 1_000_000;
 const UART_BAUD: u32 = 115_200;
+const EL2_TIMER_PPI_PRIORITY: u8 = 0x80; // Priority for the timeout monitor tick.
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct UartNode {
@@ -335,6 +338,16 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     exceptions::setup_exception();
     handler::setup_handler();
     let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
+    gic.configure_ppi(
+        timer::SBSA_EL2_PHYSICAL_TIMER_INTID,
+        IrqGroup::Group1,
+        EL2_TIMER_PPI_PRIORITY,
+        TriggerMode::Level,
+        EnableOp::Enable,
+    )
+    .map_err(|_| "gic: configure el2 timer ppi")
+    .unwrap();
+    irq_monitor::init_physical_timer_poll();
     vgic::init(&gic, &gic_info, guest_uart).unwrap();
     handler::register_gic(gic, Some(gdb_uart_intid));
     {

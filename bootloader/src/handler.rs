@@ -21,6 +21,7 @@ use arch_hal::println;
 use arch_hal::psci;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
+use arch_hal::timer;
 use core::cell::SyncUnsafeCell;
 use core::ffi::c_void;
 use core::ptr::read_volatile;
@@ -346,6 +347,11 @@ fn irq_handler(regs: &mut cpu::Registers) {
         return;
     };
     // println!("irq_handler ack intid: {}", ack.intid);
+    if ack.intid == timer::SBSA_EL2_PHYSICAL_TIMER_INTID {
+        irq_monitor::handle_physical_timer_irq();
+        gic.end_of_interrupt(ack).unwrap();
+        return;
+    }
     // SAFETY: GDB UART INTID is written once during boot and then read-only.
     let gdb_intid = unsafe { *GDB_UART_INTID.get() };
     let maintenance_intid = vgic::maintenance_intid();
@@ -356,7 +362,6 @@ fn irq_handler(regs: &mut cpu::Registers) {
             gdb_uart::handle_irq();
         }
         gic.end_of_interrupt(ack).unwrap();
-        irq_monitor::poll_timeouts();
         return;
     }
 
@@ -368,7 +373,6 @@ fn irq_handler(regs: &mut cpu::Registers) {
         vgic::on_physical_irq(ack.intid).unwrap();
     }
     gic.end_of_interrupt(ack).unwrap();
-    irq_monitor::poll_timeouts();
 
     let reason = gdb_uart::take_attach_reason();
     if reason != 0 {
