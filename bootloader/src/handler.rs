@@ -184,15 +184,8 @@ fn data_abort_handler(
         };
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                // SAFETY: address is within guest RAM and mapped at EL2.
-                let v = unsafe {
-                    match access_width {
-                        SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
-                        SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
-                        SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
-                        SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
-                    }
-                };
+                let v = crate::vbar_watch::read_vbar_value(address, access_bytes)
+                    .expect("vbar read emulation failed");
                 *register = match reg_size {
                     InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => v,
@@ -203,23 +196,8 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-                // SAFETY: address is within guest RAM and mapped at EL2.
-                unsafe {
-                    match access_width {
-                        SyndromeAccessSize::Byte => {
-                            write_volatile(address as *mut u8, reg_val as u8);
-                        }
-                        SyndromeAccessSize::HalfWord => {
-                            write_volatile(address as *mut u16, reg_val as u16);
-                        }
-                        SyndromeAccessSize::Word => {
-                            write_volatile(address as *mut u32, reg_val as u32);
-                        }
-                        SyndromeAccessSize::DoubleWord => {
-                            write_volatile(address as *mut u64, reg_val as u64);
-                        }
-                    }
-                }
+                crate::vbar_watch::write_vbar_value(address, access_bytes, reg_val)
+                    .expect("vbar write emulation failed");
             }
         }
         cpu::set_elr_el2(elr + 4);

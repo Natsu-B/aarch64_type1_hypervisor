@@ -124,6 +124,9 @@ pub(crate) fn init_gdb_stub() {
 }
 
 pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionClass) {
+    if crate::vbar_watch::handle_debug_exception(regs, ec) {
+        return;
+    }
     // Ensure the debug loop can make forward progress even if IRQ delivery is masked
     // on exception entry (polling path via gdb_uart + RX interrupt suppression).
     gdb_uart::set_debug_session_active(true);

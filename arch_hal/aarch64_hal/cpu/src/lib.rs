@@ -730,11 +730,23 @@ pub fn enable_fgt_vbar_el1_write_trap() {
         return;
     }
     // Arm ARM: HFGWTR_EL2.VBAR_EL1 traps MSR writes to VBAR_EL1 when set.
-    const HFGWTR_EL2_VBAR_EL1: u64 = 1 << 12;
+    const HFGWTR_EL2_TRAP_VBAR_EL1: u64 = 1u64 << 38;
     let mut hfgwtr = get_hfgwtr_el2();
-    hfgwtr |= HFGWTR_EL2_VBAR_EL1;
+    hfgwtr |= HFGWTR_EL2_TRAP_VBAR_EL1;
     set_hfgwtr_el2(hfgwtr);
     isb();
+}
+
+/// Clean D-cache to PoU and invalidate I-cache to PoU for a VA range.
+///
+/// The provided range must be mapped at EL2 and point to Normal memory.
+pub fn sync_icache_pou_for_va_range(start: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let addr = start as usize;
+    clean_dcache_poc(addr, len);
+    invalidate_icache_range(addr, len);
 }
 
 pub fn clean_dcache_poc(addr: usize, size: usize) {

@@ -13,6 +13,7 @@ mod irq_decode;
 mod irq_monitor;
 mod monitor;
 mod stack_overflow;
+mod vbar;
 mod vbar_watch;
 mod vgic;
 use alloc::boxed::Box;
