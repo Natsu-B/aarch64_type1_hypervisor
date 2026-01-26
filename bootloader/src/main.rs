@@ -13,6 +13,7 @@ mod irq_decode;
 mod irq_monitor;
 mod monitor;
 mod stack_overflow;
+mod vbar_watch;
 mod vgic;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -337,6 +338,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     println!("setup exception");
     exceptions::setup_exception();
     handler::setup_handler();
+    vbar_watch::init_vbar_watch();
     let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
     gic.configure_ppi(
         timer::SBSA_EL2_PHYSICAL_TIMER_INTID,

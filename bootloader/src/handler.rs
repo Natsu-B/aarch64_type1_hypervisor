@@ -59,6 +59,9 @@ const UNMAPPED_ABORT_LOG_LIMIT: u32 = 16;
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
     exceptions::synchronous_handler::set_debug_handler(debug::handle_debug_exception);
+    exceptions::synchronous_handler::set_sysreg_trap_handler(
+        crate::vbar_watch::sysreg_trap_handler,
+    );
     exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // deny guest PSCI CPU_ON.
@@ -171,6 +174,57 @@ fn data_abort_handler(
     };
     let esr = cpu::get_esr_el2();
     let elr = cpu::get_elr_el2();
+
+    if crate::vbar_watch::is_vbar_page(address & !0xfff) {
+        let Some(register) = info.register_mut(regs) else {
+            panic!(
+                "data abort at IPA 0x{:X} with invalid register {}",
+                address, reg_num
+            );
+        };
+        match write_access {
+            WriteNotRead::ReadingMemoryAbort => {
+                // SAFETY: address is within guest RAM and mapped at EL2.
+                let v = unsafe {
+                    match access_width {
+                        SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
+                        SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
+                        SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
+                        SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
+                    }
+                };
+                *register = match reg_size {
+                    InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => v,
+                };
+            }
+            WriteNotRead::WritingMemoryAbort => {
+                let reg_val = match reg_size {
+                    InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => *register,
+                };
+                // SAFETY: address is within guest RAM and mapped at EL2.
+                unsafe {
+                    match access_width {
+                        SyndromeAccessSize::Byte => {
+                            write_volatile(address as *mut u8, reg_val as u8);
+                        }
+                        SyndromeAccessSize::HalfWord => {
+                            write_volatile(address as *mut u16, reg_val as u16);
+                        }
+                        SyndromeAccessSize::Word => {
+                            write_volatile(address as *mut u32, reg_val as u32);
+                        }
+                        SyndromeAccessSize::DoubleWord => {
+                            write_volatile(address as *mut u64, reg_val as u64);
+                        }
+                    }
+                }
+            }
+        }
+        cpu::set_elr_el2(elr + 4);
+        return;
+    }
 
     if vgic::handles_gicd(addr) {
         let Some(register) = info.register_mut(regs) else {
