@@ -292,8 +292,9 @@ fn write_vbar_status(out: &mut OutBuf<'_>) {
     );
     let _ = write!(
         out,
-        " pending_repatch={} change_seq={} change_reason={}",
+        " pending_repatch={} step_depth={} change_seq={} change_reason={}",
         snapshot.pending_repatch as u8,
+        snapshot.step_depth,
         snapshot.last_change_seq,
         snapshot.last_change_reason.as_str()
     );

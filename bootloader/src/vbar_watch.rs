@@ -16,6 +16,7 @@ const VBAR_ALIGN: u64 = 0x800;
 const VBAR_ALIGN_MASK: u64 = VBAR_ALIGN - 1;
 const VBAR_PATCH_OFFSETS: [u16; 16] = VBAR_VECTOR_OFFSETS;
 const BRK_SLOT_BITS: u16 = 0x000f;
+const MAX_STEP_DEPTH: usize = 8;
 
 const SPSR_DAIF_D: u64 = 1 << 9;
 const SPSR_SS: u64 = 1 << 21;
@@ -74,6 +75,7 @@ pub(crate) struct VbarStatusSnapshot {
     pub(crate) last_error: Option<VbarErrorInfo>,
     pub(crate) in_vector_entry_window: bool,
     pub(crate) nested_count: u8,
+    pub(crate) step_depth: usize,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -103,12 +105,6 @@ struct StepRestore {
     mdscr_mde: bool,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct InternalStep {
-    slot: usize,
-    restore: StepRestore,
-}
-
 struct VbarWatchState {
     enabled: bool,
     mode: VbarWatchMode,
@@ -122,9 +118,11 @@ struct VbarWatchState {
     unknown_brk_logged: bool,
     in_vector_entry_window: bool,
     nested_count: u8,
+    step_restore: Option<StepRestore>,
+    step_stack: [usize; MAX_STEP_DEPTH],
+    step_depth: usize,
     shadow_insn: [Option<u32>; VBAR_PATCH_OFFSETS.len()],
     is_patched: [bool; VBAR_PATCH_OFFSETS.len()],
-    internal_step: Option<InternalStep>,
     last_hit: Option<VbarTrapSnapshot>,
 }
 
@@ -143,9 +141,11 @@ impl VbarWatchState {
             unknown_brk_logged: false,
             in_vector_entry_window: false,
             nested_count: 0,
+            step_restore: None,
+            step_stack: [0; MAX_STEP_DEPTH],
+            step_depth: 0,
             shadow_insn: [None; VBAR_PATCH_OFFSETS.len()],
             is_patched: [false; VBAR_PATCH_OFFSETS.len()],
-            internal_step: None,
             last_hit: None,
         }
     }
@@ -153,6 +153,32 @@ impl VbarWatchState {
     fn clear_patches(&mut self) {
         self.shadow_insn = [None; VBAR_PATCH_OFFSETS.len()];
         self.is_patched = [false; VBAR_PATCH_OFFSETS.len()];
+    }
+
+    fn step_in_progress(&self) -> bool {
+        self.step_depth != 0
+    }
+
+    fn push_step(&mut self, slot: usize) -> Result<(), ()> {
+        if self.step_depth >= self.step_stack.len() {
+            return Err(());
+        }
+        self.step_stack[self.step_depth] = slot;
+        self.step_depth += 1;
+        Ok(())
+    }
+
+    fn pop_step(&mut self) -> Option<usize> {
+        if self.step_depth == 0 {
+            return None;
+        }
+        self.step_depth -= 1;
+        Some(self.step_stack[self.step_depth])
+    }
+
+    fn clear_steps(&mut self) {
+        self.step_depth = 0;
+        self.step_restore = None;
     }
 }
 
@@ -190,6 +216,7 @@ pub(crate) fn snapshot_status() -> VbarStatusSnapshot {
         last_error: state.last_error,
         in_vector_entry_window: state.in_vector_entry_window,
         nested_count: state.nested_count,
+        step_depth: state.step_depth,
     }
 }
 
@@ -242,7 +269,7 @@ pub fn poll_vbar_el1_change() {
     if !state.enabled {
         return;
     }
-    if state.internal_step.is_some() {
+    if state.step_in_progress() {
         state.pending_repatch = true;
         return;
     }
@@ -360,6 +387,9 @@ fn record_vbar_change(state: &mut VbarWatchState, reason: VbarChangeReason) {
     state.last_error = None;
     state.pending_repatch = false;
     state.unknown_brk_logged = false;
+    state.nested_count = 0;
+    state.in_vector_entry_window = false;
+    state.clear_steps();
 }
 
 fn record_vbar_error(
@@ -396,7 +426,7 @@ fn protect_and_patch_vbar_locked(
                 .map_err(|_| "stage2 rw failed")?;
         }
         state.clear_patches();
-        state.internal_step = None;
+        state.clear_steps();
         state.in_vector_entry_window = false;
     }
 
@@ -479,11 +509,16 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
 
     let mut gprs = [0u64; 32];
     gprs.copy_from_slice(regs.gprs());
-    let nested = state.in_vector_entry_window;
+    let nested = state.step_in_progress();
     if nested {
         state.nested_count = state.nested_count.saturating_add(1);
     } else {
+        state.nested_count = 0;
         state.in_vector_entry_window = true;
+        let Some(restore) = enable_internal_single_step() else {
+            panic!("failed to enable internal single-step");
+        };
+        state.step_restore = Some(restore);
     }
     state.last_hit = Some(VbarTrapSnapshot {
         gprs,
@@ -505,30 +540,47 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
     let addr = state.current_vbar_ipa + offset as u64;
     write_u32(addr, original);
 
-    let Some(restore) = enable_internal_single_step() else {
-        panic!("failed to enable internal single-step");
-    };
-    state.internal_step = Some(InternalStep { slot, restore });
+    if state.push_step(slot).is_err() {
+        state.last_error = Some(VbarErrorInfo {
+            vbar_va: state.current_vbar_va,
+            reason: "step_stack_overflow",
+        });
+        let brk = brk_insn(slot as u16);
+        if original != brk {
+            write_u32(addr, brk);
+        }
+        if let Some(restore) = state.step_restore.take() {
+            disable_internal_single_step(restore);
+        }
+        state.clear_steps();
+        state.in_vector_entry_window = false;
+        state.nested_count = 0;
+        return false;
+    }
 
     true
 }
 
 fn handle_internal_step() -> bool {
     let mut state = VBAR_STATE.lock_irqsave();
-    let Some(pending) = state.internal_step.take() else {
+    let Some(slot) = state.pop_step() else {
         return false;
     };
 
-    disable_internal_single_step(pending.restore);
-    state.in_vector_entry_window = false;
-
-    let Some(original) = state.shadow_insn[pending.slot] else {
-        panic!("vbar single-step without shadow for slot {}", pending.slot);
+    let Some(original) = state.shadow_insn[slot] else {
+        panic!("vbar single-step without shadow for slot {}", slot);
     };
-    let addr = state.current_vbar_ipa + VBAR_PATCH_OFFSETS[pending.slot] as u64;
-    let brk = brk_insn(pending.slot as u16);
+    let addr = state.current_vbar_ipa + VBAR_PATCH_OFFSETS[slot] as u64;
+    let brk = brk_insn(slot as u16);
     if original != brk {
         write_u32(addr, brk);
+    }
+
+    if !state.step_in_progress() {
+        if let Some(restore) = state.step_restore.take() {
+            disable_internal_single_step(restore);
+        }
+        state.in_vector_entry_window = false;
     }
 
     true
