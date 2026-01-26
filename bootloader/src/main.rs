@@ -408,6 +408,12 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
         el1_main, stack_addr
     );
+
+    // Print HyprProbe ascii art
+    println!(
+        "\n\n\n\n\n\n\n\n\n _   _                  ____            _          \n| | | |_   _ _ __  _ __|  _ \\ _ __ ___ | |__   ___ \n| |_| | | | | '_ \\| '__| |_) | '__/ _ \\| '_ \\ / _ \\\n|  _  | |_| | |_) | |  |  __/| | | (_) | |_) |  __/\n|_| |_|\\__, | .__/|_|  |_|   |_|  \\___/|_.__/ \\___|\n       |___/|_|        \n\n"
+    );
+
     unsafe {
         core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
@@ -419,10 +425,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 }
 
 extern "C" fn el1_main() -> ! {
-    let hello = "hello world from el1_main\n";
-    for i in hello.as_bytes() {
-        unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
-    }
     unsafe {
         core::arch::asm!("mov x1, {}", in(reg) *DTB_ADDR.get());
     }
