@@ -199,6 +199,14 @@ bitregs! {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Stage2AccessPermission {
+    NoDataAccess = 0b00,
+    ReadOnly = 0b01,
+    WriteOnly = 0b10,
+    ReadWrite = 0b11,
+}
+
 impl Stage2_48bitLeafDescriptor {
     /// Build a Stage-2 *block* descriptor (L1/L2). `level` is the translation level (1 or 2).
     /// We mask to the [47:21] superset and leave finer-grained alignment to the caller.

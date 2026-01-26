@@ -3,6 +3,9 @@
 #![feature(generic_const_exprs)]
 #![feature(sync_unsafe_cell)]
 
+#[cfg(all(test, not(target_arch = "aarch64")))]
+extern crate std;
+
 extern crate alloc;
 
 mod registers;

@@ -153,6 +153,11 @@ pub fn get_id_aa64mmfr0_el1() -> u64 {
     id
 }
 
+pub fn has_feat_fgt() -> bool {
+    let id = ID_AA64MMFR0_EL1::from_bits(get_id_aa64mmfr0_el1());
+    id.get(ID_AA64MMFR0_EL1::fgt) != 0
+}
+
 pub fn get_id_aa64pfr0_el1() -> u64 {
     let id: u64;
     // SAFETY: Reads the read-only ID_AA64PFR0_EL1 system register.
@@ -620,6 +625,12 @@ pub fn get_vbar_el2() -> u64 {
     val
 }
 
+pub fn get_vbar_el1() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, vbar_el1", val = out(reg) val) };
+    val
+}
+
 pub fn get_cnthctl_el2() -> u64 {
     let val: u64;
     unsafe { asm!("mrs {val}, cnthctl_el2", val = out(reg) val) };
@@ -698,6 +709,32 @@ pub fn set_cptr_el2(cptr_el2: u64) {
 
 pub fn set_mdcr_el2(mdcr_el2: u64) {
     unsafe { asm!("msr mdcr_el2, {}", in(reg) mdcr_el2) };
+}
+
+pub fn get_hfgwtr_el2() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the HFGWTR_EL2 system register (EL2-only).
+    // Arm ARM: HFGWTR_EL2 is encoded as S3_4_C2_C6_0.
+    unsafe { asm!("mrs {val}, S3_4_C2_C6_0", val = out(reg) val) };
+    val
+}
+
+pub fn set_hfgwtr_el2(val: u64) {
+    // SAFETY: Caller ensures HFGWTR_EL2 updates are appropriate for the guest configuration.
+    // Arm ARM: HFGWTR_EL2 is encoded as S3_4_C2_C6_0.
+    unsafe { asm!("msr S3_4_C2_C6_0, {}", in(reg) val) };
+}
+
+pub fn enable_fgt_vbar_el1_write_trap() {
+    if !has_feat_fgt() {
+        return;
+    }
+    // Arm ARM: HFGWTR_EL2.VBAR_EL1 traps MSR writes to VBAR_EL1 when set.
+    const HFGWTR_EL2_VBAR_EL1: u64 = 1 << 12;
+    let mut hfgwtr = get_hfgwtr_el2();
+    hfgwtr |= HFGWTR_EL2_VBAR_EL1;
+    set_hfgwtr_el2(hfgwtr);
+    isb();
 }
 
 pub fn clean_dcache_poc(addr: usize, size: usize) {

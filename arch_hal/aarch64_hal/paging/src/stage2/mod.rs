@@ -11,6 +11,7 @@ use crate::PagingErr;
 use crate::registers::HCR_EL2;
 use crate::stage2::descriptor::Stage2_48bitLeafDescriptor;
 use crate::stage2::descriptor::Stage2_48bitTableDescriptor;
+use crate::stage2::descriptor::Stage2AccessPermission;
 use crate::stage2::registers::InnerCache;
 use crate::stage2::registers::OuterCache;
 use crate::stage2::registers::PhysicalAddressSize;
@@ -48,6 +49,15 @@ struct Stage2Context {
 }
 
 static STAGE2_CONTEXT: SyncUnsafeCell<Option<Stage2Context>> = SyncUnsafeCell::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage2UpdateError {
+    NotInitialized,
+    UnalignedPage,
+    Unmapped,
+    InvalidDescriptor,
+    OutOfMemory,
+}
 
 impl Stage2Paging {
     /// initialize stage2 paging
@@ -421,9 +431,156 @@ impl Stage2Paging {
     }
 }
 
+pub fn set_4k_exec_only(ipa_page: u64) -> Result<(), Stage2UpdateError> {
+    update_4k_leaf(ipa_page, Stage2AccessPermission::NoDataAccess, Some(0))
+}
+
+pub fn set_4k_rw(ipa_page: u64) -> Result<(), Stage2UpdateError> {
+    update_4k_leaf(ipa_page, Stage2AccessPermission::ReadWrite, None)
+}
+
+fn update_4k_leaf(
+    ipa_page: u64,
+    access: Stage2AccessPermission,
+    xn_override: Option<u64>,
+) -> Result<(), Stage2UpdateError> {
+    if (ipa_page & (PAGE_TABLE_SIZE as u64 - 1)) != 0 {
+        return Err(Stage2UpdateError::UnalignedPage);
+    }
+    // SAFETY: STAGE2_CONTEXT is initialized once during boot before concurrent access.
+    let ctx = unsafe { &*STAGE2_CONTEXT.get() }
+        .as_ref()
+        .ok_or(Stage2UpdateError::NotInitialized)?;
+    let total_entries = ctx.num_of_tables * 512;
+    // SAFETY: `table_addr` points to the stage-2 table pool with `total_entries` u64 entries.
+    let mut table = unsafe { slice::from_raw_parts_mut(ctx.table_addr as *mut u64, total_entries) };
+
+    let mut level = ctx.top_table_level;
+    let mut table_slice: &mut [u64] = &mut table;
+
+    loop {
+        let idx = if level == ctx.top_table_level {
+            initial_index_with_concat(ipa_page as usize, level, ctx.num_of_tables)
+        } else {
+            index_for_level(ipa_page, level)
+        };
+        let entry = &mut table_slice[idx];
+        match *entry & 0b11 {
+            0b00 => return Err(Stage2UpdateError::Unmapped),
+            0b01 => {
+                if level >= 3 {
+                    return Err(Stage2UpdateError::InvalidDescriptor);
+                }
+                let next_table = split_block_descriptor(*entry, level)?;
+                *entry = Stage2_48bitTableDescriptor::new_descriptor(next_table.as_ptr() as u64);
+                clean_table_entry(entry as *const u64);
+                table_slice = next_table;
+                level += 1;
+            }
+            0b11 => {
+                if level == 3 {
+                    let updated = update_leaf_descriptor(*entry, access, xn_override)?;
+                    *entry = updated;
+                    clean_table_entry(entry as *const u64);
+                    cpu::flush_tlb_el2_el1();
+                    return Ok(());
+                }
+                let next_table_addr = (*entry as usize) & !(PAGE_TABLE_SIZE - 1);
+                // SAFETY: next-level table address comes from a validated table descriptor.
+                table_slice =
+                    unsafe { slice::from_raw_parts_mut(next_table_addr as *mut u64, 512) };
+                level += 1;
+            }
+            _ => return Err(Stage2UpdateError::InvalidDescriptor),
+        }
+    }
+}
+
+fn split_block_descriptor(desc: u64, level: i8) -> Result<&'static mut [u64], Stage2UpdateError> {
+    if !(level == 1 || level == 2) {
+        return Err(Stage2UpdateError::InvalidDescriptor);
+    }
+    let table_level_offset = (3 - (level + 1) as usize) * 9 + 12;
+    let next_level_size = 1usize << table_level_offset;
+
+    // SAFETY: allocate a new stage-2 table page; it is owned exclusively hereafter.
+    let next_table_addr = unsafe {
+        alloc::alloc::alloc(Layout::from_size_align_unchecked(
+            PAGE_TABLE_SIZE,
+            PAGE_TABLE_SIZE,
+        ))
+    };
+    if next_table_addr.is_null() {
+        return Err(Stage2UpdateError::OutOfMemory);
+    }
+    let next_table_addr = next_table_addr as usize;
+    // SAFETY: `next_table_addr` is a freshly allocated table page owned here.
+    let next_table = unsafe { slice::from_raw_parts_mut(next_table_addr as *mut u64, 512) };
+
+    let leaf = Stage2_48bitLeafDescriptor::from_bits(desc);
+    let base_pa = leaf.get_raw(Stage2_48bitLeafDescriptor::block_oab);
+    let is_page_level = level == 2;
+    let ty_bits = if is_page_level { 0b11 } else { 0b01 };
+
+    for (idx, slot) in next_table.iter_mut().enumerate() {
+        let pa = base_pa + (idx as u64 * next_level_size as u64);
+        let mut new_leaf = Stage2_48bitLeafDescriptor::from_bits(desc)
+            .set(Stage2_48bitLeafDescriptor::ty, ty_bits);
+        if is_page_level {
+            new_leaf = new_leaf.set_raw(Stage2_48bitLeafDescriptor::page_oab, pa);
+        } else {
+            new_leaf = new_leaf.set_raw(Stage2_48bitLeafDescriptor::block_oab, pa);
+        }
+        *slot = new_leaf.bits();
+    }
+
+    cpu::clean_dcache_poc(next_table_addr, PAGE_TABLE_SIZE);
+    Ok(next_table)
+}
+
+fn update_leaf_descriptor(
+    desc: u64,
+    access: Stage2AccessPermission,
+    xn_override: Option<u64>,
+) -> Result<u64, Stage2UpdateError> {
+    let mut leaf = Stage2_48bitLeafDescriptor::from_bits(desc)
+        .set(Stage2_48bitLeafDescriptor::s2ap, access as u64);
+    if let Some(xn) = xn_override {
+        leaf = leaf.set(Stage2_48bitLeafDescriptor::xn, xn);
+    }
+    Ok(leaf.bits())
+}
+
+#[inline]
+fn clean_table_entry(entry: *const u64) {
+    let page = (entry as usize) & !(PAGE_TABLE_SIZE - 1);
+    cpu::clean_dcache_poc(page, PAGE_TABLE_SIZE);
+}
+
 #[inline]
 fn initial_index_with_concat(ipa: usize, level: i8, num_concat: usize) -> usize {
     debug_assert!(num_concat.is_power_of_two());
     let shift = 12 + 9 * (3 - level as usize);
     (ipa >> shift) & (num_concat * 512 - 1)
+}
+
+#[inline]
+fn index_for_level(ipa: u64, level: i8) -> usize {
+    let shift = 12 + 9 * (3 - level as usize);
+    ((ipa >> shift) & 0x1ff) as usize
+}
+
+#[cfg(all(test, not(target_arch = "aarch64")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaf_exec_only_sets_s2ap_and_xn() {
+        let desc = Stage2_48bitLeafDescriptor::new_page(0x4000_0000, Stage2PageTypes::Normal);
+        let updated = update_leaf_descriptor(desc, Stage2AccessPermission::NoDataAccess, Some(0))
+            .expect("update leaf");
+        let leaf = Stage2_48bitLeafDescriptor::from_bits(updated);
+        assert_eq!(leaf.get(Stage2_48bitLeafDescriptor::s2ap), 0);
+        assert_eq!(leaf.get(Stage2_48bitLeafDescriptor::xn), 0);
+    }
 }
