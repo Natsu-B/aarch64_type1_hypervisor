@@ -2,6 +2,7 @@ use crate::GUEST_UART;
 use crate::debug;
 use crate::gdb_uart;
 use crate::guest_mmio_allowlist_contains_range;
+use crate::irq_monitor;
 use crate::monitor;
 use crate::vgic;
 use arch_hal::cpu;
@@ -289,7 +290,8 @@ fn data_abort_handler(
         esr,
         far: info.far_el2,
     };
-    let decision = monitor::record_memfault(memfault_info, !gdb_uart::is_debug_active());
+    let can_trap = gdb_uart::is_debug_session_active() && !gdb_uart::is_debug_active();
+    let decision = monitor::record_memfault(memfault_info, can_trap);
     if decision.should_trap {
         let kind = match write_access {
             WriteNotRead::WritingMemoryAbort => WatchpointKind::Write,
@@ -322,6 +324,7 @@ fn data_abort_handler(
         };
         *register = 0;
     }
+    // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
     cpu::set_elr_el2(elr + 4);
 }
 
@@ -345,11 +348,15 @@ fn irq_handler(regs: &mut cpu::Registers) {
     // println!("irq_handler ack intid: {}", ack.intid);
     // SAFETY: GDB UART INTID is written once during boot and then read-only.
     let gdb_intid = unsafe { *GDB_UART_INTID.get() };
+    let maintenance_intid = vgic::maintenance_intid();
+    let count_for_storm = Some(ack.intid) != gdb_intid && Some(ack.intid) != maintenance_intid;
+    irq_monitor::record_ack(ack.intid, count_for_storm);
     if gdb_uart::is_debug_active() {
         if Some(ack.intid) == gdb_intid {
             gdb_uart::handle_irq();
         }
         gic.end_of_interrupt(ack).unwrap();
+        irq_monitor::poll_timeouts();
         return;
     }
 
@@ -361,6 +368,7 @@ fn irq_handler(regs: &mut cpu::Registers) {
         vgic::on_physical_irq(ack.intid).unwrap();
     }
     gic.end_of_interrupt(ack).unwrap();
+    irq_monitor::poll_timeouts();
 
     let reason = gdb_uart::take_attach_reason();
     if reason != 0 {

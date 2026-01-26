@@ -10,6 +10,7 @@ mod debug;
 mod gdb_uart;
 mod handler;
 mod irq_decode;
+mod irq_monitor;
 mod monitor;
 mod stack_overflow;
 mod vgic;

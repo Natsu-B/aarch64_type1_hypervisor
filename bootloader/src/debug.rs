@@ -126,6 +126,7 @@ pub(crate) fn init_gdb_stub() {
 pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionClass) {
     // Ensure the debug loop can make forward progress even if IRQ delivery is masked
     // on exception entry (polling path via gdb_uart + RX interrupt suppression).
+    gdb_uart::set_debug_session_active(true);
     let _debug_active = DebugActiveGuard::new();
     let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_exception_entry(regs, ec);
@@ -165,6 +166,7 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
         return;
     }
 
+    gdb_uart::set_debug_session_active(true);
     aarch64_gdb::debug_entry(regs, cause);
     cpu::irq_restore(saved_daif);
 }

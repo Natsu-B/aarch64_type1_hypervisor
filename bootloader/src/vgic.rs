@@ -21,6 +21,7 @@ use core::cell::SyncUnsafeCell;
 use crate::Gicv2Info;
 use crate::UartNode;
 use crate::handler;
+use crate::irq_monitor;
 
 static VGIC_VM: RawSpinLockIrqSave<Option<gic::vm::GicVmModelForVcpus<1>>> =
     RawSpinLockIrqSave::new(None);
@@ -113,10 +114,16 @@ pub fn handle_gicd_write(
 
 pub fn on_physical_irq(intid: u32) -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
-    let mut guard = VGIC_VM.lock_irqsave();
-    let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
-    let update = vm.on_physical_irq(PIntId(intid), true)?;
-    apply_update(vm, gic, update)
+    let update = {
+        let mut guard = VGIC_VM.lock_irqsave();
+        let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
+        let update = vm.on_physical_irq(PIntId(intid), true)?;
+        apply_update(vm, gic, update)?;
+        update
+    };
+    let injection_hint = matches!(update, VgicUpdate::Some { .. });
+    irq_monitor::record_injected_pirq(intid, injection_hint);
+    Ok(())
 }
 
 pub fn handle_maintenance_irq() -> Result<(), GicError> {
@@ -124,7 +131,12 @@ pub fn handle_maintenance_irq() -> Result<(), GicError> {
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
     let vcpu = vm.vcpu(VcpuId(0))?;
-    let update = vcpu.handle_maintenance(gic, &mut |_pirq| {}, &mut |_pirq| {}, &mut |_pirq| {})?;
+    let update = vcpu.handle_maintenance(
+        gic,
+        &mut |pirq| irq_monitor::record_pirq_eoi(pirq.0),
+        &mut |pirq| irq_monitor::record_pirq_deactivate(pirq.0),
+        &mut |_pirq| {},
+    )?;
     apply_update(vm, gic, update)
 }
 

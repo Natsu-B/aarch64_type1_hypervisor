@@ -19,6 +19,7 @@ const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
 // Publish debug entry state without relying on higher-level locking.
 static DEBUG_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static DEBUG_SESSION_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
 static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
 static ATTACH_REASON: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
 
@@ -194,6 +195,14 @@ pub fn is_debug_active() -> bool {
 pub fn set_debug_active(active: bool) {
     // Release publishes debug-active transitions to IRQ readers.
     DEBUG_ACTIVE.store(active, Ordering::Release);
+}
+
+pub fn is_debug_session_active() -> bool {
+    DEBUG_SESSION_ACTIVE.load(Ordering::Acquire)
+}
+
+pub fn set_debug_session_active(active: bool) {
+    DEBUG_SESSION_ACTIVE.store(active, Ordering::Release);
 }
 
 pub fn take_attach_reason() -> u8 {
