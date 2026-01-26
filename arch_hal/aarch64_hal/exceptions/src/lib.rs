@@ -12,6 +12,9 @@
 )]
 #![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
 
+#[cfg(all(test, not(target_arch = "aarch64")))]
+extern crate std;
+
 mod common_handler;
 mod el1;
 pub mod emulation;

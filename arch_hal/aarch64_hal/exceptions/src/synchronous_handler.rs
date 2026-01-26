@@ -8,13 +8,13 @@ use crate::registers::ESR_EL2;
 use crate::registers::ExceptionClass;
 use crate::registers::InstructionRegisterSize;
 use crate::registers::SyndromeAccessSize;
+use crate::registers::SysRegIss;
 use crate::registers::WriteNotRead;
 use cpu::Registers;
 use cpu::fault_ipa_el2;
 use cpu::get_elr_el2;
 use cpu::get_far_el2;
 use cpu::read_guest_insn_u32_at_el1_pc;
-use cpu::set_elr_el2;
 use print::println;
 use psci::handle_secure_monitor_call;
 
@@ -31,6 +31,7 @@ unsafe impl Sync for DataAbortHandlerEntry {}
 pub type DataAbortHandler =
     fn(*mut c_void, &mut Registers, &DataAbortInfo, Option<&emulation::MmioDecoded>);
 pub type DebugExceptionHandler = fn(&mut Registers, ExceptionClass);
+pub type SysRegTrapHandler = fn(&mut Registers, &SysRegTrapInfo);
 
 #[derive(Copy, Clone, Debug)]
 pub enum DataAbortAccessSource {
@@ -55,6 +56,12 @@ pub struct DataAbortInfo {
     pub access: Option<DataAbortAccess>,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct SysRegTrapInfo {
+    pub esr_el2: ESR_EL2,
+    pub iss: SysRegIss,
+}
+
 impl DataAbortInfo {
     pub fn register_mut<'a>(&self, regs: &'a mut Registers) -> Option<&'a mut u64> {
         let access = self.access?;
@@ -69,11 +76,13 @@ static SYNCHRONOUS_HANDLER: SyncUnsafeCell<SynchronousHandler> =
     SyncUnsafeCell::new(SynchronousHandler {
         data_abort_func: None,
         debug_func: None,
+        sysreg_trap_func: None,
     });
 
 struct SynchronousHandler {
     data_abort_func: Option<DataAbortHandlerEntry>,
     debug_func: Option<DebugExceptionHandler>,
+    sysreg_trap_func: Option<SysRegTrapHandler>,
 }
 
 pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
@@ -82,6 +91,10 @@ pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
 
 pub fn set_debug_handler(handler: DebugExceptionHandler) {
     unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.debug_func = Some(handler);
+}
+
+pub fn set_sysreg_trap_handler(handler: SysRegTrapHandler) {
+    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.sysreg_trap_func = Some(handler);
 }
 
 pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
@@ -127,6 +140,17 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                     unsafe { &*SYNCHRONOUS_HANDLER.get() }
                         .debug_func
                         .expect("debug handler not registered")(reg, ec);
+                }
+                ExceptionClass::SystemRegisterTrap => {
+                    let info = SysRegTrapInfo {
+                        esr_el2,
+                        iss: SysRegIss::from_esr(&esr_el2),
+                    };
+                    unsafe { &*SYNCHRONOUS_HANDLER.get() }
+                        .sysreg_trap_func
+                        .expect("sysreg trap handler not registered")(
+                        reg, &info
+                    );
                 }
                 _ => panic!("unexpected ESR_EL2 EC value: {:?}", ec),
             }
