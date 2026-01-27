@@ -973,8 +973,9 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                         return Ok(ProcessResult::None);
                     }
 
-                    let out_buf = &self.scratch_b[..out_cap];
-                    let out_len = n.min(out_buf.len());
+                    let out_buf = &mut self.scratch_b[..out_cap];
+                    let mut out_len = n.min(out_buf.len());
+                    ensure_trailing_newline(out_buf, &mut out_len);
                     let expected_hex_len = out_len.saturating_mul(2);
                     let mut reply_error = false;
                     let reply_len = {
@@ -2033,6 +2034,22 @@ fn append_hex_u64(buf: &mut [u8], idx: &mut usize, mut val: u64) {
     *idx = end;
 }
 
+fn ensure_trailing_newline(buf: &mut [u8], len: &mut usize) {
+    if *len == 0 {
+        return;
+    }
+    let last = len.saturating_sub(1);
+    if buf[last] == b'\n' {
+        return;
+    }
+    if *len < buf.len() {
+        buf[*len] = b'\n';
+        *len += 1;
+    } else {
+        buf[last] = b'\n';
+    }
+}
+
 fn hex_encode(src: &[u8], dst: &mut [u8]) -> usize {
     let mut idx = 0usize;
     for &b in src {
@@ -2400,6 +2417,43 @@ mod tests {
             packets.iter().any(|packet| packet.payload == b"68690a"),
             "missing qRcmd output reply"
         );
+    }
+
+    #[test]
+    fn ensure_trailing_newline_no_change_when_present() {
+        let mut buf = *b"hi\n";
+        let mut len = buf.len();
+        super::ensure_trailing_newline(&mut buf, &mut len);
+        assert_eq!(len, 3);
+        assert_eq!(&buf[..len], b"hi\n");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_appends_when_missing() {
+        let mut buf = [0u8; 8];
+        buf[..5].copy_from_slice(b"hello");
+        let mut len = 5;
+        super::ensure_trailing_newline(&mut buf, &mut len);
+        assert_eq!(len, 6);
+        assert_eq!(&buf[..len], b"hello\n");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_overwrites_when_full() {
+        let mut buf = *b"hello";
+        let mut len = buf.len();
+        super::ensure_trailing_newline(&mut buf, &mut len);
+        assert_eq!(len, 5);
+        assert_eq!(&buf, b"hell\n");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_ignores_empty_output() {
+        let mut buf = [0u8; 4];
+        let mut len = 0;
+        super::ensure_trailing_newline(&mut buf, &mut len);
+        assert_eq!(len, 0);
+        assert_eq!(&buf, &[0u8; 4]);
     }
 
     #[test]
