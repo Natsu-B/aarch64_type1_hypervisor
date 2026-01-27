@@ -17,6 +17,7 @@ pub mod registers;
 pub use cache::clean_dcache_range;
 pub use cache::clean_invalidate_dcache_range;
 pub use cache::invalidate_dcache_range;
+pub use cache::invalidate_icache_range;
 
 /// Core affinity encoded as MPIDR style fields (Aff3:Aff2:Aff1:Aff0).
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
@@ -781,7 +782,7 @@ pub fn sync_icache_pou_for_va_range(start: *const u8, len: usize) {
     }
     let addr = start as usize;
     clean_dcache_poc(addr, len);
-    invalidate_icache_range(addr, len);
+    invalidate_icache_range(start, len);
 }
 
 pub fn clean_dcache_poc(addr: usize, size: usize) {
@@ -845,31 +846,6 @@ pub fn invalidate_icache_all() {
             "isb",
             options(nostack, preserves_flags),
         );
-    }
-}
-
-/// Invalidate instruction cache for a virtual address range to PoU.
-///
-/// This is intended for self-modifying code / breakpoint patching:
-/// - Ensure the modified data has been cleaned to PoU/PoC as required before calling.
-/// - This function performs the required barriers for the I-cache invalidate sequence.
-pub fn invalidate_icache_range(addr: usize, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let line = icache_line_size();
-    let start = addr & !(line - 1);
-    let end = addr.saturating_add(len).saturating_add(line - 1) & !(line - 1);
-
-    // SAFETY: `ic ivau` operates on the current EL VA space; callers must provide a valid mapped range.
-    unsafe {
-        let mut p = start;
-        while p < end {
-            asm!("ic ivau, {}", in(reg) p);
-            p += line;
-        }
-        asm!("dsb ish");
-        asm!("isb");
     }
 }
 

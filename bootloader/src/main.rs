@@ -8,6 +8,7 @@
 extern crate alloc;
 mod debug;
 mod gdb_uart;
+mod guest_el1_demo_vectors;
 mod handler;
 mod irq_decode;
 mod irq_monitor;
@@ -339,6 +340,15 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     println!("setup exception");
     exceptions::setup_exception();
     handler::setup_handler();
+    if guest_ipa_size != 0 {
+        match guest_el1_demo_vectors::install_el1_demo_vectors(guest_ipa_base, guest_ipa_size) {
+            Ok(demo_vbar) => {
+                cpu::set_vbar_el1(demo_vbar);
+                cpu::isb();
+            }
+            Err(err) => println!("el1 demo vectors: {}", err),
+        }
+    }
     vbar_watch::init_vbar_watch();
     let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
     gic.configure_ppi(
@@ -496,6 +506,11 @@ fn lowest_memory_base() -> Option<usize> {
 fn guest_mmio_allowlist_slice() -> &'static [GuestMmioRange] {
     // SAFETY: allowlist is populated before the guest is started and then read-only.
     unsafe { (*GUEST_MMIO_ALLOWLIST.get()).as_deref().unwrap_or(&[]) }
+}
+
+pub(crate) fn guest_uart_base() -> Option<usize> {
+    // SAFETY: guest UART is discovered during early boot and not mutated afterwards.
+    unsafe { (*GUEST_UART.get()).map(|node| node.base) }
 }
 
 pub(crate) fn guest_mmio_allowlist_contains(addr: usize) -> bool {

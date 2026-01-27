@@ -425,7 +425,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
                 .write(addr, &brk)
                 .map_err(Aarch64GdbError::Memory)?;
             cpu::clean_dcache_poc(addr as usize, 4);
-            cpu::invalidate_icache_range(addr as usize, 4);
+            cpu::invalidate_icache_range(addr as *const u8, 4);
             self.breakpoints.slots[slot].installed = true;
             return Ok(());
         }
@@ -444,7 +444,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             .write(addr, &brk)
             .map_err(Aarch64GdbError::Memory)?;
         cpu::clean_dcache_poc(addr as usize, 4);
-        cpu::invalidate_icache_range(addr as usize, 4);
+        cpu::invalidate_icache_range(addr as *const u8, 4);
 
         self.breakpoints.slots[slot] = SwBreakpoint {
             addr,
@@ -466,7 +466,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
                 .write(addr, &bytes)
                 .map_err(Aarch64GdbError::Memory)?;
             cpu::clean_dcache_poc(addr as usize, 4);
-            cpu::invalidate_icache_range(addr as usize, 4);
+            cpu::invalidate_icache_range(addr as *const u8, 4);
         }
 
         self.breakpoints.slots[slot] = SwBreakpoint::empty();
@@ -494,7 +494,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             .write(entry.addr, &bytes)
             .map_err(Aarch64GdbError::Memory)?;
         cpu::clean_dcache_poc(entry.addr as usize, 4);
-        cpu::invalidate_icache_range(entry.addr as usize, 4);
+        cpu::invalidate_icache_range(entry.addr as *const u8, 4);
         entry.installed = false;
         Ok(())
     }
@@ -512,7 +512,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             .write(entry.addr, &brk)
             .map_err(Aarch64GdbError::Memory)?;
         cpu::clean_dcache_poc(entry.addr as usize, 4);
-        cpu::invalidate_icache_range(entry.addr as usize, 4);
+        cpu::invalidate_icache_range(entry.addr as *const u8, 4);
         entry.installed = true;
         Ok(())
     }
