@@ -18,6 +18,17 @@ use cpu::read_guest_insn_u32_at_el1_pc;
 use print::println;
 use psci::handle_secure_monitor_call;
 
+pub type InstructionAbortHandler = fn(regs: &mut Registers, info: &InstructionAbortInfo);
+
+#[derive(Copy, Clone, Debug)]
+pub struct InstructionAbortInfo {
+    pub esr_el2: ESR_EL2,
+    pub elr_el2: u64,
+    pub far_el2: u64,
+    pub fault_ipa: Option<u64>,
+    pub ifsc: Option<u64>,
+}
+
 #[derive(Copy, Clone)]
 pub struct DataAbortHandlerEntry {
     pub ctx: *mut c_void,
@@ -77,12 +88,14 @@ static SYNCHRONOUS_HANDLER: SyncUnsafeCell<SynchronousHandler> =
         data_abort_func: None,
         debug_func: None,
         sysreg_trap_func: None,
+        instruction_abort_func: None,
     });
 
 struct SynchronousHandler {
     data_abort_func: Option<DataAbortHandlerEntry>,
     debug_func: Option<DebugExceptionHandler>,
     sysreg_trap_func: Option<SysRegTrapHandler>,
+    instruction_abort_func: Option<InstructionAbortHandler>,
 }
 
 pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
@@ -95,6 +108,10 @@ pub fn set_debug_handler(handler: DebugExceptionHandler) {
 
 pub fn set_sysreg_trap_handler(handler: SysRegTrapHandler) {
     unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.sysreg_trap_func = Some(handler);
+}
+
+pub fn set_instruction_abort_handler(handler: InstructionAbortHandler) {
+    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.instruction_abort_func = Some(handler);
 }
 
 pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
@@ -132,6 +149,31 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                         return;
                     }
                     handle_secure_monitor_call(reg);
+                }
+                ExceptionClass::InstructionAbortFromLowerLevel => {
+                    let handler = unsafe { &mut *SYNCHRONOUS_HANDLER.get() };
+                    let elr_el2 = get_elr_el2();
+                    let far_el2 = get_far_el2();
+                    let fault_ipa = fault_ipa_hint(&esr_el2);
+                    let ifsc = Some(esr_el2.get(ESR_EL2::dfsc));
+                    let info = InstructionAbortInfo {
+                        esr_el2,
+                        elr_el2,
+                        far_el2,
+                        fault_ipa,
+                        ifsc,
+                    };
+                    if let Some(f) = handler.instruction_abort_func {
+                        f(reg, &info);
+                    } else {
+                        println!(
+                            "EL2: guest instruction abort (no handler) elr=0x{:X} far=0x{:X} ipa_hint={:?} esr=0x{:X}",
+                            elr_el2,
+                            far_el2,
+                            fault_ipa,
+                            esr_el2.bits()
+                        );
+                    }
                 }
                 ExceptionClass::BreakpointLowerLevel
                 | ExceptionClass::BrkInstructionAArch64LowerLevel

@@ -32,6 +32,7 @@ use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
 use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
+use exceptions::synchronous_handler::InstructionAbortInfo;
 use gdb_remote::WatchpointKind;
 
 static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
@@ -62,6 +63,7 @@ pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_sysreg_trap_handler(
         crate::vbar_watch::sysreg_trap_handler,
     );
+    exceptions::synchronous_handler::set_instruction_abort_handler(instruction_abort_handler);
     exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // deny guest PSCI CPU_ON.
@@ -359,6 +361,42 @@ fn data_abort_handler(
     }
     // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
     cpu::set_elr_el2(elr + 4);
+}
+
+fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortInfo) {
+    let elr = info.elr_el2;
+    let far = info.far_el2;
+    let ipa_or_far = info.fault_ipa.unwrap_or(far);
+    let ifsc = info.ifsc;
+    println!(
+        "guest instruction abort: ifsc={:?} elr=0x{:X} far=0x{:X} ipa_hint={:?} esr=0x{:X}",
+        ifsc,
+        elr,
+        far,
+        info.fault_ipa,
+        info.esr_el2.bits()
+    );
+
+    let memfault_info = monitor::MemfaultInfo {
+        addr: ipa_or_far,
+        pc: elr,
+        access: monitor::MemfaultAccess::Read,
+        size: 4,
+        esr: info.esr_el2.bits(),
+        far,
+    };
+
+    let can_trap = gdb_uart::is_debug_session_active() && !gdb_uart::is_debug_active();
+    let _ = monitor::record_memfault(memfault_info, can_trap);
+    if can_trap {
+        debug::enter_debug_from_memfault(regs, WatchpointKind::Access, ipa_or_far);
+        return;
+    }
+
+    loop {
+        // SAFETY: halting the core until an interrupt is safe since nothing else should be running.
+        unsafe { core::arch::asm!("wfi") };
+    }
 }
 
 fn gic_access_size(access_width: SyndromeAccessSize) -> Option<Gicv2AccessSize> {
