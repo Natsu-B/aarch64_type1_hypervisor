@@ -1138,8 +1138,8 @@ fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
         cpu::registers::PARange::PA42bits4TB => 42,
         cpu::registers::PARange::PA44bits16TB => 44,
         cpu::registers::PARange::PA48bits256TB => 48,
-        cpu::registers::PARange::PA52bits4PB => 52,
-        cpu::registers::PARange::PA56bits64PB => 56,
+        cpu::registers::PARange::PA52bits4PB => 48,
+        cpu::registers::PARange::PA56bits64PB => 48,
     };
     let ipa_space = 1usize << parange;
     settings.push(EL2Stage1PagingSetting {

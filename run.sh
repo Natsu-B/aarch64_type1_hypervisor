@@ -49,7 +49,7 @@ sudo losetup -d "$LOOP"
 qemu-system-aarch64 \
   -M virt,gic-version=2,secure=off,virtualization=on \
   -global virtio-mmio.force-legacy=off \
-  -bios "$BIN/u-boot.bin" -cpu cortex-a55 -m 4G \
+  -bios "$BIN/u-boot.bin" -cpu max -m 4G \
   -nographic \
   -serial mon:stdio \
   -chardev socket,id=gdbserial,port=${GDB_PORT},host=127.0.0.1,server=on,wait=off \

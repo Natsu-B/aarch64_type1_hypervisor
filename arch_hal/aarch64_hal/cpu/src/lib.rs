@@ -748,16 +748,15 @@ pub fn set_mdcr_el2(mdcr_el2: u64) {
 
 pub fn get_hfgwtr_el2() -> u64 {
     let val: u64;
-    // SAFETY: Reads the HFGWTR_EL2 system register (EL2-only).
-    // Arm ARM: HFGWTR_EL2 is encoded as S3_4_C2_C6_0.
-    unsafe { asm!("mrs {val}, S3_4_C2_C6_0", val = out(reg) val) };
+    // Arm ARM: HFGWTR_EL2 is encoded as op0=3,op1=4,CRn=1,CRm=1,op2=5 => S3_4_C1_C1_5.
+    unsafe { core::arch::asm!("mrs {}, S3_4_C1_C1_5", out(reg) val) };
     val
 }
 
 pub fn set_hfgwtr_el2(val: u64) {
     // SAFETY: Caller ensures HFGWTR_EL2 updates are appropriate for the guest configuration.
-    // Arm ARM: HFGWTR_EL2 is encoded as S3_4_C2_C6_0.
-    unsafe { asm!("msr S3_4_C2_C6_0, {}", in(reg) val) };
+    // Arm ARM: HFGWTR_EL2 is encoded as S3_4_C1_C1_5.
+    unsafe { core::arch::asm!("msr S3_4_C1_C1_5, {}", in(reg) val) };
 }
 
 pub fn enable_fgt_vbar_el1_write_trap() {
