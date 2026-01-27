@@ -97,6 +97,43 @@ pub(crate) struct VbarTrapSnapshot {
 }
 
 #[derive(Copy, Clone, Debug)]
+pub(crate) struct VbarBtFrame {
+    pub(crate) pc: u64,
+    pub(crate) sp: u64,
+    pub(crate) fp: u64,
+    pub(crate) lr: u64,
+    pub(crate) spsr: u64,
+    pub(crate) esr: u64,
+    pub(crate) far: u64,
+}
+
+impl VbarBtFrame {
+    const fn empty() -> Self {
+        Self {
+            pc: 0,
+            sp: 0,
+            fp: 0,
+            lr: 0,
+            spsr: 0,
+            esr: 0,
+            far: 0,
+        }
+    }
+
+    fn from_snapshot(s: &VbarTrapSnapshot) -> Self {
+        Self {
+            pc: s.origin_pre_pc,
+            sp: s.origin_pre_sp.unwrap_or(0),
+            fp: s.gprs[29],
+            lr: s.gprs[30],
+            spsr: s.origin_spsr_el1,
+            esr: s.origin_esr_el1,
+            far: s.origin_far_el1,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
 struct StepRestore {
     spsr_d: bool,
     spsr_ss: bool,
@@ -120,10 +157,17 @@ struct VbarWatchState {
     nested_count: u8,
     step_restore: Option<StepRestore>,
     step_stack: [usize; MAX_STEP_DEPTH],
+    step_snapshots: [Option<VbarTrapSnapshot>; MAX_STEP_DEPTH],
     step_depth: usize,
     shadow_insn: [Option<u32>; VBAR_PATCH_OFFSETS.len()],
     is_patched: [bool; VBAR_PATCH_OFFSETS.len()],
     last_hit: Option<VbarTrapSnapshot>,
+    // Monotonic sequence for last_bt snapshots; only increments on record.
+    last_bt_seq: u64,
+    last_bt_depth: u8,
+    last_bt_nested: bool,
+    last_bt: [VbarBtFrame; MAX_STEP_DEPTH],
+    stop_on_nested: bool,
 }
 
 impl VbarWatchState {
@@ -143,10 +187,16 @@ impl VbarWatchState {
             nested_count: 0,
             step_restore: None,
             step_stack: [0; MAX_STEP_DEPTH],
+            step_snapshots: [None; MAX_STEP_DEPTH],
             step_depth: 0,
             shadow_insn: [None; VBAR_PATCH_OFFSETS.len()],
             is_patched: [false; VBAR_PATCH_OFFSETS.len()],
             last_hit: None,
+            last_bt_seq: 0,
+            last_bt_depth: 0,
+            last_bt_nested: false,
+            last_bt: [VbarBtFrame::empty(); MAX_STEP_DEPTH],
+            stop_on_nested: true,
         }
     }
 
@@ -159,11 +209,12 @@ impl VbarWatchState {
         self.step_depth != 0
     }
 
-    fn push_step(&mut self, slot: usize) -> Result<(), ()> {
+    fn push_step(&mut self, slot: usize, snapshot: VbarTrapSnapshot) -> Result<(), ()> {
         if self.step_depth >= self.step_stack.len() {
             return Err(());
         }
         self.step_stack[self.step_depth] = slot;
+        self.step_snapshots[self.step_depth] = Some(snapshot);
         self.step_depth += 1;
         Ok(())
     }
@@ -173,12 +224,39 @@ impl VbarWatchState {
             return None;
         }
         self.step_depth -= 1;
+        self.step_snapshots[self.step_depth] = None;
         Some(self.step_stack[self.step_depth])
     }
 
     fn clear_steps(&mut self) {
         self.step_depth = 0;
         self.step_restore = None;
+        self.step_snapshots = [None; MAX_STEP_DEPTH];
+    }
+
+    fn clear_last_bt(&mut self) {
+        self.last_bt_depth = 0;
+        self.last_bt_nested = false;
+        self.last_bt = [VbarBtFrame::empty(); MAX_STEP_DEPTH];
+    }
+
+    fn record_last_bt_chain_from_active_steps(&mut self) {
+        let depth = self.step_depth.min(self.step_stack.len());
+        for idx in 0..depth {
+            let frame = self
+                .step_snapshots
+                .get(idx)
+                .and_then(|snapshot| *snapshot)
+                .map(|snapshot| VbarBtFrame::from_snapshot(&snapshot))
+                .unwrap_or_else(VbarBtFrame::empty);
+            self.last_bt[idx] = frame;
+        }
+        for slot in self.last_bt[depth..].iter_mut() {
+            *slot = VbarBtFrame::empty();
+        }
+        self.last_bt_depth = depth as u8;
+        self.last_bt_nested = depth >= 2;
+        self.last_bt_seq = self.last_bt_seq.saturating_add(1);
     }
 }
 
@@ -228,6 +306,23 @@ pub(crate) fn last_hit_snapshot() -> Option<VbarTrapSnapshot> {
 pub(crate) fn clear_last_hit() {
     let mut state = VBAR_STATE.lock_irqsave();
     state.last_hit = None;
+    state.clear_last_bt();
+}
+
+pub(crate) fn snapshot_last_bt_meta() -> Option<(u64, u8, bool)> {
+    let state = VBAR_STATE.lock_irqsave();
+    if state.last_bt_depth == 0 {
+        return None;
+    }
+    Some((state.last_bt_seq, state.last_bt_depth, state.last_bt_nested))
+}
+
+pub(crate) fn snapshot_last_bt_dump() -> Option<(u64, u8, [VbarBtFrame; MAX_STEP_DEPTH])> {
+    let state = VBAR_STATE.lock_irqsave();
+    if state.last_bt_depth == 0 {
+        return None;
+    }
+    Some((state.last_bt_seq, state.last_bt_depth, state.last_bt))
 }
 
 pub(crate) fn init_vbar_watch() {
@@ -390,6 +485,7 @@ fn record_vbar_change(state: &mut VbarWatchState, reason: VbarChangeReason) {
     state.nested_count = 0;
     state.in_vector_entry_window = false;
     state.clear_steps();
+    state.clear_last_bt();
 }
 
 fn record_vbar_error(
@@ -520,7 +616,7 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
         };
         state.step_restore = Some(restore);
     }
-    state.last_hit = Some(VbarTrapSnapshot {
+    let snapshot = VbarTrapSnapshot {
         gprs,
         esr,
         elr,
@@ -535,16 +631,21 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
         origin_pre_sp,
         origin_pre_pc,
         nested,
-    });
+    };
+    state.last_hit = Some(snapshot);
 
     let addr = state.current_vbar_ipa + offset as u64;
     write_u32(addr, original);
 
-    if state.push_step(slot).is_err() {
+    if state.push_step(slot, snapshot).is_err() {
         state.last_error = Some(VbarErrorInfo {
             vbar_va: state.current_vbar_va,
             reason: "step_stack_overflow",
         });
+        println!(
+            "vbar_watch: step stack overflow at slot {} (depth={})",
+            slot, state.step_depth
+        );
         let brk = brk_insn(slot as u16);
         if original != brk {
             write_u32(addr, brk);
@@ -555,6 +656,12 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
         state.clear_steps();
         state.in_vector_entry_window = false;
         state.nested_count = 0;
+        return false;
+    }
+
+    state.record_last_bt_chain_from_active_steps();
+    if nested && state.stop_on_nested {
+        println!("vbar_watch: nested exception detected during vector handling; stopping into GDB");
         return false;
     }
 

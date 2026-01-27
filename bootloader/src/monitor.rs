@@ -184,6 +184,30 @@ impl<'a> OutBuf<'a> {
     fn len(&self) -> usize {
         self.len
     }
+
+    fn try_write_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
+        if self.buf.len().saturating_sub(self.len) < bytes.len() {
+            return Err(fmt::Error);
+        }
+        let end = self.len + bytes.len();
+        self.buf[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+
+    fn try_write_str(&mut self, s: &str) -> fmt::Result {
+        self.try_write_bytes(s.as_bytes())
+    }
+
+    fn force_truncated_marker(&mut self) {
+        const MARKER: &[u8] = b"...TRUNCATED";
+        if self.buf.len() < MARKER.len() {
+            return;
+        }
+        let start = self.buf.len() - MARKER.len();
+        self.buf[start..].copy_from_slice(MARKER);
+        self.len = self.buf.len();
+    }
 }
 
 impl fmt::Write for OutBuf<'_> {
@@ -274,7 +298,7 @@ fn write_ignore_list(out: &mut OutBuf<'_>, ignores: &[IgnoreEntry; MAX_IGNORES])
 }
 
 fn write_vbar_usage(out: &mut OutBuf<'_>) {
-    let _ = write!(out, "usage=hp vbar <status|last|clear|check>");
+    let _ = write!(out, "usage=hp vbar <status|last|clear|check|bt?|bt>");
 }
 
 fn write_vbar_status(out: &mut OutBuf<'_>) {
@@ -343,6 +367,69 @@ fn write_vbar_last(out: &mut OutBuf<'_>) {
         hit.origin_far_el1,
         hit.nested as u8
     );
+}
+
+fn push_hex_u8(out: &mut OutBuf<'_>, b: u8) -> fmt::Result {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 2];
+    buf[0] = HEX[(b >> 4) as usize];
+    buf[1] = HEX[(b & 0xf) as usize];
+    out.try_write_bytes(&buf)
+}
+
+fn push_hex_bytes(out: &mut OutBuf<'_>, bytes: &[u8]) -> fmt::Result {
+    for &b in bytes {
+        push_hex_u8(out, b)?;
+    }
+    Ok(())
+}
+
+fn write_vbar_bt_meta(out: &mut OutBuf<'_>) {
+    let Some((seq, depth, nested)) = vbar_watch::snapshot_last_bt_meta() else {
+        let _ = write!(out, "none");
+        return;
+    };
+    let _ = write!(
+        out,
+        "seq={} depth={} nested={} version=1",
+        seq, depth, nested as u8
+    );
+}
+
+fn write_vbar_bt_dump(out: &mut OutBuf<'_>) {
+    let Some((seq, depth, frames)) = vbar_watch::snapshot_last_bt_dump() else {
+        let _ = write!(out, "none");
+        return;
+    };
+    let _ = write!(
+        out,
+        "version=1 seq={} depth={} stride=56 fields=pc,sp,fp,lr,spsr,esr,far data=",
+        seq, depth
+    );
+    let mut wrote_all = true;
+    for frame in frames.iter().take(depth as usize) {
+        let bytes = [
+            frame.pc.to_le_bytes(),
+            frame.sp.to_le_bytes(),
+            frame.fp.to_le_bytes(),
+            frame.lr.to_le_bytes(),
+            frame.spsr.to_le_bytes(),
+            frame.esr.to_le_bytes(),
+            frame.far.to_le_bytes(),
+        ];
+        for chunk in bytes.iter() {
+            if push_hex_bytes(out, chunk).is_err() {
+                wrote_all = false;
+                break;
+            }
+        }
+        if !wrote_all {
+            break;
+        }
+    }
+    if !wrote_all {
+        out.force_truncated_marker();
+    }
 }
 
 fn parse_u64_token(token: &str) -> Option<u64> {
@@ -602,6 +689,22 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                     }
                     vbar_watch::clear_last_hit();
                     let _ = write!(out, "ok");
+                    Some(out.len())
+                }
+                "bt?" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    write_vbar_bt_meta(&mut out);
+                    Some(out.len())
+                }
+                "bt" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    write_vbar_bt_dump(&mut out);
                     Some(out.len())
                 }
                 "check" => {

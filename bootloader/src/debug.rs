@@ -127,6 +127,7 @@ pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionCla
     if crate::vbar_watch::handle_debug_exception(regs, ec) {
         return;
     }
+    // Nested exceptions during vbar_watch stepping return false to force a GDB stop.
     // Ensure the debug loop can make forward progress even if IRQ delivery is masked
     // on exception entry (polling path via gdb_uart + RX interrupt suppression).
     gdb_uart::set_debug_session_active(true);
