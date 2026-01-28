@@ -189,6 +189,9 @@ pub(crate) fn enter_debug_from_memfault(
         return;
     }
 
+    gdb_uart::set_debug_session_active(true);
+    monitor::enable_memfault_trap_if_off();
+
     let _debug_active = DebugActiveGuard::new();
     let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);

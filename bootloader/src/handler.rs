@@ -364,7 +364,7 @@ fn data_abort_handler(
         esr,
         far: info.far_el2,
     };
-    let can_trap = gdb_uart::is_debug_session_active() && !gdb_uart::is_debug_active();
+    let can_trap = !gdb_uart::is_debug_active();
     let decision = monitor::record_memfault(memfault_info, can_trap);
     if decision.should_trap {
         let kind = match write_access {
@@ -374,7 +374,7 @@ fn data_abort_handler(
         debug::enter_debug_from_memfault(regs, kind, addr_u64);
     }
 
-    if log_now {
+    if log_now && decision.should_log {
         println!(
             "warning: unmapped access {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
             if matches!(write_access, WriteNotRead::WritingMemoryAbort) {

@@ -95,7 +95,7 @@ struct MemfaultState {
 impl MemfaultState {
     const fn new() -> Self {
         Self {
-            policy: MemfaultPolicy::Off,
+            policy: MemfaultPolicy::Trap,
             pending: false,
             last: None,
             ignores: [IgnoreEntry::empty(); MAX_IGNORES],
@@ -153,6 +153,7 @@ pub struct MemfaultDecision {
     pub policy: MemfaultPolicy,
     pub ignored: bool,
     pub should_trap: bool,
+    pub should_log: bool,
 }
 
 pub fn record_memfault(info: MemfaultInfo, can_trap: bool) -> MemfaultDecision {
@@ -161,6 +162,7 @@ pub fn record_memfault(info: MemfaultInfo, can_trap: bool) -> MemfaultDecision {
     let ignored = guard.is_ignored(info.addr);
     let policy = guard.policy;
     let should_trap = can_trap && policy == MemfaultPolicy::Trap && !ignored;
+    let should_log = !ignored && policy != MemfaultPolicy::Trap;
     if should_trap {
         guard.pending = true;
     }
@@ -168,13 +170,13 @@ pub fn record_memfault(info: MemfaultInfo, can_trap: bool) -> MemfaultDecision {
         policy,
         ignored,
         should_trap,
+        should_log,
     }
 }
 
 /// Enable memfault trapping once a debug session becomes active.
 ///
-/// This keeps the default policy `Off` for non-debug runs, while automatically turning on
-/// watchpoint-style stops for unmapped accesses after GDB attach.
+/// This ensures watchpoint-style stops even if the policy was set to `Off`.
 pub fn enable_memfault_trap_if_off() {
     let mut guard = MEMFAULT_STATE.lock_irqsave();
     if guard.policy == MemfaultPolicy::Off {
