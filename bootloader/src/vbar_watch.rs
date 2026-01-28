@@ -11,6 +11,11 @@ use arch_hal::println;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 
+unsafe extern "C" {
+    static __el1_region_start: u8;
+    static __el1_region_end: u8;
+}
+
 const PAGE_SIZE: u64 = 0x1000;
 const VBAR_ALIGN: u64 = 0x800;
 const VBAR_ALIGN_MASK: u64 = VBAR_ALIGN - 1;
@@ -24,6 +29,12 @@ const SPSR_M_MASK: u64 = 0b1111;
 const SPSR_M_EL0T: u64 = 0b0000;
 const SPSR_M_EL1T: u64 = 0b0100;
 const SPSR_M_EL1H: u64 = 0b0101;
+
+fn vbar_in_fallback_region(vbar_va: u64) -> bool {
+    let start = unsafe { &__el1_region_start as *const u8 as u64 };
+    let end = unsafe { &__el1_region_end as *const u8 as u64 };
+    vbar_va >= start && vbar_va < end
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VbarWatchMode {
@@ -502,6 +513,24 @@ fn protect_and_patch_vbar_locked(
     vbar_el1_va: u64,
     state: &mut VbarWatchState,
 ) -> Result<(), &'static str> {
+    if vbar_in_fallback_region(vbar_el1_va) {
+        if state.current_vbar_ipa != 0 {
+            restore_patches(state.current_vbar_ipa, state);
+            if state.current_vbar_ipa_page != 0 {
+                paging::stage2::set_4k_rw(state.current_vbar_ipa_page)
+                    .map_err(|_| "stage2 rw failed")?;
+            }
+            state.clear_patches();
+            state.clear_steps();
+            state.in_vector_entry_window = false;
+        }
+        state.current_vbar_va = vbar_el1_va;
+        state.current_vbar_ipa = 0;
+        state.current_vbar_ipa_page = 0;
+        state.pending_repatch = false;
+        return Ok(());
+    }
+
     let Some(ipa) = cpu::va_to_ipa_el2_read(vbar_el1_va) else {
         return Err("va_to_ipa_el2_read failed");
     };

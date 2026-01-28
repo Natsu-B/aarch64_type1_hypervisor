@@ -11,7 +11,7 @@ use crate::PagingErr;
 use crate::registers::HCR_EL2;
 use crate::stage2::descriptor::Stage2_48bitLeafDescriptor;
 use crate::stage2::descriptor::Stage2_48bitTableDescriptor;
-use crate::stage2::descriptor::Stage2AccessPermission;
+pub use crate::stage2::descriptor::Stage2AccessPermission;
 use crate::stage2::registers::InnerCache;
 use crate::stage2::registers::OuterCache;
 use crate::stage2::registers::PhysicalAddressSize;
@@ -38,6 +38,7 @@ pub struct Stage2PagingSetting {
     pub pa: usize,
     pub size: usize,
     pub types: Stage2PageTypes,
+    pub perm: Stage2AccessPermission,
 }
 
 #[derive(Clone)]
@@ -225,6 +226,7 @@ impl Stage2Paging {
                     pa as u64,
                     top_table_level,
                     data[i].types,
+                    data[i].perm,
                 );
                 pa += top_level;
                 ipa += top_level;
@@ -296,9 +298,14 @@ impl Stage2Paging {
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] = if table_level == 3 {
-                    Stage2_48bitLeafDescriptor::new_page(*pa as u64, data[*i].types)
+                    Stage2_48bitLeafDescriptor::new_page(*pa as u64, data[*i].types, data[*i].perm)
                 } else {
-                    Stage2_48bitLeafDescriptor::new_block(*pa as u64, table_level, data[*i].types)
+                    Stage2_48bitLeafDescriptor::new_block(
+                        *pa as u64,
+                        table_level,
+                        data[*i].types,
+                        data[*i].perm,
+                    )
                 };
                 *pa += table_level_size;
                 *ipa += table_level_size;
@@ -576,7 +583,11 @@ mod tests {
 
     #[test]
     fn leaf_exec_only_sets_s2ap_and_xn() {
-        let desc = Stage2_48bitLeafDescriptor::new_page(0x4000_0000, Stage2PageTypes::Normal);
+        let desc = Stage2_48bitLeafDescriptor::new_page(
+            0x4000_0000,
+            Stage2PageTypes::Normal,
+            Stage2AccessPermission::ReadWrite,
+        );
         let updated = update_leaf_descriptor(desc, Stage2AccessPermission::NoDataAccess, Some(0))
             .expect("update leaf");
         let leaf = Stage2_48bitLeafDescriptor::from_bits(updated);

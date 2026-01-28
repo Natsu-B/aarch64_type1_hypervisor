@@ -18,6 +18,23 @@ SECTIONS {
   _PROGRAM_START = .;
   . = . + SIZEOF_HEADERS;
 
+  .el1_text : ALIGN(_ALIGN_SIZE) {
+    __el1_region_start = .;
+    __el1_text_start = .;
+    KEEP(*(.text.el1_exceptions .text.el1_exceptions.*))
+    KEEP(*(.text.el1 .text.el1.*))
+    __el1_text_end = .;
+  }
+
+  .el1_rodata : ALIGN(_ALIGN_SIZE) {
+    __el1_rodata_start = .;
+    KEEP(*(.rodata.el1_exceptions .rodata.el1_exceptions.*))
+    KEEP(*(.rodata.el1 .rodata.el1.*))
+    __el1_rodata_end = .;
+  }
+
+  __el1_region_end = .;
+
   .text : ALIGN(_ALIGN_SIZE) {
     __text_start = .;
     *(.text .text.*)

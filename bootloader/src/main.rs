@@ -34,6 +34,7 @@ use arch_hal::gic::GicPpi;
 use arch_hal::gic::IrqGroup;
 use arch_hal::gic::SpiRoute;
 use arch_hal::gic::TriggerMode;
+use arch_hal::paging::Stage2AccessPermission;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
@@ -335,6 +336,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     }
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(true);
+    cpu::set_tpidr_el1(guest_uart.base as u64);
+    exceptions::setup_el1_exception();
     println!("paging success!!!");
     println!("setup exception");
     exceptions::setup_exception();
@@ -1297,6 +1300,15 @@ fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>
         }
     }
 
+    unsafe extern "C" {
+        static __el1_region_start: u8;
+        static __el1_region_end: u8;
+    }
+    let el1_start = unsafe { &__el1_region_start as *const u8 as usize };
+    let el1_end = unsafe { &__el1_region_end as *const u8 as usize };
+    let el1_start_aligned = align_down(el1_start, PAGE_SIZE);
+    let el1_end_aligned = align_up(el1_end, PAGE_SIZE);
+
     let mut settings: Vec<Stage2PagingSetting> = Vec::new();
 
     if let Some(seg) = best {
@@ -1331,6 +1343,7 @@ fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>
                 pa: range.base,
                 size: range.size,
                 types: Stage2PageTypes::Device,
+                perm: Stage2AccessPermission::ReadWrite,
             });
         }
 
@@ -1339,7 +1352,18 @@ fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>
             pa: seg.start,
             size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         });
+
+        if el1_end_aligned > el1_start_aligned {
+            settings.push(Stage2PagingSetting {
+                ipa: el1_start_aligned,
+                pa: el1_start_aligned,
+                size: el1_end_aligned - el1_start_aligned,
+                types: Stage2PageTypes::Normal,
+                perm: Stage2AccessPermission::ReadOnly,
+            });
+        }
 
         let mut count = settings.len();
         sort_stage2_settings(settings.as_mut_slice(), count);

@@ -16,6 +16,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 use cpu::registers::PARange;
 use exceptions;
+use paging::stage2::Stage2AccessPermission;
 use paging::stage2::Stage2PageTypes;
 use paging::stage2::Stage2Paging;
 use paging::stage2::Stage2PagingSetting;
@@ -117,18 +118,21 @@ fn build_stage2_scenario()
             pa: first_pa,
             size: first_size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         },
         Stage2PagingSetting {
             ipa: first_size,
             pa: second_pa,
             size: second_size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         },
         Stage2PagingSetting {
             ipa: first_size + second_size,
             pa: third_pa,
             size: third_size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         },
     ];
 
