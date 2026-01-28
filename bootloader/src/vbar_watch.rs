@@ -56,6 +56,7 @@ pub(crate) enum VbarChangeReason {
     Init,
     Trap,
     Poll,
+    Retranslate,
 }
 
 impl VbarChangeReason {
@@ -64,6 +65,7 @@ impl VbarChangeReason {
             VbarChangeReason::Init => "init",
             VbarChangeReason::Trap => "trap",
             VbarChangeReason::Poll => "poll",
+            VbarChangeReason::Retranslate => "retranslate",
         }
     }
 }
@@ -382,9 +384,6 @@ pub fn poll_vbar_el1_change() {
     if state.pending_repatch {
         state.pending_repatch = false;
     }
-    if vbar == state.current_vbar_va {
-        return;
-    }
     if (vbar & VBAR_ALIGN_MASK) != 0 {
         record_vbar_error(
             &mut state,
@@ -394,9 +393,25 @@ pub fn poll_vbar_el1_change() {
         );
         return;
     }
+    let va_changed = vbar != state.current_vbar_va;
+    let change_reason = if va_changed {
+        VbarChangeReason::Poll
+    } else {
+        VbarChangeReason::Retranslate
+    };
+    let resolved_ipa = match cpu::va_to_ipa_el2_read(vbar) {
+        Some(ipa) => ipa,
+        None => {
+            record_vbar_error(&mut state, vbar, "va_to_ipa_el2_read failed", change_reason);
+            return;
+        }
+    };
+    if !va_changed && resolved_ipa == state.current_vbar_ipa {
+        return;
+    }
     match protect_and_patch_vbar_locked(vbar, &mut state) {
-        Ok(()) => record_vbar_change(&mut state, VbarChangeReason::Poll),
-        Err(err) => record_vbar_error(&mut state, vbar, err, VbarChangeReason::Poll),
+        Ok(()) => record_vbar_change(&mut state, change_reason),
+        Err(err) => record_vbar_error(&mut state, vbar, err, change_reason),
     }
 }
 

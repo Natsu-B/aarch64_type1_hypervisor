@@ -171,13 +171,11 @@ pub fn record_memfault(info: MemfaultInfo, can_trap: bool) -> MemfaultDecision {
     }
 }
 
-/// Arm trapping for unmapped access when a debug session becomes active.
+/// Enable memfault trapping once a debug session becomes active.
 ///
-/// When called after GDB enables its session, this will promote
-/// `MemfaultPolicy::Off` to `MemfaultPolicy::Trap` so that a future
-/// unmapped access stops execution. It intentionally leaves any other
-/// user-selected policy untouched.
-pub fn arm_memfault_trap_if_off() {
+/// This keeps the default policy `Off` for non-debug runs, while automatically turning on
+/// watchpoint-style stops for unmapped accesses after GDB attach.
+pub fn enable_memfault_trap_if_off() {
     let mut guard = MEMFAULT_STATE.lock_irqsave();
     if guard.policy == MemfaultPolicy::Off {
         guard.policy = MemfaultPolicy::Trap;

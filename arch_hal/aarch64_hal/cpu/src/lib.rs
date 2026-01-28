@@ -902,7 +902,13 @@ pub fn va_to_ipa_el2(va: u64) -> Option<u64> {
     va_to_ipa_el2_read(va)
 }
 
+/// When EL1 MMU is disabled, returns the input address as IPA without executing AT.
 fn va_to_ipa_el2_common(va: u64, is_write: bool) -> Option<u64> {
+    let sctlr_el1 = get_sctlr_el1();
+    if (sctlr_el1 & 1) == 0 {
+        return Some(va);
+    }
+
     let par_after: u64;
 
     unsafe {
