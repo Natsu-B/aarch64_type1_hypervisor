@@ -1,3 +1,4 @@
+use crate::guest_mmio_allowlist_contains_range;
 use crate::vbar_watch;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::cpu;
@@ -5,10 +6,12 @@ use core::fmt;
 use core::fmt::Write;
 
 pub const MAX_IGNORES: usize = 16;
+const MEMFAULT_STORM_LIMIT: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemfaultPolicy {
     Off,
+    Warn,
     Trap,
     Autoskip,
 }
@@ -17,6 +20,7 @@ impl MemfaultPolicy {
     fn as_str(self) -> &'static str {
         match self {
             MemfaultPolicy::Off => "off",
+            MemfaultPolicy::Warn => "warn",
             MemfaultPolicy::Trap => "trap",
             MemfaultPolicy::Autoskip => "autoskip",
         }
@@ -25,6 +29,7 @@ impl MemfaultPolicy {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "off" => Some(MemfaultPolicy::Off),
+            "warn" => Some(MemfaultPolicy::Warn),
             "trap" => Some(MemfaultPolicy::Trap),
             "autoskip" => Some(MemfaultPolicy::Autoskip),
             _ => None,
@@ -32,7 +37,7 @@ impl MemfaultPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemfaultAccess {
     Read,
     Write,
@@ -90,6 +95,7 @@ struct MemfaultState {
     pending: bool,
     last: Option<MemfaultInfo>,
     ignores: [IgnoreEntry; MAX_IGNORES],
+    storm: MemfaultStorm,
 }
 
 impl MemfaultState {
@@ -99,6 +105,7 @@ impl MemfaultState {
             pending: false,
             last: None,
             ignores: [IgnoreEntry::empty(); MAX_IGNORES],
+            storm: MemfaultStorm::new(),
         }
     }
 
@@ -139,6 +146,30 @@ impl MemfaultState {
 }
 
 #[derive(Clone, Copy)]
+struct MemfaultStorm {
+    page: u64,
+    access: MemfaultAccess,
+    count: u32,
+    valid: bool,
+}
+
+impl MemfaultStorm {
+    const fn new() -> Self {
+        Self {
+            page: 0,
+            access: MemfaultAccess::Read,
+            count: 0,
+            valid: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.valid = false;
+        self.count = 0;
+    }
+}
+
+#[derive(Clone, Copy)]
 struct MemfaultSnapshot {
     policy: MemfaultPolicy,
     pending: bool,
@@ -156,14 +187,39 @@ pub struct MemfaultDecision {
     pub should_log: bool,
 }
 
-pub fn record_memfault(info: MemfaultInfo, can_trap: bool) -> MemfaultDecision {
+pub fn record_memfault(info: MemfaultInfo) -> MemfaultDecision {
     let mut guard = MEMFAULT_STATE.lock_irqsave();
     guard.last = Some(info);
-    let ignored = guard.is_ignored(info.addr);
+    let ignored = guard.is_ignored(info.addr)
+        || guest_mmio_allowlist_contains_range(info.addr as usize, info.size as usize);
     let policy = guard.policy;
-    let should_trap = can_trap && policy == MemfaultPolicy::Trap && !ignored;
-    let should_log = !ignored && policy != MemfaultPolicy::Trap;
-    if should_trap {
+    let mut storm_trap = false;
+    if !ignored && matches!(policy, MemfaultPolicy::Warn | MemfaultPolicy::Autoskip) {
+        let page = info.addr & !0xfff;
+        let access = info.access;
+        if guard.storm.valid && guard.storm.page == page && guard.storm.access == access {
+            guard.storm.count = guard.storm.count.saturating_add(1);
+        } else {
+            guard.storm.page = page;
+            guard.storm.access = access;
+            guard.storm.count = 1;
+            guard.storm.valid = true;
+        }
+        if guard.storm.count >= MEMFAULT_STORM_LIMIT {
+            storm_trap = true;
+            guard.storm.reset();
+        }
+    } else {
+        guard.storm.reset();
+    }
+
+    let should_trap = (policy == MemfaultPolicy::Trap && !ignored) || storm_trap;
+    let should_log = !ignored
+        && matches!(policy, MemfaultPolicy::Warn | MemfaultPolicy::Autoskip)
+        && !storm_trap;
+    let should_pending =
+        !ignored && matches!(policy, MemfaultPolicy::Warn | MemfaultPolicy::Autoskip);
+    if should_trap || should_pending {
         guard.pending = true;
     }
     MemfaultDecision {

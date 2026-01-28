@@ -364,9 +364,10 @@ fn data_abort_handler(
         esr,
         far: info.far_el2,
     };
-    let can_trap = !gdb_uart::is_debug_active();
-    let decision = monitor::record_memfault(memfault_info, can_trap);
-    if decision.should_trap {
+    let trap_ok = !gdb_uart::is_debug_active();
+    let decision = monitor::record_memfault(memfault_info);
+    let should_trap = decision.should_trap && trap_ok;
+    if should_trap {
         let kind = match write_access {
             WriteNotRead::WritingMemoryAbort => WatchpointKind::Write,
             WriteNotRead::ReadingMemoryAbort => WatchpointKind::Read,
@@ -374,7 +375,12 @@ fn data_abort_handler(
         debug::enter_debug_from_memfault(regs, kind, addr_u64);
     }
 
-    if log_now && decision.should_log {
+    if !should_trap && trap_ok {
+        gdb_uart::handle_irq();
+        debug::enter_debug_from_irq(regs, gdb_uart::take_attach_reason());
+    }
+
+    if log_now && decision.should_log && !should_trap {
         println!(
             "warning: unmapped access {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
             if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
@@ -425,9 +431,9 @@ fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortI
         far,
     };
 
-    let can_trap = gdb_uart::is_debug_session_active() && !gdb_uart::is_debug_active();
-    let _ = monitor::record_memfault(memfault_info, can_trap);
-    if can_trap {
+    let trap_ok = !gdb_uart::is_debug_active();
+    let decision = monitor::record_memfault(memfault_info);
+    if decision.should_trap && trap_ok {
         debug::enter_debug_from_memfault(regs, WatchpointKind::Access, ipa_or_far);
         return;
     }
