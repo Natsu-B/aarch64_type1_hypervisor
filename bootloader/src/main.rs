@@ -335,7 +335,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         panic!("stage2: no guest RAM to map");
     }
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation(true);
+    Stage2Paging::enable_stage2_translation(true, true);
     cpu::set_tpidr_el1(guest_uart.base as u64);
     exceptions::setup_el1_exception();
     println!("paging success!!!");

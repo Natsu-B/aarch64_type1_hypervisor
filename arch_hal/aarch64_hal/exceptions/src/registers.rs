@@ -27,7 +27,7 @@ bitregs! {
             }
             view wf_ {
                 // Trapped Instruction
-                pub(crate) ti@[1:0] as TI {
+                pub ti@[1:0] as TI {
                     WFI  = 0b00,
                     WFE  = 0b01,
                     // When FEAT_WFxT is implemented
@@ -382,5 +382,20 @@ mod host_tests {
         assert_eq!(decoded.op2, 0);
         assert_eq!(decoded.crn, 12);
         assert_eq!(decoded.crm, 0);
+    }
+
+    #[test]
+    fn esr_el2_trapped_wf_decodes_ti() {
+        let ec_bits = (ExceptionClass::TrappedWFInstruction as u64) << 26;
+
+        let esr_wfi = ESR_EL2::from_bits(ec_bits | (TI::WFI as u64));
+        let ec = esr_wfi.get_enum::<_, ExceptionClass>(ESR_EL2::ec);
+        let ti = esr_wfi.get_enum::<_, TI>(ESR_EL2::ti);
+        assert_eq!(ec, Some(ExceptionClass::TrappedWFInstruction));
+        assert_eq!(ti, Some(TI::WFI));
+
+        let esr_wfe = ESR_EL2::from_bits(ec_bits | (TI::WFE as u64));
+        let ti = esr_wfe.get_enum::<_, TI>(ESR_EL2::ti);
+        assert_eq!(ti, Some(TI::WFE));
     }
 }

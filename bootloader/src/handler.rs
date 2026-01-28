@@ -29,10 +29,12 @@ use core::ptr::write_volatile;
 use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
+use exceptions::registers::TI;
 use exceptions::registers::WriteNotRead;
 use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
 use exceptions::synchronous_handler::InstructionAbortInfo;
+use exceptions::synchronous_handler::TrappedWfInfo;
 use gdb_remote::WatchpointKind;
 
 static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
@@ -64,6 +66,7 @@ pub(crate) fn setup_handler() {
         crate::vbar_watch::sysreg_trap_handler,
     );
     exceptions::synchronous_handler::set_instruction_abort_handler(instruction_abort_handler);
+    exceptions::synchronous_handler::set_trapped_wf_handler(trapped_wf_handler);
     exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // deny guest PSCI CPU_ON.
@@ -492,6 +495,27 @@ fn irq_handler(regs: &mut cpu::Registers) {
     let reason = gdb_uart::take_attach_reason();
     if reason != 0 {
         debug::enter_debug_from_irq(regs, reason);
+    }
+}
+
+fn trapped_wf_handler(regs: &mut cpu::Registers, info: &TrappedWfInfo) {
+    gdb_uart::poll_rx();
+    let reason = gdb_uart::take_attach_reason();
+    if reason != 0 {
+        debug::enter_debug_from_irq(regs, reason);
+    }
+
+    cpu::set_elr_el2(cpu::get_elr_el2().wrapping_add(4));
+
+    match info.ti {
+        TI::WFE | TI::WFET => {
+            // SAFETY: WFE is used to emulate a trapped guest wait after releasing locks.
+            unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
+        }
+        TI::WFI | TI::WFIT => {
+            // SAFETY: WFI is used to emulate a trapped guest wait after releasing locks.
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+        }
     }
 }
 

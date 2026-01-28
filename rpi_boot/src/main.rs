@@ -299,7 +299,7 @@ extern "C" fn main() -> ! {
     println!("Stage2Paging: {:#?}", paging_data);
     println!("EL2Stage1Paging: {:#?}", stage1_paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation(true);
+    Stage2Paging::enable_stage2_translation(true, false);
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
 

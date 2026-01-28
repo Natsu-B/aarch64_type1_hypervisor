@@ -184,7 +184,20 @@ pub fn handle_irq() {
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
     let state = unsafe { (&mut *guard).assume_init_mut() };
+    drain_uart_locked(state);
+}
 
+pub fn poll_rx() {
+    if !GDB_UART_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let mut guard = GDB_UART_STATE.lock_irqsave();
+    // SAFETY: READY is published after full initialization with Release ordering.
+    let state = unsafe { (&mut *guard).assume_init_mut() };
+    drain_uart_locked(state);
+}
+
+fn drain_uart_locked(state: &mut GdbUartState<RX_RING_SIZE>) {
     loop {
         let Some(byte) = state.uart.try_read_byte() else {
             break;

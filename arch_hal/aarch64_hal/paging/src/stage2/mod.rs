@@ -374,7 +374,7 @@ impl Stage2Paging {
         Ok(())
     }
 
-    pub fn enable_stage2_translation(receive_irq: bool) {
+    pub fn enable_stage2_translation(receive_irq: bool, receive_wfq: bool) {
         let mut hcr = HCR_EL2::new()
             .set(HCR_EL2::vm, 0b1)
             .set(HCR_EL2::api, 0b1)
@@ -385,6 +385,9 @@ impl Stage2Paging {
                 .set(HCR_EL2::fmo, 0b1)
                 .set(HCR_EL2::imo, 0b1)
                 .set(HCR_EL2::amo, 0b1);
+        }
+        if receive_wfq {
+            hcr = hcr.set(HCR_EL2::twi, 0b1).set(HCR_EL2::twe, 0b1);
         }
         cpu::set_hcr_el2(hcr.bits());
     }

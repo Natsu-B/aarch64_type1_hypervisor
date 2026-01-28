@@ -9,6 +9,7 @@ use crate::registers::ExceptionClass;
 use crate::registers::InstructionRegisterSize;
 use crate::registers::SyndromeAccessSize;
 use crate::registers::SysRegIss;
+use crate::registers::TI;
 use crate::registers::WriteNotRead;
 use cpu::Registers;
 use cpu::fault_ipa_el2;
@@ -43,6 +44,7 @@ pub type DataAbortHandler =
     fn(*mut c_void, &mut Registers, &DataAbortInfo, Option<&emulation::MmioDecoded>);
 pub type DebugExceptionHandler = fn(&mut Registers, ExceptionClass);
 pub type SysRegTrapHandler = fn(&mut Registers, &SysRegTrapInfo);
+pub type TrappedWfHandler = fn(&mut Registers, &TrappedWfInfo);
 
 #[derive(Copy, Clone, Debug)]
 pub enum DataAbortAccessSource {
@@ -73,6 +75,13 @@ pub struct SysRegTrapInfo {
     pub iss: SysRegIss,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct TrappedWfInfo {
+    pub esr_el2: ESR_EL2,
+    pub elr_el2: u64,
+    pub ti: TI,
+}
+
 impl DataAbortInfo {
     pub fn register_mut<'a>(&self, regs: &'a mut Registers) -> Option<&'a mut u64> {
         let access = self.access?;
@@ -89,6 +98,7 @@ static SYNCHRONOUS_HANDLER: SyncUnsafeCell<SynchronousHandler> =
         debug_func: None,
         sysreg_trap_func: None,
         instruction_abort_func: None,
+        trapped_wf_func: None,
     });
 
 struct SynchronousHandler {
@@ -96,6 +106,7 @@ struct SynchronousHandler {
     debug_func: Option<DebugExceptionHandler>,
     sysreg_trap_func: Option<SysRegTrapHandler>,
     instruction_abort_func: Option<InstructionAbortHandler>,
+    trapped_wf_func: Option<TrappedWfHandler>,
 }
 
 pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
@@ -112,6 +123,10 @@ pub fn set_sysreg_trap_handler(handler: SysRegTrapHandler) {
 
 pub fn set_instruction_abort_handler(handler: InstructionAbortHandler) {
     unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.instruction_abort_func = Some(handler);
+}
+
+pub fn set_trapped_wf_handler(handler: TrappedWfHandler) {
+    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.trapped_wf_func = Some(handler);
 }
 
 pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
@@ -173,6 +188,20 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                             fault_ipa,
                             esr_el2.bits()
                         );
+                    }
+                }
+                ExceptionClass::TrappedWFInstruction => {
+                    let handler = unsafe { &*SYNCHRONOUS_HANDLER.get() };
+                    let ti = esr_el2.get_enum(ESR_EL2::ti).unwrap_or(TI::WFI);
+                    let info = TrappedWfInfo {
+                        esr_el2,
+                        elr_el2: get_elr_el2(),
+                        ti,
+                    };
+                    if let Some(f) = handler.trapped_wf_func {
+                        f(reg, &info);
+                    } else {
+                        cpu::set_elr_el2(cpu::get_elr_el2().wrapping_add(4));
                     }
                 }
                 ExceptionClass::BreakpointLowerLevel
