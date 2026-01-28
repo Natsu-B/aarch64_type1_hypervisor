@@ -1254,12 +1254,12 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
     }
 
     pub fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {
-        let ec = match cause {
-            DebugEntryCause::DebugException(ec) => Some(ec),
-            _ => None,
-        };
-        if self.handle_pending_step(ec) {
-            return;
+        if let DebugEntryCause::DebugException(ec) = cause {
+            if self.handle_pending_step(Some(ec)) {
+                return;
+            }
+        } else {
+            self.handle_pending_step(None);
         }
         let Some(io) = debug_io() else {
             return;

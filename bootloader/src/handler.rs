@@ -370,11 +370,23 @@ fn data_abort_handler(
     let trap_ok = !gdb_uart::is_debug_active();
     let decision = monitor::record_memfault(memfault_info);
     let should_trap = decision.should_trap && trap_ok;
+    // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
+    let next_elr = elr.wrapping_add(4);
     if should_trap {
         let kind = match write_access {
             WriteNotRead::WritingMemoryAbort => WatchpointKind::Write,
             WriteNotRead::ReadingMemoryAbort => WatchpointKind::Read,
         };
+        if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
+            let Some(register) = info.register_mut(regs) else {
+                panic!(
+                    "data abort at IPA 0x{:X} with invalid register {}",
+                    address, reg_num
+                );
+            };
+            *register = 0;
+        }
+        cpu::set_elr_el2(next_elr);
         debug::enter_debug_from_memfault(regs, kind, addr_u64);
     }
 
@@ -398,17 +410,18 @@ fn data_abort_handler(
             elr
         );
     }
-    if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
-        let Some(register) = info.register_mut(regs) else {
-            panic!(
-                "data abort at IPA 0x{:X} with invalid register {}",
-                address, reg_num
-            );
-        };
-        *register = 0;
+    if !should_trap {
+        if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
+            let Some(register) = info.register_mut(regs) else {
+                panic!(
+                    "data abort at IPA 0x{:X} with invalid register {}",
+                    address, reg_num
+                );
+            };
+            *register = 0;
+        }
+        cpu::set_elr_el2(next_elr);
     }
-    // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
-    cpu::set_elr_el2(elr + 4);
 }
 
 fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortInfo) {
