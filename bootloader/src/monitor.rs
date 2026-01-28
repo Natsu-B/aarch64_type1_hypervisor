@@ -370,6 +370,28 @@ fn write_vbar_usage(out: &mut OutBuf<'_>) {
     let _ = write!(out, "usage=hp vbar <status|last|clear|check|bt?|bt>");
 }
 
+fn write_hp_help(out: &mut OutBuf<'_>) {
+    const HELP_LINES: &[&str] = &[
+        "HyprProbe monitor commands:\n",
+        "  monitor help\n",
+        "  monitor hp help\n",
+        "  monitor hp memfault?\n",
+        "  monitor hp memfault last|clear\n",
+        "  monitor hp memfault policy get|set <off|trap|autoskip>\n",
+        "  monitor hp memfault ignore add <addr> <len>\n",
+        "  monitor hp memfault ignore add_last <len>\n",
+        "  monitor hp memfault ignore del <addr> <len>\n",
+        "  monitor hp memfault ignore list\n",
+        "  monitor hp vbar <status|last|clear|check|bt?|bt>\n",
+    ];
+    for &line in HELP_LINES {
+        if out.try_write_str(line).is_err() {
+            out.force_truncated_marker();
+            return;
+        }
+    }
+}
+
 fn write_vbar_status(out: &mut OutBuf<'_>) {
     let snapshot = vbar_watch::snapshot_status();
     let live_vbar = cpu::get_vbar_el1();
@@ -527,95 +549,225 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
     let Some(root) = parts.next() else {
         return None;
     };
-    if root != "hp" {
+    if root != "hp" && root != "help" {
         return None;
     }
 
     let mut out = OutBuf::new(out);
-    let Some(area) = parts.next() else {
-        write_error(&mut out, "bad_args");
-        return Some(out.len());
-    };
-
-    match area {
-        "memfault?" => {
+    match root {
+        "help" => {
             if parts.next().is_some() {
                 write_error(&mut out, "extra_args");
-                return Some(out.len());
-            }
-            let snapshot = snapshot_state();
-            if snapshot.pending {
-                let Some(info) = snapshot.last else {
-                    let _ = write!(out, "no");
-                    return Some(out.len());
-                };
-                let _ = write!(out, "yes ");
-                write_memfault_info(&mut out, info);
             } else {
-                let _ = write!(out, "no");
+                write_hp_help(&mut out);
             }
             Some(out.len())
         }
-        "memfault" => {
-            let Some(cmd) = parts.next() else {
-                write_error(&mut out, "bad_args");
-                return Some(out.len());
-            };
-            match cmd {
-                "last" => {
+        "hp" => match parts.next() {
+            None => {
+                write_hp_help(&mut out);
+                Some(out.len())
+            }
+            Some("help") => {
+                if parts.next().is_some() {
+                    write_error(&mut out, "extra_args");
+                } else {
+                    write_hp_help(&mut out);
+                }
+                Some(out.len())
+            }
+            Some(area) => match area {
+                "memfault?" => {
                     if parts.next().is_some() {
                         write_error(&mut out, "extra_args");
                         return Some(out.len());
                     }
                     let snapshot = snapshot_state();
-                    if let Some(info) = snapshot.last {
+                    if snapshot.pending {
+                        let Some(info) = snapshot.last else {
+                            let _ = write!(out, "no");
+                            return Some(out.len());
+                        };
+                        let _ = write!(out, "yes ");
                         write_memfault_info(&mut out, info);
-                        let _ = write!(out, " pending={}", if snapshot.pending { 1 } else { 0 });
                     } else {
-                        let _ = write!(out, "none");
+                        let _ = write!(out, "no");
                     }
                     Some(out.len())
                 }
-                "clear" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    clear_pending();
-                    let _ = write!(out, "ok");
-                    Some(out.len())
-                }
-                "policy" => {
-                    let Some(subcmd) = parts.next() else {
+                "memfault" => {
+                    let Some(cmd) = parts.next() else {
                         write_error(&mut out, "bad_args");
                         return Some(out.len());
                     };
-                    match subcmd {
-                        "get" => {
+                    match cmd {
+                        "last" => {
                             if parts.next().is_some() {
                                 write_error(&mut out, "extra_args");
                                 return Some(out.len());
                             }
                             let snapshot = snapshot_state();
-                            let _ = write!(out, "policy={}", snapshot.policy.as_str());
+                            if let Some(info) = snapshot.last {
+                                write_memfault_info(&mut out, info);
+                                let _ = write!(
+                                    out,
+                                    " pending={}",
+                                    if snapshot.pending { 1 } else { 0 }
+                                );
+                            } else {
+                                let _ = write!(out, "none");
+                            }
                             Some(out.len())
                         }
-                        "set" => {
-                            let Some(policy_str) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
-                            };
+                        "clear" => {
                             if parts.next().is_some() {
                                 write_error(&mut out, "extra_args");
                                 return Some(out.len());
                             }
-                            let Some(policy) = MemfaultPolicy::parse(policy_str) else {
-                                write_error(&mut out, "bad_policy");
+                            clear_pending();
+                            let _ = write!(out, "ok");
+                            Some(out.len())
+                        }
+                        "policy" => {
+                            let Some(subcmd) = parts.next() else {
+                                write_error(&mut out, "bad_args");
                                 return Some(out.len());
                             };
-                            set_policy(policy);
-                            let _ = write!(out, "ok policy={}", policy.as_str());
-                            Some(out.len())
+                            match subcmd {
+                                "get" => {
+                                    if parts.next().is_some() {
+                                        write_error(&mut out, "extra_args");
+                                        return Some(out.len());
+                                    }
+                                    let snapshot = snapshot_state();
+                                    let _ = write!(out, "policy={}", snapshot.policy.as_str());
+                                    Some(out.len())
+                                }
+                                "set" => {
+                                    let Some(policy_str) = parts.next() else {
+                                        write_error(&mut out, "bad_args");
+                                        return Some(out.len());
+                                    };
+                                    if parts.next().is_some() {
+                                        write_error(&mut out, "extra_args");
+                                        return Some(out.len());
+                                    }
+                                    let Some(policy) = MemfaultPolicy::parse(policy_str) else {
+                                        write_error(&mut out, "bad_policy");
+                                        return Some(out.len());
+                                    };
+                                    set_policy(policy);
+                                    let _ = write!(out, "ok policy={}", policy.as_str());
+                                    Some(out.len())
+                                }
+                                _ => {
+                                    write_error(&mut out, "bad_args");
+                                    Some(out.len())
+                                }
+                            }
+                        }
+                        "ignore" => {
+                            let Some(subcmd) = parts.next() else {
+                                write_error(&mut out, "bad_args");
+                                return Some(out.len());
+                            };
+                            match subcmd {
+                                "add" => {
+                                    let Some(addr_str) = parts.next() else {
+                                        write_error(&mut out, "bad_args");
+                                        return Some(out.len());
+                                    };
+                                    let Some(len_str) = parts.next() else {
+                                        write_error(&mut out, "bad_args");
+                                        return Some(out.len());
+                                    };
+                                    if parts.next().is_some() {
+                                        write_error(&mut out, "extra_args");
+                                        return Some(out.len());
+                                    }
+                                    let Some(base) = parse_u64_token(addr_str) else {
+                                        write_error(&mut out, "bad_addr");
+                                        return Some(out.len());
+                                    };
+                                    let Some(len) = parse_u64_token(len_str) else {
+                                        write_error(&mut out, "bad_len");
+                                        return Some(out.len());
+                                    };
+                                    match add_ignore(base, len) {
+                                        Ok(()) => {
+                                            let _ =
+                                                write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
+                                        }
+                                        Err(reason) => write_error(&mut out, reason),
+                                    }
+                                    Some(out.len())
+                                }
+                                "add_last" => {
+                                    let Some(len_str) = parts.next() else {
+                                        write_error(&mut out, "bad_args");
+                                        return Some(out.len());
+                                    };
+                                    if parts.next().is_some() {
+                                        write_error(&mut out, "extra_args");
+                                        return Some(out.len());
+                                    }
+                                    let Some(len) = parse_u64_token(len_str) else {
+                                        write_error(&mut out, "bad_len");
+                                        return Some(out.len());
+                                    };
+                                    match add_ignore_last(len) {
+                                        Ok(base) => {
+                                            let _ =
+                                                write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
+                                        }
+                                        Err(reason) => write_error(&mut out, reason),
+                                    }
+                                    Some(out.len())
+                                }
+                                "del" => {
+                                    let Some(addr_str) = parts.next() else {
+                                        write_error(&mut out, "bad_args");
+                                        return Some(out.len());
+                                    };
+                                    let Some(len_str) = parts.next() else {
+                                        write_error(&mut out, "bad_args");
+                                        return Some(out.len());
+                                    };
+                                    if parts.next().is_some() {
+                                        write_error(&mut out, "extra_args");
+                                        return Some(out.len());
+                                    }
+                                    let Some(base) = parse_u64_token(addr_str) else {
+                                        write_error(&mut out, "bad_addr");
+                                        return Some(out.len());
+                                    };
+                                    let Some(len) = parse_u64_token(len_str) else {
+                                        write_error(&mut out, "bad_len");
+                                        return Some(out.len());
+                                    };
+                                    match del_ignore(base, len) {
+                                        Ok(()) => {
+                                            let _ =
+                                                write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
+                                        }
+                                        Err(reason) => write_error(&mut out, reason),
+                                    }
+                                    Some(out.len())
+                                }
+                                "list" => {
+                                    if parts.next().is_some() {
+                                        write_error(&mut out, "extra_args");
+                                        return Some(out.len());
+                                    }
+                                    let snapshot = snapshot_state();
+                                    write_ignore_list(&mut out, &snapshot.ignores);
+                                    Some(out.len())
+                                }
+                                _ => {
+                                    write_error(&mut out, "bad_args");
+                                    Some(out.len())
+                                }
+                            }
                         }
                         _ => {
                             write_error(&mut out, "bad_args");
@@ -623,102 +775,64 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         }
                     }
                 }
-                "ignore" => {
-                    let Some(subcmd) = parts.next() else {
-                        write_error(&mut out, "bad_args");
+                "vbar" => {
+                    let Some(cmd) = parts.next() else {
+                        write_vbar_usage(&mut out);
                         return Some(out.len());
                     };
-                    match subcmd {
-                        "add" => {
-                            let Some(addr_str) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
-                            };
-                            let Some(len_str) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
-                            };
+                    match cmd {
+                        "status" => {
                             if parts.next().is_some() {
                                 write_error(&mut out, "extra_args");
                                 return Some(out.len());
                             }
-                            let Some(base) = parse_u64_token(addr_str) else {
-                                write_error(&mut out, "bad_addr");
-                                return Some(out.len());
-                            };
-                            let Some(len) = parse_u64_token(len_str) else {
-                                write_error(&mut out, "bad_len");
-                                return Some(out.len());
-                            };
-                            match add_ignore(base, len) {
-                                Ok(()) => {
-                                    let _ = write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
-                                }
-                                Err(reason) => write_error(&mut out, reason),
-                            }
+                            write_vbar_status(&mut out);
                             Some(out.len())
                         }
-                        "add_last" => {
-                            let Some(len_str) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
-                            };
+                        "last" => {
                             if parts.next().is_some() {
                                 write_error(&mut out, "extra_args");
                                 return Some(out.len());
                             }
-                            let Some(len) = parse_u64_token(len_str) else {
-                                write_error(&mut out, "bad_len");
-                                return Some(out.len());
-                            };
-                            match add_ignore_last(len) {
-                                Ok(base) => {
-                                    let _ = write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
-                                }
-                                Err(reason) => write_error(&mut out, reason),
-                            }
+                            write_vbar_last(&mut out);
                             Some(out.len())
                         }
-                        "del" => {
-                            let Some(addr_str) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
-                            };
-                            let Some(len_str) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
-                            };
+                        "clear" => {
                             if parts.next().is_some() {
                                 write_error(&mut out, "extra_args");
                                 return Some(out.len());
                             }
-                            let Some(base) = parse_u64_token(addr_str) else {
-                                write_error(&mut out, "bad_addr");
-                                return Some(out.len());
-                            };
-                            let Some(len) = parse_u64_token(len_str) else {
-                                write_error(&mut out, "bad_len");
-                                return Some(out.len());
-                            };
-                            match del_ignore(base, len) {
-                                Ok(()) => {
-                                    let _ = write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
-                                }
-                                Err(reason) => write_error(&mut out, reason),
-                            }
+                            vbar_watch::clear_last_hit();
+                            let _ = write!(out, "ok");
                             Some(out.len())
                         }
-                        "list" => {
+                        "bt?" => {
                             if parts.next().is_some() {
                                 write_error(&mut out, "extra_args");
                                 return Some(out.len());
                             }
-                            let snapshot = snapshot_state();
-                            write_ignore_list(&mut out, &snapshot.ignores);
+                            write_vbar_bt_meta(&mut out);
+                            Some(out.len())
+                        }
+                        "bt" => {
+                            if parts.next().is_some() {
+                                write_error(&mut out, "extra_args");
+                                return Some(out.len());
+                            }
+                            write_vbar_bt_dump(&mut out);
+                            Some(out.len())
+                        }
+                        "check" => {
+                            if parts.next().is_some() {
+                                write_error(&mut out, "extra_args");
+                                return Some(out.len());
+                            }
+                            vbar_watch::poll_vbar_el1_change();
+                            write_vbar_status(&mut out);
                             Some(out.len())
                         }
                         _ => {
-                            write_error(&mut out, "bad_args");
+                            write_vbar_usage(&mut out);
                             Some(out.len())
                         }
                     }
@@ -727,73 +841,8 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                     write_error(&mut out, "bad_args");
                     Some(out.len())
                 }
-            }
-        }
-        "vbar" => {
-            let Some(cmd) = parts.next() else {
-                write_vbar_usage(&mut out);
-                return Some(out.len());
-            };
-            match cmd {
-                "status" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    write_vbar_status(&mut out);
-                    Some(out.len())
-                }
-                "last" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    write_vbar_last(&mut out);
-                    Some(out.len())
-                }
-                "clear" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    vbar_watch::clear_last_hit();
-                    let _ = write!(out, "ok");
-                    Some(out.len())
-                }
-                "bt?" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    write_vbar_bt_meta(&mut out);
-                    Some(out.len())
-                }
-                "bt" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    write_vbar_bt_dump(&mut out);
-                    Some(out.len())
-                }
-                "check" => {
-                    if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
-                    }
-                    vbar_watch::poll_vbar_el1_change();
-                    write_vbar_status(&mut out);
-                    Some(out.len())
-                }
-                _ => {
-                    write_vbar_usage(&mut out);
-                    Some(out.len())
-                }
-            }
-        }
-        _ => {
-            write_error(&mut out, "bad_args");
-            Some(out.len())
-        }
+            },
+        },
+        _ => unreachable!(),
     }
 }
