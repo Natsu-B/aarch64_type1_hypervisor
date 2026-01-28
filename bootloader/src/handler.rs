@@ -132,6 +132,43 @@ fn should_log_unmapped_abort() -> bool {
     }
 }
 
+fn decoded_mmio_is_allowlisted(decoded: &MmioDecoded) -> bool {
+    fn split_allowlisted(split: &emulation::SplitPlan) -> bool {
+        for segment in split.segments() {
+            if !guest_mmio_allowlist_contains_range(segment.ipa as usize, segment.size as usize) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn range_allowlisted(ipa: u64, size: u8, split: &Option<emulation::SplitPlan>) -> bool {
+        if let Some(plan) = split {
+            split_allowlisted(plan)
+        } else {
+            guest_mmio_allowlist_contains_range(ipa as usize, size as usize)
+        }
+    }
+
+    match decoded {
+        MmioDecoded::Single {
+            desc, ipa, split, ..
+        } => range_allowlisted(*ipa, desc.size, split),
+        MmioDecoded::Pair {
+            desc,
+            ipa0,
+            ipa1,
+            split0,
+            split1,
+            ..
+        } => {
+            range_allowlisted(*ipa0, desc.size, split0)
+                && range_allowlisted(*ipa1, desc.size, split1)
+        }
+        MmioDecoded::Prefetch { .. } => true,
+    }
+}
+
 fn data_abort_handler(
     _ctx: *mut c_void,
     regs: &mut cpu::Registers,
@@ -139,10 +176,12 @@ fn data_abort_handler(
     decoded: Option<&MmioDecoded>,
 ) {
     if let Some(plan) = decoded {
-        match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
-            EmulationOutcome::Handled => return,
-            EmulationOutcome::NotHandled => {
-                panic!("decoded MMIO request was not handled: {:?}", plan)
+        if decoded_mmio_is_allowlisted(plan) {
+            match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
+                EmulationOutcome::Handled => return,
+                EmulationOutcome::NotHandled => {
+                    panic!("decoded MMIO request was not handled: {:?}", plan)
+                }
             }
         }
     }
