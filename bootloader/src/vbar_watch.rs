@@ -8,13 +8,9 @@ use arch_hal::exceptions;
 use arch_hal::exceptions::registers::ExceptionClass;
 use arch_hal::paging;
 use arch_hal::println;
+use core::arch::asm;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
-
-unsafe extern "C" {
-    static __el1_region_start: u8;
-    static __el1_region_end: u8;
-}
 
 const PAGE_SIZE: u64 = 0x1000;
 const VBAR_ALIGN: u64 = 0x800;
@@ -29,12 +25,6 @@ const SPSR_M_MASK: u64 = 0b1111;
 const SPSR_M_EL0T: u64 = 0b0000;
 const SPSR_M_EL1T: u64 = 0b0100;
 const SPSR_M_EL1H: u64 = 0b0101;
-
-fn vbar_in_fallback_region(vbar_va: u64) -> bool {
-    let start = unsafe { &__el1_region_start as *const u8 as u64 };
-    let end = unsafe { &__el1_region_end as *const u8 as u64 };
-    vbar_va >= start && vbar_va < end
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VbarWatchMode {
@@ -528,24 +518,6 @@ fn protect_and_patch_vbar_locked(
     vbar_el1_va: u64,
     state: &mut VbarWatchState,
 ) -> Result<(), &'static str> {
-    if vbar_in_fallback_region(vbar_el1_va) {
-        if state.current_vbar_ipa != 0 {
-            restore_patches(state.current_vbar_ipa, state);
-            if state.current_vbar_ipa_page != 0 {
-                paging::stage2::set_4k_rw(state.current_vbar_ipa_page)
-                    .map_err(|_| "stage2 rw failed")?;
-            }
-            state.clear_patches();
-            state.clear_steps();
-            state.in_vector_entry_window = false;
-        }
-        state.current_vbar_va = vbar_el1_va;
-        state.current_vbar_ipa = 0;
-        state.current_vbar_ipa_page = 0;
-        state.pending_repatch = false;
-        return Ok(());
-    }
-
     let Some(ipa) = cpu::va_to_ipa_el2_read(vbar_el1_va) else {
         return Err("va_to_ipa_el2_read failed");
     };
@@ -581,6 +553,44 @@ fn protect_and_patch_vbar_locked(
     Ok(())
 }
 
+/// Synchronize modified instruction bytes so that the guest reliably fetches the updated vectors.
+///
+/// This performs:
+/// - D-cache clean by VA to PoU for the affected range
+/// - ISH DSB
+/// - I-cache invalidate by VA to PoU for the affected range
+/// - ISH DSB + ISB
+///
+/// Note: we conservatively assume a 64-byte cache line. Stepping by 64B is safe even if the
+/// actual line size is larger (we may touch the same line multiple times). If the platform uses
+/// a smaller line size, this should be updated to read CTR_EL0 and derive the real line size.
+fn sync_modified_code_range(addr: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    const LINE: u64 = 64;
+    let start = addr & !(LINE - 1);
+    let end = (addr + len as u64 + (LINE - 1)) & !(LINE - 1);
+
+    // SAFETY: cache maintenance instructions; `addr` range is assumed to be valid VA in the
+    // current address space (EL2 stage-1). The operations are bounded by `[start, end)`.
+    unsafe {
+        let mut cur = start;
+        while cur < end {
+            asm!("dc cvau, {x}", x = in(reg) cur, options(nostack, preserves_flags));
+            cur += LINE;
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+        cur = start;
+        while cur < end {
+            asm!("ic ivau, {x}", x = in(reg) cur, options(nostack, preserves_flags));
+            cur += LINE;
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
 fn patch_vectors(ipa_base: u64, state: &mut VbarWatchState) -> Result<(), &'static str> {
     for (slot_idx, offset) in VBAR_PATCH_OFFSETS.iter().enumerate() {
         let offset_u64 = *offset as u64;
@@ -600,10 +610,13 @@ fn patch_vectors(ipa_base: u64, state: &mut VbarWatchState) -> Result<(), &'stat
 
         state.is_patched[slot_idx] = true;
     }
+    // Vector table spans 0x800 bytes from VBAR base (0x0..0x7ff).
+    sync_modified_code_range(ipa_base, 0x800);
     Ok(())
 }
 
 fn restore_patches(ipa_base: u64, state: &mut VbarWatchState) {
+    let mut touched = false;
     for (slot_idx, offset) in VBAR_PATCH_OFFSETS.iter().enumerate() {
         if !state.is_patched[slot_idx] {
             continue;
@@ -613,6 +626,10 @@ fn restore_patches(ipa_base: u64, state: &mut VbarWatchState) {
         };
         let addr = ipa_base + *offset as u64;
         write_u32(addr, original);
+        touched = true;
+    }
+    if touched {
+        sync_modified_code_range(ipa_base, 0x800);
     }
 }
 
@@ -680,6 +697,7 @@ fn handle_vbar_brk(regs: &mut cpu::Registers) -> bool {
 
     let addr = state.current_vbar_ipa + offset as u64;
     write_u32(addr, original);
+    sync_modified_code_range(addr, 4);
 
     if state.push_step(slot, snapshot).is_err() {
         state.last_error = Some(VbarErrorInfo {
@@ -726,6 +744,7 @@ fn handle_internal_step() -> bool {
     if original != brk {
         write_u32(addr, brk);
     }
+    sync_modified_code_range(addr, 4);
 
     if !state.step_in_progress() {
         if let Some(restore) = state.step_restore.take() {
