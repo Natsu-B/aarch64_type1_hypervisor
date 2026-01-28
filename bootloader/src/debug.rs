@@ -154,16 +154,7 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
     let _stop_loop = gdb_uart::begin_stop_loop();
 
     let el2_timer = timer::El2PhysicalTimer::new();
-    let now = el2_timer.now();
-    let freq = el2_timer.counter_frequency_hz().get();
-    let attach_ticks = (u128::from(freq) * u128::from(ATTACH_DEADLINE_MS)) / 1000;
-    let attach_deadline = now.saturating_add(attach_ticks as u64);
-    let prefetch_idle_ticks = if PREFETCH_IDLE_TIMEOUT_MS == 0 {
-        0
-    } else {
-        let ticks = (u128::from(freq) * u128::from(PREFETCH_IDLE_TIMEOUT_MS)) / 1000;
-        ticks.min(u128::from(u64::MAX)) as u64
-    };
+    let (attach_deadline, prefetch_idle_ticks) = attach_deadlines(&el2_timer);
     // Reserved for post-attach idle timeout wiring in the debug loop.
     let _post_attach_idle_timeout_ms = IDLE_TIMEOUT_MS;
 
@@ -184,17 +175,43 @@ pub(crate) fn enter_debug_from_memfault(
     regs: &mut cpu::Registers,
     kind: WatchpointKind,
     addr: u64,
-) {
+) -> bool {
     if gdb_uart::is_debug_active() {
-        return;
+        return false;
     }
 
-    gdb_uart::set_debug_session_active(true);
+    let _stop_loop = gdb_uart::begin_stop_loop();
+    gdb_uart::poll_rx();
+    if !gdb_uart::is_debug_session_active() {
+        let reason = gdb_uart::take_attach_reason();
+        if reason == 0 {
+            return false;
+        }
+        let el2_timer = timer::El2PhysicalTimer::new();
+        let (attach_deadline, prefetch_idle_ticks) = attach_deadlines(&el2_timer);
+        let prefetch = gdb_uart::prefetch_first_rsp_frame(attach_deadline, prefetch_idle_ticks);
+        if prefetch != gdb_uart::PrefetchResult::Success {
+            return false;
+        }
+        gdb_uart::set_debug_session_active(true);
+    }
     monitor::enable_memfault_trap_if_off();
 
+    // Enter "stop-loop" mode so GDB UART RX is not consumed by IRQ handler.
+    // This ensures the debug loop (polling) can receive RSP packets reliably.
+    gdb_uart::set_debug_session_active(true);
+    gdb_uart::set_debug_active(true);
+
+    // Disable RX/RT interrupts while stopped and compensate guest virtual counter on exit.
+    let _stop_guard = gdb_uart::begin_stop_loop();
+
     let _debug_active = DebugActiveGuard::new();
-    let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
+
+    // Always clear flags even if the debug loop exits via continue/step.
+    gdb_uart::set_debug_active(false);
+    gdb_uart::set_debug_session_active(false);
+    true
 }
 
 fn guest_ipa_contains(ipa: u64, len: usize) -> bool {
@@ -235,6 +252,20 @@ fn append_bytes(buf: &mut [u8], idx: &mut usize, bytes: &[u8]) -> bool {
     buf[*idx..end].copy_from_slice(bytes);
     *idx = end;
     true
+}
+
+fn attach_deadlines(el2_timer: &timer::El2PhysicalTimer) -> (u64, u64) {
+    let now = el2_timer.now();
+    let freq = el2_timer.counter_frequency_hz().get();
+    let attach_ticks = (u128::from(freq) * u128::from(ATTACH_DEADLINE_MS)) / 1000;
+    let attach_deadline = now.saturating_add(attach_ticks as u64);
+    let prefetch_idle_ticks = if PREFETCH_IDLE_TIMEOUT_MS == 0 {
+        0
+    } else {
+        let ticks = (u128::from(freq) * u128::from(PREFETCH_IDLE_TIMEOUT_MS)) / 1000;
+        ticks.min(u128::from(u64::MAX)) as u64
+    };
+    (attach_deadline, prefetch_idle_ticks)
 }
 
 fn append_memory_entry(buf: &mut [u8], idx: &mut usize, kind: &[u8], start: u64, len: u64) -> bool {

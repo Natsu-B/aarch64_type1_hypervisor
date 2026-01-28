@@ -56,8 +56,27 @@ static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
 static GICV2: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 static GDB_UART_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
 static UNMAPPED_ABORT_COUNT: SyncUnsafeCell<u32> = SyncUnsafeCell::new(0);
+static MEMFAULT_TRAP_SKIP_LOG: SyncUnsafeCell<MemfaultTrapSkipLog> =
+    SyncUnsafeCell::new(MemfaultTrapSkipLog::new());
 
 const UNMAPPED_ABORT_LOG_LIMIT: u32 = 16;
+const MEMFAULT_TRAP_SKIP_LOG_WINDOW_MS: u64 = 500;
+
+struct MemfaultTrapSkipLog {
+    last_addr: u64,
+    last_ticks: u64,
+    valid: bool,
+}
+
+impl MemfaultTrapSkipLog {
+    const fn new() -> Self {
+        Self {
+            last_addr: 0,
+            last_ticks: 0,
+            valid: false,
+        }
+    }
+}
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
@@ -132,6 +151,35 @@ fn should_log_unmapped_abort() -> bool {
         let next = counter.saturating_add(1);
         *counter = next;
         next <= UNMAPPED_ABORT_LOG_LIMIT || next.is_power_of_two()
+    }
+}
+
+fn should_log_memfault_trap_skip(addr: u64) -> bool {
+    let now = timer::read_counter();
+    let freq = timer::read_counter_frequency();
+    if freq == 0 {
+        return true;
+    }
+    let window_ticks = (u128::from(freq) * u128::from(MEMFAULT_TRAP_SKIP_LOG_WINDOW_MS)) / 1000;
+    let window_ticks = window_ticks.min(u128::from(u64::MAX)) as u64;
+
+    // SAFETY: data abort handler is synchronous and non-preemptible for this state.
+    unsafe {
+        let state = &mut *MEMFAULT_TRAP_SKIP_LOG.get();
+        if !state.valid {
+            state.valid = true;
+            state.last_addr = addr;
+            state.last_ticks = now;
+            return true;
+        }
+        let same_addr = state.last_addr == addr;
+        let within_window = window_ticks != 0 && now.wrapping_sub(state.last_ticks) < window_ticks;
+        if same_addr && within_window {
+            return false;
+        }
+        state.last_addr = addr;
+        state.last_ticks = now;
+        true
     }
 }
 
@@ -367,12 +415,14 @@ fn data_abort_handler(
         esr,
         far: info.far_el2,
     };
-    let trap_ok = !gdb_uart::is_debug_active();
+    let in_debug = gdb_uart::is_debug_active();
+    let session_active = gdb_uart::is_debug_session_active();
+    let trap_ok = !in_debug && session_active;
     let decision = monitor::record_memfault(memfault_info);
-    let should_trap = decision.should_trap && trap_ok;
     // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
     let next_elr = elr.wrapping_add(4);
-    if should_trap {
+    let mut did_trap = false;
+    if decision.should_trap && !in_debug {
         let kind = match write_access {
             WriteNotRead::WritingMemoryAbort => WatchpointKind::Write,
             WriteNotRead::ReadingMemoryAbort => WatchpointKind::Read,
@@ -387,15 +437,21 @@ fn data_abort_handler(
             *register = 0;
         }
         cpu::set_elr_el2(next_elr);
-        debug::enter_debug_from_memfault(regs, kind, addr_u64);
+        did_trap = debug::enter_debug_from_memfault(regs, kind, addr_u64);
+        if !did_trap && !trap_ok && should_log_memfault_trap_skip(addr_u64) {
+            println!(
+                "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                addr, access_bytes, reg_bits, esr, elr
+            );
+        }
     }
 
-    if !should_trap && trap_ok {
+    if !decision.should_trap && !in_debug {
         gdb_uart::handle_irq();
         debug::enter_debug_from_irq(regs, gdb_uart::take_attach_reason());
     }
 
-    if log_now && decision.should_log && !should_trap {
+    if log_now && decision.should_log && !did_trap {
         println!(
             "warning: unmapped access {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
             if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
@@ -410,7 +466,7 @@ fn data_abort_handler(
             elr
         );
     }
-    if !should_trap {
+    if !did_trap {
         if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
             let Some(register) = info.register_mut(regs) else {
                 panic!(
@@ -447,11 +503,12 @@ fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortI
         far,
     };
 
-    let trap_ok = !gdb_uart::is_debug_active();
+    let in_debug = gdb_uart::is_debug_active();
     let decision = monitor::record_memfault(memfault_info);
-    if decision.should_trap && trap_ok {
-        debug::enter_debug_from_memfault(regs, WatchpointKind::Access, ipa_or_far);
-        return;
+    if decision.should_trap && !in_debug {
+        if debug::enter_debug_from_memfault(regs, WatchpointKind::Access, ipa_or_far) {
+            return;
+        }
     }
 
     loop {
