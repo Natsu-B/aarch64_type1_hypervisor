@@ -237,6 +237,7 @@ fn data_abort_handler(
         }
     }
 
+    let fault_addr = info.fault_ipa.unwrap_or(info.far_el2);
     let Some(address) = info.fault_ipa else {
         panic!(
             "data abort without IPA (FnV={}, FAR_EL2={:#X})",
@@ -257,7 +258,7 @@ fn data_abort_handler(
     let write_access: WriteNotRead = access.write_access;
     let reg_num = access.reg_num;
 
-    let addr_u64 = address;
+    let addr_u64 = fault_addr;
     let addr = address as usize;
     let access_bytes = access_width_bytes(access_width);
     let reg_bits = match reg_size {
@@ -423,9 +424,12 @@ fn data_abort_handler(
     let next_elr = elr.wrapping_add(4);
     let mut did_trap = false;
     if decision.should_trap && !in_debug {
-        let kind = match write_access {
-            WriteNotRead::WritingMemoryAbort => WatchpointKind::Write,
-            WriteNotRead::ReadingMemoryAbort => WatchpointKind::Read,
+        let kind = if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+            WatchpointKind::Write
+        } else if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
+            WatchpointKind::Read
+        } else {
+            WatchpointKind::Access
         };
         if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
             let Some(register) = info.register_mut(regs) else {
@@ -441,7 +445,7 @@ fn data_abort_handler(
         if !did_trap && !trap_ok && should_log_memfault_trap_skip(addr_u64) {
             println!(
                 "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                addr, access_bytes, reg_bits, esr, elr
+                addr_u64, access_bytes, reg_bits, esr, elr
             );
         }
     }
@@ -459,7 +463,7 @@ fn data_abort_handler(
             } else {
                 "read"
             },
-            addr,
+            addr_u64,
             access_bytes,
             reg_bits,
             esr,
@@ -538,6 +542,11 @@ fn irq_handler(regs: &mut cpu::Registers) {
     if ack.intid == timer::SBSA_EL2_PHYSICAL_TIMER_INTID {
         irq_monitor::handle_physical_timer_irq();
         gic.end_of_interrupt(ack).unwrap();
+        gdb_uart::poll_rx();
+        let reason = gdb_uart::take_attach_reason();
+        if reason != 0 {
+            debug::enter_debug_from_irq(regs, reason);
+        }
         return;
     }
     // SAFETY: GDB UART INTID is written once during boot and then read-only.

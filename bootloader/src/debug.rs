@@ -183,12 +183,14 @@ pub(crate) fn enter_debug_from_memfault(
     // Hold debug-active + stop-loop for the whole debug entry to guarantee polling works
     // even when guest IRQs are masked.
     let _debug_guard = DebugActiveGuard::new();
+    let saved_daif = cpu::read_daif();
     let _stop_guard = gdb_uart::begin_stop_loop();
     gdb_uart::poll_rx();
 
     if !gdb_uart::is_debug_session_active() {
         let attach_reason = gdb_uart::take_attach_reason();
         if attach_reason == 0 {
+            cpu::irq_restore(saved_daif);
             return false;
         }
         let attach_deadline_ticks = timer::El2PhysicalTimer::new()
@@ -198,6 +200,7 @@ pub(crate) fn enter_debug_from_memfault(
         let prefetch =
             gdb_uart::prefetch_first_rsp_frame(attach_deadline_ticks, idle_timeout_ticks);
         if prefetch != gdb_uart::PrefetchResult::Success {
+            cpu::irq_restore(saved_daif);
             return false;
         }
         gdb_uart::set_debug_session_active(true);
@@ -211,11 +214,13 @@ pub(crate) fn enter_debug_from_memfault(
             _ => aarch64_gdb::DebugEntryCause::AttachDollarWithWatchpoint { kind, addr },
         };
         aarch64_gdb::debug_entry(regs, cause);
+        cpu::irq_restore(saved_daif);
         return true;
     }
 
     // Session already active: send a normal asynchronous watchpoint stop-reply.
     aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
+    cpu::irq_restore(saved_daif);
     true
 }
 
