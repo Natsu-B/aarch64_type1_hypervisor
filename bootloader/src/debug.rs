@@ -180,37 +180,42 @@ pub(crate) fn enter_debug_from_memfault(
         return false;
     }
 
-    let _stop_loop = gdb_uart::begin_stop_loop();
+    // Hold debug-active + stop-loop for the whole debug entry to guarantee polling works
+    // even when guest IRQs are masked.
+    let _debug_guard = DebugActiveGuard::new();
+    let _stop_guard = gdb_uart::begin_stop_loop();
     gdb_uart::poll_rx();
+
     if !gdb_uart::is_debug_session_active() {
-        let reason = gdb_uart::take_attach_reason();
-        if reason == 0 {
+        let attach_reason = gdb_uart::take_attach_reason();
+        if attach_reason == 0 {
             return false;
         }
-        let el2_timer = timer::El2PhysicalTimer::new();
-        let (attach_deadline, prefetch_idle_ticks) = attach_deadlines(&el2_timer);
-        let prefetch = gdb_uart::prefetch_first_rsp_frame(attach_deadline, prefetch_idle_ticks);
+        let attach_deadline_ticks = timer::El2PhysicalTimer::new()
+            .now()
+            .saturating_add(625_000_000);
+        let idle_timeout_ticks = 3_750_000_000;
+        let prefetch =
+            gdb_uart::prefetch_first_rsp_frame(attach_deadline_ticks, idle_timeout_ticks);
         if prefetch != gdb_uart::PrefetchResult::Success {
             return false;
         }
         gdb_uart::set_debug_session_active(true);
+
+        // IMPORTANT:
+        // - The first RSP frame (e.g. qSupported) may already be buffered by prefetch.
+        // - Do NOT send an unsolicited stop-reply (T05watch...) before replying to that request.
+        // - Report the memfault stop reason via `?` using server last_stop.
+        let cause = match attach_reason {
+            2 => aarch64_gdb::DebugEntryCause::CtrlCWithWatchpoint { kind, addr },
+            _ => aarch64_gdb::DebugEntryCause::AttachDollarWithWatchpoint { kind, addr },
+        };
+        aarch64_gdb::debug_entry(regs, cause);
+        return true;
     }
-    monitor::enable_memfault_trap_if_off();
 
-    // Enter "stop-loop" mode so GDB UART RX is not consumed by IRQ handler.
-    // This ensures the debug loop (polling) can receive RSP packets reliably.
-    gdb_uart::set_debug_session_active(true);
-    gdb_uart::set_debug_active(true);
-
-    // Disable RX/RT interrupts while stopped and compensate guest virtual counter on exit.
-    let _stop_guard = gdb_uart::begin_stop_loop();
-
-    let _debug_active = DebugActiveGuard::new();
+    // Session already active: send a normal asynchronous watchpoint stop-reply.
     aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
-
-    // Always clear flags even if the debug loop exits via continue/step.
-    gdb_uart::set_debug_active(false);
-    gdb_uart::set_debug_session_active(false);
     true
 }
 

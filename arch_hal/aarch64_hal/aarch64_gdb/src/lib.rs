@@ -1121,7 +1121,22 @@ pub enum DebugEntryCause {
     DebugException(ExceptionClass),
     AttachDollar,
     CtrlC,
-    Watchpoint { kind: WatchpointKind, addr: u64 },
+    Watchpoint {
+        kind: WatchpointKind,
+        addr: u64,
+    },
+
+    /// Attach is in progress (first RSP frame may already be buffered),
+    /// so do NOT send an unsolicited stop-reply before responding to the buffered request.
+    /// The stop reason is reported via `?` (GdbServer last_stop).
+    AttachDollarWithWatchpoint {
+        kind: WatchpointKind,
+        addr: u64,
+    },
+    CtrlCWithWatchpoint {
+        kind: WatchpointKind,
+        addr: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1301,11 +1316,23 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         }
 
         let mut pending_stop_reply = match cause {
-            DebugEntryCause::DebugException(_) => Some(StopReply::Sigtrap),
+            DebugEntryCause::DebugException(_) => {
+                self.server.set_last_stop_sigtrap();
+                Some(StopReply::Sigtrap)
+            }
             DebugEntryCause::Watchpoint { kind, addr } => {
+                self.server.set_last_stop_watch(kind, addr);
                 Some(StopReply::Watchpoint { kind, addr })
             }
-            _ => None,
+            DebugEntryCause::AttachDollar | DebugEntryCause::CtrlC => {
+                self.server.set_last_stop_sigtrap();
+                None
+            }
+            DebugEntryCause::AttachDollarWithWatchpoint { kind, addr }
+            | DebugEntryCause::CtrlCWithWatchpoint { kind, addr } => {
+                self.server.set_last_stop_watch(kind, addr);
+                None
+            }
         };
         let mut tx_hold = None;
         let outcome = 'debug: loop {

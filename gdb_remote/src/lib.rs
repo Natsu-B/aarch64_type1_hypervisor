@@ -1,5 +1,49 @@
 #![no_std]
 
+use core::mem;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LastStopKind {
+    Sigtrap = 0,
+    WatchRead = 1,
+    WatchWrite = 2,
+    WatchAccess = 3,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LastStop {
+    kind: LastStopKind,
+    addr: u64,
+}
+
+impl LastStop {
+    const fn sigtrap() -> Self {
+        Self {
+            kind: LastStopKind::Sigtrap,
+            addr: 0,
+        }
+    }
+}
+
+impl LastStopKind {
+    fn from_watch(kind: target::WatchpointKind) -> Self {
+        match kind {
+            target::WatchpointKind::Read => LastStopKind::WatchRead,
+            target::WatchpointKind::Write => LastStopKind::WatchWrite,
+            target::WatchpointKind::Access => LastStopKind::WatchAccess,
+        }
+    }
+    fn to_watch(self) -> Option<target::WatchpointKind> {
+        match self {
+            LastStopKind::WatchRead => Some(target::WatchpointKind::Read),
+            LastStopKind::WatchWrite => Some(target::WatchpointKind::Write),
+            LastStopKind::WatchAccess => Some(target::WatchpointKind::Access),
+            LastStopKind::Sigtrap => None,
+        }
+    }
+}
+
 use core::convert::Infallible;
 use core::fmt;
 
@@ -160,6 +204,9 @@ pub struct GdbServer<const MAX_PKT: usize, const TX_CAP: usize> {
     monitor_exit_armed: bool,
     advertised_packet_size: usize,
     ack_mode: bool,
+
+    // All-zero must be valid because we may be init'd via zeroing.
+    last_stop: LastStop,
 }
 
 impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
@@ -189,6 +236,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             monitor_exit_armed: false,
             advertised_packet_size,
             ack_mode: true,
+            last_stop: LastStop::sigtrap(),
         }
     }
 
@@ -340,6 +388,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
     }
 
     pub fn notify_stop_sigtrap(&mut self) -> Result<(), GdbError<Infallible, Infallible>> {
+        self.last_stop = LastStop::sigtrap();
         let out_cap = self.out_payload_cap();
         let signal = 5u8;
         let payload = [
@@ -358,6 +407,10 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         kind: WatchpointKind,
         addr: u64,
     ) -> Result<(), GdbError<Infallible, Infallible>> {
+        self.last_stop = LastStop {
+            kind: LastStopKind::from_watch(kind),
+            addr,
+        };
         let out_cap = self.out_payload_cap();
         let mut payload = [0u8; 32];
         let mut idx = 0usize;
@@ -382,6 +435,41 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             return Err(GdbError::PacketTooLong);
         }
         Self::queue_packet(&mut self.tx, &payload[..idx]).map_err(|_| GdbError::TxOverflow)
+    }
+
+    pub fn set_last_stop_sigtrap(&mut self) {
+        self.last_stop = LastStop::sigtrap();
+    }
+
+    pub fn set_last_stop_watch(&mut self, kind: WatchpointKind, addr: u64) {
+        self.last_stop = LastStop {
+            kind: LastStopKind::from_watch(kind),
+            addr,
+        };
+    }
+
+    fn send_last_stop_reply<T: Target>(&mut self) -> Result<(), GdbServerError<T>> {
+        let Some(wk) = self.last_stop.kind.to_watch() else {
+            self.send::<T>(b"S05")?;
+            return Ok(());
+        };
+        // Mirror notify_stop_watch payload format.
+        let mut scratch = [0u8; 32];
+        let mut len = 0usize;
+        scratch[len..len + 3].copy_from_slice(b"T05");
+        len += 3;
+        let label: &[u8] = match wk {
+            WatchpointKind::Write => b"watch:",
+            WatchpointKind::Read => b"rwatch:",
+            WatchpointKind::Access => b"awatch:",
+        };
+        scratch[len..len + label.len()].copy_from_slice(label);
+        len += label.len();
+        append_hex_u64(&mut scratch, &mut len, self.last_stop.addr);
+        scratch[len] = b';';
+        len += 1;
+        self.send::<T>(&scratch[..len])?;
+        Ok(())
     }
 
     fn finish_frame<T: Target>(
@@ -454,7 +542,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         );
 
         if payload == b"?" {
-            self.send::<T>(b"S05")?;
+            // Reply with the most recent stop reason (sigtrap/watchpoint).
+            self.send_last_stop_reply::<T>()?;
             return Ok(ProcessResult::None);
         }
 
