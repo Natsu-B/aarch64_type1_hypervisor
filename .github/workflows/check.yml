@@ -151,6 +151,20 @@ jobs:
 
       - run: nix develop --accept-flake-config --command bash -c 'cargo xbuild && cargo xrun rpi5'
 
+      - name: List build outputs
+        run: ls -al bin || (echo "bin/ not found" && exit 1)
+
+      - name: Upload build artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: elf-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            bin/*.elf
+            bin/.img
+          if-no-files-found: error
+          retention-days: 14
+
   canary_latest_cargo:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
