@@ -84,26 +84,31 @@ pub fn exit_failure() -> ! {
 }
 
 pub extern "C" fn exit_with_code(code: u32) -> ! {
-    const SYS_EXIT_EXTENDED: u64 = 0x20; // semihosting op
-    const ADP_APP_EXIT: u32 = 0x20026; // ADP_Stopped_ApplicationExit
+    // A64 SYS_EXIT (0x18) takes a parameter block and can return an exit status.
+    // Using SYS_EXIT keeps compatibility with implementations that may not support SYS_EXIT_EXTENDED.
+    const SYS_EXIT: u64 = 0x18; // semihosting op
+    const ADP_APP_EXIT: u64 = 0x20026; // ADP_Stopped_ApplicationExit
 
     #[repr(C)]
     struct ExitArgs {
-        reason: u32,
-        value: u32,
+        // AArch64 semihosting parameter blocks are interpreted as target_ulong words (64-bit on A64).
+        // Field 0: reason code (e.g. ADP_Stopped_ApplicationExit)
+        // Field 1: subcode (exit status)
+        reason: u64,
+        subcode: u64,
     }
 
-    let mut args = ExitArgs {
+    let args = ExitArgs {
         reason: ADP_APP_EXIT,
-        value: code,
+        subcode: code as u64,
     };
-    let ptr = &mut args as *mut ExitArgs as usize;
+    let ptr = core::ptr::addr_of!(args) as usize;
 
     unsafe {
         asm!(
             "hlt #0xf000",                 // AArch64 semihosting trap
-            in("x0") SYS_EXIT_EXTENDED,    // op
-            in("x1") ptr,                  // &ExitArgs { reason, value }
+            in("x0") SYS_EXIT,             // op
+            in("x1") ptr,                  // &ExitArgs { reason, subcode }
             options(noreturn)
         );
     }
