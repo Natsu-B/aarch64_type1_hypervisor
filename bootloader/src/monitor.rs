@@ -324,6 +324,7 @@ fn snapshot_state() -> MemfaultSnapshot {
 fn set_policy(policy: MemfaultPolicy) {
     let mut guard = MEMFAULT_STATE.lock_irqsave();
     guard.policy = policy;
+    guard.pending = false;
 }
 
 fn clear_pending() {
