@@ -19,7 +19,10 @@ const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
 // Publish debug entry state without relying on higher-level locking.
 static DEBUG_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+// Set once a GDB session handshake has completed and we should emit async stop replies.
 static DEBUG_SESSION_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+// Tracks whether we've completed an initial RSP handshake at least once.
+static DEBUG_SESSION_INITIALIZED: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
 static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
 static ATTACH_REASON: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
 
@@ -208,6 +211,7 @@ fn drain_uart_locked(state: &mut GdbUartState<RX_RING_SIZE>) {
 }
 
 fn record_attach_byte(byte: u8) {
+    // Breakpoint: attach byte detection (should be inactive after session init).
     if !DEBUG_SESSION_ACTIVE.load(Ordering::Acquire) {
         let reason = ATTACH_REASON.load(Ordering::Acquire);
         if byte == 0x03 {
@@ -238,6 +242,14 @@ pub fn is_debug_session_active() -> bool {
 
 pub fn set_debug_session_active(active: bool) {
     DEBUG_SESSION_ACTIVE.store(active, Ordering::Release);
+}
+
+pub fn is_debug_session_initialized() -> bool {
+    DEBUG_SESSION_INITIALIZED.load(Ordering::Acquire)
+}
+
+pub fn set_debug_session_initialized(active: bool) {
+    DEBUG_SESSION_INITIALIZED.store(active, Ordering::Release);
 }
 
 pub fn take_attach_reason() -> u8 {
@@ -468,6 +480,7 @@ mod tests {
     fn reset_attach_state() {
         DEBUG_ACTIVE.store(false, Ordering::Release);
         DEBUG_SESSION_ACTIVE.store(false, Ordering::Release);
+        DEBUG_SESSION_INITIALIZED.store(false, Ordering::Release);
         ATTACH_REASON.store(0, Ordering::Release);
     }
 

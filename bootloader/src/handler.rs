@@ -25,6 +25,7 @@ use arch_hal::psci::PsciReturnCode;
 use arch_hal::timer;
 use core::cell::SyncUnsafeCell;
 use core::ffi::c_void;
+use core::hint::spin_loop;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use exceptions::registers::ESR_EL2;
@@ -479,15 +480,23 @@ fn data_abort_handler(
     let next_elr = elr.wrapping_add(4);
     let mut did_trap = false;
     if decision.should_trap && !in_debug && !suppress_trap {
-        did_trap = debug::enter_debug_from_memfault(regs, stop_kind, addr_u64);
-        if did_trap {
-            return;
-        }
-        if !did_trap {
+        if decision.policy == monitor::MemfaultPolicy::Trap && !trap_ok {
+            if should_log_memfault_trap_skip(addr_u64) {
+                println!(
+                    "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                    addr_u64, access_bytes, reg_bits, esr, elr
+                );
+            }
+        } else {
+            // Breakpoint: trap decision reached (watchpoint stop expected here).
+            did_trap = debug::enter_debug_from_memfault(regs, stop_kind, addr_u64);
+            if did_trap {
+                return;
+            }
             let session_active_now = gdb_uart::is_debug_session_active();
-            if decision.policy == monitor::MemfaultPolicy::Trap || session_active_now {
-                let debug_active_now = gdb_uart::is_debug_active();
-                let attach_reason = gdb_uart::peek_attach_reason();
+            let debug_active_now = gdb_uart::is_debug_active();
+            let attach_reason = gdb_uart::peek_attach_reason();
+            if decision.policy == monitor::MemfaultPolicy::Trap && trap_ok {
                 if let Some(ipa) = fault_addr.ipa {
                     println!(
                         "bug: memfault trap requested but entry failed policy={:?} attach_reason={} debug_active={} session_active={} class={} addr=0x{:X} ipa=0x{:X} far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
@@ -528,8 +537,12 @@ fn data_abort_handler(
                         elr
                     );
                 }
-            }
-            if !trap_ok && should_log_memfault_trap_skip(addr_u64) {
+                loop {
+                    gdb_uart::poll_rx();
+                    gdb_uart::flush();
+                    spin_loop();
+                }
+            } else if !trap_ok && should_log_memfault_trap_skip(addr_u64) {
                 println!(
                     "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
                     addr_u64, access_bytes, reg_bits, esr, elr

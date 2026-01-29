@@ -132,6 +132,7 @@ pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionCla
     // Ensure the debug loop can make forward progress even if IRQ delivery is masked
     // on exception entry (polling path via gdb_uart + RX interrupt suppression).
     gdb_uart::set_debug_session_active(true);
+    gdb_uart::set_debug_session_initialized(true);
     monitor::enable_memfault_trap_if_off();
 
     let _debug_active = DebugActiveGuard::new();
@@ -166,6 +167,7 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
     }
 
     gdb_uart::set_debug_session_active(true);
+    gdb_uart::set_debug_session_initialized(true);
     monitor::enable_memfault_trap_if_off();
 
     aarch64_gdb::debug_entry(regs, cause);
@@ -189,6 +191,13 @@ pub(crate) fn enter_debug_from_memfault(
     gdb_uart::poll_rx();
 
     if !gdb_uart::is_debug_session_active() {
+        if gdb_uart::is_debug_session_initialized() {
+            // Session was initialized previously; treat as active to emit async stop reply.
+            gdb_uart::set_debug_session_active(true);
+            aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
+            cpu::irq_restore(saved_daif);
+            return true;
+        }
         let attach_reason = gdb_uart::take_attach_reason();
         if attach_reason == 0 {
             cpu::irq_restore(saved_daif);
@@ -203,6 +212,7 @@ pub(crate) fn enter_debug_from_memfault(
             return false;
         }
         gdb_uart::set_debug_session_active(true);
+        gdb_uart::set_debug_session_initialized(true);
 
         // IMPORTANT:
         // - The first RSP frame (e.g. qSupported) may already be buffered by prefetch.
@@ -218,6 +228,7 @@ pub(crate) fn enter_debug_from_memfault(
     }
 
     // Session already active: send a normal asynchronous watchpoint stop-reply.
+    // Breakpoint: watchpoint stop reply path (async watchpoint stop).
     aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
     cpu::irq_restore(saved_daif);
     true

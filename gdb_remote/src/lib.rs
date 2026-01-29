@@ -152,6 +152,17 @@ impl<const N: usize> TxRing<N> {
         if N == 0 { 0 } else { N - self.len() }
     }
 
+    fn peek(&self, offset: usize) -> Option<u8> {
+        if N == 0 {
+            return None;
+        }
+        if offset >= self.len() {
+            return None;
+        }
+        let idx = (self.tail + offset) % N;
+        Some(self.buf[idx])
+    }
+
     fn push(&mut self, byte: u8) -> Result<(), TxOverflow> {
         if N == 0 || self.full {
             return Err(TxOverflow);
@@ -437,6 +448,36 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, &payload[..idx]).map_err(|_| GdbError::TxOverflow)
     }
 
+    pub fn drop_console_output(&mut self) {
+        // Drop pending console packets to make room for stop replies.
+        loop {
+            if self.tx.len() < 2 {
+                return;
+            }
+            let Some(first) = self.tx.peek(0) else {
+                return;
+            };
+            if first != b'$' {
+                return;
+            }
+            let Some(kind) = self.tx.peek(1) else {
+                return;
+            };
+            if kind != b'O' {
+                return;
+            }
+            let _ = self.tx.pop();
+            let _ = self.tx.pop();
+            while let Some(next) = self.tx.pop() {
+                if next == b'#' {
+                    let _ = self.tx.pop();
+                    let _ = self.tx.pop();
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn set_last_stop_sigtrap(&mut self) {
         self.last_stop = LastStop::sigtrap();
     }
@@ -542,7 +583,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         );
 
         if payload == b"?" {
-            // Reply with the most recent stop reason (sigtrap/watchpoint).
+            // Breakpoint: '?' stop-reply path (server last_stop).
             self.send_last_stop_reply::<T>()?;
             return Ok(ProcessResult::None);
         }

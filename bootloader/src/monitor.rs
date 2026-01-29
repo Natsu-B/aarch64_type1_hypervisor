@@ -1,5 +1,6 @@
 use crate::guest_mmio_allowlist_contains_range;
 use crate::vbar_watch;
+use arch_hal::aarch64_gdb;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::cpu;
 use core::fmt;
@@ -442,6 +443,7 @@ fn write_hp_help(out: &mut OutBuf<'_>) {
         "  monitor hp memfault ignore add_last <len>\n",
         "  monitor hp memfault ignore del <addr> <len>\n",
         "  monitor hp memfault ignore list\n",
+        "  monitor hp gdb stop-counters\n",
         "  monitor hp vbar <status|last|clear|check|bt?|bt>\n",
     ];
     for &line in HELP_LINES {
@@ -637,6 +639,31 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                 Some(out.len())
             }
             Some(area) => match area {
+                "gdb" => {
+                    let Some(cmd) = parts.next() else {
+                        write_error(&mut out, "bad_args");
+                        return Some(out.len());
+                    };
+                    match cmd {
+                        "stop-counters" => {
+                            if parts.next().is_some() {
+                                write_error(&mut out, "extra_args");
+                                return Some(out.len());
+                            }
+                            let counters = aarch64_gdb::stop_reply_counters();
+                            let _ = write!(
+                                out,
+                                "queued={} overflow={} sent={}",
+                                counters.queued, counters.overflow, counters.sent
+                            );
+                            Some(out.len())
+                        }
+                        _ => {
+                            write_error(&mut out, "bad_args");
+                            Some(out.len())
+                        }
+                    }
+                }
                 "memfault?" => {
                     if parts.next().is_some() {
                         write_error(&mut out, "extra_args");

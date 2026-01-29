@@ -3,6 +3,7 @@
 use aarch64_mutex::RawSpinLockIrqSave;
 use core::hint::spin_loop;
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use cpu::Registers;
 use cpu::registers::DBGWCR_EL1;
@@ -1152,6 +1153,23 @@ unsafe impl Sync for DebugStubPtr {}
 static DEBUG_STUB: RawSpinLockIrqSave<Option<DebugStubPtr>> = RawSpinLockIrqSave::new(None);
 static DEBUG_IO: RawSpinLockIrqSave<Option<DebugIo>> = RawSpinLockIrqSave::new(None);
 static IN_DEBUG_STOP: AtomicBool = AtomicBool::new(false);
+static STOP_REPLY_QUEUED: AtomicU64 = AtomicU64::new(0);
+static STOP_REPLY_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+static STOP_REPLY_SENT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StopReplyCounters {
+    pub queued: u64,
+    pub overflow: u64,
+    pub sent: u64,
+}
+
+fn debug_assert_stop_counters() {
+    #[cfg(debug_assertions)]
+    {
+        let _ = stop_reply_counters();
+    }
+}
 
 struct DebugStopGuard {
     prev: bool,
@@ -1188,6 +1206,14 @@ fn debug_io() -> Option<DebugIo> {
 
 pub fn in_debug_stop() -> bool {
     IN_DEBUG_STOP.load(Ordering::Acquire)
+}
+
+pub fn stop_reply_counters() -> StopReplyCounters {
+    StopReplyCounters {
+        queued: STOP_REPLY_QUEUED.load(Ordering::Acquire),
+        overflow: STOP_REPLY_OVERFLOW.load(Ordering::Acquire),
+        sent: STOP_REPLY_SENT.load(Ordering::Acquire),
+    }
 }
 
 pub fn debug_entry(regs: &mut Registers, cause: DebugEntryCause) {
@@ -1342,10 +1368,12 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
         let mut pending_stop_reply = match cause {
             DebugEntryCause::DebugException(_) => {
+                STOP_REPLY_QUEUED.fetch_add(1, Ordering::Relaxed);
                 self.server.set_last_stop_sigtrap();
                 Some(StopReply::Sigtrap)
             }
             DebugEntryCause::Watchpoint { kind, addr } => {
+                STOP_REPLY_QUEUED.fetch_add(1, Ordering::Relaxed);
                 self.server.set_last_stop_watch(kind, addr);
                 Some(StopReply::Watchpoint { kind, addr })
             }
@@ -1365,6 +1393,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             let mut progress = false;
 
             if let Some(reply) = pending_stop_reply {
+                // Breakpoint: pending stop-reply send (watchpoint/sigtrap).
                 let send_result = match reply {
                     StopReply::Sigtrap => self.server.notify_stop_sigtrap(),
                     StopReply::Watchpoint { kind, addr } => {
@@ -1373,10 +1402,14 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 };
                 match send_result {
                     Ok(()) => {
+                        STOP_REPLY_SENT.fetch_add(1, Ordering::Relaxed);
                         pending_stop_reply = None;
                         progress = true;
                     }
-                    Err(GdbError::TxOverflow) => {}
+                    Err(GdbError::TxOverflow) => {
+                        STOP_REPLY_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                        self.server.drop_console_output();
+                    }
                     Err(_) => break 'debug DebugOutcome::Exit,
                 }
             }
