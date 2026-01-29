@@ -4,6 +4,7 @@ use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::cpu;
 use core::fmt;
 use core::fmt::Write;
+use gdb_remote::WatchpointKind;
 
 pub const MAX_IGNORES: usize = 16;
 const MEMFAULT_STORM_LIMIT: u32 = 64;
@@ -56,10 +57,13 @@ impl MemfaultAccess {
 pub struct MemfaultInfo {
     pub addr: u64,
     pub pc: u64,
+    pub kind: WatchpointKind,
+    pub ipa: Option<u64>,
     pub access: MemfaultAccess,
     pub size: u8,
     pub esr: u64,
     pub far: u64,
+    pub reg: Option<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -312,6 +316,10 @@ fn clear_pending() {
     guard.pending = false;
 }
 
+pub fn clear_memfault_pending() {
+    clear_pending();
+}
+
 fn add_ignore(base: u64, len: u64) -> Result<(), &'static str> {
     let mut guard = MEMFAULT_STATE.lock_irqsave();
     guard.add_ignore(base, len)
@@ -336,17 +344,53 @@ fn write_error(out: &mut OutBuf<'_>, reason: &str) {
     let _ = write!(out, "error={}", reason);
 }
 
+fn memfault_kind_label(kind: WatchpointKind) -> &'static str {
+    match kind {
+        WatchpointKind::Read => "read",
+        WatchpointKind::Write => "write",
+        WatchpointKind::Access => "access",
+    }
+}
+
+fn memfault_class(info: MemfaultInfo) -> &'static str {
+    let Ok(addr) = usize::try_from(info.addr) else {
+        return "invalid";
+    };
+    if guest_mmio_allowlist_contains_range(addr, info.size as usize) {
+        "allowlisted"
+    } else {
+        "invalid"
+    }
+}
+
 fn write_memfault_info(out: &mut OutBuf<'_>, info: MemfaultInfo) {
     let _ = write!(
         out,
-        "addr=0x{:x} pc=0x{:x} access={} size={} esr=0x{:x} far=0x{:x}",
+        "addr=0x{:x} kind={} access={} size={} esr=0x{:x} elr=0x{:x}",
         info.addr,
-        info.pc,
+        memfault_kind_label(info.kind),
         info.access.as_char(),
         info.size,
         info.esr,
-        info.far
+        info.pc,
     );
+    match info.ipa {
+        Some(ipa) => {
+            let _ = write!(out, " ipa=0x{:x}", ipa);
+        }
+        None => {
+            let _ = write!(out, " ipa=none");
+        }
+    }
+    match info.reg {
+        Some(reg) => {
+            let _ = write!(out, " far=0x{:x} reg={}", info.far, reg);
+        }
+        None => {
+            let _ = write!(out, " far=0x{:x} reg=none", info.far);
+        }
+    }
+    let _ = write!(out, " class={}", memfault_class(info),);
 }
 
 fn write_ignore_list(out: &mut OutBuf<'_>, ignores: &[IgnoreEntry; MAX_IGNORES]) {

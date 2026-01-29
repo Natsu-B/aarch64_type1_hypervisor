@@ -5,6 +5,7 @@ use crate::guest_mmio_allowlist_contains_range;
 use crate::irq_monitor;
 use crate::monitor;
 use crate::vgic;
+use arch_hal::aarch64_gdb;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::exceptions::emulation::EmulationOutcome;
@@ -61,6 +62,24 @@ static MEMFAULT_TRAP_SKIP_LOG: SyncUnsafeCell<MemfaultTrapSkipLog> =
 
 const UNMAPPED_ABORT_LOG_LIMIT: u32 = 16;
 const MEMFAULT_TRAP_SKIP_LOG_WINDOW_MS: u64 = 500;
+const PAGE_SIZE: u64 = 0x1000;
+
+struct FaultAddr {
+    canonical: u64,
+    ipa: Option<u64>,
+    far: u64,
+}
+
+fn canonical_fault_addr(fault_ipa: Option<u64>, far: u64) -> FaultAddr {
+    if let Some(ipa) = fault_ipa {
+        debug_assert_eq!(ipa & (PAGE_SIZE - 1), far & (PAGE_SIZE - 1));
+    }
+    FaultAddr {
+        canonical: fault_ipa.unwrap_or(far),
+        ipa: fault_ipa,
+        far,
+    }
+}
 
 struct MemfaultTrapSkipLog {
     last_addr: u64,
@@ -237,19 +256,15 @@ fn data_abort_handler(
         }
     }
 
-    let fault_addr = info.fault_ipa.unwrap_or(info.far_el2);
-    let Some(address) = info.fault_ipa else {
-        panic!(
-            "data abort without IPA (FnV={}, FAR_EL2={:#X})",
-            info.esr_el2.get(ESR_EL2::fnv),
-            info.far_el2
-        );
-    };
+    let fault_addr = canonical_fault_addr(info.fault_ipa, info.far_el2);
+    let addr_u64 = fault_addr.canonical;
+    let addr = addr_u64 as usize;
+    let addr_is_ipa = fault_addr.ipa.is_some();
 
     let Some(access) = info.access else {
         panic!(
-            "data abort at IPA 0x{:X} without access info (ISV decode failed)",
-            address
+            "data abort at addr 0x{:X} without access info (ISV decode failed)",
+            addr_u64
         );
     };
 
@@ -257,9 +272,15 @@ fn data_abort_handler(
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
     let reg_num = access.reg_num;
+    let kind = if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+        WatchpointKind::Write
+    } else if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
+        WatchpointKind::Read
+    } else {
+        WatchpointKind::Access
+    };
+    let reg_opt = u8::try_from(reg_num).ok();
 
-    let addr_u64 = fault_addr;
-    let addr = address as usize;
     let access_bytes = access_width_bytes(access_width);
     let reg_bits = match reg_size {
         InstructionRegisterSize::Instruction32bit => 32,
@@ -267,17 +288,24 @@ fn data_abort_handler(
     };
     let esr = cpu::get_esr_el2();
     let elr = cpu::get_elr_el2();
+    let log_now = should_log_unmapped_abort();
+    if !addr_is_ipa && log_now {
+        println!(
+            "warning: data abort without IPA addr=0x{:X} far=0x{:X} esr=0x{:X} elr=0x{:X}",
+            addr_u64, fault_addr.far, esr, elr
+        );
+    }
 
-    if crate::vbar_watch::is_vbar_page(address & !0xfff) {
+    if addr_is_ipa && crate::vbar_watch::is_vbar_page(addr_u64 & !0xfff) {
         let Some(register) = info.register_mut(regs) else {
             panic!(
                 "data abort at IPA 0x{:X} with invalid register {}",
-                address, reg_num
+                addr_u64, reg_num
             );
         };
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                let v = crate::vbar_watch::read_vbar_value(address, access_bytes)
+                let v = crate::vbar_watch::read_vbar_value(addr_u64, access_bytes)
                     .expect("vbar read emulation failed");
                 *register = match reg_size {
                     InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
@@ -289,7 +317,7 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-                crate::vbar_watch::write_vbar_value(address, access_bytes, reg_val)
+                crate::vbar_watch::write_vbar_value(addr_u64, access_bytes, reg_val)
                     .expect("vbar write emulation failed");
             }
         }
@@ -297,11 +325,11 @@ fn data_abort_handler(
         return;
     }
 
-    if vgic::handles_gicd(addr) {
+    if addr_is_ipa && vgic::handles_gicd(addr) {
         let Some(register) = info.register_mut(regs) else {
             panic!(
                 "data abort at IPA 0x{:X} with invalid register {}",
-                address, reg_num
+                addr_u64, reg_num
             );
         };
         match write_access {
@@ -331,39 +359,57 @@ fn data_abort_handler(
         return;
     }
 
-    let allowlisted = guest_mmio_allowlist_contains_range(addr, access_bytes);
-    let log_now = should_log_unmapped_abort();
+    let allowlisted = addr_is_ipa && guest_mmio_allowlist_contains_range(addr, access_bytes);
     if allowlisted {
         let Some(register) = info.register_mut(regs) else {
             panic!(
                 "data abort at IPA 0x{:X} with invalid register {}",
-                address, reg_num
+                addr_u64, reg_num
             );
         };
         if log_now {
-            println!(
-                "warning: unexpected abort on allowlisted MMIO {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                    "write"
-                } else {
-                    "read"
-                },
-                addr,
-                access_bytes,
-                reg_bits,
-                esr,
-                elr
-            );
+            if let Some(ipa) = fault_addr.ipa {
+                println!(
+                    "warning: mmio abort class=allowlisted {} addr=0x{:X} ipa=0x{:X} far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                    if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                        "write"
+                    } else {
+                        "read"
+                    },
+                    addr_u64,
+                    ipa,
+                    fault_addr.far,
+                    access_bytes,
+                    reg_bits,
+                    esr,
+                    elr
+                );
+            } else {
+                println!(
+                    "warning: mmio abort class=allowlisted {} addr=0x{:X} ipa=none far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                    if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                        "write"
+                    } else {
+                        "read"
+                    },
+                    addr_u64,
+                    fault_addr.far,
+                    access_bytes,
+                    reg_bits,
+                    esr,
+                    elr
+                );
+            }
         }
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
                 // SAFETY: address is within a DTB-derived allowlisted MMIO range.
                 let v = unsafe {
                     match access_width {
-                        SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
-                        SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
-                        SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
-                        SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
+                        SyndromeAccessSize::Byte => read_volatile(addr as *const u8) as u64,
+                        SyndromeAccessSize::HalfWord => read_volatile(addr as *const u16) as u64,
+                        SyndromeAccessSize::Word => read_volatile(addr as *const u32) as u64,
+                        SyndromeAccessSize::DoubleWord => read_volatile(addr as *const u64),
                     }
                 };
                 *register = match reg_size {
@@ -380,16 +426,16 @@ fn data_abort_handler(
                 unsafe {
                     match access_width {
                         SyndromeAccessSize::Byte => {
-                            write_volatile(address as *mut u8, reg_val as u8);
+                            write_volatile(addr as *mut u8, reg_val as u8);
                         }
                         SyndromeAccessSize::HalfWord => {
-                            write_volatile(address as *mut u16, reg_val as u16);
+                            write_volatile(addr as *mut u16, reg_val as u16);
                         }
                         SyndromeAccessSize::Word => {
-                            write_volatile(address as *mut u32, reg_val as u32);
+                            write_volatile(addr as *mut u32, reg_val as u32);
                         }
                         SyndromeAccessSize::DoubleWord => {
-                            write_volatile(address as *mut u64, reg_val as u64);
+                            write_volatile(addr as *mut u64, reg_val as u64);
                         }
                     }
                 }
@@ -407,6 +453,8 @@ fn data_abort_handler(
     let memfault_info = monitor::MemfaultInfo {
         addr: addr_u64,
         pc: elr,
+        kind,
+        ipa: fault_addr.ipa,
         access: if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
             monitor::MemfaultAccess::Write
         } else {
@@ -414,28 +462,23 @@ fn data_abort_handler(
         },
         size: access_bytes as u8,
         esr,
-        far: info.far_el2,
+        far: fault_addr.far,
+        reg: reg_opt,
     };
     let in_debug = gdb_uart::is_debug_active();
+    let in_debug_stop = aarch64_gdb::in_debug_stop();
     let session_active = gdb_uart::is_debug_session_active();
-    let trap_ok = !in_debug && session_active;
+    let trap_ok = !in_debug && !in_debug_stop && session_active;
     let decision = monitor::record_memfault(memfault_info);
     // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
     let next_elr = elr.wrapping_add(4);
     let mut did_trap = false;
-    if decision.should_trap && !in_debug {
-        let kind = if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-            WatchpointKind::Write
-        } else if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
-            WatchpointKind::Read
-        } else {
-            WatchpointKind::Access
-        };
+    if decision.should_trap && !in_debug && !in_debug_stop {
         if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
             let Some(register) = info.register_mut(regs) else {
                 panic!(
                     "data abort at IPA 0x{:X} with invalid register {}",
-                    address, reg_num
+                    addr_u64, reg_num
                 );
             };
             *register = 0;
@@ -450,32 +493,51 @@ fn data_abort_handler(
         }
     }
 
-    if !decision.should_trap && !in_debug {
+    if !decision.should_trap && !in_debug && !in_debug_stop {
         gdb_uart::handle_irq();
         debug::enter_debug_from_irq(regs, gdb_uart::take_attach_reason());
     }
 
-    if log_now && decision.should_log && !did_trap {
-        println!(
-            "warning: unmapped access {} addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-            if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                "write"
-            } else {
-                "read"
-            },
-            addr_u64,
-            access_bytes,
-            reg_bits,
-            esr,
-            elr
-        );
+    if log_now && !did_trap {
+        if let Some(ipa) = fault_addr.ipa {
+            println!(
+                "warning: abort class=invalid {} addr=0x{:X} ipa=0x{:X} far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                    "write"
+                } else {
+                    "read"
+                },
+                addr_u64,
+                ipa,
+                fault_addr.far,
+                access_bytes,
+                reg_bits,
+                esr,
+                elr
+            );
+        } else {
+            println!(
+                "warning: abort class=invalid {} addr=0x{:X} ipa=none far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                    "write"
+                } else {
+                    "read"
+                },
+                addr_u64,
+                fault_addr.far,
+                access_bytes,
+                reg_bits,
+                esr,
+                elr
+            );
+        }
     }
     if !did_trap {
         if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
             let Some(register) = info.register_mut(regs) else {
                 panic!(
                     "data abort at IPA 0x{:X} with invalid register {}",
-                    address, reg_num
+                    addr_u64, reg_num
                 );
             };
             *register = 0;
@@ -487,7 +549,8 @@ fn data_abort_handler(
 fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortInfo) {
     let elr = info.elr_el2;
     let far = info.far_el2;
-    let ipa_or_far = info.fault_ipa.unwrap_or(far);
+    let fault_addr = canonical_fault_addr(info.fault_ipa, far);
+    let addr_u64 = fault_addr.canonical;
     let ifsc = info.ifsc;
     println!(
         "guest instruction abort: ifsc={:?} elr=0x{:X} far=0x{:X} ipa_hint={:?} esr=0x{:X}",
@@ -499,18 +562,22 @@ fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortI
     );
 
     let memfault_info = monitor::MemfaultInfo {
-        addr: ipa_or_far,
+        addr: addr_u64,
         pc: elr,
+        kind: WatchpointKind::Access,
+        ipa: fault_addr.ipa,
         access: monitor::MemfaultAccess::Read,
         size: 4,
         esr: info.esr_el2.bits(),
-        far,
+        far: fault_addr.far,
+        reg: None,
     };
 
     let in_debug = gdb_uart::is_debug_active();
+    let in_debug_stop = aarch64_gdb::in_debug_stop();
     let decision = monitor::record_memfault(memfault_info);
-    if decision.should_trap && !in_debug {
-        if debug::enter_debug_from_memfault(regs, WatchpointKind::Access, ipa_or_far) {
+    if decision.should_trap && !in_debug && !in_debug_stop {
+        if debug::enter_debug_from_memfault(regs, WatchpointKind::Access, addr_u64) {
             return;
         }
     }

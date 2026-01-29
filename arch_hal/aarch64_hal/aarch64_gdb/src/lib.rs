@@ -2,6 +2,8 @@
 
 use aarch64_mutex::RawSpinLockIrqSave;
 use core::hint::spin_loop;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering;
 use cpu::Registers;
 use cpu::registers::DBGWCR_EL1;
 use cpu::registers::DBGWVR_EL1;
@@ -1149,6 +1151,24 @@ unsafe impl Sync for DebugStubPtr {}
 
 static DEBUG_STUB: RawSpinLockIrqSave<Option<DebugStubPtr>> = RawSpinLockIrqSave::new(None);
 static DEBUG_IO: RawSpinLockIrqSave<Option<DebugIo>> = RawSpinLockIrqSave::new(None);
+static IN_DEBUG_STOP: AtomicBool = AtomicBool::new(false);
+
+struct DebugStopGuard {
+    prev: bool,
+}
+
+impl DebugStopGuard {
+    fn new() -> Self {
+        let prev = IN_DEBUG_STOP.swap(true, Ordering::AcqRel);
+        Self { prev }
+    }
+}
+
+impl Drop for DebugStopGuard {
+    fn drop(&mut self) {
+        IN_DEBUG_STOP.store(self.prev, Ordering::Release);
+    }
+}
 
 pub fn register_debug_stub(stub: &'static mut dyn DebugStub) {
     let ptr: *mut dyn DebugStub = stub;
@@ -1164,6 +1184,10 @@ pub fn register_debug_io(io: DebugIo) {
 fn debug_io() -> Option<DebugIo> {
     let guard = DEBUG_IO.lock_irqsave();
     *guard
+}
+
+pub fn in_debug_stop() -> bool {
+    IN_DEBUG_STOP.load(Ordering::Acquire)
 }
 
 pub fn debug_entry(regs: &mut Registers, cause: DebugEntryCause) {
@@ -1279,6 +1303,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         let Some(io) = debug_io() else {
             return;
         };
+        let _debug_stop = DebugStopGuard::new();
         self.state.suspend_hw_watchpoints();
 
         enum DebugOutcome {

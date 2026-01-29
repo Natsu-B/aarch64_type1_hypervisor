@@ -1,4 +1,5 @@
 use crate::gdb_uart;
+use crate::guest_mmio_allowlist_contains_range;
 use crate::monitor;
 use arch_hal::aarch64_gdb;
 use arch_hal::aarch64_gdb::Aarch64GdbStub;
@@ -136,6 +137,7 @@ pub(crate) fn handle_debug_exception(regs: &mut cpu::Registers, ec: ExceptionCla
     let _debug_active = DebugActiveGuard::new();
     let _stop_loop = gdb_uart::begin_stop_loop();
     aarch64_gdb::debug_exception_entry(regs, ec);
+    monitor::clear_memfault_pending();
 }
 
 pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
@@ -168,6 +170,7 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
     monitor::enable_memfault_trap_if_off();
 
     aarch64_gdb::debug_entry(regs, cause);
+    monitor::clear_memfault_pending();
     cpu::irq_restore(saved_daif);
 }
 
@@ -214,12 +217,14 @@ pub(crate) fn enter_debug_from_memfault(
             _ => aarch64_gdb::DebugEntryCause::AttachDollarWithWatchpoint { kind, addr },
         };
         aarch64_gdb::debug_entry(regs, cause);
+        monitor::clear_memfault_pending();
         cpu::irq_restore(saved_daif);
         return true;
     }
 
     // Session already active: send a normal asynchronous watchpoint stop-reply.
     aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
+    monitor::clear_memfault_pending();
     cpu::irq_restore(saved_daif);
     true
 }
@@ -324,6 +329,9 @@ fn copy_from_guest_ipa(ipa: u64, dst: &mut [u8]) -> Result<(), PagingErr> {
         return Err(PagingErr::Corrupted);
     }
     let base = ipa as usize;
+    if guest_mmio_allowlist_contains_range(base, dst.len()) {
+        return Err(PagingErr::Stage2Fault);
+    }
     let mut copied = 0;
     while copied < dst.len() {
         let cur_ipa = base.checked_add(copied).ok_or(PagingErr::Corrupted)?;
@@ -350,6 +358,9 @@ fn copy_to_guest_ipa(ipa: u64, src: &[u8]) -> Result<(), PagingErr> {
         return Err(PagingErr::Corrupted);
     }
     let base = ipa as usize;
+    if guest_mmio_allowlist_contains_range(base, src.len()) {
+        return Err(PagingErr::Stage2Fault);
+    }
     let mut copied = 0;
     while copied < src.len() {
         let cur_ipa = base.checked_add(copied).ok_or(PagingErr::Corrupted)?;

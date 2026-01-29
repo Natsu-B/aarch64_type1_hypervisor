@@ -1251,6 +1251,7 @@ fn test(args: &[String]) {
                 parts.push(existing);
             }
             parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
+            parts.push("-C debuginfo=0".to_string());
             parts.push("-C relocation-model=static".to_string());
             parts.push(format!("-C link-arg=-T{}", test_lds));
             parts.join(" ")
@@ -1335,8 +1336,21 @@ fn test(args: &[String]) {
             .arg("--target")
             .arg("aarch64-unknown-none-softfloat")
             .arg("-p")
-            .arg(&pkg)
-            .arg("--lib");
+            .arg(&pkg);
+
+        let has_explicit_target = extra.iter().any(|arg| {
+            arg == "--bin"
+                || arg == "--test"
+                || arg == "--example"
+                || arg == "--bench"
+                || arg.starts_with("--bin=")
+                || arg.starts_with("--test=")
+                || arg.starts_with("--example=")
+                || arg.starts_with("--bench=")
+        });
+        if !has_explicit_target {
+            cmd.arg("--lib");
+        }
 
         cmd.args(&extra)
             .args(&test_args)

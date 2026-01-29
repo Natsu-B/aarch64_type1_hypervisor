@@ -111,6 +111,8 @@ dependencies = [
 name = "elf-hypervisor"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
+ "aarch64_unit_test",
  "allocator",
  "arch_hal",
  "dtb",

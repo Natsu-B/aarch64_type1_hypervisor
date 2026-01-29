@@ -1,6 +1,15 @@
 #![feature(once_cell_get_mut)]
 #![feature(sync_unsafe_cell)]
 #![feature(generic_const_exprs)]
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
 #![no_std]
 #![no_main]
 #![recursion_limit = "256"]
@@ -16,6 +25,9 @@ mod stack_overflow;
 mod vbar;
 mod vbar_watch;
 mod vgic;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -134,9 +146,15 @@ struct Gicv2Info {
     maintenance_intid: Option<u32>,
 }
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
 
+#[cfg(all(test, target_arch = "aarch64"))]
+static GLOBAL_ALLOCATOR: allocator::MemoryAllocator<4096, { allocator::levels!(4096) }> =
+    allocator::MemoryAllocator::new();
+
 #[unsafe(naked)]
+#[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
     naked_asm!(
@@ -148,6 +166,7 @@ extern "C" fn _start() {
     )
 }
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let program_start = &raw mut _PROGRAM_START as *const _ as usize;
@@ -567,6 +586,11 @@ fn normalize_guest_mmio_allowlist(ranges: &mut Vec<GuestMmioRange>) {
         }
     }
     ranges.truncate(write);
+    debug_assert!(
+        ranges
+            .iter()
+            .all(|range| (range.base | range.size) & (PAGE_SIZE - 1) == 0)
+    );
 }
 
 fn set_guest_mmio_allowlist(ranges: Vec<GuestMmioRange>) {
@@ -1668,6 +1692,7 @@ fn decode_cstr(bytes: &[u8]) -> Option<&str> {
     core::str::from_utf8(&bytes[..end]).ok()
 }
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // SAFETY: panic path uses a best-effort UART address chosen during early boot.
@@ -1677,4 +1702,88 @@ fn panic(info: &PanicInfo) -> ! {
     debug_uart.write("core 0 panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::str;
+    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::Ordering;
+    use gdb_remote::WatchpointKind;
+
+    static INIT: AtomicBool = AtomicBool::new(false);
+
+    fn init_test_env() {
+        if INIT.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let mut ranges = Vec::new();
+        if let Some(range) = normalize_guest_mmio_range(0x1900_0000, 0x1000) {
+            ranges.push(range);
+        }
+        normalize_guest_mmio_allowlist(&mut ranges);
+        set_guest_mmio_allowlist(ranges);
+    }
+
+    #[test_case]
+    fn memfault_invalid_reports_pending() {
+        init_test_env();
+        monitor::clear_memfault_pending();
+
+        let addr = 0x1A00_0000u64;
+        let info = monitor::MemfaultInfo {
+            addr,
+            pc: 0x1000,
+            kind: WatchpointKind::Read,
+            ipa: Some(addr),
+            access: monitor::MemfaultAccess::Read,
+            size: 4,
+            esr: 0,
+            far: addr,
+            reg: Some(0),
+        };
+        let decision = monitor::record_memfault(info);
+        assert!(decision.should_trap);
+
+        let mut out = [0u8; 256];
+        let Some(len) = monitor::bootloader_monitor_handler(b"hp memfault?", &mut out) else {
+            panic!("memfault? returned none");
+        };
+        let text = str::from_utf8(&out[..len]).unwrap();
+        assert!(text.starts_with("yes "));
+        assert!(text.contains("class=invalid"));
+        assert!(text.contains("kind=read"));
+    }
+
+    #[test_case]
+    fn memfault_allowlisted_is_ignored() {
+        init_test_env();
+        monitor::clear_memfault_pending();
+
+        let addr = 0x1900_0000u64;
+        let info = monitor::MemfaultInfo {
+            addr,
+            pc: 0x2000,
+            kind: WatchpointKind::Read,
+            ipa: Some(addr),
+            access: monitor::MemfaultAccess::Read,
+            size: 4,
+            esr: 0,
+            far: addr,
+            reg: Some(1),
+        };
+        let decision = monitor::record_memfault(info);
+        assert!(decision.ignored);
+        assert!(!decision.should_trap);
+
+        let mut out = [0u8; 128];
+        let Some(len) = monitor::bootloader_monitor_handler(b"hp memfault?", &mut out) else {
+            panic!("memfault? returned none");
+        };
+        let text = str::from_utf8(&out[..len]).unwrap();
+        assert!(text.starts_with("no"));
+    }
 }
