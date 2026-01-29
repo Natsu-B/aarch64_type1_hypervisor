@@ -279,6 +279,7 @@ fn data_abort_handler(
     } else {
         WatchpointKind::Access
     };
+    let stop_kind = WatchpointKind::Write;
     let reg_opt = u8::try_from(reg_num).ok();
 
     let access_bytes = access_width_bytes(access_width);
@@ -470,10 +471,13 @@ fn data_abort_handler(
     let session_active = gdb_uart::is_debug_session_active();
     let trap_ok = !in_debug && !in_debug_stop && session_active;
     let decision = monitor::record_memfault(memfault_info);
+    let suppress_trap = decision.policy == monitor::MemfaultPolicy::Trap
+        && !decision.ignored
+        && (decision.pending_before || decision.storm_suppress);
     // AArch64 instructions are 4 bytes; `size` is the access width, not instruction length.
     let next_elr = elr.wrapping_add(4);
     let mut did_trap = false;
-    if decision.should_trap && !in_debug && !in_debug_stop {
+    if decision.should_trap && !in_debug && !in_debug_stop && !suppress_trap {
         if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
             let Some(register) = info.register_mut(regs) else {
                 panic!(
@@ -484,7 +488,7 @@ fn data_abort_handler(
             *register = 0;
         }
         cpu::set_elr_el2(next_elr);
-        did_trap = debug::enter_debug_from_memfault(regs, kind, addr_u64);
+        did_trap = debug::enter_debug_from_memfault(regs, stop_kind, addr_u64);
         if !did_trap && !trap_ok && should_log_memfault_trap_skip(addr_u64) {
             println!(
                 "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",

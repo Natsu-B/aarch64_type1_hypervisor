@@ -186,6 +186,8 @@ static MEMFAULT_STATE: RawSpinLockIrqSave<MemfaultState> =
 
 pub struct MemfaultDecision {
     pub policy: MemfaultPolicy,
+    pub pending_before: bool,
+    pub storm_suppress: bool,
     pub ignored: bool,
     pub should_trap: bool,
     pub should_log: bool,
@@ -193,12 +195,19 @@ pub struct MemfaultDecision {
 
 pub fn record_memfault(info: MemfaultInfo) -> MemfaultDecision {
     let mut guard = MEMFAULT_STATE.lock_irqsave();
+    let pending_before = guard.pending;
     guard.last = Some(info);
     let ignored = guard.is_ignored(info.addr)
         || guest_mmio_allowlist_contains_range(info.addr as usize, info.size as usize);
     let policy = guard.policy;
     let mut storm_trap = false;
-    if !ignored && matches!(policy, MemfaultPolicy::Warn | MemfaultPolicy::Autoskip) {
+    let mut storm_suppress = false;
+    if !ignored
+        && matches!(
+            policy,
+            MemfaultPolicy::Warn | MemfaultPolicy::Autoskip | MemfaultPolicy::Trap
+        )
+    {
         let page = info.addr & !0xfff;
         let access = info.access;
         if guard.storm.valid && guard.storm.page == page && guard.storm.access == access {
@@ -210,7 +219,11 @@ pub fn record_memfault(info: MemfaultInfo) -> MemfaultDecision {
             guard.storm.valid = true;
         }
         if guard.storm.count >= MEMFAULT_STORM_LIMIT {
-            storm_trap = true;
+            if policy == MemfaultPolicy::Trap {
+                storm_suppress = true;
+            } else {
+                storm_trap = true;
+            }
             guard.storm.reset();
         }
     } else {
@@ -228,6 +241,8 @@ pub fn record_memfault(info: MemfaultInfo) -> MemfaultDecision {
     }
     MemfaultDecision {
         policy,
+        pending_before,
+        storm_suppress,
         ignored,
         should_trap,
         should_log,
@@ -634,6 +649,7 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         };
                         let _ = write!(out, "yes ");
                         write_memfault_info(&mut out, info);
+                        clear_pending();
                     } else {
                         let _ = write!(out, "no");
                     }

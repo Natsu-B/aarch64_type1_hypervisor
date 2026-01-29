@@ -1756,6 +1756,12 @@ mod tests {
         assert!(text.starts_with("yes "));
         assert!(text.contains("class=invalid"));
         assert!(text.contains("kind=read"));
+
+        let Some(len) = monitor::bootloader_monitor_handler(b"hp memfault?", &mut out) else {
+            panic!("memfault? returned none");
+        };
+        let text = str::from_utf8(&out[..len]).unwrap();
+        assert!(text.starts_with("no"));
     }
 
     #[test_case]
