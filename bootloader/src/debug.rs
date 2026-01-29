@@ -194,10 +194,8 @@ pub(crate) fn enter_debug_from_memfault(
             cpu::irq_restore(saved_daif);
             return false;
         }
-        let attach_deadline_ticks = timer::El2PhysicalTimer::new()
-            .now()
-            .saturating_add(625_000_000);
-        let idle_timeout_ticks = 3_750_000_000;
+        let el2_timer = timer::El2PhysicalTimer::new();
+        let (attach_deadline_ticks, idle_timeout_ticks) = attach_deadlines(&el2_timer);
         let prefetch =
             gdb_uart::prefetch_first_rsp_frame(attach_deadline_ticks, idle_timeout_ticks);
         if prefetch != gdb_uart::PrefetchResult::Success {

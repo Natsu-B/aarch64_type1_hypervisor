@@ -203,17 +203,21 @@ fn drain_uart_locked(state: &mut GdbUartState<RX_RING_SIZE>) {
             break;
         };
         let _ = state.rx.push_drop_oldest(byte);
-        if !DEBUG_ACTIVE.load(Ordering::Acquire) {
-            let reason = ATTACH_REASON.load(Ordering::Acquire);
-            if byte == 0x03 {
-                // Release publishes the attach request after RX buffering.
-                if reason != 2 {
-                    ATTACH_REASON.store(2, Ordering::Release);
-                }
-            } else if byte == b'$' && reason == 0 {
-                // Release publishes the attach request after RX buffering.
-                ATTACH_REASON.store(1, Ordering::Release);
+        record_attach_byte(byte);
+    }
+}
+
+fn record_attach_byte(byte: u8) {
+    if !DEBUG_SESSION_ACTIVE.load(Ordering::Acquire) {
+        let reason = ATTACH_REASON.load(Ordering::Acquire);
+        if byte == 0x03 {
+            // Release publishes the attach request after RX buffering.
+            if reason != 2 {
+                ATTACH_REASON.store(2, Ordering::Release);
             }
+        } else if byte == b'$' && reason == 0 {
+            // Release publishes the attach request after RX buffering.
+            ATTACH_REASON.store(1, Ordering::Release);
         }
     }
 }
@@ -239,6 +243,10 @@ pub fn set_debug_session_active(active: bool) {
 pub fn take_attach_reason() -> u8 {
     // AcqRel ensures we observe any IRQ-side buffering before consuming the reason.
     ATTACH_REASON.swap(0, Ordering::AcqRel)
+}
+
+pub fn peek_attach_reason() -> u8 {
+    ATTACH_REASON.load(Ordering::Acquire)
 }
 
 pub fn clear_prefetch() {
@@ -450,4 +458,35 @@ pub fn flush() {
     // SAFETY: READY is published after full initialization with Release ordering.
     let state = unsafe { (&mut *guard).assume_init_mut() };
     state.uart.flush();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    fn reset_attach_state() {
+        DEBUG_ACTIVE.store(false, Ordering::Release);
+        DEBUG_SESSION_ACTIVE.store(false, Ordering::Release);
+        ATTACH_REASON.store(0, Ordering::Release);
+    }
+
+    #[test_case]
+    fn attach_reason_sets_with_debug_active_and_session_inactive() {
+        reset_attach_state();
+        set_debug_active(true);
+        set_debug_session_active(false);
+        record_attach_byte(b'$');
+        assert_eq!(ATTACH_REASON.load(Ordering::Acquire), 1);
+        reset_attach_state();
+    }
+
+    #[test_case]
+    fn attach_reason_ignored_when_session_active() {
+        reset_attach_state();
+        set_debug_session_active(true);
+        record_attach_byte(b'$');
+        assert_eq!(ATTACH_REASON.load(Ordering::Acquire), 0);
+        reset_attach_state();
+    }
 }

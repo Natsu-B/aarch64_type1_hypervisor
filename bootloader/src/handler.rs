@@ -489,11 +489,58 @@ fn data_abort_handler(
         }
         cpu::set_elr_el2(next_elr);
         did_trap = debug::enter_debug_from_memfault(regs, stop_kind, addr_u64);
-        if !did_trap && !trap_ok && should_log_memfault_trap_skip(addr_u64) {
-            println!(
-                "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                addr_u64, access_bytes, reg_bits, esr, elr
-            );
+        if !did_trap {
+            let session_active_now = gdb_uart::is_debug_session_active();
+            if decision.policy == monitor::MemfaultPolicy::Trap || session_active_now {
+                let debug_active_now = gdb_uart::is_debug_active();
+                let attach_reason = gdb_uart::peek_attach_reason();
+                if let Some(ipa) = fault_addr.ipa {
+                    println!(
+                        "bug: memfault trap requested but entry failed policy={:?} attach_reason={} debug_active={} session_active={} class={} addr=0x{:X} ipa=0x{:X} far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                        decision.policy,
+                        attach_reason,
+                        debug_active_now,
+                        session_active_now,
+                        if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                            "write"
+                        } else {
+                            "read"
+                        },
+                        addr_u64,
+                        ipa,
+                        fault_addr.far,
+                        access_bytes,
+                        reg_bits,
+                        esr,
+                        elr
+                    );
+                } else {
+                    println!(
+                        "bug: memfault trap requested but entry failed policy={:?} attach_reason={} debug_active={} session_active={} class={} addr=0x{:X} ipa=none far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                        decision.policy,
+                        attach_reason,
+                        debug_active_now,
+                        session_active_now,
+                        if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
+                            "write"
+                        } else {
+                            "read"
+                        },
+                        addr_u64,
+                        fault_addr.far,
+                        access_bytes,
+                        reg_bits,
+                        esr,
+                        elr
+                    );
+                }
+            }
+            if !trap_ok && should_log_memfault_trap_skip(addr_u64) {
+                println!(
+                    "warning: memfault trap requested but no active debugger session; autoskipping addr=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
+                    addr_u64, access_bytes, reg_bits, esr, elr
+                );
+            }
         }
     }
 
