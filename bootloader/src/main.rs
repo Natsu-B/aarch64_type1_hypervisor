@@ -17,6 +17,10 @@
 extern crate alloc;
 mod debug;
 mod gdb_uart;
+mod build_info {
+    include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
+}
+
 mod handler;
 mod irq_decode;
 mod irq_monitor;
@@ -435,6 +439,20 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     println!(
         "\n\n\n\n\n\n\n\n\n _   _                  ____            _          \n| | | |_   _ _ __  _ __|  _ \\ _ __ ___ | |__   ___ \n| |_| | | | | '_ \\| '__| |_) | '__/ _ \\| '_ \\ / _ \\\n|  _  | |_| | |_) | |  |  __/| | | (_) | |_) |  __/\n|_| |_|\\__, | .__/|_|  |_|   |_|  \\___/|_.__/ \\___|\n       |___/|_|        \n\n"
     );
+    {
+        // Print git build info early (after UART init).
+        let dirty = if build_info::BUILD_GIT_DIRTY {
+            "-dirty"
+        } else {
+            ""
+        };
+        println!(
+            "HyprProbe build: git={}{}",
+            build_info::BUILD_GIT_SHA_SHORT,
+            dirty
+        );
+        println!("HyprProbe git full: {}\n\n", build_info::BUILD_GIT_SHA);
+    }
 
     unsafe {
         core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
