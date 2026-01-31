@@ -1,5 +1,6 @@
 use aarch64_mutex::RawSpinLockIrqSave;
 use core::fmt;
+use core::fmt::Write;
 use cpu::Registers;
 
 use super::MemoryAccess;
