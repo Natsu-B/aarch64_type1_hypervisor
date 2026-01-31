@@ -19,6 +19,8 @@ use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
 pub use gdb_remote::WatchpointKind;
 
+mod semihost;
+
 #[derive(Clone, Copy)]
 pub struct DebugIo {
     pub try_read: fn() -> Option<u8>,
@@ -863,6 +865,11 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         cmd: &[u8],
         out: &mut [u8],
     ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+        if let Ok(text) = core::str::from_utf8(cmd) {
+            if let Some(len) = semihost::monitor_command(text, out, &mut self.state.mem) {
+                return Ok(len);
+            }
+        }
         let Some(handler) = self.state.monitor_handler else {
             return Err(TargetError::NotSupported);
         };
@@ -1331,6 +1338,11 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         };
         let _debug_stop = DebugStopGuard::new();
         self.state.suspend_hw_watchpoints();
+        let mut semihost_trap = false;
+        if matches!(cause, DebugEntryCause::DebugException(_)) {
+            let pc = cpu::get_elr_el2();
+            semihost_trap = semihost::capture_from_debug(&mut self.state.mem, regs, pc);
+        }
 
         enum DebugOutcome {
             Resume(ResumeAction),
@@ -1346,11 +1358,13 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
         if let DebugEntryCause::DebugException(ec) = cause {
-            if matches!(
-                ec,
-                ExceptionClass::BreakpointLowerLevel
-                    | ExceptionClass::BrkInstructionAArch64LowerLevel
-            ) {
+            if !semihost_trap
+                && matches!(
+                    ec,
+                    ExceptionClass::BreakpointLowerLevel
+                        | ExceptionClass::BrkInstructionAArch64LowerLevel
+                )
+            {
                 let pc = cpu::get_elr_el2();
                 if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
                     breakpoint_slot = Some(slot);
@@ -1439,6 +1453,16 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                         progress = true;
                         match self.server.on_rx_byte_irq(&mut target, byte) {
                             Ok(ProcessResult::Resume(action)) => {
+                                match semihost::resume_gate() {
+                                    semihost::ResumeGate::Hold => {
+                                        continue;
+                                    }
+                                    semihost::ResumeGate::Proceed(Some((req, completion))) => {
+                                        regs.x0 = completion.result as u64;
+                                        cpu::set_elr_el2(req.pc_after);
+                                    }
+                                    semihost::ResumeGate::Proceed(None) => {}
+                                }
                                 break 'debug DebugOutcome::Resume(action);
                             }
                             Ok(ProcessResult::MonitorExit) => break 'debug DebugOutcome::Exit,

@@ -12,6 +12,7 @@ std intrusive_linked_list
 std mutex
 std typestate
 unit gdb_remote
+unit aarch64_gdb
 
 uefi block-device virtio_blk_modern file/block-device/scripts/run_qemu.sh
 uefi file fat32_virtio file/scripts/run_fat32_virtio_test.sh

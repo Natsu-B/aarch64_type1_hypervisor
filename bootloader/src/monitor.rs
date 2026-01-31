@@ -443,6 +443,12 @@ fn write_hp_help(out: &mut OutBuf<'_>) {
         "  monitor hp memfault ignore add_last <len>\n",
         "  monitor hp memfault ignore del <addr> <len>\n",
         "  monitor hp memfault ignore list\n",
+        "  monitor hp semihost?\n",
+        "  monitor hp semihost info\n",
+        "  monitor hp semihost read <n>\n",
+        "  monitor hp semihost reply <result> <errno>\n",
+        "  monitor hp semihost alloc_handle\n",
+        "  monitor hp semihost reset\n",
         "  monitor hp gdb stop-counters\n",
         "  monitor hp vbar <status|last|clear|check|bt?|bt>\n",
     ];

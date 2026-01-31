@@ -113,3 +113,73 @@ pub extern "C" fn exit_with_code(code: u32) -> ! {
         );
     }
 }
+
+#[repr(C)]
+struct SemihostOpenArgs {
+    path: u64,
+    mode: u64,
+    len: u64,
+}
+
+#[repr(C)]
+struct SemihostWriteArgs {
+    handle: u64,
+    buf: u64,
+    len: u64,
+}
+
+#[repr(C)]
+struct SemihostCloseArgs {
+    handle: u64,
+}
+
+fn semihost_call(op: u64, args: u64) -> u64 {
+    let mut x0 = op;
+    // SAFETY: caller provides valid semihosting arguments for the guest.
+    unsafe {
+        asm!(
+            "hlt #0xf000",
+            inout("x0") x0,
+            in("x1") args,
+            options(nostack)
+        );
+    }
+    x0
+}
+
+/// Writes a null-terminated string to the semihosting console.
+pub fn semihost_write0(ptr: *const u8) {
+    const SYS_WRITE0: u64 = 0x04;
+    let _ = semihost_call(SYS_WRITE0, ptr as u64);
+}
+
+/// Opens a host file and returns a semihosting handle, or -1 on failure.
+pub fn semihost_open(path: *const u8, len: usize, mode: u64) -> i32 {
+    const SYS_OPEN: u64 = 0x01;
+    let args = SemihostOpenArgs {
+        path: path as u64,
+        mode,
+        len: len as u64,
+    };
+    semihost_call(SYS_OPEN, core::ptr::addr_of!(args) as u64) as i32
+}
+
+/// Writes a buffer to a semihosting handle. Returns bytes not written.
+pub fn semihost_write(handle: i32, buf: *const u8, len: usize) -> i32 {
+    const SYS_WRITE: u64 = 0x05;
+    let args = SemihostWriteArgs {
+        handle: handle as u64,
+        buf: buf as u64,
+        len: len as u64,
+    };
+    semihost_call(SYS_WRITE, core::ptr::addr_of!(args) as u64) as i32
+}
+
+/// Closes a semihosting handle and returns 0 on success or -1 on failure.
+pub fn semihost_close(handle: i32) -> i32 {
+    const SYS_CLOSE: u64 = 0x02;
+    let args = SemihostCloseArgs {
+        handle: handle as u64,
+    };
+    semihost_call(SYS_CLOSE, core::ptr::addr_of!(args) as u64) as i32
+}
