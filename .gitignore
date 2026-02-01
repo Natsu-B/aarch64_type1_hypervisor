@@ -41,7 +41,6 @@ no_llvm_build
 
 ## Build
 /dl/
-/doc/
 /inst/
 /llvm/
 /mingw-build/
