@@ -1,0 +1,10 @@
+[package]
+name = "aarch64_gdb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gdb_remote = { path = "../../../gdb_remote", default-features = false }
+aarch64_mutex = { path = "../aarch64_mutex" }
+cpu = { path = "../cpu" }
+exceptions = { path = "../exceptions" }

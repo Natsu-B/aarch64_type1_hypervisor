@@ -16,6 +16,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 use cpu::registers::PARange;
 use exceptions;
+use paging::stage2::Stage2AccessPermission;
 use paging::stage2::Stage2PageTypes;
 use paging::stage2::Stage2Paging;
 use paging::stage2::Stage2PagingSetting;
@@ -72,10 +73,16 @@ fn run() -> Result<(), &'static str> {
         baseline.restore();
         "stage2 init failed"
     })?;
-    Stage2Paging::enable_stage2_translation(false);
+    Stage2Paging::enable_stage2_translation(false, false);
 
     for (ipa, expected) in ipa_points.iter().zip(expected_pas.iter()) {
-        let translated = translate_stage2(*ipa)?;
+        let translated = match Stage2Paging::ipa_to_pa(*ipa) {
+            Ok(pa) => pa,
+            Err(_) => {
+                baseline.restore();
+                return Err("stage2 translation faulted");
+            }
+        };
         if translated != *expected {
             baseline.restore();
             return Err("stage2 translation mismatch");
@@ -111,18 +118,21 @@ fn build_stage2_scenario()
             pa: first_pa,
             size: first_size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         },
         Stage2PagingSetting {
             ipa: first_size,
             pa: second_pa,
             size: second_size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         },
         Stage2PagingSetting {
             ipa: first_size + second_size,
             pa: third_pa,
             size: third_size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         },
     ];
 
@@ -151,28 +161,6 @@ fn parange_limit_bytes() -> Option<usize> {
         PARange::PA52bits4PB => 1usize << 52,
         PARange::PA56bits64PB => 1usize << 56,
     })
-}
-
-fn translate_stage2(ipa: usize) -> Result<usize, &'static str> {
-    let par_after: u64;
-    unsafe {
-        asm!(
-            "mrs {tmp}, par_el1",
-            "at S12E1R, {ipa}",
-            "isb",
-            "mrs {par_after}, par_el1",
-            "msr par_el1, {tmp}",
-            tmp = lateout(reg) _,
-            par_after = out(reg) par_after,
-            ipa = in(reg) ipa,
-            options(nostack)
-        );
-    }
-    if (par_after & 1) != 0 {
-        return Err("stage2 translation faulted");
-    }
-    let pa = (par_after & 0x0000_FFFF_FFFF_F000) as usize;
-    Ok(pa | (ipa & 0xFFF))
 }
 
 struct Stage2State {

@@ -3,9 +3,19 @@ name = "exceptions"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+doctest = false
+
 [dependencies]
 cpu = { path = "../cpu" }
 typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
 print = { path = "../print" }
 psci = { path = "../psci" }
+
+[features]
+testapi = []
+
+[dev-dependencies]
+aarch64_test = { path = "../aarch64_test" }
+aarch64_unit_test = { path = "../aarch64_unit_test" }

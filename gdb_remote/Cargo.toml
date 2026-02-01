@@ -3,10 +3,13 @@ name = "gdb_remote"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-byte_stream = { path = "../byte_stream" }
+[features]
+default = []
+gdb_monitor_debug = []
 
-[dev-dependencies]
+[dependencies]
+
+[target.'cfg(target_arch = "aarch64")'.dev-dependencies]
 aarch64_test = { path = "../arch_hal/aarch64_hal/aarch64_test" }
 print = { path = "../arch_hal/aarch64_hal/print" }
 
@@ -17,4 +20,14 @@ test = false
 [[test]]
 name = "uefi_basic_handshake"
 path = "tests/uefi_basic_handshake.rs"
+harness = false
+
+[[test]]
+name = "uefi_qxfer_features"
+path = "tests/uefi_qxfer_features.rs"
+harness = false
+
+[[test]]
+name = "uefi_packet_size"
+path = "tests/uefi_packet_size.rs"
 harness = false

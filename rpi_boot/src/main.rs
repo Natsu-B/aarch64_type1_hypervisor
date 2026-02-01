@@ -16,6 +16,7 @@ use arch_hal::exceptions;
 use arch_hal::paging::EL2Stage1PageTypes;
 use arch_hal::paging::EL2Stage1Paging;
 use arch_hal::paging::EL2Stage1PagingSetting;
+use arch_hal::paging::Stage2AccessPermission;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
@@ -248,6 +249,7 @@ extern "C" fn main() -> ! {
                 pa: memory_last_addr,
                 size: addr - memory_last_addr,
                 types: Stage2PageTypes::Device,
+                perm: Stage2AccessPermission::ReadWrite,
             });
             stage1_paging_data.push(EL2Stage1PagingSetting {
                 va: memory_last_addr,
@@ -261,6 +263,7 @@ extern "C" fn main() -> ! {
             pa: addr,
             size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         });
         stage1_paging_data.push(EL2Stage1PagingSetting {
             va: addr,
@@ -278,12 +281,14 @@ extern "C" fn main() -> ! {
         pa: memory_last_addr,
         size: PL011_UART_ADDR - memory_last_addr,
         types: Stage2PageTypes::Device,
+        perm: Stage2AccessPermission::ReadWrite,
     });
     paging_data.push(Stage2PagingSetting {
         ipa: PL011_UART_ADDR + 0x1000,
         pa: PL011_UART_ADDR + 0x1000,
         size: ipa_space - PL011_UART_ADDR - 0x1000,
         types: Stage2PageTypes::Device,
+        perm: Stage2AccessPermission::ReadWrite,
     });
     stage1_paging_data.push(EL2Stage1PagingSetting {
         va: memory_last_addr,
@@ -294,7 +299,7 @@ extern "C" fn main() -> ! {
     println!("Stage2Paging: {:#?}", paging_data);
     println!("EL2Stage1Paging: {:#?}", stage1_paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation(true);
+    Stage2Paging::enable_stage2_translation(true, false);
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
 

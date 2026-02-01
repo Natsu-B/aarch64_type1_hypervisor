@@ -20,14 +20,14 @@ bitregs! {
 
 bitregs! {
     /// Exception Syndrome Register(EL2)
-    pub(crate) struct ESR_EL2: u64 {
+    pub struct ESR_EL2: u64 {
         union iss@[24:0] {
             view unknown {
                 reserved@[24:0] [res0],
             }
             view wf_ {
                 // Trapped Instruction
-                pub(crate) ti@[1:0] as TI {
+                pub ti@[1:0] as TI {
                     WFI  = 0b00,
                     WFE  = 0b01,
                     // When FEAT_WFxT is implemented
@@ -128,7 +128,7 @@ bitregs! {
                 // Implementation Defined
                 pub(crate) ea@[9:9],
                 // Fault Address Register Not Valid
-                pub(crate) fnv@[10:10] as FARNotValid {
+                pub fnv@[10:10] as FARNotValid {
                     Valid = 0b0,
                     // FAR is not valid, holds UNKNOWN value
                     NotValid = 0b1,
@@ -222,19 +222,101 @@ bitregs! {
                 pub(crate) imm16@[15:0],
                 reserved@[24:16] [res0],
             }
+
+            // Trapped MSR/MRS (AArch64) syndrome layout (EC=0x18).
+            view sysreg {
+                reserved@[24:22] [res0],
+                // op0/op1/op2/CRn/CRm/Rt follow Arm ARM ISS layout for EC=0x18.
+                pub(crate) op0@[21:20],
+                pub(crate) op2@[19:17],
+                pub(crate) op1@[16:14],
+                pub(crate) crn@[13:10],
+                pub(crate) rt@[9:5],
+                pub(crate) crm@[4:1],
+                pub direction@[0:0] as SysRegDirection {
+                    Write = 0b0,
+                    Read  = 0b1,
+                },
+            }
         }
         pub(crate) il@[25:25],
-        pub(crate) ec@[31:26] as ExceptionClass {
+        pub ec@[31:26] as ExceptionClass {
             // unknown reason
             UnknownReason                  = 0b00_0000,
             TrappedWFInstruction           = 0b00_0001,
+            // Trapped MSR/MRS/System register access from lower EL (AArch64).
+            SystemRegisterTrap             = 0b01_1000,
             InstructionAbortFromLowerLevel = 0b10_0000,
             DataAbortFormLowerLevel        = 0b10_0100,
             // SMC Instruction Exception in Aarch64 state
             SMCInstructionExecution        = 0b01_0111,
+            // BRK Instruction Exception in AArch64 state from lower EL
+            BrkInstructionAArch64LowerLevel = 0b11_1100,
+            // Breakpoint from lower EL (AArch64)
+            BreakpointLowerLevel           = 0b11_0000,
+            // Software step from lower EL (AArch64)
+            SoftwareStepLowerLevel         = 0b11_0010,
+            // Watchpoint from lower EL (AArch64)
+            WatchpointLowerLevel           = 0b11_0100,
         },
         pub(crate) iss2@[55:32],
         reserved@[63:56] [res0],
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SysRegIss {
+    pub op0: u8,
+    pub op1: u8,
+    pub op2: u8,
+    pub crn: u8,
+    pub crm: u8,
+    pub rt: u8,
+    pub direction: SysRegDirection,
+}
+
+impl SysRegIss {
+    /// Decode the EC=0x18 ISS field (AArch64 trapped MSR/MRS).
+    pub fn decode(esr_raw: u64) -> Self {
+        const ISS_MASK: u64 = 0x01ff_ffff;
+        const DIR_SHIFT: u64 = 0;
+        const CRM_SHIFT: u64 = 1;
+        const RT_SHIFT: u64 = 5;
+        const CRN_SHIFT: u64 = 10;
+        const OP1_SHIFT: u64 = 14;
+        const OP2_SHIFT: u64 = 17;
+        const OP0_SHIFT: u64 = 20;
+
+        let iss = esr_raw & ISS_MASK;
+        let direction = if ((iss >> DIR_SHIFT) & 0x1) == 0 {
+            SysRegDirection::Write
+        } else {
+            SysRegDirection::Read
+        };
+
+        Self {
+            op0: ((iss >> OP0_SHIFT) & 0x3) as u8,
+            op1: ((iss >> OP1_SHIFT) & 0x7) as u8,
+            op2: ((iss >> OP2_SHIFT) & 0x7) as u8,
+            crn: ((iss >> CRN_SHIFT) & 0xf) as u8,
+            crm: ((iss >> CRM_SHIFT) & 0xf) as u8,
+            rt: ((iss >> RT_SHIFT) & 0x1f) as u8,
+            direction,
+        }
+    }
+
+    pub fn from_esr(esr: &ESR_EL2) -> Self {
+        Self {
+            op0: esr.get(ESR_EL2::op0) as u8,
+            op1: esr.get(ESR_EL2::op1) as u8,
+            op2: esr.get(ESR_EL2::op2) as u8,
+            crn: esr.get(ESR_EL2::crn) as u8,
+            crm: esr.get(ESR_EL2::crm) as u8,
+            rt: esr.get(ESR_EL2::rt) as u8,
+            direction: esr
+                .get_enum(ESR_EL2::direction)
+                .unwrap_or(SysRegDirection::Write),
+        }
     }
 }
 
@@ -244,8 +326,6 @@ bitregs! {
         pub(crate) resturn_addr@[63:0],
     }
 }
-
-pub(crate) const HPFAR_OFFSET: usize = 12;
 
 bitregs! {
     pub(crate) struct HPFAR_EL2: u64 {
@@ -268,5 +348,54 @@ bitregs! {
     pub(crate) struct FAR_EL2: u64 {
         // Faulting Virtual Address
         pub(crate) va@[63:0],
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn esr_el2_brk_ec_decodes() {
+        let esr = ESR_EL2::from_bits((0x3c_u64) << 26);
+        let ec = esr.get_enum::<_, ExceptionClass>(ESR_EL2::ec);
+        assert_eq!(ec, Some(ExceptionClass::BrkInstructionAArch64LowerLevel));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "aarch64")))]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn sysreg_iss_decode_vbar_el1_write() {
+        // VBAR_EL1 encoding: op0=3, op1=0, op2=0, CRn=12, CRm=0.
+        let iss =
+            (3u64 << 20) | (0u64 << 14) | (0u64 << 17) | (12u64 << 10) | (0u64 << 1) | (5u64 << 5);
+        let esr = (0x18u64 << 26) | iss; // EC=0x18, DIR=0 (write)
+        let decoded = SysRegIss::decode(esr);
+
+        assert_eq!(decoded.direction, SysRegDirection::Write);
+        assert_eq!(decoded.rt, 5);
+        assert_eq!(decoded.op0, 3);
+        assert_eq!(decoded.op1, 0);
+        assert_eq!(decoded.op2, 0);
+        assert_eq!(decoded.crn, 12);
+        assert_eq!(decoded.crm, 0);
+    }
+
+    #[test]
+    fn esr_el2_trapped_wf_decodes_ti() {
+        let ec_bits = (ExceptionClass::TrappedWFInstruction as u64) << 26;
+
+        let esr_wfi = ESR_EL2::from_bits(ec_bits | (TI::WFI as u64));
+        let ec = esr_wfi.get_enum::<_, ExceptionClass>(ESR_EL2::ec);
+        let ti = esr_wfi.get_enum::<_, TI>(ESR_EL2::ti);
+        assert_eq!(ec, Some(ExceptionClass::TrappedWFInstruction));
+        assert_eq!(ti, Some(TI::WFI));
+
+        let esr_wfe = ESR_EL2::from_bits(ec_bits | (TI::WFE as u64));
+        let ti = esr_wfe.get_enum::<_, TI>(ESR_EL2::ti);
+        assert_eq!(ti, Some(TI::WFE));
     }
 }

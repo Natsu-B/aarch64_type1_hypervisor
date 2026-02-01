@@ -44,6 +44,16 @@ SECTIONS
     __stack_top = .;
   } :data
 
+  /DISCARD/ : {
+    *(.comment)
+    *(.eh_frame*)
+    *(.debug*)
+    *(.gnu*)
+    *(.note*)
+    *(.symtab)
+    *(.strtab)
+  }
+
   . = ALIGN(_ALIGN_SIZE);
   __image_end = .;
 }

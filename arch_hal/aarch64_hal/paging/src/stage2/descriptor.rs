@@ -199,11 +199,24 @@ bitregs! {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Stage2AccessPermission {
+    NoDataAccess = 0b00,
+    ReadOnly = 0b01,
+    WriteOnly = 0b10,
+    ReadWrite = 0b11,
+}
+
 impl Stage2_48bitLeafDescriptor {
     /// Build a Stage-2 *block* descriptor (L1/L2). `level` is the translation level (1 or 2).
     /// We mask to the [47:21] superset and leave finer-grained alignment to the caller.
     #[inline]
-    pub(crate) fn new_block(pa: u64, level: i8, types: Stage2PageTypes) -> u64 {
+    pub(crate) fn new_block(
+        pa: u64,
+        level: i8,
+        types: Stage2PageTypes,
+        perm: Stage2AccessPermission,
+    ) -> u64 {
         let _aligned_bits = match level {
             1 => 1 << 30, // 1GiB
             2 => 1 << 21, // 2MiB
@@ -217,34 +230,61 @@ impl Stage2_48bitLeafDescriptor {
             }
             Stage2PageTypes::Device => (MemAttr::Device_nGnRnE, Shareability::NonSharable),
         };
+        let executable = matches!(types, Stage2PageTypes::Normal);
 
         Self::new()
             .set_enum(Self::mem_attr, mem_attr)
-            .set_enum(Self::s2ap, AccessPermission::ReadWrite)
+            .set_enum(Self::s2ap, access_permission_from(perm))
             .set_enum(Self::sh, sh)
             .set_enum(Self::ty, DescriptorType::Block)
             .set_raw(Self::block_oab, pa)
             .set(Self::af, 0b1)
+            .set(Self::xn, xn_field(executable))
             .bits()
     }
 
     /// Build a Stage-2 *page* descriptor (L3). We use the same [47:12] superset.
     #[inline]
-    pub(crate) fn new_page(pa: u64, types: Stage2PageTypes) -> u64 {
+    pub(crate) fn new_page(pa: u64, types: Stage2PageTypes, perm: Stage2AccessPermission) -> u64 {
         let (mem_attr, sh) = match types {
             Stage2PageTypes::Normal => {
                 (MemAttr::BothWriteBackCacheable, Shareability::InnerSharable)
             }
             Stage2PageTypes::Device => (MemAttr::Device_nGnRnE, Shareability::NonSharable),
         };
+        let executable = matches!(types, Stage2PageTypes::Normal);
 
         Self::new()
             .set_enum(Self::mem_attr, mem_attr)
-            .set_enum(Self::s2ap, AccessPermission::ReadWrite)
+            .set_enum(Self::s2ap, access_permission_from(perm))
             .set_enum(Self::sh, sh)
             .set_enum(Self::ty, DescriptorType::Page)
             .set_raw(Self::page_oab, pa)
             .set(Self::af, 0b1)
+            .set(Self::xn, xn_field(executable))
             .bits()
+    }
+
+    #[inline]
+    pub(crate) fn clear_access_and_dirty(desc: u64) -> u64 {
+        Self::from_bits(desc)
+            .set(Self::af, 0)
+            .set(Self::dbm, 0)
+            .bits()
+    }
+}
+
+#[inline]
+fn xn_field(executable: bool) -> u64 {
+    if executable { 0b00 } else { 0b10 }
+}
+
+#[inline]
+fn access_permission_from(perm: Stage2AccessPermission) -> AccessPermission {
+    match perm {
+        Stage2AccessPermission::NoDataAccess => AccessPermission::NoDataAccess,
+        Stage2AccessPermission::ReadOnly => AccessPermission::ReadOnly,
+        Stage2AccessPermission::WriteOnly => AccessPermission::WriteOnly,
+        Stage2AccessPermission::ReadWrite => AccessPermission::ReadWrite,
     }
 }
