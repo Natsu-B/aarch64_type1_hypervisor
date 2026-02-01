@@ -1274,6 +1274,7 @@ pub struct Aarch64GdbStub<
     server: GdbServer<MAX_PKT, TX_CAP>,
     state: Aarch64GdbState<M, N>,
     pending_step: Option<PendingStep>,
+    pending_fileio_resume: Option<ResumeAction>,
 }
 
 impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
@@ -1284,6 +1285,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             server: GdbServer::new(),
             state: Aarch64GdbState::new(mem),
             pending_step: None,
+            pending_fileio_resume: None,
         }
     }
 
@@ -1314,6 +1316,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
             core::ptr::addr_of_mut!((*p).state).write(Aarch64GdbState::new(mem));
             core::ptr::addr_of_mut!((*p).pending_step).write(None);
+            core::ptr::addr_of_mut!((*p).pending_fileio_resume).write(None);
         }
     }
 
@@ -1343,6 +1346,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             let pc = cpu::get_elr_el2();
             semihost_trap = semihost::capture_from_debug(&mut self.state.mem, regs, pc);
         }
+        self.pending_fileio_resume = None;
 
         enum DebugOutcome {
             Resume(ResumeAction),
@@ -1453,6 +1457,48 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                         progress = true;
                         match self.server.on_rx_byte_irq(&mut target, byte) {
                             Ok(ProcessResult::Resume(action)) => {
+                                if semihost::fileio_pending() {
+                                    if semihost::fileio_enabled() {
+                                        if !semihost::fileio_inflight() {
+                                            let mut buf = [0u8; 128];
+                                            if let Ok(Some(len)) =
+                                                semihost::fileio_try_build_request(
+                                                    &mut target.state.mem,
+                                                    &mut buf,
+                                                )
+                                            {
+                                                let mut queued =
+                                                    self.server.queue_packet_payload(&buf[..len]);
+                                                if matches!(queued, Err(GdbError::TxOverflow)) {
+                                                    self.server.drop_console_output();
+                                                    queued = self
+                                                        .server
+                                                        .queue_packet_payload(&buf[..len]);
+                                                }
+                                                match queued {
+                                                    Ok(()) => {
+                                                        self.pending_fileio_resume = Some(action);
+                                                        continue;
+                                                    }
+                                                    Err(_) => {
+                                                        let _ = semihost::fileio_on_reply(
+                                                            -1,
+                                                            semihost::EINVAL,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if semihost::fileio_inflight() {
+                                            continue;
+                                        }
+                                    } else {
+                                        if pending_stop_reply.is_none() {
+                                            pending_stop_reply = Some(StopReply::Sigtrap);
+                                        }
+                                        continue;
+                                    }
+                                }
                                 match semihost::resume_gate() {
                                     semihost::ResumeGate::Hold => {
                                         continue;
@@ -1465,8 +1511,50 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                 }
                                 break 'debug DebugOutcome::Resume(action);
                             }
+                            Ok(ProcessResult::FileIoReply {
+                                retcode,
+                                errno,
+                                ctrl_c: _,
+                            }) => {
+                                let _ = semihost::fileio_on_reply(retcode, errno);
+                                if let Some(action) = self.pending_fileio_resume.take() {
+                                    match semihost::resume_gate() {
+                                        semihost::ResumeGate::Hold => {
+                                            continue;
+                                        }
+                                        semihost::ResumeGate::Proceed(Some((req, completion))) => {
+                                            regs.x0 = completion.result as u64;
+                                            cpu::set_elr_el2(req.pc_after);
+                                        }
+                                        semihost::ResumeGate::Proceed(None) => {}
+                                    }
+                                    break 'debug DebugOutcome::Resume(action);
+                                }
+                            }
                             Ok(ProcessResult::MonitorExit) => break 'debug DebugOutcome::Exit,
-                            Ok(ProcessResult::None) => {}
+                            Ok(ProcessResult::None) => {
+                                if self.server.take_fileio_parse_error()
+                                    && self.pending_fileio_resume.is_some()
+                                {
+                                    let _ = semihost::fileio_on_reply(-1, semihost::EINVAL);
+                                    if let Some(action) = self.pending_fileio_resume.take() {
+                                        match semihost::resume_gate() {
+                                            semihost::ResumeGate::Hold => {
+                                                continue;
+                                            }
+                                            semihost::ResumeGate::Proceed(Some((
+                                                req,
+                                                completion,
+                                            ))) => {
+                                                regs.x0 = completion.result as u64;
+                                                cpu::set_elr_el2(req.pc_after);
+                                            }
+                                            semihost::ResumeGate::Proceed(None) => {}
+                                        }
+                                        break 'debug DebugOutcome::Resume(action);
+                                    }
+                                }
+                            }
                             Err(GdbError::MalformedPacket | GdbError::PacketTooLong) => {
                                 self.server.resync();
                             }

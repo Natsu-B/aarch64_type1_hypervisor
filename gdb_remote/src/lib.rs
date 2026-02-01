@@ -89,6 +89,12 @@ pub enum ProcessResult {
     None,
     /// Resume execution with the provided action.
     Resume(ResumeAction),
+    /// File-I/O reply packet from GDB.
+    FileIoReply {
+        retcode: i64,
+        errno: i32,
+        ctrl_c: bool,
+    },
     /// Special-case monitor-exit used by the UEFI test harness.
     ///
     /// Note: This is triggered after `qRcmd "exit 0"` arms an exit request and the client
@@ -215,6 +221,7 @@ pub struct GdbServer<const MAX_PKT: usize, const TX_CAP: usize> {
     monitor_exit_armed: bool,
     advertised_packet_size: usize,
     ack_mode: bool,
+    fileio_parse_error: bool,
 
     // All-zero must be valid because we may be init'd via zeroing.
     last_stop: LastStop,
@@ -247,6 +254,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             monitor_exit_armed: false,
             advertised_packet_size,
             ack_mode: true,
+            fileio_parse_error: false,
             last_stop: LastStop::sigtrap(),
         }
     }
@@ -337,6 +345,12 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         self.reset_rx_full();
     }
 
+    pub fn take_fileio_parse_error(&mut self) -> bool {
+        let had_error = self.fileio_parse_error;
+        self.fileio_parse_error = false;
+        had_error
+    }
+
     fn push_payload_byte(&mut self, byte: u8) {
         self.rx_checksum = self.rx_checksum.wrapping_add(byte);
         if self.rx_len < self.rx_buf.len() {
@@ -395,6 +409,16 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
 
     fn send_scratch_b<T: Target>(&mut self, len: usize) -> Result<(), GdbServerError<T>> {
         let payload = &self.scratch_b[..len];
+        Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
+    }
+
+    pub fn queue_packet_payload(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(), GdbError<Infallible, Infallible>> {
+        if payload.len() > self.out_payload_cap() {
+            return Err(GdbError::PacketTooLong);
+        }
         Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
     }
 
@@ -581,6 +605,18 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             "dispatch: payload=\"{}\"",
             debug_printable_prefix(payload)
         );
+
+        if payload.first() == Some(&b'F') {
+            if let Some((retcode, errno, ctrl_c)) = parse_fileio_reply(payload) {
+                return Ok(ProcessResult::FileIoReply {
+                    retcode,
+                    errno,
+                    ctrl_c,
+                });
+            }
+            self.fileio_parse_error = true;
+            return Ok(ProcessResult::None);
+        }
 
         if payload == b"?" {
             // Breakpoint: '?' stop-reply path (server last_stop).
@@ -2068,6 +2104,78 @@ fn parse_dec_u8(buf: &[u8]) -> Option<u8> {
     Some(val as u8)
 }
 
+fn parse_dec_u64(buf: &[u8]) -> Option<u64> {
+    if buf.is_empty() {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in buf {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        val = val.checked_mul(10)?;
+        val = val.checked_add((b - b'0') as u64)?;
+    }
+    Some(val)
+}
+
+fn parse_hex_or_dec_u64(buf: &[u8]) -> Option<u64> {
+    if buf.is_empty() {
+        return None;
+    }
+    let has_alpha = buf.iter().any(|&b| matches!(b, b'a'..=b'f' | b'A'..=b'F'));
+    if has_alpha {
+        return parse_hex_u64(buf);
+    }
+    parse_hex_u64(buf).or_else(|| parse_dec_u64(buf))
+}
+
+fn parse_signed_i64(buf: &[u8]) -> Option<i64> {
+    if buf.is_empty() {
+        return None;
+    }
+    let (neg, rest) = if buf[0] == b'-' {
+        (true, &buf[1..])
+    } else {
+        (false, buf)
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let unsigned = parse_hex_or_dec_u64(rest)? as i128;
+    let value = if neg { -unsigned } else { unsigned };
+    if value < i64::MIN as i128 || value > i64::MAX as i128 {
+        return None;
+    }
+    Some(value as i64)
+}
+
+fn parse_fileio_reply(payload: &[u8]) -> Option<(i64, i32, bool)> {
+    let body = payload.strip_prefix(b"F")?;
+    let mut parts = body.split(|&b| b == b',');
+    let retcode = parse_signed_i64(parts.next()?)?;
+    let errno = match parts.next() {
+        Some(part) if !part.is_empty() => {
+            let val = parse_signed_i64(part)?;
+            if val < i32::MIN as i64 || val > i32::MAX as i64 {
+                return None;
+            }
+            val as i32
+        }
+        Some(_) => return None,
+        None => 0,
+    };
+    let ctrl_c = match parts.next() {
+        Some(part) if !part.is_empty() => parse_signed_i64(part)? != 0,
+        Some(_) => return None,
+        None => false,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((retcode, errno, ctrl_c))
+}
+
 fn parse_flash_header(buf: &[u8]) -> Option<(u64, u64)> {
     let mut parts = buf.splitn(2, |&b| b == b',');
     let addr = parse_hex_u64(parts.next()?)?;
@@ -2547,6 +2655,111 @@ mod tests {
             packets.iter().any(|packet| packet.payload == b"68690a"),
             "missing qRcmd output reply"
         );
+    }
+
+    #[test]
+    fn fileio_reply_parses_and_queues_no_packet() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = DummyTarget;
+        let frame = build_frame(b"F0,0");
+
+        let mut last = ProcessResult::None;
+        for &byte in &frame {
+            last = server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+
+        match last {
+            ProcessResult::FileIoReply {
+                retcode,
+                errno,
+                ctrl_c,
+            } => {
+                assert_eq!(retcode, 0);
+                assert_eq!(errno, 0);
+                assert!(!ctrl_c);
+            }
+            _ => panic!("expected file-io reply"),
+        }
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn fileio_reply_parses_negative_retcode() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = DummyTarget;
+        let frame = build_frame(b"F-1,2");
+
+        let mut last = ProcessResult::None;
+        for &byte in &frame {
+            last = server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+
+        match last {
+            ProcessResult::FileIoReply {
+                retcode,
+                errno,
+                ctrl_c,
+            } => {
+                assert_eq!(retcode, -1);
+                assert_eq!(errno, 2);
+                assert!(!ctrl_c);
+            }
+            _ => panic!("expected file-io reply"),
+        }
+    }
+
+    #[test]
+    fn fileio_reply_parses_retcode_only() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = DummyTarget;
+        let frame = build_frame(b"F1");
+
+        let mut last = ProcessResult::None;
+        for &byte in &frame {
+            last = server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+
+        match last {
+            ProcessResult::FileIoReply {
+                retcode,
+                errno,
+                ctrl_c,
+            } => {
+                assert_eq!(retcode, 1);
+                assert_eq!(errno, 0);
+                assert!(!ctrl_c);
+            }
+            _ => panic!("expected file-io reply"),
+        }
+    }
+
+    #[test]
+    fn fileio_reply_malformed_is_ignored() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = DummyTarget;
+        let frame = build_frame(b"F,");
+
+        let mut last = ProcessResult::None;
+        for &byte in &frame {
+            last = server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+        assert!(matches!(last, ProcessResult::None));
+        assert!(server.take_fileio_parse_error());
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx);
+        assert!(packets.is_empty());
     }
 
     #[test]

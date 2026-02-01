@@ -15,6 +15,15 @@ const SYS_CLOSE: u32 = 0x02;
 const SYS_WRITE0: u32 = 0x04;
 const SYS_WRITE: u32 = 0x05;
 
+pub const EINVAL: i32 = 22;
+
+const O_RDONLY: u32 = 0;
+const O_WRONLY: u32 = 1;
+const O_CREAT: u32 = 0x40;
+const O_TRUNC: u32 = 0x200;
+const O_APPEND: u32 = 0x400;
+const FILEIO_CREATE_MODE: u32 = 0o666;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemihostOp {
     Write0,
@@ -50,6 +59,8 @@ struct SemihostState {
     next_handle: u32,
     read_offset: u64,
     read_done: bool,
+    fileio_enabled: bool,
+    fileio_inflight: bool,
 }
 
 impl SemihostState {
@@ -61,6 +72,8 @@ impl SemihostState {
             next_handle: 3,
             read_offset: 0,
             read_done: false,
+            fileio_enabled: true,
+            fileio_inflight: false,
         }
     }
 
@@ -70,6 +83,7 @@ impl SemihostState {
         self.completion = None;
         self.read_offset = 0;
         self.read_done = false;
+        self.fileio_inflight = false;
     }
 
     fn start_request(&mut self, req: SemihostRequest) {
@@ -78,6 +92,7 @@ impl SemihostState {
         self.completion = None;
         self.read_offset = 0;
         self.read_done = false;
+        self.fileio_inflight = false;
     }
 
     fn alloc_handle(&mut self) -> u32 {
@@ -158,6 +173,172 @@ pub fn resume_gate() -> ResumeGate {
     }
 }
 
+pub fn fileio_enabled() -> bool {
+    let guard = SEMIHOST.lock_irqsave();
+    guard.fileio_enabled
+}
+
+pub fn fileio_pending() -> bool {
+    let guard = SEMIHOST.lock_irqsave();
+    guard.pending && guard.completion.is_none()
+}
+
+pub fn fileio_inflight() -> bool {
+    let guard = SEMIHOST.lock_irqsave();
+    guard.fileio_inflight
+}
+
+pub fn fileio_clear_inflight() -> Result<(), &'static str> {
+    let mut guard = SEMIHOST.lock_irqsave();
+    if !guard.pending {
+        return Err("no_pending");
+    }
+    guard.fileio_inflight = false;
+    Ok(())
+}
+
+fn set_fileio_enabled(enabled: bool) {
+    let mut guard = SEMIHOST.lock_irqsave();
+    guard.fileio_enabled = enabled;
+}
+
+pub fn fileio_try_build_request<M: MemoryAccess>(
+    mem: &mut M,
+    out: &mut [u8],
+) -> Result<Option<usize>, &'static str> {
+    let mut guard = SEMIHOST.lock_irqsave();
+    if !guard.pending || guard.completion.is_some() {
+        return Ok(None);
+    }
+    if guard.fileio_inflight {
+        return Ok(None);
+    }
+    let Some(req) = guard.req else {
+        return Ok(None);
+    };
+    let Some(kind) = req.kind else {
+        let _ = store_completion_locked(&mut guard, -1, EINVAL);
+        return Ok(None);
+    };
+    if !req.decoded_ok && !matches!(kind, SemihostOp::Write0) {
+        let _ = store_completion_locked(&mut guard, -1, EINVAL);
+        return Ok(None);
+    }
+
+    let mut out_buf = OutBuf::new(out);
+    let build = (|| -> Result<(), &'static str> {
+        match kind {
+            SemihostOp::Open => {
+                let flags = match req.mode {
+                    0 => O_RDONLY,
+                    4 => O_WRONLY | O_CREAT | O_TRUNC,
+                    8 => O_WRONLY | O_CREAT | O_APPEND,
+                    _ => return Err("bad_mode"),
+                };
+                let mode = if (flags & O_CREAT) != 0 {
+                    FILEIO_CREATE_MODE
+                } else {
+                    0
+                };
+                write_bytes(&mut out_buf, b"Fopen,")?;
+                write_hex_u64(&mut out_buf, req.buf_ptr)?;
+                write_bytes(&mut out_buf, b"/")?;
+                write_hex_u64(&mut out_buf, req.len)?;
+                write_bytes(&mut out_buf, b",")?;
+                write_hex_u64(&mut out_buf, flags as u64)?;
+                write_bytes(&mut out_buf, b",")?;
+                write_hex_u64(&mut out_buf, mode as u64)?;
+            }
+            SemihostOp::Write => {
+                write_bytes(&mut out_buf, b"Fwrite,")?;
+                write_hex_u64(&mut out_buf, req.handle)?;
+                write_bytes(&mut out_buf, b",")?;
+                write_hex_u64(&mut out_buf, req.buf_ptr)?;
+                write_bytes(&mut out_buf, b"/")?;
+                write_hex_u64(&mut out_buf, req.len)?;
+            }
+            SemihostOp::Close => {
+                write_bytes(&mut out_buf, b"Fclose,")?;
+                write_hex_u64(&mut out_buf, req.handle)?;
+            }
+            SemihostOp::Write0 => {
+                let len = match cstring_len(mem, req.buf_ptr, SEMIHOST_READ_MAX) {
+                    Ok(Some(len)) => len,
+                    Ok(None) => return Err("no_terminator"),
+                    Err(_) => return Err("mem_read"),
+                };
+                write_bytes(&mut out_buf, b"Fwrite,1,")?;
+                write_hex_u64(&mut out_buf, req.buf_ptr)?;
+                write_bytes(&mut out_buf, b"/")?;
+                write_hex_u64(&mut out_buf, len as u64)?;
+            }
+        }
+        Ok(())
+    })();
+    if build.is_err() {
+        let _ = store_completion_locked(&mut guard, -1, EINVAL);
+        return Ok(None);
+    }
+
+    guard.fileio_inflight = true;
+    Ok(Some(out_buf.len()))
+}
+
+pub fn fileio_on_reply(retcode: i64, errno: i32) -> Result<(), &'static str> {
+    let mut guard = SEMIHOST.lock_irqsave();
+    if !guard.pending {
+        return Err("no_pending");
+    }
+    if !guard.fileio_inflight {
+        return Err("not_inflight");
+    }
+    let Some(req) = guard.req else {
+        guard.fileio_inflight = false;
+        return Err("no_request");
+    };
+    let Some(kind) = req.kind else {
+        let _ = store_completion_locked(&mut guard, -1, EINVAL);
+        guard.fileio_inflight = false;
+        return Err("unsupported_op");
+    };
+    if !req.decoded_ok && !matches!(kind, SemihostOp::Write0) {
+        let _ = store_completion_locked(&mut guard, -1, EINVAL);
+        guard.fileio_inflight = false;
+        return Err("decode_failed");
+    }
+
+    let result = match kind {
+        SemihostOp::Open => {
+            if retcode >= 0 {
+                retcode
+            } else {
+                -1
+            }
+        }
+        SemihostOp::Close => {
+            if retcode == 0 {
+                0
+            } else {
+                -1
+            }
+        }
+        SemihostOp::Write => {
+            if retcode >= 0 {
+                let written = retcode as u64;
+                let remaining = req.len.saturating_sub(written);
+                i64::try_from(remaining).unwrap_or(i64::MAX)
+            } else {
+                i64::try_from(req.len).unwrap_or(i64::MAX)
+            }
+        }
+        SemihostOp::Write0 => 0,
+    };
+
+    let res = store_completion_locked(&mut guard, result, errno);
+    guard.fileio_inflight = false;
+    res
+}
+
 pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) -> Option<usize> {
     let mut parts = cmd.split_ascii_whitespace();
     let root = parts.next()?;
@@ -206,6 +387,36 @@ pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) 
                                 }
                             }
                             None => write_error(&mut out, "bad_len"),
+                        }
+                    }
+                }
+                "fileio?" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                    } else if fileio_enabled() {
+                        let _ = write!(out, "fileio=on\n");
+                    } else {
+                        let _ = write!(out, "fileio=off\n");
+                    }
+                }
+                "fileio" => {
+                    let Some(mode) = parts.next() else {
+                        write_error(&mut out, "bad_args");
+                        return Some(out.len());
+                    };
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                    } else {
+                        match mode {
+                            "on" => {
+                                set_fileio_enabled(true);
+                                let _ = write!(out, "ok\n");
+                            }
+                            "off" => {
+                                set_fileio_enabled(false);
+                                let _ = write!(out, "ok\n");
+                            }
+                            _ => write_error(&mut out, "bad_args"),
                         }
                     }
                 }
@@ -351,8 +562,11 @@ fn read_args_u64<M: MemoryAccess>(
     Ok(fields)
 }
 
-fn store_completion(result: i64, errno: i32) -> Result<(), &'static str> {
-    let mut guard = SEMIHOST.lock_irqsave();
+fn store_completion_locked(
+    guard: &mut SemihostState,
+    result: i64,
+    errno: i32,
+) -> Result<(), &'static str> {
     if !guard.pending {
         return Err("no_pending");
     }
@@ -361,6 +575,11 @@ fn store_completion(result: i64, errno: i32) -> Result<(), &'static str> {
     }
     guard.completion = Some(SemihostCompletion { result, errno });
     Ok(())
+}
+
+fn store_completion(result: i64, errno: i32) -> Result<(), &'static str> {
+    let mut guard = SEMIHOST.lock_irqsave();
+    store_completion_locked(&mut guard, result, errno)
 }
 
 fn alloc_handle() -> u32 {
@@ -517,6 +736,53 @@ fn write_semihost_read<M: MemoryAccess>(
     Ok(())
 }
 
+fn write_bytes(out: &mut OutBuf<'_>, bytes: &[u8]) -> Result<(), &'static str> {
+    out.try_write_bytes(bytes).map_err(|_| "buf_overflow")
+}
+
+fn write_hex_u64(out: &mut OutBuf<'_>, mut val: u64) -> Result<(), &'static str> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 16];
+    let mut len = 0usize;
+
+    if val == 0 {
+        tmp[0] = b'0';
+        len = 1;
+    } else {
+        while val != 0 {
+            tmp[len] = HEX[(val & 0xf) as usize];
+            len += 1;
+            val >>= 4;
+        }
+    }
+
+    let mut out_buf = [0u8; 16];
+    for i in 0..len {
+        out_buf[i] = tmp[len - 1 - i];
+    }
+    write_bytes(out, &out_buf[..len])
+}
+
+fn cstring_len<M: MemoryAccess>(
+    mem: &mut M,
+    addr: u64,
+    cap: usize,
+) -> Result<Option<usize>, &'static str> {
+    let mut offset = 0usize;
+    let mut buf = [0u8; 64];
+    while offset < cap {
+        let read_len = core::cmp::min(cap - offset, buf.len());
+        let read_addr = addr.checked_add(offset as u64).ok_or("addr_overflow")?;
+        mem.read(read_addr, &mut buf[..read_len])
+            .map_err(|_| "mem_read")?;
+        if let Some(pos) = buf[..read_len].iter().position(|&b| b == 0) {
+            return Ok(Some(offset + pos));
+        }
+        offset += read_len;
+    }
+    Ok(None)
+}
+
 fn parse_usize_token(token: &str) -> Option<usize> {
     let token = token.trim();
     if token.is_empty() {
@@ -643,6 +909,50 @@ mod tests {
     fn reset_for_test() {
         let mut guard = SEMIHOST.lock_irqsave();
         guard.clear();
+        guard.fileio_enabled = true;
+    }
+
+    struct BufMem {
+        base: u64,
+        data: [u8; 128],
+    }
+
+    impl BufMem {
+        fn new(base: u64) -> Self {
+            Self {
+                base,
+                data: [0u8; 128],
+            }
+        }
+
+        fn write_at(&mut self, offset: usize, src: &[u8]) {
+            let end = offset.saturating_add(src.len());
+            self.data[offset..end].copy_from_slice(src);
+        }
+    }
+
+    impl MemoryAccess for BufMem {
+        type Error = ();
+
+        fn read(&mut self, addr: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
+            let start = addr.checked_sub(self.base).ok_or(())? as usize;
+            let end = start.checked_add(dst.len()).ok_or(())?;
+            if end > self.data.len() {
+                return Err(());
+            }
+            dst.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+
+        fn write(&mut self, addr: u64, src: &[u8]) -> Result<(), Self::Error> {
+            let start = addr.checked_sub(self.base).ok_or(())? as usize;
+            let end = start.checked_add(src.len()).ok_or(())?;
+            if end > self.data.len() {
+                return Err(());
+            }
+            self.data[start..end].copy_from_slice(src);
+            Ok(())
+        }
     }
 
     #[test]
@@ -713,5 +1023,106 @@ mod tests {
                 .unwrap_or("")
                 .starts_with("error")
         );
+    }
+
+    #[test]
+    fn fileio_write0_builds_fwrite_with_len() {
+        reset_for_test();
+        let mut mem = BufMem::new(0x1000);
+        mem.write_at(0, b"hi\0");
+
+        let req = SemihostRequest {
+            op: SYS_WRITE0 as u64,
+            args_ptr: 0,
+            insn_addr: 0,
+            pc_after: 0,
+            kind: Some(SemihostOp::Write0),
+            handle: 0,
+            buf_ptr: 0x1000,
+            len: 0,
+            mode: 0,
+            decoded_ok: true,
+        };
+        {
+            let mut guard = SEMIHOST.lock_irqsave();
+            guard.start_request(req);
+        }
+
+        let mut out = [0u8; 64];
+        let len = fileio_try_build_request(&mut mem, &mut out)
+            .unwrap()
+            .expect("expected request");
+        assert_eq!(&out[..len], b"Fwrite,1,1000/2");
+    }
+
+    #[test]
+    fn fileio_open_builds_and_rejects_unknown_mode() {
+        reset_for_test();
+        let mut mem = DummyMem;
+        let req = SemihostRequest {
+            op: SYS_OPEN as u64,
+            args_ptr: 0,
+            insn_addr: 0,
+            pc_after: 0,
+            kind: Some(SemihostOp::Open),
+            handle: 0,
+            buf_ptr: 0x2000,
+            len: 0x10,
+            mode: 4,
+            decoded_ok: true,
+        };
+        {
+            let mut guard = SEMIHOST.lock_irqsave();
+            guard.start_request(req);
+        }
+
+        let mut out = [0u8; 64];
+        let len = fileio_try_build_request(&mut mem, &mut out)
+            .unwrap()
+            .expect("expected request");
+        assert_eq!(&out[..len], b"Fopen,2000/10,241,1b6");
+
+        reset_for_test();
+        let req = SemihostRequest { mode: 7, ..req };
+        {
+            let mut guard = SEMIHOST.lock_irqsave();
+            guard.start_request(req);
+        }
+        let mut out = [0u8; 64];
+        let built = fileio_try_build_request(&mut mem, &mut out).unwrap();
+        assert!(built.is_none());
+        let guard = SEMIHOST.lock_irqsave();
+        let completion = guard.completion.expect("missing completion");
+        assert_eq!(completion.result, -1);
+        assert_eq!(completion.errno, EINVAL);
+    }
+
+    #[test]
+    fn fileio_write_reply_maps_bytes_not_written() {
+        reset_for_test();
+        let mut mem = DummyMem;
+        let req = SemihostRequest {
+            op: SYS_WRITE as u64,
+            args_ptr: 0,
+            insn_addr: 0,
+            pc_after: 0,
+            kind: Some(SemihostOp::Write),
+            handle: 3,
+            buf_ptr: 0x3000,
+            len: 10,
+            mode: 0,
+            decoded_ok: true,
+        };
+        {
+            let mut guard = SEMIHOST.lock_irqsave();
+            guard.start_request(req);
+        }
+        let mut out = [0u8; 64];
+        let _ = fileio_try_build_request(&mut mem, &mut out).unwrap();
+        fileio_on_reply(7, 0).expect("fileio reply failed");
+
+        let guard = SEMIHOST.lock_irqsave();
+        let completion = guard.completion.expect("missing completion");
+        assert_eq!(completion.result, 3);
     }
 }
