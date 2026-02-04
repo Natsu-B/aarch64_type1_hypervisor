@@ -28,6 +28,7 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
     const PROP_INTERRUPTS: &'static str = "interrupts";
     const PROP_INTERRUPT_CELLS: &'static str = "#interrupt-cells";
     const PROP_INTERRUPT_PARENT: &'static str = "interrupt-parent";
+    const PROP_MSI_PARENT: &'static str = "msi-parent";
     const PROP_PHANDLE: &'static str = "phandle";
     const PROP_LINUX_PHANDLE: &'static str = "linux,phandle";
     const MAX_INTERRUPT_CELLS: usize = 4;
@@ -89,12 +90,34 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         }
     }
 
-    pub fn interrupt_parent(&self) -> Option<u32> {
-        self.interrupt_parent_phandle().ok().flatten()
+    pub fn interrupt_parent(&self) -> Result<Option<DtbNodeView<'dtb, 'static>>, &'static str> {
+        let Some(phandle) = self.interrupt_parent_phandle()? else {
+            return Ok(None);
+        };
+        let controller = self
+            .parser
+            .find_node_view_by_phandle(phandle)?
+            .ok_or("interrupt-parent: controller not found")?;
+        Ok(Some(controller))
     }
 
     pub fn interrupt_parent_phandle(&self) -> Result<Option<u32>, &'static str> {
         self.inherited_u32_be(Self::PROP_INTERRUPT_PARENT)
+    }
+
+    pub fn msi_parent(&self) -> Result<Option<DtbNodeView<'dtb, 'static>>, &'static str> {
+        let Some(phandle) = self.msi_parent_phandle()? else {
+            return Ok(None);
+        };
+        let controller = self
+            .parser
+            .find_node_view_by_phandle(phandle)?
+            .ok_or("msi-parent: controller not found")?;
+        Ok(Some(controller))
+    }
+
+    pub fn msi_parent_phandle(&self) -> Result<Option<u32>, &'static str> {
+        self.inherited_u32_be(Self::PROP_MSI_PARENT)
     }
 
     pub fn phandle(&self) -> Option<u32> {
@@ -109,13 +132,9 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
     }
 
     pub fn interrupt_cells(&self) -> Result<Option<u32>, &'static str> {
-        let Some(phandle) = self.interrupt_parent_phandle()? else {
+        let Some(controller) = self.interrupt_parent()? else {
             return Ok(None);
         };
-        let controller = self
-            .parser
-            .find_node_view_by_phandle(phandle)?
-            .ok_or("interrupt-parent: controller not found")?;
         controller.property_u32_be(Self::PROP_INTERRUPT_CELLS)
     }
 
