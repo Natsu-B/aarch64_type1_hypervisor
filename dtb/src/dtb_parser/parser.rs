@@ -296,85 +296,69 @@ impl DtbParser<Validated> {
         })
     }
 
-    pub fn for_each_node_view<F>(&self, f: &mut F) -> Result<(), &'static str>
+    pub fn for_each_node_view<T, F>(&self, f: &mut F) -> Result<ControlFlow<T>, &'static str>
     where
-        F: for<'s> FnMut(DtbNodeView<'_, 's>) -> ControlFlow<()>,
+        F: for<'s> FnMut(DtbNodeView<'_, 's>) -> ControlFlow<T>,
     {
-        fn walk<'dtb, 's, F>(
+        fn walk<'dtb, 's, T, F>(
             node: DtbNodeView<'dtb, 's>,
             f: &mut F,
-        ) -> Result<ControlFlow<()>, &'static str>
+        ) -> Result<ControlFlow<T>, &'static str>
         where
-            F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> ControlFlow<()>,
+            F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> ControlFlow<T>,
         {
-            if f(node).is_break() {
-                return Ok(ControlFlow::Break(()));
+            match f(node) {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
             }
-            let mut result: Result<ControlFlow<()>, &'static str> = Ok(ControlFlow::Continue(()));
-            let mut should_break = false;
-
-            node.for_each_child_view(&mut |child| match walk(child, f) {
+            let child_result = node.for_each_child_view(&mut |child| match walk(child, f) {
                 Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
-                Ok(ControlFlow::Break(())) => {
-                    should_break = true;
-                    ControlFlow::Break(())
-                }
-                Err(err) => {
-                    result = Err(err);
-                    ControlFlow::Break(())
-                }
+                Ok(ControlFlow::Break(value)) => ControlFlow::Break(Ok(value)),
+                Err(err) => ControlFlow::Break(Err(err)),
             })?;
 
-            result?;
-            if should_break {
-                return Ok(ControlFlow::Break(()));
+            match child_result {
+                ControlFlow::Continue(()) => Ok(ControlFlow::Continue(())),
+                ControlFlow::Break(Ok(value)) => Ok(ControlFlow::Break(value)),
+                ControlFlow::Break(Err(err)) => Err(err),
             }
-            Ok(ControlFlow::Continue(()))
         }
 
         let root = self.root_node_view()?;
-        let _ = walk(root, f)?;
-        Ok(())
+        walk(root, f)
     }
 
     pub fn find_node_view_by_phandle(
         &self,
         phandle: u32,
     ) -> Result<Option<DtbNodeView<'_, 'static>>, &'static str> {
-        let mut found: Option<(usize, usize, &'static str)> = None;
-        let mut error: Option<&'static str> = None;
-        self.for_each_node_view(&mut |node| {
+        let result = self.for_each_node_view(&mut |node| {
             let primary = match node.property_u32_be("phandle") {
                 Ok(value) => value,
-                Err(err) => {
-                    error = Some(err);
-                    return ControlFlow::Break(());
-                }
+                Err(err) => return ControlFlow::Break(Err(err)),
             };
             let secondary = match node.property_u32_be("linux,phandle") {
                 Ok(value) => value,
-                Err(err) => {
-                    error = Some(err);
-                    return ControlFlow::Break(());
-                }
+                Err(err) => return ControlFlow::Break(Err(err)),
             };
             if primary == Some(phandle) || secondary == Some(phandle) {
                 let (begin, end) = node.struct_range();
-                found = Some((begin, end, node.name()));
-                return ControlFlow::Break(());
+                return ControlFlow::Break(Ok((begin, end, node.name())));
             }
             ControlFlow::Continue(())
         })?;
-        if let Some(err) = error {
-            return Err(err);
+
+        match result {
+            ControlFlow::Continue(()) => Ok(None),
+            ControlFlow::Break(Ok((begin, end, name))) => Ok(Some(DtbNodeView {
+                parser: self,
+                begin,
+                end,
+                name,
+                ancestors: &[],
+            })),
+            ControlFlow::Break(Err(err)) => Err(err),
         }
-        Ok(found.map(|(begin, end, name)| DtbNodeView {
-            parser: self,
-            begin,
-            end,
-            name,
-            ancestors: &[],
-        }))
     }
 
     pub fn find_nodes_by_compatible_view(
@@ -382,21 +366,21 @@ impl DtbParser<Validated> {
         compatible_name: &str,
         f: &mut impl FnMut(&DtbNodeView<'_, '_>, &'static str) -> ControlFlow<()>,
     ) -> Result<(), &'static str> {
-        let mut error: Option<&'static str> = None;
-        self.for_each_node_view(
-            &mut |node| match node.compatible_contains(compatible_name) {
-                Ok(true) => f(&node, node.name()),
-                Ok(false) => ControlFlow::Continue(()),
-                Err(e) => {
-                    error = Some(e);
-                    ControlFlow::Break(())
-                }
+        let result = self.for_each_node_view(&mut |node| match node
+            .compatible_contains(compatible_name)
+        {
+            Ok(true) => match f(&node, node.name()) {
+                ControlFlow::Continue(()) => ControlFlow::Continue(()),
+                ControlFlow::Break(()) => ControlFlow::Break(Ok(())),
             },
-        )?;
-        if let Some(e) = error {
-            return Err(e);
+            Ok(false) => ControlFlow::Continue(()),
+            Err(e) => ControlFlow::Break(Err(e)),
+        })?;
+
+        match result {
+            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => Ok(()),
+            ControlFlow::Break(Err(e)) => Err(e),
         }
-        Ok(())
     }
 
     pub fn find_node<F>(
@@ -414,8 +398,7 @@ impl DtbParser<Validated> {
             return Err("find_node: specify exactly one of device_name/compatible_name");
         }
 
-        let mut err: Option<&'static str> = None;
-        self.for_each_node_view(&mut |node| {
+        let result = self.for_each_node_view(&mut |node| {
             let matched = if let Some(dev) = device_name {
                 match node.property_bytes("device_type") {
                     Ok(Some(bytes)) => {
@@ -424,18 +407,12 @@ impl DtbParser<Validated> {
                             .is_some_and(|s| s == dev)
                     }
                     Ok(None) => false,
-                    Err(e) => {
-                        err = Some(e);
-                        return ControlFlow::Break(());
-                    }
+                    Err(e) => return ControlFlow::Break(Err(e)),
                 }
             } else if let Some(comp) = compatible_name {
                 match node.compatible_contains(comp) {
                     Ok(v) => v,
-                    Err(e) => {
-                        err = Some(e);
-                        return ControlFlow::Break(());
-                    }
+                    Err(e) => return ControlFlow::Break(Err(e)),
                 }
             } else {
                 false
@@ -447,31 +424,25 @@ impl DtbParser<Validated> {
 
             let mut it = match node.reg_iter() {
                 Ok(it) => it,
-                Err(e) => {
-                    err = Some(e);
-                    return ControlFlow::Break(());
-                }
+                Err(e) => return ControlFlow::Break(Err(e)),
             };
             while let Some(r) = it.next() {
                 match r {
                     Ok((addr, size)) => {
                         if f(addr, size).is_break() {
-                            return ControlFlow::Break(());
+                            return ControlFlow::Break(Ok(()));
                         }
                     }
-                    Err(e) => {
-                        err = Some(e);
-                        return ControlFlow::Break(());
-                    }
+                    Err(e) => return ControlFlow::Break(Err(e)),
                 }
             }
             ControlFlow::Continue(())
         })?;
 
-        if let Some(e) = err {
-            return Err(e);
+        match result {
+            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => Ok(()),
+            ControlFlow::Break(Err(e)) => Err(e),
         }
-        Ok(())
     }
 
     pub fn find_memory_reservation_block<F>(&self, f: &mut F)
@@ -497,38 +468,29 @@ impl DtbParser<Validated> {
         phandle: u32,
         key: &str,
     ) -> Result<Option<u32>, &'static str> {
-        let mut out: Option<u32> = None;
-        let mut err: Option<&'static str> = None;
-
-        self.for_each_node_view(&mut |node| {
+        let result = self.for_each_node_view(&mut |node| {
             let primary = match node.property_u32_be("phandle") {
                 Ok(v) => v,
-                Err(e) => {
-                    err = Some(e);
-                    return ControlFlow::Break(());
-                }
+                Err(e) => return ControlFlow::Break(Err(e)),
             };
             let secondary = match node.property_u32_be("linux,phandle") {
                 Ok(v) => v,
-                Err(e) => {
-                    err = Some(e);
-                    return ControlFlow::Break(());
-                }
+                Err(e) => return ControlFlow::Break(Err(e)),
             };
             if primary == Some(phandle) || secondary == Some(phandle) {
-                match node.property_u32_be(key) {
-                    Ok(v) => out = v,
-                    Err(e) => err = Some(e),
-                }
-                return ControlFlow::Break(());
+                return match node.property_u32_be(key) {
+                    Ok(v) => ControlFlow::Break(Ok(v)),
+                    Err(e) => ControlFlow::Break(Err(e)),
+                };
             }
             ControlFlow::Continue(())
         })?;
 
-        if let Some(e) = err {
-            return Err(e);
+        match result {
+            ControlFlow::Continue(()) => Ok(None),
+            ControlFlow::Break(Ok(v)) => Ok(v),
+            ControlFlow::Break(Err(e)) => Err(e),
         }
-        Ok(out)
     }
 
     pub fn find_reserved_memory_node<F, D>(
@@ -540,13 +502,12 @@ impl DtbParser<Validated> {
         F: FnMut(usize, usize) -> ControlFlow<()>,
         D: FnMut(usize, Option<usize>, Option<(usize, usize)>) -> Result<ControlFlow<()>, ()>,
     {
-        let mut err: Option<&'static str> = None;
-        self.for_each_node_view(&mut |node| {
+        let result = self.for_each_node_view(&mut |node| {
             if node.name() != "reserved-memory" {
                 return ControlFlow::Continue(());
             }
 
-            let result = node.for_each_child_view(&mut |child| {
+            let child_result = match node.for_each_child_view(&mut |child| {
                 let reg = child.property_bytes("reg");
                 if let Ok(Some(_)) = reg {
                     if let Ok(mut it) = child.reg_iter() {
@@ -615,17 +576,18 @@ impl DtbParser<Validated> {
                 }
 
                 ControlFlow::Continue(())
-            });
+            }) {
+                Ok(result) => result,
+                Err(e) => return ControlFlow::Break(Err(e)),
+            };
 
-            if let Err(e) = result {
-                err = Some(e);
-            }
-            ControlFlow::Break(())
+            let _ = child_result;
+            ControlFlow::Break(Ok(()))
         })?;
 
-        if let Some(e) = err {
-            return Err(e);
+        match result {
+            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => Ok(()),
+            ControlFlow::Break(Err(e)) => Err(e),
         }
-        Ok(())
     }
 }

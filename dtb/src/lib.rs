@@ -192,40 +192,33 @@ mod tests {
         let parser = DtbParser::init(test_data_addr).unwrap();
 
         let mut found = false;
-        let mut error: Option<&'static str> = None;
 
-        parser
+        let result = parser
             .for_each_node_view(&mut |node| match node.compatible_contains("arm,pl011") {
                 Ok(true) => {
                     found = true;
                     match node.interrupt_cells() {
                         Ok(value) => assert_eq!(value, Some(3)),
-                        Err(err) => {
-                            error = Some(err);
-                            return ControlFlow::Break(());
-                        }
+                        Err(err) => return ControlFlow::Break(Err(err)),
                     }
                     let mut spec = None;
                     if let Err(err) = node.for_each_interrupt_specifier(&mut |cells| {
                         spec = Some([cells[0], cells[1], cells[2]]);
                         ControlFlow::Break(())
                     }) {
-                        error = Some(err);
-                        return ControlFlow::Break(());
+                        return ControlFlow::Break(Err(err));
                     }
                     assert_eq!(spec, Some([0, 0x79, 4]));
-                    ControlFlow::Break(())
+                    ControlFlow::Break(Ok(()))
                 }
                 Ok(false) => ControlFlow::Continue(()),
-                Err(err) => {
-                    error = Some(err);
-                    ControlFlow::Break(())
-                }
+                Err(err) => ControlFlow::Break(Err(err)),
             })
             .unwrap();
 
-        if let Some(err) = error {
-            panic!("{}", err);
+        match result {
+            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => {}
+            ControlFlow::Break(Err(err)) => panic!("{}", err),
         }
         assert!(found);
     }
@@ -269,9 +262,8 @@ mod tests {
         let parser = DtbParser::init(test_data_addr).unwrap();
 
         let mut found = false;
-        let mut error: Option<&'static str> = None;
 
-        parser
+        let result = parser
             .for_each_node_view(
                 &mut |node| match node.compatible_contains("brcm,bcm2712-pcie") {
                     Ok(true) => {
@@ -282,24 +274,22 @@ mod tests {
                                     assert_eq!(addr, 0x10_0012_0000);
                                     assert_eq!(size, 0x9310);
                                 }
-                                Some(Err(err)) => error = Some(err),
-                                None => error = Some("reg_iter: no entries"),
+                                Some(Err(err)) => return ControlFlow::Break(Err(err)),
+                                None => return ControlFlow::Break(Err("reg_iter: no entries")),
                             },
-                            Err(err) => error = Some(err),
+                            Err(err) => return ControlFlow::Break(Err(err)),
                         }
-                        ControlFlow::Break(())
+                        ControlFlow::Break(Ok(()))
                     }
                     Ok(false) => ControlFlow::Continue(()),
-                    Err(err) => {
-                        error = Some(err);
-                        ControlFlow::Break(())
-                    }
+                    Err(err) => ControlFlow::Break(Err(err)),
                 },
             )
             .unwrap();
 
-        if let Some(err) = error {
-            panic!("{}", err);
+        match result {
+            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => {}
+            ControlFlow::Break(Err(err)) => panic!("{}", err),
         }
         assert!(found);
     }

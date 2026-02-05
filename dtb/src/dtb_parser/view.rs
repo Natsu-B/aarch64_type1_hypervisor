@@ -211,9 +211,9 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         self.size_cells_result().unwrap_or(1)
     }
 
-    pub fn for_each_child_view<F>(&self, f: &mut F) -> Result<(), &'static str>
+    pub fn for_each_child_view<T, F>(&self, f: &mut F) -> Result<ControlFlow<T>, &'static str>
     where
-        F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> ControlFlow<()>,
+        F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> ControlFlow<T>,
     {
         let (_, mut cursor) = self
             .parser
@@ -250,14 +250,15 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
                     name: child_name,
                     ancestors: &scopes[..depth + 1],
                 };
-                if f(view).is_break() {
-                    return Ok(());
+                match f(view) {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
                 }
                 cursor = child_end;
                 continue;
             }
             if token == DtbParser::FDT_END_NODE {
-                return Ok(());
+                return Ok(ControlFlow::Continue(()));
             }
             return Err("child traversal: unexpected token");
         }
