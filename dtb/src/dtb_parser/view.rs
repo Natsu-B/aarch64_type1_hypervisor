@@ -9,6 +9,8 @@ use super::iters::RegIter;
 use super::parser::DtbParser;
 use super::types::NodeScope;
 use super::types::Validated;
+use super::types::WalkError;
+use super::types::WalkResult;
 use super::types::read_u32_be;
 
 #[derive(Clone, Copy)]
@@ -90,6 +92,7 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         }
     }
 
+    /// Note: returned view has empty ancestors; use with_interrupt_parent_view for ancestors.
     pub fn interrupt_parent(&self) -> Result<Option<DtbNodeView<'dtb, 'static>>, &'static str> {
         let Some(phandle) = self.interrupt_parent_phandle()? else {
             return Ok(None);
@@ -105,6 +108,20 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         self.inherited_u32_be(Self::PROP_INTERRUPT_PARENT)
     }
 
+    pub fn with_interrupt_parent_view<F, R>(&self, f: &mut F) -> Result<Option<R>, &'static str>
+    where
+        F: for<'a, 'cs> FnMut(DtbNodeView<'a, 'cs>) -> Result<R, &'static str>,
+    {
+        let Some(phandle) = self.interrupt_parent_phandle()? else {
+            return Ok(None);
+        };
+        match self.parser.with_node_view_by_phandle(phandle, f)? {
+            Some(value) => Ok(Some(value)),
+            None => Err("interrupt-parent: controller not found"),
+        }
+    }
+
+    /// Note: returned view has empty ancestors; use with_msi_parent_view for ancestors.
     pub fn msi_parent(&self) -> Result<Option<DtbNodeView<'dtb, 'static>>, &'static str> {
         let Some(phandle) = self.msi_parent_phandle()? else {
             return Ok(None);
@@ -120,6 +137,19 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         self.inherited_u32_be(Self::PROP_MSI_PARENT)
     }
 
+    pub fn with_msi_parent_view<F, R>(&self, f: &mut F) -> Result<Option<R>, &'static str>
+    where
+        F: for<'a, 'cs> FnMut(DtbNodeView<'a, 'cs>) -> Result<R, &'static str>,
+    {
+        let Some(phandle) = self.msi_parent_phandle()? else {
+            return Ok(None);
+        };
+        match self.parser.with_node_view_by_phandle(phandle, f)? {
+            Some(value) => Ok(Some(value)),
+            None => Err("msi-parent: controller not found"),
+        }
+    }
+
     pub fn phandle(&self) -> Option<u32> {
         self.property_u32_be(Self::PROP_PHANDLE)
             .ok()
@@ -132,32 +162,39 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
     }
 
     pub fn interrupt_cells(&self) -> Result<Option<u32>, &'static str> {
-        let Some(controller) = self.interrupt_parent()? else {
-            return Ok(None);
-        };
-        controller.property_u32_be(Self::PROP_INTERRUPT_CELLS)
+        let result = self.with_interrupt_parent_view(&mut |controller| {
+            controller.property_u32_be(Self::PROP_INTERRUPT_CELLS)
+        })?;
+        Ok(result.flatten())
     }
 
-    pub fn for_each_interrupt_specifier<F>(&self, f: &mut F) -> Result<(), &'static str>
+    pub fn for_each_interrupt_specifier<T, E, F>(&self, f: &mut F) -> WalkResult<T, E>
     where
-        F: FnMut(&[u32]) -> ControlFlow<()>,
+        F: FnMut(&[u32]) -> WalkResult<T, E>,
     {
-        let Some(data) = self.property_bytes(Self::PROP_INTERRUPTS)? else {
-            return Ok(());
+        let Some(data) = self
+            .property_bytes(Self::PROP_INTERRUPTS)
+            .map_err(WalkError::Dtb)?
+        else {
+            return Ok(ControlFlow::Continue(()));
         };
         let cells = self
-            .interrupt_cells()?
-            .ok_or("interrupts: missing #interrupt-cells")?;
-        let cells = usize::try_from(cells).map_err(|_| "interrupts: cell count overflow")?;
+            .interrupt_cells()
+            .map_err(WalkError::Dtb)?
+            .ok_or(WalkError::Dtb("interrupts: missing #interrupt-cells"))?;
+        let cells = usize::try_from(cells)
+            .map_err(|_| WalkError::Dtb("interrupts: cell count overflow"))?;
         if cells == 0 || cells > Self::MAX_INTERRUPT_CELLS {
-            return Err("interrupts: invalid cell count");
+            return Err(WalkError::Dtb("interrupts: invalid cell count"));
         }
 
         let stride = cells
             .checked_mul(size_of::<u32>())
-            .ok_or("interrupts: stride overflow")?;
+            .ok_or(WalkError::Dtb("interrupts: stride overflow"))?;
         if data.len() % stride != 0 {
-            return Err("interrupts: length not multiple of cell count");
+            return Err(WalkError::Dtb(
+                "interrupts: length not multiple of cell count",
+            ));
         }
 
         let mut offset = 0usize;
@@ -166,14 +203,15 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
             for i in 0..cells {
                 let base = offset + i * size_of::<u32>();
                 let chunk = &data[base..base + size_of::<u32>()];
-                decoded[i] = read_u32_be(chunk)?;
+                decoded[i] = read_u32_be(chunk).map_err(WalkError::Dtb)?;
             }
-            if f(&decoded[..cells]).is_break() {
-                break;
+            match f(&decoded[..cells])? {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
             }
             offset += stride;
         }
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     pub fn has_ranges(&self) -> bool {
@@ -211,17 +249,21 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         self.size_cells_result().unwrap_or(1)
     }
 
-    pub fn for_each_child_view<T, F>(&self, f: &mut F) -> Result<ControlFlow<T>, &'static str>
+    pub fn for_each_child_view<T, E, F>(&self, f: &mut F) -> WalkResult<T, E>
     where
-        F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> ControlFlow<T>,
+        F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> WalkResult<T, E>,
     {
         let (_, mut cursor) = self
             .parser
-            .scan_node_properties(self.begin, self.end, None)?;
+            .scan_node_properties(self.begin, self.end, None)
+            .map_err(WalkError::Dtb)?;
         const MAX_DEPTH: usize = 32;
 
         while cursor < self.end {
-            let token = self.parser.read_token(cursor, self.end)?;
+            let token = self
+                .parser
+                .read_token(cursor, self.end)
+                .map_err(WalkError::Dtb)?;
             if token == DtbParser::FDT_NOP {
                 cursor += DtbParser::TOKEN_SIZE;
                 continue;
@@ -229,12 +271,17 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
             if token == DtbParser::FDT_BEGIN_NODE {
                 let child_begin = cursor;
                 let mut child_end = child_begin;
-                self.parser.skip_node(&mut child_end, self.end)?;
-                let child_name = self.parser.node_name(child_begin, child_end)?;
+                self.parser
+                    .skip_node(&mut child_end, self.end)
+                    .map_err(WalkError::Dtb)?;
+                let child_name = self
+                    .parser
+                    .node_name(child_begin, child_end)
+                    .map_err(WalkError::Dtb)?;
 
                 let depth = self.ancestors.len();
                 if depth + 1 > MAX_DEPTH {
-                    return Err("node depth exceeded");
+                    return Err(WalkError::Dtb("node depth exceeded"));
                 }
                 let mut scopes = [NodeScope { begin: 0, end: 0 }; MAX_DEPTH];
                 scopes[..depth].copy_from_slice(self.ancestors);
@@ -250,19 +297,19 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
                     name: child_name,
                     ancestors: &scopes[..depth + 1],
                 };
-                match f(view) {
+                match f(view)? {
                     ControlFlow::Continue(()) => {}
                     ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
-                }
+                };
                 cursor = child_end;
                 continue;
             }
             if token == DtbParser::FDT_END_NODE {
                 return Ok(ControlFlow::Continue(()));
             }
-            return Err("child traversal: unexpected token");
+            return Err(WalkError::Dtb("child traversal: unexpected token"));
         }
-        Err("child traversal: unexpected end")
+        Err(WalkError::Dtb("child traversal: unexpected end"))
     }
 
     pub(crate) fn parent_address_cells(&self) -> Result<u32, &'static str> {

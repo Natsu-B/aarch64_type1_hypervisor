@@ -13,4 +13,6 @@ pub use iters::RegIter;
 pub use parser::DtbParser;
 pub use types::Unchecked;
 pub use types::Validated;
+pub use types::WalkError;
+pub use types::WalkResult;
 pub use view::DtbNodeView;

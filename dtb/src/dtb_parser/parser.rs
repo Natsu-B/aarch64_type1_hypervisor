@@ -9,6 +9,8 @@ use super::types::NodeScope;
 use super::types::TOKEN_SIZE;
 use super::types::Unchecked;
 use super::types::Validated;
+use super::types::WalkError;
+use super::types::WalkResult;
 use super::types::read_u32_be;
 use super::view::DtbNodeView;
 
@@ -296,35 +298,27 @@ impl DtbParser<Validated> {
         })
     }
 
-    pub fn for_each_node_view<T, F>(&self, f: &mut F) -> Result<ControlFlow<T>, &'static str>
+    pub fn for_each_node_view<T, E, F>(&self, f: &mut F) -> WalkResult<T, E>
     where
-        F: for<'s> FnMut(DtbNodeView<'_, 's>) -> ControlFlow<T>,
+        F: for<'s> FnMut(DtbNodeView<'_, 's>) -> WalkResult<T, E>,
     {
-        fn walk<'dtb, 's, T, F>(
-            node: DtbNodeView<'dtb, 's>,
-            f: &mut F,
-        ) -> Result<ControlFlow<T>, &'static str>
+        fn walk<'dtb, 's, T, E, F>(node: DtbNodeView<'dtb, 's>, f: &mut F) -> WalkResult<T, E>
         where
-            F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> ControlFlow<T>,
+            F: for<'cs> FnMut(DtbNodeView<'dtb, 'cs>) -> WalkResult<T, E>,
         {
-            match f(node) {
+            match f(node)? {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
             }
-            let child_result = node.for_each_child_view(&mut |child| match walk(child, f) {
-                Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
-                Ok(ControlFlow::Break(value)) => ControlFlow::Break(Ok(value)),
-                Err(err) => ControlFlow::Break(Err(err)),
-            })?;
 
+            let child_result = node.for_each_child_view(&mut |child| walk(child, f))?;
             match child_result {
                 ControlFlow::Continue(()) => Ok(ControlFlow::Continue(())),
-                ControlFlow::Break(Ok(value)) => Ok(ControlFlow::Break(value)),
-                ControlFlow::Break(Err(err)) => Err(err),
+                ControlFlow::Break(value) => Ok(ControlFlow::Break(value)),
             }
         }
 
-        let root = self.root_node_view()?;
+        let root = self.root_node_view().map_err(WalkError::Dtb)?;
         walk(root, f)
     }
 
@@ -333,116 +327,123 @@ impl DtbParser<Validated> {
         phandle: u32,
     ) -> Result<Option<DtbNodeView<'_, 'static>>, &'static str> {
         let result = self.for_each_node_view(&mut |node| {
-            let primary = match node.property_u32_be("phandle") {
-                Ok(value) => value,
-                Err(err) => return ControlFlow::Break(Err(err)),
-            };
-            let secondary = match node.property_u32_be("linux,phandle") {
-                Ok(value) => value,
-                Err(err) => return ControlFlow::Break(Err(err)),
-            };
+            let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
+            let secondary = node
+                .property_u32_be("linux,phandle")
+                .map_err(WalkError::Dtb)?;
             if primary == Some(phandle) || secondary == Some(phandle) {
                 let (begin, end) = node.struct_range();
-                return ControlFlow::Break(Ok((begin, end, node.name())));
+                return Ok(ControlFlow::Break((begin, end, node.name())));
             }
-            ControlFlow::Continue(())
-        })?;
+            Ok(ControlFlow::Continue(()))
+        });
 
         match result {
-            ControlFlow::Continue(()) => Ok(None),
-            ControlFlow::Break(Ok((begin, end, name))) => Ok(Some(DtbNodeView {
+            Ok(ControlFlow::Continue(())) => Ok(None),
+            Ok(ControlFlow::Break((begin, end, name))) => Ok(Some(DtbNodeView {
                 parser: self,
                 begin,
                 end,
                 name,
                 ancestors: &[],
             })),
-            ControlFlow::Break(Err(err)) => Err(err),
+            Err(WalkError::Dtb(err)) => Err(err),
+            Err(WalkError::User(())) => Err("find_node_view_by_phandle: unexpected user error"),
         }
     }
 
-    pub fn find_nodes_by_compatible_view(
+    pub fn with_node_view_by_phandle<F, R>(
         &self,
-        compatible_name: &str,
-        f: &mut impl FnMut(&DtbNodeView<'_, '_>, &'static str) -> ControlFlow<()>,
-    ) -> Result<(), &'static str> {
-        let result = self.for_each_node_view(&mut |node| match node
-            .compatible_contains(compatible_name)
-        {
-            Ok(true) => match f(&node, node.name()) {
-                ControlFlow::Continue(()) => ControlFlow::Continue(()),
-                ControlFlow::Break(()) => ControlFlow::Break(Ok(())),
-            },
-            Ok(false) => ControlFlow::Continue(()),
-            Err(e) => ControlFlow::Break(Err(e)),
-        })?;
+        phandle: u32,
+        f: &mut F,
+    ) -> Result<Option<R>, &'static str>
+    where
+        F: for<'a, 's> FnMut(DtbNodeView<'a, 's>) -> Result<R, &'static str>,
+    {
+        let result = self.for_each_node_view(&mut |node| {
+            let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
+            let secondary = node
+                .property_u32_be("linux,phandle")
+                .map_err(WalkError::Dtb)?;
+            if primary == Some(phandle) || secondary == Some(phandle) {
+                let value = f(node).map_err(WalkError::User)?;
+                return Ok(ControlFlow::Break(value));
+            }
+            Ok(ControlFlow::Continue(()))
+        });
 
         match result {
-            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => Ok(()),
-            ControlFlow::Break(Err(e)) => Err(e),
+            Ok(ControlFlow::Continue(())) => Ok(None),
+            Ok(ControlFlow::Break(value)) => Ok(Some(value)),
+            Err(WalkError::Dtb(err)) => Err(err),
+            Err(WalkError::User(err)) => Err(err),
         }
     }
 
-    pub fn find_node<F>(
+    pub fn find_nodes_by_compatible_view<T, E>(
+        &self,
+        compatible_name: &str,
+        f: &mut impl FnMut(&DtbNodeView<'_, '_>, &'static str) -> WalkResult<T, E>,
+    ) -> WalkResult<T, E> {
+        self.for_each_node_view(&mut |node| {
+            if node
+                .compatible_contains(compatible_name)
+                .map_err(WalkError::Dtb)?
+            {
+                return f(&node, node.name());
+            }
+            Ok(ControlFlow::Continue(()))
+        })
+    }
+
+    pub fn find_node<T, E, F>(
         &self,
         device_name: Option<&str>,
         compatible_name: Option<&str>,
         f: &mut F,
-    ) -> Result<(), &'static str>
+    ) -> WalkResult<T, E>
     where
-        F: FnMut(usize, usize) -> ControlFlow<()>,
+        F: FnMut(usize, usize) -> WalkResult<T, E>,
     {
         if (device_name.is_some() && compatible_name.is_some())
             || (device_name.is_none() && compatible_name.is_none())
         {
-            return Err("find_node: specify exactly one of device_name/compatible_name");
+            return Err(WalkError::Dtb(
+                "find_node: specify exactly one of device_name/compatible_name",
+            ));
         }
 
-        let result = self.for_each_node_view(&mut |node| {
+        self.for_each_node_view(&mut |node| {
             let matched = if let Some(dev) = device_name {
-                match node.property_bytes("device_type") {
-                    Ok(Some(bytes)) => {
+                let prop = node.property_bytes("device_type").map_err(WalkError::Dtb)?;
+                match prop {
+                    Some(bytes) => {
                         core::str::from_utf8(bytes.split(|b| *b == 0).next().unwrap_or(bytes))
                             .ok()
                             .is_some_and(|s| s == dev)
                     }
-                    Ok(None) => false,
-                    Err(e) => return ControlFlow::Break(Err(e)),
+                    None => false,
                 }
             } else if let Some(comp) = compatible_name {
-                match node.compatible_contains(comp) {
-                    Ok(v) => v,
-                    Err(e) => return ControlFlow::Break(Err(e)),
-                }
+                node.compatible_contains(comp).map_err(WalkError::Dtb)?
             } else {
                 false
             };
 
             if !matched {
-                return ControlFlow::Continue(());
+                return Ok(ControlFlow::Continue(()));
             }
 
-            let mut it = match node.reg_iter() {
-                Ok(it) => it,
-                Err(e) => return ControlFlow::Break(Err(e)),
-            };
+            let mut it = node.reg_iter().map_err(WalkError::Dtb)?;
             while let Some(r) = it.next() {
-                match r {
-                    Ok((addr, size)) => {
-                        if f(addr, size).is_break() {
-                            return ControlFlow::Break(Ok(()));
-                        }
-                    }
-                    Err(e) => return ControlFlow::Break(Err(e)),
+                let (addr, size) = r.map_err(WalkError::Dtb)?;
+                match f(addr, size)? {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
                 }
             }
-            ControlFlow::Continue(())
-        })?;
-
-        match result {
-            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => Ok(()),
-            ControlFlow::Break(Err(e)) => Err(e),
-        }
+            Ok(ControlFlow::Continue(()))
+        })
     }
 
     pub fn find_memory_reservation_block<F>(&self, f: &mut F)
@@ -469,125 +470,112 @@ impl DtbParser<Validated> {
         key: &str,
     ) -> Result<Option<u32>, &'static str> {
         let result = self.for_each_node_view(&mut |node| {
-            let primary = match node.property_u32_be("phandle") {
-                Ok(v) => v,
-                Err(e) => return ControlFlow::Break(Err(e)),
-            };
-            let secondary = match node.property_u32_be("linux,phandle") {
-                Ok(v) => v,
-                Err(e) => return ControlFlow::Break(Err(e)),
-            };
+            let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
+            let secondary = node
+                .property_u32_be("linux,phandle")
+                .map_err(WalkError::Dtb)?;
             if primary == Some(phandle) || secondary == Some(phandle) {
-                return match node.property_u32_be(key) {
-                    Ok(v) => ControlFlow::Break(Ok(v)),
-                    Err(e) => ControlFlow::Break(Err(e)),
-                };
+                let value = node.property_u32_be(key).map_err(WalkError::Dtb)?;
+                return Ok(ControlFlow::Break(value));
             }
-            ControlFlow::Continue(())
-        })?;
+            Ok(ControlFlow::Continue(()))
+        });
 
         match result {
-            ControlFlow::Continue(()) => Ok(None),
-            ControlFlow::Break(Ok(v)) => Ok(v),
-            ControlFlow::Break(Err(e)) => Err(e),
+            Ok(ControlFlow::Continue(())) => Ok(None),
+            Ok(ControlFlow::Break(value)) => Ok(value),
+            Err(WalkError::Dtb(e)) => Err(e),
+            Err(WalkError::User(())) => Err("property_u32_by_phandle: unexpected user error"),
         }
     }
 
-    pub fn find_reserved_memory_node<F, D>(
+    pub fn find_reserved_memory_node<E, F, D>(
         &self,
         f: &mut F,
         dynamic: &mut D,
-    ) -> Result<(), &'static str>
+    ) -> WalkResult<(), E>
     where
-        F: FnMut(usize, usize) -> ControlFlow<()>,
-        D: FnMut(usize, Option<usize>, Option<(usize, usize)>) -> Result<ControlFlow<()>, ()>,
+        F: FnMut(usize, usize) -> WalkResult<(), E>,
+        D: FnMut(usize, Option<usize>, Option<(usize, usize)>) -> WalkResult<(), E>,
     {
-        let result = self.for_each_node_view(&mut |node| {
+        self.for_each_node_view(&mut |node| {
             if node.name() != "reserved-memory" {
-                return ControlFlow::Continue(());
+                return Ok(ControlFlow::Continue(()));
             }
 
-            let child_result = match node.for_each_child_view(&mut |child| {
-                let reg = child.property_bytes("reg");
-                if let Ok(Some(_)) = reg {
-                    if let Ok(mut it) = child.reg_iter() {
-                        while let Some(r) = it.next() {
-                            match r {
-                                Ok((addr, size)) => {
-                                    if f(addr, size).is_break() {
-                                        return ControlFlow::Break(());
-                                    }
-                                }
-                                Err(_) => return ControlFlow::Break(()),
-                            }
+            let _ = node.for_each_child_view(&mut |child| {
+                let reg = child.property_bytes("reg").map_err(WalkError::Dtb)?;
+                if reg.is_some() {
+                    let mut it = child.reg_iter().map_err(WalkError::Dtb)?;
+                    while let Some(r) = it.next() {
+                        let (addr, size) = r.map_err(WalkError::Dtb)?;
+                        match f(addr, size)? {
+                            ControlFlow::Continue(()) => {}
+                            ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
                         }
                     }
-                    return ControlFlow::Continue(());
+                    return Ok(ControlFlow::Continue(()));
                 }
 
-                let size = match child.property_bytes("size") {
-                    Ok(Some(b)) => b,
-                    _ => return ControlFlow::Continue(()),
+                let size = match child.property_bytes("size").map_err(WalkError::Dtb)? {
+                    Some(b) => b,
+                    None => return Ok(ControlFlow::Continue(())),
                 };
-                let cells = child.parent_size_cells().unwrap_or(1);
+                let cells = child.parent_size_cells().map_err(WalkError::Dtb)?;
                 let sc_bytes = (cells as usize) * size_of::<u32>();
                 if size.len() != sc_bytes {
-                    return ControlFlow::Break(());
+                    return Err(WalkError::Dtb("reserved-memory: invalid size length"));
                 }
 
                 let alloc_size = super::types::read_regs_from_bytes(size, cells)
-                    .ok()
-                    .map(|v| v.0);
-                let alloc_size = match alloc_size {
-                    Some(v) => v,
-                    None => return ControlFlow::Break(()),
+                    .map_err(WalkError::Dtb)?
+                    .0;
+
+                let alignment = match child.property_bytes("alignment").map_err(WalkError::Dtb)? {
+                    Some(b) => Some(
+                        super::types::read_regs_from_bytes(b, cells)
+                            .map_err(WalkError::Dtb)?
+                            .0,
+                    ),
+                    None => None,
                 };
 
-                let alignment = match child.property_bytes("alignment") {
-                    Ok(Some(b)) => super::types::read_regs_from_bytes(b, cells)
-                        .ok()
-                        .map(|v| v.0),
-                    _ => None,
-                };
+                match child
+                    .property_bytes("alloc-ranges")
+                    .map_err(WalkError::Dtb)?
+                {
+                    Some(ar) => {
+                        let ac = child.parent_address_cells().map_err(WalkError::Dtb)?;
+                        let stride = (ac as usize + cells as usize) * size_of::<u32>();
+                        if stride == 0 || ar.len() % stride != 0 {
+                            return Err(WalkError::Dtb("reserved-memory: invalid alloc-ranges"));
+                        }
 
-                if let Ok(Some(ar)) = child.property_bytes("alloc-ranges") {
-                    let ac = child.parent_address_cells().unwrap_or(2);
-                    let stride = (ac as usize + cells as usize) * size_of::<u32>();
-                    if stride == 0 || ar.len() % stride != 0 {
-                        return ControlFlow::Break(());
-                    }
+                        let mut off = 0usize;
+                        while off < ar.len() {
+                            let (addr, a_len) = super::types::read_regs_from_bytes(&ar[off..], ac)
+                                .map_err(WalkError::Dtb)?;
+                            let (len, l_len) =
+                                super::types::read_regs_from_bytes(&ar[off + a_len..], cells)
+                                    .map_err(WalkError::Dtb)?;
+                            off += a_len + l_len;
 
-                    let mut off = 0usize;
-                    while off < ar.len() {
-                        let (addr, a_len) =
-                            super::types::read_regs_from_bytes(&ar[off..], ac).unwrap();
-                        let (len, l_len) =
-                            super::types::read_regs_from_bytes(&ar[off + a_len..], cells).unwrap();
-                        off += a_len + l_len;
-
-                        if let Ok(cf) = dynamic(alloc_size, alignment, Some((addr, len))) {
-                            if cf.is_break() {
-                                return ControlFlow::Break(());
+                            match dynamic(alloc_size, alignment, Some((addr, len)))? {
+                                ControlFlow::Continue(()) => {}
+                                ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
                             }
                         }
                     }
-                } else {
-                    let _ = dynamic(alloc_size, alignment, None);
+                    None => match dynamic(alloc_size, alignment, None)? {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
+                    },
                 }
 
-                ControlFlow::Continue(())
-            }) {
-                Ok(result) => result,
-                Err(e) => return ControlFlow::Break(Err(e)),
-            };
+                Ok(ControlFlow::Continue(()))
+            })?;
 
-            let _ = child_result;
-            ControlFlow::Break(Ok(()))
-        })?;
-
-        match result {
-            ControlFlow::Continue(()) | ControlFlow::Break(Ok(())) => Ok(()),
-            ControlFlow::Break(Err(e)) => Err(e),
-        }
+            Ok(ControlFlow::Break(()))
+        })
     }
 }

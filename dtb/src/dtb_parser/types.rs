@@ -1,5 +1,6 @@
 use core::convert::TryFrom;
 use core::mem::size_of;
+use core::ops::ControlFlow;
 
 use typestate::Be;
 
@@ -19,6 +20,20 @@ pub(crate) struct NodeScope {
 
 pub(crate) const TOKEN_SIZE: usize = 4;
 pub(crate) const DTB_ALIGN: usize = 4;
+
+#[derive(Debug)]
+pub enum WalkError<E> {
+    Dtb(&'static str),
+    User(E),
+}
+
+impl<E> From<E> for WalkError<E> {
+    fn from(e: E) -> Self {
+        WalkError::User(e)
+    }
+}
+
+pub type WalkResult<T, E> = Result<ControlFlow<T>, WalkError<E>>;
 
 pub(crate) fn read_u32_be(bytes: &[u8]) -> Result<u32, &'static str> {
     if bytes.len() != size_of::<u32>() {
