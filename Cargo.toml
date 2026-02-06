@@ -11,6 +11,7 @@ members = [
     "gdb_remote",
     "intrusive_linked_list",
     "mutex",
+    "pci",
     "rpi_boot",
     "typestate",
     "typestate_macro",

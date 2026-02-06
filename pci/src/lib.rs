@@ -1,3 +1,5 @@
+#![no_std]
+
 use core::mem::size_of;
 use typestate::ReadOnly;
 use typestate::ReadWrite;
@@ -170,7 +172,7 @@ pub struct PCIConfigRegType1 {
     pub io_limit_upper16: ReadWrite<u16>, // 0x32
 
     pub capabilities_ptr: ReadOnly<u8>, // 0x34
-    _reserved: [u8; 3],                // 0x35..0x37
+    _reserved: [u8; 3],                 // 0x35..0x37
 
     pub expansion_rom_base: ReadWrite<u32>, // 0x38
 

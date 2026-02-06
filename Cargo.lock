@@ -13,6 +13,7 @@ dependencies = [
  "paging",
  "print",
  "psci",
+ "soc",
  "timer",
 ]
 
@@ -171,6 +172,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pci"
+version = "0.1.0"
+dependencies = [
+ "typestate",
+ "typestate_macro",
+]
+
+[[package]]
 name = "print"
 version = "0.1.0"
 dependencies = [
@@ -217,6 +226,18 @@ dependencies = [
  "file",
  "mutex",
  "typestate",
+ "typestate_macro",
+]
+
+[[package]]
+name = "soc"
+version = "0.1.0"
+dependencies = [
+ "dtb",
+ "pci",
+ "print",
+ "typestate",
+ "typestate_macro",
 ]
 
 [[package]]

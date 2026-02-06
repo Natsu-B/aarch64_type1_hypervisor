@@ -32,6 +32,7 @@ use core::slice;
 use core::usize;
 use dtb::DtbGenerator;
 use dtb::DtbParser;
+use dtb::WalkError;
 use file::OpenOptions;
 use file::StorageDevice;
 use typestate::Le;
@@ -89,13 +90,18 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let dtb = DtbParser::init(dtb_ptr).unwrap();
     let mut pl011_addr = None;
     let mut pl011_size = None;
-    dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
+    let result = dtb.find_node(None, Some("arm,pl011"), &mut |addr, size| {
         debug_uart::init(addr, 48 * 1000 * 1000, 115200);
         pl011_addr = Some(addr);
         pl011_size = Some(size);
-        ControlFlow::Break(())
-    })
-    .unwrap();
+        Ok(ControlFlow::Break(()))
+    });
+    match result {
+        Ok(ControlFlow::Break(())) => {}
+        Ok(ControlFlow::Continue(())) => panic!("pl011: node not found"),
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("pl011: unexpected user error"),
+    }
     unsafe { *UART_ADDR.get() = pl011_addr };
     println!("debug uart starting...\r\n");
     assert_eq!(cpu::get_current_el(), 2);
@@ -108,33 +114,44 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     );
     println!("setup allocator");
     GLOBAL_ALLOCATOR.init();
-    dtb.find_node(Some("memory"), None, &mut |addr, size| {
-        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+    let result = dtb.find_node(Some("memory"), None, &mut |addr, size| {
+        GLOBAL_ALLOCATOR
+            .add_available_region(addr, size)
+            .map_err(|_| WalkError::User(()))?;
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("memory: allocator error"),
+    }
     dtb.find_memory_reservation_block(&mut |addr, size| {
         GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
-    dtb.find_reserved_memory_node(
+    let result = dtb.find_reserved_memory_node(
         &mut |addr, size| {
-            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
-            ControlFlow::Continue(())
+            GLOBAL_ALLOCATOR
+                .add_reserved_region(addr, size)
+                .map_err(|_| WalkError::User(()))?;
+            Ok(ControlFlow::Continue(()))
         },
-        &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
-            if GLOBAL_ALLOCATOR
+        &mut |size, align, alloc_range| {
+            let allocated = GLOBAL_ALLOCATOR
                 .allocate_dynamic_reserved_region(size, align, alloc_range)
-                .unwrap()
-                .is_some()
-            {
+                .map_err(|_| WalkError::User(()))?;
+            if allocated.is_some() {
                 Ok(ControlFlow::Continue(()))
             } else {
-                Err(())
+                Err(WalkError::User(()))
             }
         },
-    )
-    .unwrap();
+    );
+    match result {
+        Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("reserved-memory: allocator error"),
+    }
     GLOBAL_ALLOCATOR
         .add_reserved_region(program_start, stack_start - program_start)
         .unwrap();
@@ -179,13 +196,17 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     exceptions::setup_exception();
     handler::setup_handler();
     let mut file_driver = None;
-    dtb.find_node(None, Some("virtio,mmio"), &mut |addr, _size| {
+    let result = dtb.find_node(None, Some("virtio,mmio"), &mut |addr, _size| {
         if let Ok(driver) = StorageDevice::new_virtio(addr) {
             file_driver = Some(driver);
         }
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("virtio-mmio: unexpected user error"),
+    }
     let file_driver = file_driver.unwrap();
     let linux = file_driver
         .open(0, "/image", &file::OpenOptions::Read)

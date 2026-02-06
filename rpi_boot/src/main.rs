@@ -5,6 +5,7 @@
 extern crate alloc;
 mod handler;
 mod multicore;
+mod pcie;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -28,7 +29,6 @@ use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::println_force;
-use arch_hal::timer::El2PhysicalTimer;
 use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::global_asm;
@@ -51,6 +51,7 @@ use dtb::NodeEditExt;
 use dtb::NodeId;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
+use dtb::WalkError;
 use typestate::Le;
 
 unsafe extern "C" {
@@ -69,8 +70,8 @@ static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 static RP1_BASE: usize = 0x1c_0000_0000;
 static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
 static RP1_PAD: usize = RP1_BASE + 0xf_0000;
-// static PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
-static PL011_UART_ADDR: (usize, u64) = (0x10_7D00_1000, 44 * 1000 * 1000);
+static PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
+// static PL011_UART_ADDR: (usize, u64) = (0x10_7D00_1000, 44 * 1000 * 1000);
 
 #[repr(C)]
 struct LinuxHeader {
@@ -145,43 +146,54 @@ extern "C" fn main() -> ! {
     );
     println!("setup allocator");
     GLOBAL_ALLOCATOR.init();
-    dtb.find_node(Some("memory"), None, &mut |addr, size| {
+    let result = dtb.find_node(Some("memory"), None, &mut |addr, size| {
         println!("available region addr=0x{:X}, size=0x{:X}", addr, size);
-        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        GLOBAL_ALLOCATOR
+            .add_available_region(addr, size)
+            .map_err(|_| WalkError::User(()))?;
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("find_node: allocator error"),
+    }
     dtb.find_memory_reservation_block(&mut |addr, size| {
         println!("reserved (memreserve) addr=0x{:X}, size=0x{:X}", addr, size);
         GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
-    dtb.find_reserved_memory_node(
+    let result = dtb.find_reserved_memory_node(
         &mut |addr, size| {
             println!(
                 "reserved (node static) addr=0x{:X}, size=0x{:X}",
                 addr, size
             );
-            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
-            ControlFlow::Continue(())
+            GLOBAL_ALLOCATOR
+                .add_reserved_region(addr, size)
+                .map_err(|_| WalkError::User(()))?;
+            Ok(ControlFlow::Continue(()))
         },
-        &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
+        &mut |size, align, alloc_range| {
             println!(
                 "reserved (node dynamic) size=0x{:X}, align={:?}, range={:?}",
                 size, align, alloc_range
             );
-            if GLOBAL_ALLOCATOR
+            let allocated = GLOBAL_ALLOCATOR
                 .allocate_dynamic_reserved_region(size, align, alloc_range)
-                .unwrap()
-                .is_some()
-            {
+                .map_err(|_| WalkError::User(()))?;
+            if allocated.is_some() {
                 Ok(ControlFlow::Continue(()))
             } else {
-                Err(())
+                Err(WalkError::User(()))
             }
         },
-    )
-    .unwrap();
+    );
+    match result {
+        Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("reserved-memory: allocator error"),
+    }
     println!(
         "reserved program image addr=0x{:X}, size=0x{:X}",
         program_start,
@@ -243,7 +255,7 @@ extern "C" fn main() -> ! {
     let ipa_space = 1usize << parange;
     let mut paging_data: Vec<Stage2PagingSetting> = Vec::new();
     let mut stage1_paging_data: Vec<EL2Stage1PagingSetting> = Vec::new();
-    dtb.find_node(Some("memory"), None, &mut |addr, size| {
+    let result = dtb.find_node(Some("memory"), None, &mut |addr, size| {
         let memory_last = paging_data.last();
         let memory_last_addr = if let Some(memory_last) = memory_last {
             memory_last.ipa + memory_last.size
@@ -277,9 +289,13 @@ extern "C" fn main() -> ! {
             size,
             types: EL2Stage1PageTypes::Normal,
         });
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("find_node: paging allocator error"),
+    }
     let memory_last = paging_data.last().unwrap();
     let memory_last_addr = memory_last.ipa + memory_last.size;
     paging_data.push(Stage2PagingSetting {
@@ -312,7 +328,7 @@ extern "C" fn main() -> ! {
     let mut gic_distributor = None;
     let mut gic_cpu_interface = None;
     let mut i = 0;
-    dtb.find_node(None, Some("arm,gic-400"), &mut |addr, size| {
+    let result = dtb.find_node(None, Some("arm,gic-400"), &mut |addr, size| {
         match i {
             0 => {
                 gic_distributor = Some(MmioRegion { base: addr, size });
@@ -328,9 +344,13 @@ extern "C" fn main() -> ! {
             }
         }
         i += 1;
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("find_node: gic parse error"),
+    }
     let gicv2 = Gicv2::new(
         gic_distributor.expect("gic distributor missing"),
         gic_cpu_interface.expect("gic cpu interface missing"),
@@ -351,21 +371,32 @@ extern "C" fn main() -> ! {
         })
         .unwrap();
 
-    dtb.find_nodes_by_compatible_view("arm,pl011", &mut |view, string| {
-        if view
-            .reg_iter()
-            .unwrap()
-            .any(|info| info.unwrap().0 == PL011_UART_ADDR.0)
-        {
-            view.for_each_interrupt_specifier(&mut |int| {
-                println!("  pl011 interrupt specifier: {:?}", int);
-                ControlFlow::Continue(())
-            })
-            .unwrap();
+    let result = dtb.find_nodes_by_compatible_view("arm,pl011", &mut |view, _string| {
+        let mut iter = view.reg_iter().map_err(WalkError::Dtb)?;
+        let mut is_uart = false;
+        while let Some(info) = iter.next() {
+            let (addr, _) = info.map_err(WalkError::Dtb)?;
+            if addr == PL011_UART_ADDR.0 {
+                is_uart = true;
+                break;
+            }
         }
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        if is_uart {
+            let _ = view.for_each_interrupt_specifier(&mut |int| -> Result<
+                ControlFlow<()>,
+                WalkError<()>,
+            > {
+                println!("pl011 interrupt specifier: {:?}", int);
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("pl011: unexpected user error"),
+    }
 
     // setup pl011 interrupts
     gicv2
@@ -398,8 +429,14 @@ extern "C" fn main() -> ! {
 
     unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
 
-    let phy = El2PhysicalTimer::new();
-    // phy.set_timeout(Duration::from_secs(1));
+    let result = dtb.find_nodes_by_compatible_view("brcm,bcm2712-pcie", &mut |view, _name| {
+        pcie::init_pcie_with_node(view)
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("pcie: unexpected user error"),
+    }
 
     loop {
         systimer.wait(Duration::from_secs(1));
@@ -478,7 +515,7 @@ extern "C" fn main() -> ! {
 
 #[inline(always)]
 unsafe fn mmio_read32(addr: usize) -> u32 {
-    core::ptr::read_volatile(addr as *const u32)
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
 fn dump_uart_gic(gicd_base: usize, uart_base: usize, intid: u32) {

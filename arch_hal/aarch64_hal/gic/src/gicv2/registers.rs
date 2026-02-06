@@ -1,3 +1,4 @@
+#![allow(clippy::assertions_on_constants)]
 #![allow(non_camel_case_types)]
 
 use core::mem::size_of;
@@ -7,13 +8,9 @@ use typestate::WriteOnly;
 use typestate::bitregs;
 
 // ARM IHI 0048B tables define the offsets; GIC-400 TRM sets the 4KB/8KB GICv2 frame sizes.
-#[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<GicV2Distributor>() == 0x1_000);
-#[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<GicV2CpuInterface>() == 0x2_000);
-#[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<GicV2VirtualInterfaceControl>() == 0x1_000);
-#[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<GicV2VirtualCpuInterface>() == 0x2_000);
 
 bitregs! {
