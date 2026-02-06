@@ -283,6 +283,59 @@ mod tests {
     }
 
     #[test]
+    fn node_view_msi_parent_callback_has_ancestors() {
+        let out_dir = env!("OUT_DIR");
+        let mut path = PathBuf::from(out_dir);
+        path.push("node_view_msi_parent.dtb");
+        assert!(
+            path.exists(),
+            "{} not found. dtc is required to build DTS fixtures.",
+            path.display()
+        );
+
+        let test_data = std::fs::read(&path).expect("failed to load generated dtb file");
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
+        let parser = DtbParser::init(test_data_addr).unwrap();
+
+        let mut found = false;
+        let mut checked = false;
+
+        let result = parser.for_each_node_view(&mut |node| {
+            if node
+                .compatible_contains("test,msi-device")
+                .map_err(WalkError::Dtb)?
+            {
+                found = true;
+                let result = node.with_msi_parent_view(&mut |mip, _name| {
+                    let mut iter = mip.reg_iter().map_err(WalkError::Dtb)?;
+                    match iter.next() {
+                        Some(Ok((addr, size))) => {
+                            assert_eq!(addr, 0x1000_0000);
+                            assert_eq!(size, 0x1000);
+                        }
+                        Some(Err(err)) => return Err(WalkError::Dtb(err)),
+                        None => return Err(WalkError::Dtb("msi-parent: missing reg")),
+                    }
+                    checked = true;
+                    Ok(ControlFlow::Break(()))
+                })?;
+                match result {
+                    ControlFlow::Break(()) => {}
+                    ControlFlow::Continue(()) => {
+                        return Err(WalkError::Dtb("msi-parent: missing property"));
+                    }
+                }
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        });
+        assert_walk_ok(result);
+        assert!(found);
+        assert!(checked);
+    }
+
+    #[test]
     fn ranges_pci_3cells_translation_works() {
         let out_dir = env::var_os("OUT_DIR").unwrap();
         let mut path = PathBuf::from(out_dir);

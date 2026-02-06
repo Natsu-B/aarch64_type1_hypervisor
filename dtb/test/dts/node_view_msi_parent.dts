@@ -1,0 +1,17 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <2>;
+    #size-cells = <1>;
+
+    mip: msi-parent@10000000 {
+        compatible = "brcm,bcm2712-mip";
+        reg = <0x0 0x10000000 0x1000>;
+        phandle = <1>;
+    };
+
+    msi-device@0 {
+        compatible = "test,msi-device";
+        msi-parent = <&mip>;
+    };
+};

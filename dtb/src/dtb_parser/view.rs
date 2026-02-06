@@ -121,32 +121,45 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         }
     }
 
-    /// Note: returned view has empty ancestors; use with_msi_parent_view for ancestors.
-    pub fn msi_parent(&self) -> Result<Option<DtbNodeView<'dtb, 'static>>, &'static str> {
-        let Some(phandle) = self.msi_parent_phandle()? else {
-            return Ok(None);
-        };
-        let controller = self
-            .parser
-            .find_node_view_by_phandle(phandle)?
-            .ok_or("msi-parent: controller not found")?;
-        Ok(Some(controller))
-    }
-
     pub fn msi_parent_phandle(&self) -> Result<Option<u32>, &'static str> {
         self.inherited_u32_be(Self::PROP_MSI_PARENT)
     }
 
-    pub fn with_msi_parent_view<F, R>(&self, f: &mut F) -> Result<Option<R>, &'static str>
-    where
-        F: for<'a, 'cs> FnMut(DtbNodeView<'a, 'cs>) -> Result<R, &'static str>,
-    {
-        let Some(phandle) = self.msi_parent_phandle()? else {
-            return Ok(None);
+    /// Visit the MSI parent controller with a view that preserves ancestors.
+    ///
+    /// - If `msi-parent` is missing, returns `Ok(ControlFlow::Continue(()))`.
+    /// - If the controller node is missing, returns
+    ///   `Err(WalkError::Dtb("msi-parent: controller not found"))`.
+    /// - If found, calls `f(&controller, controller.name())` exactly once, stops scanning,
+    ///   and returns its result.
+    pub fn with_msi_parent_view<T, E>(
+        &self,
+        f: &mut impl FnMut(&DtbNodeView<'_, '_>, &'static str) -> WalkResult<T, E>,
+    ) -> WalkResult<T, E> {
+        let Some(phandle) = self.msi_parent_phandle().map_err(WalkError::Dtb)? else {
+            return Ok(ControlFlow::Continue(()));
         };
-        match self.parser.with_node_view_by_phandle(phandle, f)? {
-            Some(value) => Ok(Some(value)),
-            None => Err("msi-parent: controller not found"),
+
+        let result = self.parser.for_each_node_view(&mut |node| {
+            let primary = node
+                .property_u32_be(Self::PROP_PHANDLE)
+                .map_err(WalkError::Dtb)?;
+            let secondary = node
+                .property_u32_be(Self::PROP_LINUX_PHANDLE)
+                .map_err(WalkError::Dtb)?;
+            if primary == Some(phandle) || secondary == Some(phandle) {
+                let result = f(&node, node.name())?;
+                return Ok(ControlFlow::Break(result));
+            }
+            Ok(ControlFlow::Continue(()))
+        });
+
+        match result {
+            Ok(ControlFlow::Break(value)) => Ok(value),
+            Ok(ControlFlow::Continue(())) => {
+                Err(WalkError::Dtb("msi-parent: controller not found"))
+            }
+            Err(err) => Err(err),
         }
     }
 
