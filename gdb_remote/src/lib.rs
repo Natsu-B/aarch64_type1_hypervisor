@@ -2496,6 +2496,16 @@ mod tests {
         packets
     }
 
+    fn is_console_packet(packet: &Packet) -> bool {
+        let Some((&b'O', rest)) = packet.payload.split_first() else {
+            return false;
+        };
+        if rest.is_empty() || rest.len() % 2 != 0 {
+            return false;
+        }
+        rest.iter().all(|&b| is_hex(b))
+    }
+
     fn drain_tx<const MAX: usize, const TX: usize>(server: &mut GdbServer<MAX, TX>) -> Vec<u8> {
         let mut tx = Vec::new();
         while let Some(byte) = server.pop_tx_byte_irq() {
@@ -2686,7 +2696,7 @@ mod tests {
         let tx = drain_tx(&mut server);
         let packets = parse_packets(&tx)
             .into_iter()
-            .filter(|packet| packet.payload.first() != Some(&b'O'))
+            .filter(|packet| !is_console_packet(packet))
             .collect::<Vec<_>>();
         assert!(packets.is_empty());
     }
@@ -2763,7 +2773,7 @@ mod tests {
         let tx = drain_tx(&mut server);
         let packets = parse_packets(&tx)
             .into_iter()
-            .filter(|packet| packet.payload.first() != Some(&b'O'))
+            .filter(|packet| !is_console_packet(packet))
             .collect::<Vec<_>>();
         assert!(packets.is_empty());
     }
