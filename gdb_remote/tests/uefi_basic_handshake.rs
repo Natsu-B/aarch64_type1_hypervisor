@@ -44,6 +44,11 @@ extern "C" fn efi_main() -> ! {
             progress = true;
             match server.on_rx_byte_irq(&mut target, byte) {
                 Ok(ProcessResult::MonitorExit) => exit_success(),
+                Ok(ProcessResult::FileIoReply {
+                    retcode: _,
+                    errno: _,
+                    ctrl_c: _,
+                }) => {}
                 Ok(ProcessResult::Resume(_)) => {}
                 Ok(ProcessResult::None) => {}
                 Err(_) => exit_failure(),
