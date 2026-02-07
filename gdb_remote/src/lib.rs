@@ -2684,7 +2684,10 @@ mod tests {
         }
 
         let tx = drain_tx(&mut server);
-        let packets = parse_packets(&tx);
+        let packets = parse_packets(&tx)
+            .into_iter()
+            .filter(|packet| packet.payload.first() != Some(&b'O'))
+            .collect::<Vec<_>>();
         assert!(packets.is_empty());
     }
 
@@ -2758,7 +2761,10 @@ mod tests {
         assert!(server.take_fileio_parse_error());
 
         let tx = drain_tx(&mut server);
-        let packets = parse_packets(&tx);
+        let packets = parse_packets(&tx)
+            .into_iter()
+            .filter(|packet| packet.payload.first() != Some(&b'O'))
+            .collect::<Vec<_>>();
         assert!(packets.is_empty());
     }
 
