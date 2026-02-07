@@ -161,7 +161,7 @@ jobs:
           name: elf-${{ github.ref_name }}-${{ github.sha }}
           path: |
             bin/*.elf
-            bin/.img
+            bin/*.img
           if-no-files-found: error
           retention-days: 14
 
