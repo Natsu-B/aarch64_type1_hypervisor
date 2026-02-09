@@ -13,6 +13,8 @@ use virtio::device_type::VirtIoDeviceTypes;
 mod configuration;
 mod operation;
 use configuration::VirtioBlkConfig;
+use cpu::clean_dcache_range;
+use cpu::invalidate_dcache_range;
 use virtio::VirtIoDevice;
 use virtio::VirtioFeatures;
 use virtio::mmio::VirtIoMmio;
@@ -21,8 +23,6 @@ use virtio::queue::VirtqDescFlags;
 use crate::virtio_blk::operation::VirtioBlkReq;
 use crate::virtio_blk::operation::VirtioBlkReqStatus;
 use crate::virtio_blk::operation::VirtioBlkReqType;
-use virtio::cache::clean_dcache_range;
-use virtio::cache::invalidate_dcache_range;
 
 pub struct VirtIoBlk {
     virtio: VirtIoCore<VirtIoMmio>,

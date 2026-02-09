@@ -315,6 +315,16 @@ impl Pl011Uart {
         self.pushb(byte);
     }
 
+    pub fn try_write_byte(&self, byte: u8) -> bool {
+        if self.registers.flag.read().get(UARTFR::txff) != 0 {
+            return false;
+        }
+        self.registers
+            .data
+            .write(UARTDR::new().set(UARTDR::data, byte as u32));
+        true
+    }
+
     pub fn drain_rx(&self) {
         while self.registers.flag.read().get(UARTFR::rxfe) == 0 {
             let _ = self.read_char();
@@ -369,6 +379,19 @@ impl Pl011Uart {
                 .set_enum(UARTIFLS::rxiflsel, rx)
                 .set_enum(UARTIFLS::txiflsel, tx),
         );
+    }
+
+    /// Enable RX-related interrupts (RX FIFO + optional timeout).
+    pub fn enable_rx_interrupts(&self, rx_level: FifoLevel, enable_timeout: bool) {
+        self.set_fifo_irq_levels(rx_level, FifoLevel::OneEighth);
+        self.registers.interrupt_clear.write(UARTICR::all());
+
+        let mut mask = UARTIMSC::new().set(UARTIMSC::rxim, 1);
+        if enable_timeout {
+            mask = mask.set(UARTIMSC::rtim, 1);
+        }
+        self.clear_interrupts(UARTICR::all());
+        self.enable_interrupts(mask);
     }
 
     /// Enable selected interrupts by unmasking bits in UARTIMSC.
@@ -443,3 +466,6 @@ impl fmt::Write for Pl011Uart {
 }
 
 unsafe impl Send for Pl011Uart {}
+// SAFETY: Pl011Uart provides interior mutability over MMIO registers; callers must ensure
+// any concurrent access is synchronized at a higher level (e.g. by masking IRQs or locks).
+unsafe impl Sync for Pl011Uart {}

@@ -11,7 +11,7 @@ PHDRS
 
 _ALIGN_SIZE = 0x1000;
 _IMAGE_BASE = 0x40400000;
-_STACK_SIZE = 0x20000;
+_STACK_SIZE = 0x100000;
 
 SECTIONS
 {
@@ -43,6 +43,16 @@ SECTIONS
     . = . + _STACK_SIZE;
     __stack_top = .;
   } :data
+
+  /DISCARD/ : {
+    *(.comment)
+    *(.eh_frame*)
+    *(.debug*)
+    *(.gnu*)
+    *(.note*)
+    *(.symtab)
+    *(.strtab)
+  }
 
   . = ALIGN(_ALIGN_SIZE);
   __image_end = .;

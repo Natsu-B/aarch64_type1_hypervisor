@@ -160,10 +160,10 @@ impl MemoryBlock {
         // Check for overlap with pre_region
         if x > 0 {
             let _pre_region = &regions_slice[x - 1];
-            if let Some(pre_end) = pre_region_end {
-                if region.address <= pre_end {
-                    pre_region_overlaps = true;
-                }
+            if let Some(pre_end) = pre_region_end
+                && region.address <= pre_end
+            {
+                pre_region_overlaps = true;
             }
         }
 
@@ -839,7 +839,7 @@ impl MemoryBlock {
     ///
     /// # Safety
     /// Allocates a `Vec` while `self` is exclusively borrowed under the allocator
-    /// lock; callers must ensure this path only runs before `enable_atomic`
+    /// lock; callers must ensure this path only runs before `enable_raw_atomics`
     /// (when `RawSpinLock::lock()` is a no-op) and while execution is
     /// single-threaded. After atomic locking is enabled, re-entering the global
     /// allocator here may deadlock or spin forever.

@@ -47,7 +47,7 @@ impl El2PhysicalTimer {
             .saturating_mul(u128::from(self.counter_frequency.get()))
             / 1_000_000_000u128;
         let ticks = ticks.min(u128::from(u64::MAX)) as u64;
-        let deadline = self.now().saturating_add(ticks);
+        let deadline = self.now().wrapping_add(ticks);
 
         self.set_deadline(deadline);
         self.enable();

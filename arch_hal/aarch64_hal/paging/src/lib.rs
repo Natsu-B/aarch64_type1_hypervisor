@@ -1,5 +1,10 @@
 #![no_std]
 #![recursion_limit = "1024"]
+#![feature(generic_const_exprs)]
+#![feature(sync_unsafe_cell)]
+
+#[cfg(all(test, not(target_arch = "aarch64")))]
+extern crate std;
 
 extern crate alloc;
 
@@ -18,4 +23,5 @@ pub enum PagingErr {
     ZeroSizedPage,
     UnsupportedPARange,
     OutOfMemory,
+    Stage2Fault,
 }

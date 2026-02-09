@@ -1,15 +1,27 @@
 #![no_std]
 #![feature(naked_functions_rustic_abi)]
 #![feature(sync_unsafe_cell)]
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
+#![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
+
+#[cfg(all(test, not(target_arch = "aarch64")))]
+extern crate std;
 
 mod common_handler;
 mod el1;
+pub mod emulation;
 pub mod irq_handler;
+pub mod memory_hook;
 pub mod registers;
 pub mod synchronous_handler;
-
-use cpu::set_vbar_el1;
-use cpu::set_vbar_el2;
 
 use crate::common_handler::common_handler;
 use crate::irq_handler::irq_handler;
@@ -18,7 +30,13 @@ use crate::registers::VBAR_EL2;
 use crate::synchronous_handler::synchronous_handler;
 use core::arch::global_asm;
 use core::arch::naked_asm;
+use cpu::set_vbar_el1;
+use cpu::set_vbar_el2;
 
+pub use memory_hook::AccessClass;
+pub use memory_hook::MmioError;
+pub use memory_hook::MmioHandler;
+pub use memory_hook::SplitPolicy;
 global_asm!(
 r#"
     .macro SAVE_CALL_RESTORE
@@ -76,8 +94,7 @@ s_error_current_el_stack_pointer_0:
 
 .balign 0x080
 synchronous_current_el_stack_pointer_x:
-    SAVE_CALL_RESTORE
-    CALL_COMMON_HANDLER name_sync_current_x
+    b el2_sync_current_x_handler
 
 .balign 0x080
 irq_current_el_stack_pointer_x:
@@ -136,6 +153,11 @@ fiq_lower_el_aarch32:
 s_error_lower_el_aarch32:
     SAVE_CALL_RESTORE
     CALL_COMMON_HANDLER name_s_error_lower_aarch32
+
+.weak el2_sync_current_x_handler
+el2_sync_current_x_handler:
+    SAVE_CALL_RESTORE
+    CALL_COMMON_HANDLER name_sync_current_x
 
 
     .section .rodata
@@ -213,3 +235,12 @@ pub fn setup_el1_exception() {
             .bits(),
     );
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn __unit_test_init() {
+    aarch64_unit_test::init_default_uart();
+    setup_exception();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);

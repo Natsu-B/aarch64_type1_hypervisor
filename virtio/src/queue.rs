@@ -12,8 +12,8 @@ use typestate::WriteOnly;
 use typestate_macro::RawReg;
 
 use crate::VirtioErr;
-use crate::cache::clean_dcache_range;
-use crate::cache::invalidate_dcache_range;
+use cpu::clean_dcache_range;
+use cpu::invalidate_dcache_range;
 
 #[derive(Debug)]
 pub struct VirtQueue {

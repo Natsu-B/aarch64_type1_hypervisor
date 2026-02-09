@@ -4,7 +4,6 @@ members = [
     "allocator",
     "arch_hal",
     "bootloader",
-    "byte_stream",
     "dtb",
     "elf",
     "file",

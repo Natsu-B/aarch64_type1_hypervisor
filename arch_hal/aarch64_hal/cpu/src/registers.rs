@@ -148,6 +148,21 @@ bitregs! {
 }
 
 bitregs! {
+    /// ID_AA64DFR0_EL1 — AArch64 Debug Feature Register 0
+    /// Purpose:
+    ///     Provides information about the implemented debug architecture, including breakpoint count.
+    pub(crate) struct ID_AA64DFR0_EL1: u64 {
+        reserved@[11:0] [res0],
+        // BRPs: number of breakpoint registers minus one.
+        pub(crate) brps@[15:12],
+        reserved@[19:16] [res1],
+        // WRPs: number of watchpoint registers minus one.
+        pub(crate) wrps@[23:20],
+        reserved@[63:24] [res0],
+    }
+}
+
+bitregs! {
     pub(crate) struct MPIDR_EL1: u64 {
         pub(crate) aff0@[7:0],
         pub(crate) aff1@[15:8],
@@ -158,5 +173,44 @@ bitregs! {
         reserved@[31:31] [res1],
         pub(crate) aff3@[39:32],
         reserved@[63:40] [res0],
+    }
+}
+
+bitregs! {
+    /// MDSCR_EL1 — Monitor Debug System Control Register.
+    pub struct MDSCR_EL1: u64 {
+        pub ss@[0:0],
+        reserved@[12:1] [ignore],
+        pub kde@[13:13],
+        reserved@[14:14] [ignore],
+        pub mde@[15:15],
+        reserved@[63:16] [ignore],
+    }
+}
+
+bitregs! {
+    /// DBGWVR<n>_EL1 — Debug Watchpoint Value Register n.
+    /// Holds the address value used by watchpoint comparison.
+    pub struct DBGWVR_EL1: u64 {
+        pub va@[63:0],
+    }
+}
+
+bitregs! {
+    /// DBGWCR<n>_EL1 — Debug Watchpoint Control Register n.
+    /// Field positions follow Arm's public register definition (AArch64).
+    pub struct DBGWCR_EL1: u64 {
+        pub e@[0:0],
+        pub pac@[2:1],
+        pub lsc@[4:3],
+        pub bas@[12:5],
+        pub hmc@[13:13],
+        pub ssc@[15:14],
+        pub lbn@[19:16],
+        pub wt@[20:20],
+        reserved@[23:21] [ignore],
+        pub mask@[28:24],
+        pub ssce@[29:29],
+        reserved@[63:30] [ignore],
     }
 }

@@ -11,11 +11,19 @@ std dtb
 std intrusive_linked_list
 std mutex
 std typestate
+unit gdb_remote
 
 uefi block-device virtio_blk_modern file/block-device/scripts/run_qemu.sh
 uefi file fat32_virtio file/scripts/run_fat32_virtio_test.sh
 uboot paging stage1_translation arch_hal/aarch64_hal/paging/scripts/run_stage_paging_test.sh
 uboot paging stage2_translation arch_hal/aarch64_hal/paging/scripts/run_stage_paging_test.sh
+uboot-unit exceptions arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot-unit gic arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot-unit elf-hypervisor arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh --bin elf-hypervisor
 uboot gic gicv2_pending arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot gic gicv2_vgic_pending arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot gic vgic_types arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot gic gicv2_ppi_enable arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uefi gdb_remote uefi_basic_handshake gdb_remote/scripts/run_uefi_gdb_remote_test.sh
+uefi gdb_remote uefi_packet_size gdb_remote/scripts/run_uefi_gdb_remote_qxfer_test.sh
+uefi gdb_remote uefi_qxfer_features gdb_remote/scripts/run_uefi_gdb_remote_qxfer_test.sh

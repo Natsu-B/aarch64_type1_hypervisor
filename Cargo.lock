@@ -3,9 +3,21 @@
 version = 4
 
 [[package]]
+name = "aarch64_gdb"
+version = "0.1.0"
+dependencies = [
+ "aarch64_mutex",
+ "cpu",
+ "exceptions",
+ "gdb_remote",
+]
+
+[[package]]
 name = "aarch64_hal"
 version = "0.1.0"
 dependencies = [
+ "aarch64_gdb",
+ "aarch64_mutex",
  "aarch64_test",
  "cpu",
  "exceptions",
@@ -18,8 +30,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aarch64_mutex"
+version = "0.1.0"
+dependencies = [
+ "aarch64_unit_test",
+ "cpu",
+ "exceptions",
+ "mutex",
+]
+
+[[package]]
 name = "aarch64_test"
 version = "0.1.0"
+
+[[package]]
+name = "aarch64_unit_test"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "print",
+]
 
 [[package]]
 name = "allocator"
@@ -43,6 +73,7 @@ version = "0.1.0"
 dependencies = [
  "arch_hal",
  "block-device-api",
+ "cpu",
  "mutex",
  "typestate",
  "typestate_macro",
@@ -51,10 +82,6 @@ dependencies = [
 
 [[package]]
 name = "block-device-api"
-version = "0.1.0"
-
-[[package]]
-name = "byte_stream"
 version = "0.1.0"
 
 [[package]]
@@ -85,11 +112,15 @@ dependencies = [
 name = "elf-hypervisor"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
+ "aarch64_unit_test",
  "allocator",
  "arch_hal",
  "dtb",
  "elf",
  "file",
+ "gdb_remote",
+ "mutex",
  "typestate",
 ]
 
@@ -97,6 +128,8 @@ dependencies = [
 name = "exceptions"
 version = "0.1.0"
 dependencies = [
+ "aarch64_test",
+ "aarch64_unit_test",
  "cpu",
  "print",
  "psci",
@@ -134,7 +167,6 @@ name = "gdb_remote"
 version = "0.1.0"
 dependencies = [
  "aarch64_test",
- "byte_stream",
  "print",
 ]
 
@@ -142,8 +174,11 @@ dependencies = [
 name = "gic"
 version = "0.1.0"
 dependencies = [
+ "aarch64_mutex",
  "aarch64_test",
+ "aarch64_unit_test",
  "cpu",
+ "exceptions",
  "mutex",
  "print",
  "typestate",
@@ -157,6 +192,9 @@ version = "0.1.0"
 [[package]]
 name = "mutex"
 version = "0.1.0"
+dependencies = [
+ "typestate",
+]
 
 [[package]]
 name = "paging"
@@ -183,7 +221,6 @@ dependencies = [
 name = "print"
 version = "0.1.0"
 dependencies = [
- "byte_stream",
  "mutex",
  "typestate",
  "typestate_macro",
@@ -285,6 +322,7 @@ name = "virtio"
 version = "0.1.0"
 dependencies = [
  "allocator",
+ "cpu",
  "intrusive_linked_list",
  "mutex",
  "typestate",

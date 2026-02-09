@@ -15,8 +15,9 @@ use typestate::Readable;
 
 mod cpu_interface;
 mod distributor;
-mod registers;
-mod virtualization;
+pub mod registers;
+pub mod vgic_frontend;
+pub mod virtualization;
 
 pub const GICV2_GICD_FRAME_SIZE: usize = size_of::<GicV2Distributor>();
 pub const GICV2_GICC_FRAME_SIZE: usize = size_of::<GicV2CpuInterface>();
@@ -39,8 +40,6 @@ pub struct Gicv2VirtualizationRegion {
 
 struct GicV2VirtualizationExtension {
     gich: &'static GicV2VirtualInterfaceControl,
-    gicv: &'static GicV2VirtualCpuInterface,
-    maintenance_interrupt: u32,
 }
 
 pub struct Gicv2 {
@@ -64,6 +63,10 @@ pub struct Gicv2 {
 unsafe impl Sync for Gicv2 {}
 
 impl Gicv2 {
+    pub fn distributor(&self) -> &GicV2Distributor {
+        self.gicd
+    }
+
     pub fn new(
         gicd_reg: MmioRegion,
         gicc_reg: MmioRegion,
@@ -91,7 +94,7 @@ impl Gicv2 {
             {
                 return Err(GicError::InvalidSize);
             }
-            if interrupt_id < 16 || 32 <= interrupt_id {
+            if !(16..32).contains(&interrupt_id) {
                 return Err(GicError::UnsupportedIntId);
             }
         }
@@ -119,18 +122,10 @@ impl Gicv2 {
             gicc: unsafe { &*(gicc_reg.base as *const GicV2CpuInterface) },
             virtualization_extension: virtualization.map(|v| GicV2VirtualizationExtension {
                 gich: unsafe { &*(v.gich.base as *const GicV2VirtualInterfaceControl) },
-                gicv: unsafe { &*(v.gicv.base as *const GicV2VirtualCpuInterface) },
-                maintenance_interrupt: v.maintenance_interrupt_id,
             }),
             logical_groups: RawRwLock::new([0; 32]),
             affinity_table: RawRwLock::new([None; 8]),
         })
-    }
-
-    pub fn enable_atomic(&self) {
-        self.mutex.enable_atomic();
-        self.logical_groups.enable_atomic();
-        self.affinity_table.enable_atomic();
     }
 
     #[inline]
@@ -141,7 +136,7 @@ impl Gicv2 {
     }
 
     #[inline]
-    fn cpu_id_from_affinity(&self, affinity: CoreAffinity) -> Result<u8, GicError> {
+    pub(crate) fn cpu_id_from_affinity(&self, affinity: CoreAffinity) -> Result<u8, GicError> {
         let table = self.affinity_table.read();
         let cpu_if = table
             .iter()
@@ -151,7 +146,7 @@ impl Gicv2 {
     }
 
     #[inline]
-    fn affinity_from_cpu_id(&self, cpu_if: u8) -> Result<CoreAffinity, GicError> {
+    pub(crate) fn affinity_from_cpu_id(&self, cpu_if: u8) -> Result<CoreAffinity, GicError> {
         if cpu_if >= 8 {
             return Err(GicError::InvalidCpuId);
         }

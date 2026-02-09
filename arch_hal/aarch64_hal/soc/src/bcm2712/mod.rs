@@ -60,19 +60,6 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
 
             let brcm_stb = BrcmStb::new(pcie_reg.0);
 
-            // check msi-parent are mip
-            let mip = view
-                .msi_parent()
-                .map_err(WalkError::Dtb)?
-                .ok_or(Bcm2712Error::DtbDeviceNotFound)?;
-            let mip_name = mip.name();
-            if mip
-                .compatible_contains("brcm,bcm2712-mip")
-                .map_err(Bcm2712Error::DtbParseError)?
-            {
-                return Err(Bcm2712Error::UnexpectedDevice(mip_name).into());
-            }
-
             // check the pcie are initialized
             if !link_up(brcm_stb) {
                 return Err(Bcm2712Error::PcieIsNotInitialized.into());
@@ -94,7 +81,19 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
                 bar2.pcie_base, bar2.cpu_base, bar2.size
             );
 
-            init_rp1_interrupt(brcm_stb, &mip)?;
+            let mip_result = view.with_msi_parent_view(&mut |mip, mip_name| {
+                if mip
+                    .compatible_contains("brcm,bcm2712-mip")
+                    .map_err(Bcm2712Error::DtbParseError)?
+                {
+                    return Err(Bcm2712Error::UnexpectedDevice(mip_name).into());
+                }
+                init_rp1_interrupt(brcm_stb, mip)?;
+                Ok(ControlFlow::Break(()))
+            })?;
+            if matches!(mip_result, ControlFlow::Continue(())) {
+                return Err(Bcm2712Error::DtbDeviceNotFound.into());
+            }
 
             Ok(ControlFlow::Break(Rp1Config {
                 peripheral_bar_addr: bar1,
