@@ -237,6 +237,82 @@ impl<'a> Iterator for RangesIterWide<'a> {
     }
 }
 
+pub struct RegRawIter<'a, 'dtb, 's> {
+    property: &'a [u8],
+    remaining: usize,
+    stride: usize,
+    parent_address_cells: u32,
+    parent_size_cells: u32,
+    _node: &'a DtbNodeView<'dtb, 's>,
+}
+
+impl<'a, 'dtb, 's> RegRawIter<'a, 'dtb, 's> {
+    pub(crate) fn new(node: &'a DtbNodeView<'dtb, 's>) -> Result<Self, &'static str> {
+        let reg = node.property_bytes("reg")?.ok_or("reg: missing property")?;
+        if reg.is_empty() {
+            return Err("reg: empty property");
+        }
+
+        let parent_address_cells = node.parent_address_cells()?;
+        let parent_size_cells = node.parent_size_cells()?;
+
+        let max_cells = size_of::<usize>() / size_of::<u32>();
+        if parent_address_cells as usize > max_cells || parent_size_cells as usize > max_cells {
+            return Err("reg: cells overflow usize");
+        }
+
+        let cell_count = parent_address_cells
+            .checked_add(parent_size_cells)
+            .ok_or("reg: stride overflow")?;
+        let stride = cell_count
+            .checked_mul(size_of::<u32>() as u32)
+            .ok_or("reg: stride overflow")? as usize;
+
+        if stride == 0 || reg.len() % stride != 0 {
+            return Err("reg: length not multiple of stride");
+        }
+
+        Ok(Self {
+            property: reg,
+            remaining: reg.len(),
+            stride,
+            parent_address_cells,
+            parent_size_cells,
+            _node: node,
+        })
+    }
+
+    fn next_internal(&mut self) -> Result<Option<(usize, usize)>, &'static str> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+
+        let consumed = self.property.len() - self.remaining;
+        let start = consumed;
+
+        let (addr, a_len) =
+            read_regs_from_bytes(&self.property[start..], self.parent_address_cells)?;
+        let (len, l_len) =
+            read_regs_from_bytes(&self.property[start + a_len..], self.parent_size_cells)?;
+
+        let used = a_len.checked_add(l_len).ok_or("reg: overrun")?;
+        if used != self.stride {
+            return Err("reg: unexpected entry size");
+        }
+
+        self.remaining = self.remaining.checked_sub(used).ok_or("reg: overrun")?;
+        Ok(Some((addr, len)))
+    }
+}
+
+impl<'a, 'dtb, 's> Iterator for RegRawIter<'a, 'dtb, 's> {
+    type Item = Result<(usize, usize), &'static str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_internal().transpose()
+    }
+}
+
 pub struct RegIter<'a, 'dtb, 's> {
     node: &'a DtbNodeView<'dtb, 's>,
     property: &'a [u8],

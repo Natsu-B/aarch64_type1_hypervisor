@@ -6,6 +6,7 @@ use super::iters::InterruptCellsIter;
 use super::iters::RangesIter;
 use super::iters::RangesIterWide;
 use super::iters::RegIter;
+use super::iters::RegRawIter;
 use super::parser::DtbParser;
 use super::types::NodeScope;
 use super::types::Validated;
@@ -81,6 +82,10 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
 
     pub fn reg_iter(&self) -> Result<RegIter<'_, 'dtb, 's>, &'static str> {
         RegIter::new(self)
+    }
+
+    pub fn reg_raw_iter(&self) -> Result<RegRawIter<'_, 'dtb, 's>, &'static str> {
+        RegRawIter::new(self)
     }
 
     pub fn interrupts_iter<const CELLS: usize>(

@@ -13,6 +13,7 @@ pub use dtb_parser::InterruptCellsIter;
 pub use dtb_parser::RangesEntry;
 pub use dtb_parser::RangesIter;
 pub use dtb_parser::RegIter;
+pub use dtb_parser::RegRawIter;
 pub use dtb_parser::Unchecked;
 pub use dtb_parser::Validated;
 pub use dtb_parser::WalkError;
