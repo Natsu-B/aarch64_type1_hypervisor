@@ -552,6 +552,18 @@ pub fn set_tpidr_el1(val: u64) {
     unsafe { asm!("msr tpidr_el1, {}", in(reg) val) };
 }
 
+pub fn get_tpidr_el2() -> u64 {
+    let val: u64;
+    // SAFETY: Reads the current TPIDR_EL2 value.
+    unsafe { asm!("mrs {val}, tpidr_el2", val = out(reg) val) };
+    val
+}
+
+pub fn set_tpidr_el2(val: u64) {
+    // SAFETY: Caller ensures the TPIDR_EL2 value is valid for the running context.
+    unsafe { asm!("msr tpidr_el2, {}", in(reg) val) };
+}
+
 pub fn get_sctlr_el1() -> u64 {
     let val: u64;
     // SAFETY: Reads the current SCTLR_EL1 value.

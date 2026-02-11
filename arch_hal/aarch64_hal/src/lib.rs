@@ -13,3 +13,4 @@ pub use paging;
 pub use print::*;
 pub use psci;
 pub use timer;
+pub use tls;

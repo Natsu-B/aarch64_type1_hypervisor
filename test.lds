@@ -28,6 +28,9 @@ SECTIONS
   }
 
   .rodata : ALIGN(_ALIGN_SIZE) {
+    __el2_tls_start = .;
+    KEEP(*(.el2_tls .el2_tls.*))
+    __el2_tls_end = .;
     *(.rodata .rodata.*)
   }
 

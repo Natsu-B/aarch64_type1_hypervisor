@@ -20,3 +20,4 @@ timer = { path = "./timer" }
 aarch64_mutex = { path = "./aarch64_mutex" }
 aarch64_gdb = { path = "./aarch64_gdb" }
 soc = { path = "./soc" }
+tls = { path = "./tls" }

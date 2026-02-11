@@ -27,6 +27,7 @@ dependencies = [
  "psci",
  "soc",
  "timer",
+ "tls",
 ]
 
 [[package]]
@@ -290,6 +291,13 @@ dependencies = [
 
 [[package]]
 name = "timer"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+]
+
+[[package]]
+name = "tls"
 version = "0.1.0"
 dependencies = [
  "cpu",
