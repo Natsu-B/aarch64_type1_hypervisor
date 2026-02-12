@@ -7,17 +7,16 @@ use dtb::WalkResult;
 use print::println;
 
 use crate::bcm2712::brcmstb::BrcmStb;
-use crate::bcm2712::brcmstb::OutBoundData;
 use crate::bcm2712::brcmstb::PcieStatus;
-use crate::bcm2712::mip::Bcm2712MIP;
 use typestate::Readable;
 
 pub mod brcmstb;
 pub mod mip;
+pub mod rp1_interrupt;
 
 pub struct Rp1Config {
-    pub peripheral_bar_addr: OutBoundData,
-    pub shared_sram_bar_addr: OutBoundData,
+    pub peripheral_addr: Option<(u64, u64)>,
+    pub shared_sram_addr: Option<(u64, u64)>,
 }
 
 pub fn init_rp1(dtb: &DtbParser) -> Result<Rp1Config, Bcm2712Error> {
@@ -34,12 +33,15 @@ pub fn init_rp1(dtb: &DtbParser) -> Result<Rp1Config, Bcm2712Error> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bcm2712Error {
     DtbParseError(&'static str),
     DtbDeviceNotFound,
     PcieIsNotInitialized,
     UnexpectedDevice(&'static str),
     InvalidWindow,
+    InvalidPciHeaderType,
+    InvalidSettings,
 }
 
 fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
@@ -60,45 +62,65 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
 
             let brcm_stb = BrcmStb::new(pcie_reg.0);
 
-            // check the pcie are initialized
-            if !link_up(brcm_stb) {
-                return Err(Bcm2712Error::PcieIsNotInitialized.into());
-            }
-
-            // check bar address
-            let bar1 = brcm_stb
-                .read_outbound_window(1)?
-                .ok_or(Bcm2712Error::PcieIsNotInitialized)?;
-            println!(
-                "PCIE: pheripheral BAR address: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
-                bar1.pcie_base, bar1.cpu_base, bar1.size
-            );
-            let bar2 = brcm_stb
-                .read_outbound_window(2)?
-                .ok_or(Bcm2712Error::PcieIsNotInitialized)?;
-            println!(
-                "PCIE: shared SRAM BAR address: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
-                bar2.pcie_base, bar2.cpu_base, bar2.size
-            );
-
-            let mip_result = view.with_msi_parent_view(&mut |mip, mip_name| {
-                if mip
+            let result = view.with_msi_parent_view(&mut |mip, mip_name| {
+                if !mip
                     .compatible_contains("brcm,bcm2712-mip")
-                    .map_err(Bcm2712Error::DtbParseError)?
+                    .map_err(WalkError::Dtb)?
                 {
                     return Err(Bcm2712Error::UnexpectedDevice(mip_name).into());
                 }
-                init_rp1_interrupt(brcm_stb, mip)?;
-                Ok(ControlFlow::Break(()))
-            })?;
-            if matches!(mip_result, ControlFlow::Continue(())) {
-                return Err(Bcm2712Error::DtbDeviceNotFound.into());
-            }
 
-            Ok(ControlFlow::Break(Rp1Config {
-                peripheral_bar_addr: bar1,
-                shared_sram_bar_addr: bar2,
-            }))
+                let mip_reg = mip
+                    .reg_iter()
+                    .map_err(WalkError::Dtb)?
+                    .next()
+                    .ok_or(Bcm2712Error::DtbDeviceNotFound)?
+                    .map_err(WalkError::Dtb)?;
+                println!("PCIE: MIP addr: 0x{:x}, size: 0x{:x}", mip_reg.0, mip_reg.1);
+
+                // check the pcie are initialized
+                if !link_up(brcm_stb) {
+                    return Err(Bcm2712Error::PcieIsNotInitialized.into());
+                }
+
+                // check bar address
+                let (bar1, bar2) = brcm_stb.read_rp1_pci_bar_address()?;
+                println!("PCIE: RP1 Pheripheral BAR addr: 0x{:x}", bar1);
+                println!("PCIE: RP1 Shared SRAM BAR addr: 0x{:x}", bar2);
+
+                let mut peripheral_addr = None;
+                let mut  shared_sram_addr = None;
+
+                // check outbound windows
+                for i in 0..=4 {
+                   if let Ok(Some(bar)) = brcm_stb
+                        .read_outbound_window(i){
+                    println!(
+                        "PCIE: outbound window {}: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
+                        i, bar.pcie_base, bar.cpu_base, bar.size
+                    );
+                    if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&bar1) {
+                        peripheral_addr = Some((bar1 - bar.pcie_base + bar.cpu_base, 0x40_0000));
+                    }
+                    if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&bar2) {
+                        shared_sram_addr = Some((bar2 - bar.pcie_base + bar.cpu_base, 0x1_0000));
+                    }
+                }
+                }
+
+                rp1_interrupt::init_rp1_interrupt(brcm_stb, mip_reg.0 as u64)?;
+
+                Ok(ControlFlow::Break(Rp1Config {
+                    peripheral_addr,
+                    shared_sram_addr,
+                }))
+            });
+
+            match result {
+                Ok(ControlFlow::Break(config)) => Ok(ControlFlow::Break(config)),
+                Ok(ControlFlow::Continue(())) => Err(Bcm2712Error::DtbDeviceNotFound.into()),
+                Err(err) => Err(err),
+            }
         } else {
             Ok(ControlFlow::Continue(()))
         }
@@ -108,50 +130,4 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
 fn link_up(brcm_stb: &BrcmStb) -> bool {
     let status = brcm_stb.pcie_status.read();
     status.get(PcieStatus::phy_linkup) != 0 && status.get(PcieStatus::dl_active) != 0
-}
-
-fn init_rp1_interrupt(brcm_stb: &BrcmStb, mip: &DtbNodeView) -> Result<(), Bcm2712Error> {
-    // mip settings
-    let mip_addr = mip
-        .reg_iter()
-        .map_err(Bcm2712Error::DtbParseError)?
-        .next()
-        .ok_or(Bcm2712Error::DtbDeviceNotFound)?
-        .map_err(Bcm2712Error::DtbParseError)?;
-    let mip = Bcm2712MIP::new(mip_addr.0);
-    mip.init();
-
-    // check inbound settings
-    let found = (1..=10)
-        .try_fold(
-            ControlFlow::Continue(()),
-            |_, i| -> Result<ControlFlow<(), ()>, Bcm2712Error> {
-                if let Some(inbound) = brcm_stb.read_inbound_window(i)? {
-                    println!(
-                        "PCIE: inbound window {}: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
-                        i, inbound.pcie_base, inbound.cpu_base, inbound.size
-                    );
-
-                    // TODO read from DTB
-                    let ok = inbound.pcie_base == 0xff_ffff_f000
-                        && inbound.cpu_base == 0x10_0013_0000
-                        && inbound.size == 0x1000;
-
-                    if ok {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?
-        .is_break();
-
-    if !found {
-        return Err(Bcm2712Error::PcieIsNotInitialized);
-    }
-
-    // set RP1 interrupt
-    // TODO
-
-    Ok(())
 }

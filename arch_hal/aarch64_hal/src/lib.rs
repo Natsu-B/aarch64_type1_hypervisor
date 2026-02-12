@@ -12,5 +12,6 @@ pub use gic;
 pub use paging;
 pub use print::*;
 pub use psci;
+pub use soc;
 pub use timer;
 pub use tls;

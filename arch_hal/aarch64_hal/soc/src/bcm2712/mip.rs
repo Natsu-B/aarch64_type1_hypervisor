@@ -35,7 +35,7 @@ pub(crate) struct Bcm2712MIP {
 }
 
 impl Bcm2712MIP {
-    pub const fn new(addr: usize) -> &'static Self {
+    pub const fn new(addr: u64) -> &'static Self {
         unsafe { &*(addr as *const Self) }
     }
 
@@ -53,5 +53,6 @@ impl Bcm2712MIP {
         // set host edge triggered
         self.cfgl_host.write(MASK);
         self.cfgh_host.write(MASK);
+        cpu::dsb_sy();
     }
 }

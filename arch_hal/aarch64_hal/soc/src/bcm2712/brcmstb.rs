@@ -1,10 +1,17 @@
 #![allow(dead_code)]
 
+use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::mem::offset_of;
+use pci::PCIConfigRegType0;
 use pci::PCIConfigRegType1;
-use typestate::RawReg;
+use pci::PciBhlc;
+use pci::PciHeaderKind;
+use pci::PciId;
+use print::println;
 use typestate::ReadWrite;
 use typestate::Readable;
+use typestate::Writable;
 use typestate::bitregs;
 
 use crate::bcm2712::Bcm2712Error;
@@ -28,7 +35,6 @@ const _: () = assert!(offset_of!(BrcmStb, config_data) == 0x8000);
 const _: () = assert!(offset_of!(BrcmStb, config_address) == 0x9000);
 const _: () = assert!(core::mem::size_of::<BrcmStb>() == 0x10000);
 
-const BRCM_PCIE_HW_REV_33: u32 = 0x0303;
 const SHIFT_1MB: u64 = 20;
 
 #[repr(C)]
@@ -84,9 +90,9 @@ pub struct BrcmStb {
     // 0x5000
     reserved_0x5000: [u8; 0x3000],
     // 0x8000
-    pub(crate) config_data: ReadWrite<[u8; 0x1000]>,
+    pub(crate) config_data: UnsafeCell<[u8; 0x1000]>,
     // 0x9000
-    pub(crate) config_address: ReadWrite<u32>,
+    pub(crate) config_address: ReadWrite<ConfigAddress>,
     reserved_0x9004: [u8; 0x6ffc],
 }
 
@@ -138,6 +144,10 @@ impl BrcmStb {
         let cpu_mb = cpu_addr_mb_lower | cpu_addr_mb_higher << 12;
         let limit_mb = limit_addr_mb_lower | limit_addr_mb_higher << 12;
 
+        println!(
+            "PCIE: outbound window {} cpu_addr_mb: 0x{:x} limit_addr_mb: 0x{:x}",
+            num, cpu_mb, limit_mb
+        );
         let size = (limit_mb
             .checked_sub(cpu_mb)
             .ok_or(Bcm2712Error::InvalidWindow)?
@@ -176,6 +186,7 @@ impl BrcmStb {
         }
         if bar_lower.bits() == 0 && bar_higher == 0 && ubus_lower.bits() == 0 && ubus_higher == 0
             || ubus_lower.get(InboundUbusLower::en) == 0
+            || bar_lower.get(InboundBarLower::size) == 0
         {
             return Ok(None);
         }
@@ -183,12 +194,140 @@ impl BrcmStb {
             bar_lower.get_raw(InboundBarLower::offset) as u64 | (bar_higher as u64) << 32;
         let cpu_base =
             ubus_lower.get_raw(InboundUbusLower::addr) as u64 | (ubus_higher as u64) << 32;
+        println!(
+            "PCIE: inbound window {} pcie_base: 0x{:x} cpu_base: 0x{:x} bar_lower: 0x{:x} bar_higher: 0x{:x} ubus_lower: 0x{:x} ubus_higher: 0x{:x}",
+            num,
+            pcie_base,
+            cpu_base,
+            bar_lower.bits(),
+            bar_higher,
+            ubus_lower.bits(),
+            ubus_higher,
+        );
         let size = InboundBarLower::decode_size(bar_lower)?;
         Ok(Some(InBoundData {
             pcie_base,
             cpu_base,
             size,
         }))
+    }
+
+    pub(crate) fn set_inbound_window(
+        &self,
+        num: u8,
+        inbound_window: InBoundData,
+    ) -> Result<(), Bcm2712Error> {
+        let (bar_win, ubus_win) = match num {
+            1..=3 => (
+                &self.inbound_bar1_3[num as usize - 1],
+                &self.ubus_bar1_3[num as usize - 1],
+            ),
+            4..=10 => (
+                &self.inbound_bar4_10[num as usize - 4],
+                &self.ubus_bar4_10[num as usize - 4],
+            ),
+            _ => return Err(Bcm2712Error::InvalidWindow),
+        };
+
+        if inbound_window.size == 0 {
+            ubus_win.lower.write(InboundUbusLower::from_bits(0)); // en=0
+            ubus_win.higher.write(0);
+            bar_win.lower.write(InboundBarLower::from_bits(0)); // size=0, offset=0
+            bar_win.higher.write(0);
+            return Ok(());
+        }
+
+        // size encoding is non-linear; follow Linux brcmstb driver mapping.
+        let size_enc = InboundBarLower::encode_size(inbound_window.size)?;
+
+        // inbound view constraints (power-of-two size, base aligned to size).
+        let size = inbound_window.size;
+        if (size & (size - 1)) != 0
+            || (inbound_window.pcie_base & (size - 1)) != 0
+            || (inbound_window.cpu_base & (size - 1)) != 0
+        {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+
+        // register field granularity:
+        // - InboundBarLower::offset is [31:5]  -> at least 32-byte aligned
+        // - InboundUbusLower::addr is [31:12]  -> 4KB aligned
+        if (inbound_window.pcie_base & 0x1f) != 0 || (inbound_window.cpu_base & 0xfff) != 0 {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+
+        let pcie_lo = inbound_window.pcie_base as u32;
+        let pcie_hi = (inbound_window.pcie_base >> 32) as u32;
+        let cpu_lo = inbound_window.cpu_base as u32;
+        let cpu_hi = (inbound_window.cpu_base >> 32) as u32;
+
+        // Disable first to avoid transient enable with inconsistent parameters.
+        ubus_win.lower.write(InboundUbusLower::from_bits(0)); // en=0
+        bar_win.lower.write(InboundBarLower::from_bits(0)); // size=0
+
+        // Program high parts first, then lows, then enable last.
+        bar_win.higher.write(pcie_hi);
+        ubus_win.higher.write(cpu_hi);
+
+        let bar_lower = InboundBarLower::new()
+            .set(InboundBarLower::size, size_enc)
+            .set_raw(InboundBarLower::offset, pcie_lo & 0xffff_ffe0);
+
+        let ubus_lower = InboundUbusLower::new()
+            .set(InboundUbusLower::en, 1)
+            .set_raw(InboundUbusLower::addr, cpu_lo & 0xffff_f000);
+
+        bar_win.lower.write(bar_lower);
+        ubus_win.lower.write(ubus_lower);
+
+        Ok(())
+    }
+
+    pub(crate) fn read_rp1_pci_bar_address(
+        &self,
+    ) -> Result<(u64 /* bar1 */, u64 /* bar2 */), Bcm2712Error> {
+        // TODO hal lock
+        for bus in 0..=1 {
+            for device in 0..32 {
+                for function in 0..8 {
+                    unsafe { asm!("dmb oshst") };
+                    self.config_address.write(
+                        ConfigAddress::new()
+                            .set(ConfigAddress::bus_num, bus)
+                            .set(ConfigAddress::device_num, device)
+                            .set(ConfigAddress::function_num, function),
+                    );
+                    cpu::dsb_sy();
+                    let config =
+                        unsafe { &mut *(self.config_data.get() as *mut PCIConfigRegType0) };
+                    if config.id.read().bits() == 0xffff {
+                        continue;
+                    }
+                    println!(
+                        "PCIE: Checking bus {} device {} function {}",
+                        bus, device, function
+                    );
+                    println!(
+                        "PCIE: RP1 Vender ID: 0x{:x}",
+                        config.id.read().get(PciId::vendor_id)
+                    );
+                    println!(
+                        "PCIE: RP1 Device ID: 0x{:x}",
+                        config.id.read().get(PciId::device_id)
+                    );
+                    if config
+                        .bhlc
+                        .read()
+                        .get_enum(PciBhlc::header_kind)
+                        .is_none_or(|t: PciHeaderKind| t != PciHeaderKind::Standard)
+                    {
+                        return Err(Bcm2712Error::InvalidPciHeaderType);
+                    }
+                    return Ok((config.bar[1].read() as u64, config.bar[2].read() as u64));
+                }
+            }
+        }
+        Err(Bcm2712Error::DtbDeviceNotFound)
     }
 }
 
@@ -222,6 +361,24 @@ impl InboundBarLower {
             } else {
                 return Err(Bcm2712Error::InvalidWindow);
             })
+    }
+
+    fn encode_size(size: u64) -> Result<u32, Bcm2712Error> {
+        if size == 0 || (size & (size - 1)) != 0 {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+        let log2 = size.trailing_zeros() as u32;
+
+        // Linux brcmstb: 4KB..32KB => 0x1c..0x1f, 64KB..64GB => 1..21 :contentReference[oaicite:5]{index=5}
+        let enc = if (12..=15).contains(&log2) {
+            (log2 - 12) + 0x1c
+        } else if (16..=36).contains(&log2) {
+            log2 - 15
+        } else {
+            return Err(Bcm2712Error::InvalidWindow);
+        };
+
+        Ok(enc)
     }
 }
 
@@ -299,4 +456,14 @@ bitregs! {
         }
     }
 
+}
+
+bitregs! {
+    pub struct ConfigAddress: u32 {
+        reserved@[11:0] [res0],
+        pub function_num@[14:12],
+        pub device_num@[19:15],
+        pub bus_num@[27:20],
+        reserved@[31:28] [res0],
+    }
 }
