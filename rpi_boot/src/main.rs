@@ -23,12 +23,14 @@ use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::paging::EL2Stage1PageTypes;
 use arch_hal::paging::EL2Stage1Paging;
 use arch_hal::paging::EL2Stage1PagingSetting;
+use arch_hal::paging::Stage2AccessPermission;
 use arch_hal::paging::Stage2PageTypes;
 use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::println_force;
+use arch_hal::soc::bcm2712;
 use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::global_asm;
@@ -39,6 +41,7 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
+use core::ptr::slice_from_raw_parts_mut;
 use core::time::Duration;
 use core::usize;
 use dtb::DeviceTree;
@@ -53,6 +56,9 @@ use dtb::NodeQueryExt;
 use dtb::ValueRef;
 use dtb::WalkError;
 use typestate::Le;
+use typestate::ReadWrite;
+use typestate::Readable;
+use typestate::Writable;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -269,6 +275,7 @@ extern "C" fn main() -> ! {
                 pa: memory_last_addr,
                 size: addr - memory_last_addr,
                 types: Stage2PageTypes::Device,
+                perm: Stage2AccessPermission::ReadWrite,
             });
             stage1_paging_data.push(EL2Stage1PagingSetting {
                 va: memory_last_addr,
@@ -282,6 +289,7 @@ extern "C" fn main() -> ! {
             pa: addr,
             size,
             types: Stage2PageTypes::Normal,
+            perm: Stage2AccessPermission::ReadWrite,
         });
         stage1_paging_data.push(EL2Stage1PagingSetting {
             va: addr,
@@ -303,12 +311,14 @@ extern "C" fn main() -> ! {
         pa: memory_last_addr,
         size: PL011_UART_ADDR.0 - memory_last_addr,
         types: Stage2PageTypes::Device,
+        perm: Stage2AccessPermission::ReadWrite,
     });
     paging_data.push(Stage2PagingSetting {
         ipa: PL011_UART_ADDR.0 + 0x1000,
         pa: PL011_UART_ADDR.0 + 0x1000,
         size: ipa_space - PL011_UART_ADDR.0 - 0x1000,
         types: Stage2PageTypes::Device,
+        perm: Stage2AccessPermission::ReadWrite,
     });
     stage1_paging_data.push(EL2Stage1PagingSetting {
         va: memory_last_addr,
@@ -319,7 +329,7 @@ extern "C" fn main() -> ! {
     println!("Stage2Paging: {:#?}", paging_data);
     println!("EL2Stage1Paging: {:#?}", stage1_paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation(true);
+    Stage2Paging::enable_stage2_translation(true, false);
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
 
@@ -401,7 +411,7 @@ extern "C" fn main() -> ! {
     // setup pl011 interrupts
     gicv2
         .configure_spi(
-            120 + 32,
+            128 + 25 + 32,
             arch_hal::gic::IrqGroup::Group1,
             0x80,
             arch_hal::gic::TriggerMode::Level,
@@ -438,12 +448,33 @@ extern "C" fn main() -> ! {
         Err(WalkError::User(())) => panic!("pcie: unexpected user error"),
     }
 
+    // check rp1
+    let rp1 = bcm2712::init_rp1(&dtb).unwrap();
+    println!(
+        "RP1: Peripheral addr: 0x{:x} SRAM addr: 0x{:x}",
+        rp1.peripheral_addr.unwrap().0,
+        rp1.shared_sram_addr.unwrap().0
+    );
+
+    // setup rp1 uart0 interrupt
+    let pcie_config = unsafe {
+        &*slice_from_raw_parts_mut(
+            (rp1.peripheral_addr.unwrap().0 + 0x10_8000 + 0x08) as *mut ReadWrite<u32>,
+            64,
+        )
+    };
+    pcie_config[25].set_bits(0b1001);
+
     loop {
         systimer.wait(Duration::from_secs(1));
         println!("UARTMIS: 0x{:X}", unsafe {
             ptr::read_volatile((PL011_UART_ADDR.0 + 0x40) as *const u32)
         });
-        dump_uart_gic(gic_distributor.unwrap().base, PL011_UART_ADDR.0, 0x79 + 32);
+        dump_uart_gic(
+            gic_distributor.unwrap().base,
+            PL011_UART_ADDR.0,
+            128 + 25 + 32,
+        );
         debug_uart::handle_rx_irq_force(|byte| println_force!("force: {}", byte));
         println!("wait for interrupt...");
     }

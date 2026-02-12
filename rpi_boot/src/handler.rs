@@ -171,7 +171,7 @@ fn data_abort_handler(
     cpu::set_elr_el2(cpu::get_elr_el2() + 4);
 }
 
-fn irq_handler() {
+fn irq_handler(_regs: &mut cpu::Registers) {
     println_force!("irq received");
     let gicv2 = unsafe { &*GICV2_DRIVER.get() }.as_ref().unwrap();
     let irq = gicv2.acknowledge().unwrap();
@@ -180,7 +180,7 @@ fn irq_handler() {
         return;
     };
     println_force!("irq number: {}", irq.intid);
-    if irq.intid == 120 + 32 {
+    if irq.intid == 128 + 25 + 32 {
         debug_uart::handle_rx_irq_force(|bytes| println_force!("interrupt: {}", bytes as char));
     }
 
@@ -214,11 +214,12 @@ fn log_uart_write(plan: &MmioDecoded, regs: &cpu::Registers) {
         } if desc.is_store => (*ipa as usize, desc),
         _ => return,
     };
-    if !(PL011_UART_ADDR..PL011_UART_ADDR + 0x1000).contains(&ipa) {
+    let uart = PL011_UART_ADDR.0;
+    if !(uart..uart + 0x1000).contains(&ipa) {
         return;
     }
     let value = store_value(desc, regs);
-    if ipa == PL011_UART_ADDR && value == b'\n' as u64 {
+    if ipa == uart && value == b'\n' as u64 {
         println!("\nhypervisor: alive");
     }
 }
