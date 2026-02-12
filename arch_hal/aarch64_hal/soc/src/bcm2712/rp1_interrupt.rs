@@ -45,8 +45,8 @@ pub(crate) fn init_rp1_interrupt(brcm_stb: &BrcmStb, mip_base: u64) -> Result<()
         };
         println!("PCIE: Setting Inbound Window {}...", x);
         let inbound_window = InBoundData {
-            pcie_base: mip_base,
-            cpu_base: 0xff_ffff_f000,
+            pcie_base: 0xff_ffff_f000,
+            cpu_base: mip_base,
             size: 0x1000,
         };
         brcm_stb.set_inbound_window(x as u8, inbound_window)?;
