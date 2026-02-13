@@ -33,6 +33,7 @@ use arch_hal::println_force;
 use arch_hal::soc::bcm2712;
 use arch_hal::soc::bcm2712::rp1_interrupt::enable_interrupt;
 use arch_hal::timer::SystemTimer;
+use arch_hal::tls;
 use core::alloc::Layout;
 use core::arch::global_asm;
 use core::cell::SyncUnsafeCell;
@@ -42,6 +43,7 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
+use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts_mut;
 use core::time::Duration;
 use core::usize;
@@ -66,6 +68,8 @@ unsafe extern "C" {
     static mut _PROGRAM_END: usize;
     static mut _STACK_TOP: usize;
     static mut _LINUX_IMAGE: usize;
+    static mut __el2_tls_bsp_start: usize;
+    static mut __el2_tls_bsp_end: usize;
 }
 
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
@@ -128,6 +132,17 @@ extern "C" fn main() -> ! {
     let program_end = &raw mut _PROGRAM_END as *const _ as usize;
     let linux_image = &raw mut _LINUX_IMAGE as *const _ as usize;
     let stack_top = &raw mut _STACK_TOP as *const _ as usize;
+    let tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
+    let tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
+
+    // setup tls
+    unsafe {
+        tls::init_current_cpu(
+            NonNull::new_unchecked(tls_bsp_start as *mut u8),
+            tls_bsp_end - tls_bsp_start,
+        )
+        .unwrap()
+    };
 
     debug_uart::init(PL011_UART_ADDR.0, PL011_UART_ADDR.1, 115200);
     cpu::isb();

@@ -198,6 +198,18 @@ pub unsafe fn write_daif(daif: u64) {
     }
 }
 
+pub fn mask_irq_fiq() {
+    unsafe {
+        asm!("msr daifset, #0b11", "isb", options(nostack));
+    }
+}
+
+pub fn enable_irq_fiq() {
+    unsafe {
+        asm!("msr daifclr, #0b11", "isb", options(nostack));
+    }
+}
+
 /// Unmask debug exceptions (PSTATE.D / DAIF.D = 0) at the current exception level.
 ///
 /// This enables Watchpoint/Breakpoint/Software Step exceptions targeted at the current EL.

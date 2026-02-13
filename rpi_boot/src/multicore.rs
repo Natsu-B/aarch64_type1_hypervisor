@@ -1,16 +1,21 @@
+use crate::GICV2_DRIVER;
 use crate::GLOBAL_ALLOCATOR;
 use crate::SPSR_EL2_M_EL1H;
 use alloc::vec;
 use alloc::vec::Vec;
 use arch_hal::cpu;
 use arch_hal::cpu::CoreAffinity;
+use arch_hal::gic::GicCpuConfig;
+use arch_hal::gic::GicCpuInterface;
 use arch_hal::println;
 use arch_hal::psci::secure_monitor_call;
+use arch_hal::tls;
+use arch_hal::tls::template_size;
 use core::arch::asm;
-use core::arch::naked_asm;
 use core::cell::OnceCell;
 use core::mem::size_of;
 use core::ops::ControlFlow;
+use core::ptr::NonNull;
 use mutex::SpinLock;
 
 static AP_STACK_SIZE: usize = 0x1000;
@@ -106,15 +111,26 @@ pub fn ap_on(regs: &mut cpu::Registers) {
 }
 
 #[unsafe(naked)]
-extern "C" fn ap_start() {
-    naked_asm!("
-    mov sp, x0
-    b {AP_MAIN}
-    ",
-    AP_MAIN = sym ap_main)
+extern "C" fn ap_start() -> ! {
+    unsafe extern "C" {
+        static __el2_tls_size: u8;
+    }
+    core::arch::naked_asm!(
+        "
+        adrp x2, {TLS_MEM}
+        ldr  x2, [x2, :lo12:{TLS_MEM}]
+        sub  x1, x0, x2
+        mov  sp, x1
+        b    {AP_MAIN}
+        ",
+        TLS_MEM = sym __el2_tls_size,
+        AP_MAIN = sym ap_main,
+    )
 }
 
-extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
+extern "C" fn ap_main(register_context: *const HypervisorRegisters, tls_space: *mut u8) -> ! {
+    // mask irq/fiq
+    cpu::mask_irq_fiq();
     let register_context = unsafe { &*register_context };
     // Stage-2 translation tables
     cpu::set_vtcr_el2(register_context.vtcr_el2);
@@ -146,6 +162,9 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
 
     cpu::isb();
 
+    unsafe { tls::init_current_cpu(NonNull::new_unchecked(tls_space), template_size()).unwrap() };
+
+    cpu::enable_irq_fiq();
     println!("ap_main setup DONE!!!");
 
     unsafe {
