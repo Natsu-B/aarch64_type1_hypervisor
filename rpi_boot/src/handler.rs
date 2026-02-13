@@ -17,6 +17,7 @@ use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
 use core::ffi::c_void;
 use core::ptr::read_volatile;
+use core::ptr::slice_from_raw_parts_mut;
 use core::ptr::write_volatile;
 use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
@@ -24,9 +25,11 @@ use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
 use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
+use typestate::ReadWrite;
 
 use crate::GICV2_DRIVER;
 use crate::PL011_UART_ADDR;
+use crate::RP1_BASE;
 use crate::multicore::ap_on;
 
 pub(crate) fn setup_handler() {
@@ -182,6 +185,10 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     println_force!("irq number: {}", irq.intid);
     if irq.intid == 128 + 25 + 32 {
         debug_uart::handle_rx_irq_force(|bytes| println_force!("interrupt: {}", bytes as char));
+        let pcie_config = unsafe {
+            &*slice_from_raw_parts_mut((RP1_BASE + 0x10_8000 + 0x08) as *mut ReadWrite<u32>, 64)
+        };
+        pcie_config[25].set_bits(0b0100);
     }
 
     gicv2.end_of_interrupt(irq).unwrap();

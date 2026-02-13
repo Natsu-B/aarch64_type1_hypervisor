@@ -31,6 +31,7 @@ use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::println_force;
 use arch_hal::soc::bcm2712;
+use arch_hal::soc::bcm2712::rp1_interrupt::enable_interrupt;
 use arch_hal::timer::SystemTimer;
 use core::alloc::Layout;
 use core::arch::global_asm;
@@ -414,7 +415,7 @@ extern "C" fn main() -> ! {
             128 + 25 + 32,
             arch_hal::gic::IrqGroup::Group1,
             0x80,
-            arch_hal::gic::TriggerMode::Level,
+            arch_hal::gic::TriggerMode::Edge,
             arch_hal::gic::SpiRoute::Specific(cpu::get_current_core_id()),
             arch_hal::gic::EnableOp::Enable,
         )
@@ -455,6 +456,27 @@ extern "C" fn main() -> ! {
         rp1.peripheral_addr.unwrap().0,
         rp1.shared_sram_addr.unwrap().0
     );
+
+    debug_assert_eq!(rp1.peripheral_addr.unwrap().0, RP1_BASE as u64);
+
+    let io_config = unsafe {
+        &*slice_from_raw_parts_mut(
+            (rp1.peripheral_addr.unwrap().0 + 0xd_0000) as *mut ReadWrite<u32>,
+            56,
+        )
+    };
+    io_config[29].update_bits(0b1111, 0b100);
+
+    let gpio_config = unsafe {
+        &*slice_from_raw_parts_mut(
+            (rp1.peripheral_addr.unwrap().0 + 0xf_0000 + 0x04) as *mut ReadWrite<u32>,
+            28,
+        )
+    };
+    // input enable
+    gpio_config[15].set_bits(0b100_1000);
+
+    enable_interrupt(128 + 25 + 32).unwrap();
 
     // setup rp1 uart0 interrupt
     let pcie_config = unsafe {
