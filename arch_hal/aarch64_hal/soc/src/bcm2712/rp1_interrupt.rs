@@ -76,9 +76,9 @@ fn toggle_interrupt(spi: u32, enable: bool) -> Result<(), Bcm2712Error> {
     };
     let tables = get_msi_x_table(msi_x_table);
     tables[offset as usize].vector_control.write(if enable {
-        PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1)
-    } else {
         PciMsiXTableVectorControl::new()
+    } else {
+        PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1)
     });
     Ok(())
 }

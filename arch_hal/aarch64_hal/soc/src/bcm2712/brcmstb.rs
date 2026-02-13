@@ -391,9 +391,9 @@ impl BrcmStb {
                 .message_address_high
                 .write((msi_x_pci_addr >> 32) as u32);
             table.message_data.write(i as u32);
-            table.vector_control.clear_bits(
-                PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1),
-            );
+            table
+                .vector_control
+                .write(PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1));
         }
         // enable msi-x
         msi_x.configurations.update_bits(
