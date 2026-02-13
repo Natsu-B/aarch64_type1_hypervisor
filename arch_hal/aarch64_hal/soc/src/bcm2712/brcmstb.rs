@@ -329,9 +329,10 @@ impl BrcmStb {
             return Err(Bcm2712Error::InvalidSettings);
         }
         let cap = config.cap_ptr.read().get(PciCapPtr::capabilities_ptr);
-        if cap < size_of::<PCIConfigRegType0>() as u32 || cap & 0xffff != 0
+        if cap < size_of::<PCIConfigRegType0>() as u32 || cap & 0b11 != 0
         /* require 32 bit align */
         {
+            println!("PCIE: Invalid capabilities pointer: 0x{:x}", cap);
             return Err(Bcm2712Error::InvalidSettings);
         }
         let config_data =
@@ -344,14 +345,15 @@ impl BrcmStb {
                 println!("PCIE: infinite recursion detected");
                 return Err(Bcm2712Error::InvalidSettings);
             }
-            let capability_header = PciCapabilityHead::from_bits(config_data[cap as usize]);
+            let capability_header =
+                PciCapabilityHead::from_bits(config_data[cap as usize / size_of::<u32>()]);
             if capability_header.get(PciCapabilityHead::id) == 0x11 {
                 break;
             }
             cap = capability_header.get(PciCapabilityHead::next_ptr);
             count += 1;
         }
-        PciCapabilityMsiX::from_array(&config_data[cap as usize..(cap as usize + 2)])
+        PciCapabilityMsiX::from_array(&config_data[cap as usize / size_of::<u32>()..])
             .ok_or(Bcm2712Error::InvalidWindow)
     }
 
