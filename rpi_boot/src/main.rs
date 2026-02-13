@@ -75,7 +75,7 @@ unsafe extern "C" {
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
-static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
+pub(crate) static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 static RP1_BASE: usize = 0x1c_0000_0000;
 static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
 static RP1_PAD: usize = RP1_BASE + 0xf_0000;

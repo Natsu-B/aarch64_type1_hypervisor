@@ -164,6 +164,18 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters, tls_space: *
 
     unsafe { tls::init_current_cpu(NonNull::new_unchecked(tls_space), template_size()).unwrap() };
 
+    let gicv2 = unsafe { GICV2_DRIVER.get().as_ref().unwrap().as_ref().unwrap() };
+    let caps = gicv2.init_cpu_interface().unwrap();
+    gicv2
+        .configure(&GicCpuConfig {
+            priority_mask: 0xff,
+            enable_group0: false,
+            enable_group1: true,
+            binary_point: arch_hal::gic::BinaryPoint::Common(caps.binary_points_min),
+            eoi_mode: arch_hal::gic::EoiMode::DropOnly,
+        })
+        .unwrap();
+
     cpu::enable_irq_fiq();
     println!("ap_main setup DONE!!!");
 
