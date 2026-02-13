@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
+#![feature(generic_const_exprs)]
 #![feature(sync_unsafe_cell)]
 
 extern crate alloc;
 mod handler;
 mod multicore;
 mod pcie;
+mod vgic;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -19,6 +21,7 @@ use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicPpi;
 use arch_hal::gic::MmioRegion;
+use arch_hal::gic::dt_irq;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::paging::EL2Stage1PageTypes;
 use arch_hal::paging::EL2Stage1Paging;
@@ -29,9 +32,7 @@ use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
-use arch_hal::println_force;
 use arch_hal::soc::bcm2712;
-use arch_hal::soc::bcm2712::rp1_interrupt::enable_interrupt;
 use arch_hal::timer::SystemTimer;
 use arch_hal::tls;
 use core::alloc::Layout;
@@ -45,8 +46,6 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts_mut;
-use core::time::Duration;
-use core::usize;
 use dtb::DeviceTree;
 use dtb::DeviceTreeEditExt;
 use dtb::DeviceTreeQueryExt;
@@ -76,11 +75,18 @@ pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 pub(crate) static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
-static RP1_BASE: usize = 0x1c_0000_0000;
-static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
-static RP1_PAD: usize = RP1_BASE + 0xf_0000;
-static PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
+pub(crate) const RP1_BASE: usize = 0x1c_0000_0000;
+pub(crate) const PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
 // static PL011_UART_ADDR: (usize, u64) = (0x10_7D00_1000, 44 * 1000 * 1000);
+
+#[derive(Copy, Clone, Debug)]
+struct Gicv2Info {
+    dist: MmioRegion,
+    cpu: MmioRegion,
+    gich: Option<MmioRegion>,
+    gicv: Option<MmioRegion>,
+    maintenance_intid: Option<u32>,
+}
 
 #[repr(C)]
 struct LinuxHeader {
@@ -157,6 +163,11 @@ extern "C" fn main() -> ! {
     const DTB_PTR: usize = 0x2000_0000;
     let dtb = DtbParser::init(DTB_PTR).unwrap();
     assert_eq!(cpu::get_current_el(), 2);
+    let gic_info = find_gicv2_info(&dtb).unwrap();
+    let uart_irq = vgic::UartIrq {
+        pintid: 128 + 25 + 32,
+        sense: arch_hal::gic::IrqSense::Edge,
+    };
 
     let mut systimer = SystemTimer::new();
     systimer.init();
@@ -347,85 +358,38 @@ extern "C" fn main() -> ! {
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
     println!("paging success!!!");
 
-    // setup gicv2
+    // setup gicv2 (with virtualization)
     println!("setup gicv2...");
-    let mut gic_distributor = None;
-    let mut gic_cpu_interface = None;
-    let mut i = 0;
-    let result = dtb.find_node(None, Some("arm,gic-400"), &mut |addr, size| {
-        match i {
-            0 => {
-                gic_distributor = Some(MmioRegion { base: addr, size });
-            }
-            1 => {
-                gic_cpu_interface = Some(MmioRegion { base: addr, size });
-            }
-            _ => {
-                println!(
-                    "extra gic-400 node found: addr=0x{:X}, size=0x{:X}",
-                    addr, size
-                );
-            }
+    let virt = match (gic_info.gich, gic_info.gicv, gic_info.maintenance_intid) {
+        (Some(gich), Some(gicv), Some(maint)) => {
+            Some(arch_hal::gic::gicv2::Gicv2VirtualizationRegion {
+                gich,
+                gicv,
+                maintenance_interrupt_id: maint,
+            })
         }
-        i += 1;
-        Ok(ControlFlow::Continue(()))
-    });
-    match result {
-        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
-        Err(WalkError::Dtb(err)) => panic!("{}", err),
-        Err(WalkError::User(())) => panic!("find_node: gic parse error"),
+        _ => None,
     }
-    let gicv2 = Gicv2::new(
-        gic_distributor.expect("gic distributor missing"),
-        gic_cpu_interface.expect("gic cpu interface missing"),
-        None,
-        None,
-    )
-    .unwrap();
+    .expect("gic: missing virtualization region or maintenance interrupt");
+    println!("gic v2: {:?}", gic_info);
+    let gicv2 = Gicv2::new(gic_info.dist, gic_info.cpu, Some(virt), None).unwrap();
     gicv2.init_distributor().unwrap();
     let caps = gicv2.init_cpu_interface().unwrap();
     println!("GICv2 CPU Interface capabilities: {:?}", caps);
     gicv2
         .configure(&GicCpuConfig {
             priority_mask: 0xff,
-            enable_group0: false,
+            enable_group0: caps.supports_group0,
             enable_group1: true,
             binary_point: arch_hal::gic::BinaryPoint::Common(caps.binary_points_min),
-            eoi_mode: arch_hal::gic::EoiMode::DropOnly,
+            eoi_mode: arch_hal::gic::EoiMode::DropAndDeactivate,
         })
         .unwrap();
-
-    let result = dtb.find_nodes_by_compatible_view("arm,pl011", &mut |view, _string| {
-        let mut iter = view.reg_iter().map_err(WalkError::Dtb)?;
-        let mut is_uart = false;
-        while let Some(info) = iter.next() {
-            let (addr, _) = info.map_err(WalkError::Dtb)?;
-            if addr == PL011_UART_ADDR.0 {
-                is_uart = true;
-                break;
-            }
-        }
-        if is_uart {
-            let _ = view.for_each_interrupt_specifier(&mut |int| -> Result<
-                ControlFlow<()>,
-                WalkError<()>,
-            > {
-                println!("pl011 interrupt specifier: {:?}", int);
-                Ok(ControlFlow::Continue(()))
-            })?;
-        }
-        Ok(ControlFlow::Continue(()))
-    });
-    match result {
-        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
-        Err(WalkError::Dtb(err)) => panic!("{}", err),
-        Err(WalkError::User(())) => panic!("pl011: unexpected user error"),
-    }
 
     // setup pl011 interrupts
     gicv2
         .configure_spi(
-            128 + 25 + 32,
+            uart_irq.pintid,
             arch_hal::gic::IrqGroup::Group1,
             0x80,
             arch_hal::gic::TriggerMode::Edge,
@@ -433,6 +397,12 @@ extern "C" fn main() -> ! {
             arch_hal::gic::EnableOp::Enable,
         )
         .unwrap();
+
+    println!("setup vgic...");
+
+    vgic::init(&gicv2, &gic_info, Some(uart_irq)).unwrap();
+
+    println!("vgic setup success!!!");
 
     // setup timer
     gicv2
@@ -445,13 +415,15 @@ extern "C" fn main() -> ! {
         )
         .unwrap();
 
+    unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
+
     debug_uart::enable_rx_interrupts(arch_hal::pl011::FifoLevel::OneEighth, true);
+
+    println!("gicv2 setup success!!!");
 
     unsafe {
         core::arch::asm!("msr daifclr, #3", options(nostack, preserves_flags)); // enable irq
     }
-
-    unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
 
     let result = dtb.find_nodes_by_compatible_view("brcm,bcm2712-pcie", &mut |view, _name| {
         pcie::init_pcie_with_node(view)
@@ -489,9 +461,8 @@ extern "C" fn main() -> ! {
     // input enable
     gpio_config[15].set_bits(0b100_1000);
 
-    enable_interrupt(128 + 25 + 32).unwrap();
-
     // setup rp1 uart0 interrupt
+    // SAFETY: RP1 peripheral MMIO is mapped; the table is sized for the index used below.
     let pcie_config = unsafe {
         &*slice_from_raw_parts_mut(
             (rp1.peripheral_addr.unwrap().0 + 0x10_8000 + 0x08) as *mut ReadWrite<u32>,
@@ -499,20 +470,6 @@ extern "C" fn main() -> ! {
         )
     };
     pcie_config[25].set_bits(0b1001);
-
-    loop {
-        systimer.wait(Duration::from_secs(1));
-        println!("UARTMIS: 0x{:X}", unsafe {
-            ptr::read_volatile((PL011_UART_ADDR.0 + 0x40) as *const u32)
-        });
-        dump_uart_gic(
-            gic_distributor.unwrap().base,
-            PL011_UART_ADDR.0,
-            128 + 25 + 32,
-        );
-        debug_uart::handle_rx_irq_force(|byte| println_force!("force: {}", byte));
-        println!("wait for interrupt...");
-    }
 
     multicore::setup_multicore(stack_top);
 
@@ -546,6 +503,11 @@ extern "C" fn main() -> ! {
     remove_initrd_memreserve(&mut tree, initrd_range);
     append_reserved_memory(&mut tree, &reserved_memory);
     configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR.0).unwrap();
+    if let Some(gicv) = gic_info.gicv {
+        update_gicv2_cpu_interface_reg(&mut tree, gicv).unwrap();
+    } else {
+        panic!("gic: missing GICV region for DT update");
+    }
 
     let dtb_box = tree.into_dtb_box().unwrap();
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
@@ -576,42 +538,6 @@ extern "C" fn main() -> ! {
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
         cpu::isb();
         core::arch::asm!("eret", options(noreturn));
-    }
-}
-
-#[inline(always)]
-unsafe fn mmio_read32(addr: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
-}
-
-fn dump_uart_gic(gicd_base: usize, uart_base: usize, intid: u32) {
-    let n = (intid / 32) as usize;
-    let bit = (intid % 32) as u32;
-    let mask = 1u32 << bit;
-
-    unsafe {
-        let u_imsc = mmio_read32(uart_base + 0x38);
-        let u_ris = mmio_read32(uart_base + 0x3c);
-        let u_mis = mmio_read32(uart_base + 0x40);
-
-        let g_isen = mmio_read32(gicd_base + 0x100 + 4 * n);
-        let g_ispe = mmio_read32(gicd_base + 0x200 + 4 * n);
-
-        arch_hal::println!(
-            "UART: IMSC=0x{:08X} RIS=0x{:08X} MIS=0x{:08X}",
-            u_imsc,
-            u_ris,
-            u_mis
-        );
-        arch_hal::println!(
-            "GICD: ISENABLER{}=0x{:08X} (en={}) ISPENDR{}=0x{:08X} (pend={})",
-            n,
-            g_isen,
-            (g_isen & mask) != 0,
-            n,
-            g_ispe,
-            (g_ispe & mask) != 0
-        );
     }
 }
 
@@ -770,6 +696,214 @@ fn update_bootargs(
     tree.node_mut(chosen)
         .ok_or("chosen node missing")?
         .set_property(NameRef::Borrowed("bootargs"), ValueRef::Owned(bytes));
+    Ok(())
+}
+
+fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
+    const COMPATS: [&str; 13] = [
+        "arm,arm1176jzf-devchip-gic",
+        "arm,arm11mp-gic",
+        "arm,cortex-a15-gic",
+        "arm,cortex-a7-gic",
+        "arm,cortex-a9-gic",
+        "arm,eb11mp-gic",
+        "arm,gic-400",
+        "arm,pl390",
+        "arm,tc11mp-gic",
+        "brcm,brahma-b15-gic",
+        "nvidia,tegra210-agic",
+        "qcom,msm-8660-qgic",
+        "qcom,msm-qgic2",
+    ];
+    let mut found: Option<Gicv2Info> = None;
+    for compat in COMPATS {
+        let result = dtb.find_nodes_by_compatible_view(compat, &mut |view,
+                                                                     _name|
+         -> Result<
+            ControlFlow<()>,
+            WalkError<()>,
+        > {
+            println!("found GICv2 node: {}", compat);
+            let mut regs = view.reg_iter().map_err(WalkError::Dtb)?;
+            let Some(Ok((dist_base, _dist_size))) = regs.next() else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let Some(Ok((cpu_base, _cpu_size))) = regs.next() else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let gich = regs
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(base, _size)| MmioRegion { base, size: 0x1000 });
+            let gicv = regs
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(base, _size)| MmioRegion { base, size: 0x2000 });
+            let mut maintenance_intid = None;
+            let _ = view.for_each_interrupt_specifier(&mut |cells| -> Result<
+                ControlFlow<()>,
+                WalkError<()>,
+            > {
+                if maintenance_intid.is_some() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                let decoded = dt_irq::decode_dt_irq(cells)
+                    .map_err(|_| WalkError::Dtb("gic: invalid maintenance interrupt"))?;
+                maintenance_intid = Some(decoded.intid);
+                Ok(ControlFlow::Break(()))
+            })?;
+
+            found = Some(Gicv2Info {
+                dist: MmioRegion {
+                    base: dist_base,
+                    size: 0x1000,
+                },
+                cpu: MmioRegion {
+                    base: cpu_base,
+                    size: 0x2000,
+                },
+                gich,
+                gicv,
+                maintenance_intid,
+            });
+            Ok(ControlFlow::Break(()))
+        });
+        match result {
+            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+            Err(WalkError::Dtb(err)) => return Err(err),
+            Err(WalkError::User(())) => return Err("gic: unexpected user error"),
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    found.ok_or("gic: missing GICv2 node")
+}
+
+fn update_gicv2_cpu_interface_reg(
+    tree: &mut DeviceTree<'_>,
+    gicv: MmioRegion,
+) -> Result<(), &'static str> {
+    const COMPATS: [&str; 2] = ["arm,gic-400", "arm,cortex-a15-gic"];
+    let mut gic_node = None;
+    for id in 0..tree.nodes.len() {
+        for compat in COMPATS {
+            if node_compatible_contains(tree, id, compat)? {
+                gic_node = Some(id);
+                break;
+            }
+        }
+        if gic_node.is_some() {
+            break;
+        }
+    }
+    let Some(node_id) = gic_node else {
+        return Ok(());
+    };
+
+    let parent = tree
+        .node(node_id)
+        .and_then(|n| n.parent)
+        .unwrap_or(tree.root);
+    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
+    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
+    let stride = (addr_cells + size_cells) * 4;
+    let Some(node) = tree.node(node_id) else {
+        return Ok(());
+    };
+    let Some(reg) = node.property("reg") else {
+        return Ok(());
+    };
+    let mut bytes = reg.value.as_slice().to_vec();
+    if bytes.len() < stride * 2 {
+        return Err("gic: reg property too short");
+    }
+    let base_off = stride;
+    write_be_u32s(&mut bytes, base_off, addr_cells, gicv.base as u64)?;
+    write_be_u32s(
+        &mut bytes,
+        base_off + addr_cells * 4,
+        size_cells,
+        gicv.size as u64,
+    )?;
+
+    if let Some(node) = tree.node_mut(node_id) {
+        node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
+    }
+    Ok(())
+}
+
+fn node_compatible_contains(
+    tree: &DeviceTree<'_>,
+    node_id: usize,
+    needle: &str,
+) -> Result<bool, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(false);
+    };
+    let Some(prop) = node.property("compatible") else {
+        return Ok(false);
+    };
+    let bytes = prop.value.as_slice();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| start + p)
+            .unwrap_or(bytes.len());
+        if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
+            if entry == needle {
+                return Ok(true);
+            }
+        }
+        start = end + 1;
+    }
+    Ok(false)
+}
+
+fn property_u32(
+    tree: &DeviceTree<'_>,
+    node_id: usize,
+    key: &str,
+) -> Result<Option<u32>, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(None);
+    };
+    let Some(prop) = node.property(key) else {
+        return Ok(None);
+    };
+    let bytes = prop.value.as_slice();
+    if bytes.len() != 4 {
+        return Ok(None);
+    }
+    Ok(Some(read_be_u32(bytes, 0)?))
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
+    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
+    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
+    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
+    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
+    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
+    slice.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn write_be_u32s(
+    bytes: &mut [u8],
+    offset: usize,
+    cells: usize,
+    value: u64,
+) -> Result<(), &'static str> {
+    for i in 0..cells {
+        let shift = 32 * (cells - 1 - i);
+        let cell = ((value >> shift) & 0xffff_ffff) as u32;
+        write_be_u32(bytes, offset + i * 4, cell)?;
+    }
     Ok(())
 }
 

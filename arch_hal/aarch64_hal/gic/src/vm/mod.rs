@@ -18,7 +18,7 @@ use crate::VgicVcpuModel;
 use crate::VgicVcpuQueue;
 use crate::VgicVmInfo;
 use crate::VgicWork;
-use crate::vm::common::pirq::PirqHooks;
+pub use crate::vm::common::pirq::PirqHooks;
 use crate::vm::vcpu::GicVCpuGeneric;
 
 pub(crate) mod common;

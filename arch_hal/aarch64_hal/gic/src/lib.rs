@@ -28,6 +28,9 @@ pub mod gicv2;
 /// GICv3 implementation (Distributor/Redistributor; CPU interface via system registers; optional ITS/MSI).
 pub mod gicv3;
 
+/// Device-tree interrupt decoding helpers.
+pub mod dt_irq;
+
 pub mod vm;
 
 use cpu::CoreAffinity;

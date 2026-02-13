@@ -69,14 +69,21 @@ pub fn disable_interrupt(spi: u32) -> Result<(), Bcm2712Error> {
 }
 
 fn toggle_interrupt(spi: u32, enable: bool) -> Result<(), Bcm2712Error> {
-    let offset = spi - MIP_SPI_OFFSET - 32;
+    let Some(offset) = spi
+        .checked_sub(MIP_SPI_OFFSET)
+        .and_then(|v| v.checked_sub(32))
+    else {
+        return Err(Bcm2712Error::InvalidSettings);
+    };
     let msi_x_table = MsiXTable.lock();
     let Some(msi_x_table) = msi_x_table.as_ref() else {
         return Err(Bcm2712Error::PcieIsNotInitialized);
     };
+    // SAFETY: `get_msi_x_table` returns a valid MMIO slice covering all MSI-X vectors.
     let tables = get_msi_x_table(msi_x_table);
-    tables[offset as usize].vector_control.write(if enable {
-        PciMsiXTableVectorControl::new()
+    let entry = tables.get(offset as usize).ok_or(Bcm2712Error::InvalidSettings)?;
+    entry.vector_control.write(if enable {
+        PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 0)
     } else {
         PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1)
     });

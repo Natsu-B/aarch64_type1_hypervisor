@@ -40,6 +40,10 @@ pub struct PirqHooks {
     pub on_resample: Option<unsafe fn(*mut (), pintid: PIntId)>,
 }
 
+// SAFETY: PirqHooks only stores raw context and function pointers; callers must
+// ensure hook implementations are safe to invoke under the VM's locking rules.
+unsafe impl Send for PirqHooks {}
+
 impl PirqHooks {
     pub const fn empty() -> Self {
         Self {

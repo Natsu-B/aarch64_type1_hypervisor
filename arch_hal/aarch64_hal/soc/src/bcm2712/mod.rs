@@ -29,6 +29,8 @@ unsafe impl Send for MsiXTablePtr {}
 pub(crate) static MsiXTable: RawSpinLock<Option<MsiXTablePtr>> = RawSpinLock::new(None);
 
 pub(crate) fn get_msi_x_table(table: &MsiXTablePtr) -> &'static [PciMsiXTable] {
+    // SAFETY: `MsiXTablePtr` is created from a valid, MMIO-mapped MSI-X table during RP1 init
+    // and remains valid for the lifetime of the system; `len` is the table entry count.
     unsafe { &*slice_from_raw_parts(table.base, table.len) }
 }
 
