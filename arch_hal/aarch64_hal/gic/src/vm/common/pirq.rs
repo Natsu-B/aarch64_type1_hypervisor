@@ -4,6 +4,7 @@ use crate::IrqSense;
 use crate::PIntId;
 use crate::TriggerMode;
 use crate::VIntId;
+use crate::VSpiRouting;
 use crate::VcpuId;
 use crate::VgicGuestRegs;
 use crate::VgicIrqScope;
@@ -25,6 +26,68 @@ where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
 {
     entries: [Option<PirqEntry>; crate::max_intids_for_vcpus(VCPUS)],
+    v2p: [Option<PIntId>; crate::max_intids_for_vcpus(VCPUS)],
+}
+
+#[derive(Copy, Clone)]
+pub struct PirqHooks {
+    pub ctx: *mut (),
+    pub on_enable: Option<unsafe fn(*mut (), pintid: PIntId, enable: bool) -> Result<(), GicError>>,
+    pub on_route:
+        Option<unsafe fn(*mut (), pintid: PIntId, route: VSpiRouting) -> Result<(), GicError>>,
+    pub on_eoi: Option<unsafe fn(*mut (), pintid: PIntId)>,
+    pub on_deactivate: Option<unsafe fn(*mut (), pintid: PIntId)>,
+    pub on_resample: Option<unsafe fn(*mut (), pintid: PIntId)>,
+}
+
+impl PirqHooks {
+    pub const fn empty() -> Self {
+        Self {
+            ctx: core::ptr::null_mut(),
+            on_enable: None,
+            on_route: None,
+            on_eoi: None,
+            on_deactivate: None,
+            on_resample: None,
+        }
+    }
+}
+
+pub(crate) struct PirqHookTable<const VCPUS: usize>
+where
+    [(); crate::max_intids_for_vcpus(VCPUS)]:,
+{
+    hooks: [Option<PirqHooks>; crate::max_intids_for_vcpus(VCPUS)],
+}
+
+impl<const VCPUS: usize> PirqHookTable<VCPUS>
+where
+    [(); crate::max_intids_for_vcpus(VCPUS)]:,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            hooks: [None; crate::max_intids_for_vcpus(VCPUS)],
+        }
+    }
+
+    fn index(&self, pintid: PIntId) -> Result<usize, GicError> {
+        let idx = pintid.0 as usize;
+        if idx >= self.hooks.len() {
+            return Err(GicError::UnsupportedIntId);
+        }
+        Ok(idx)
+    }
+
+    pub(crate) fn set(&mut self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
+        let idx = self.index(pintid)?;
+        self.hooks[idx] = Some(hooks);
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, pintid: PIntId) -> Result<Option<PirqHooks>, GicError> {
+        let idx = self.index(pintid)?;
+        Ok(self.hooks[idx])
+    }
 }
 
 impl<const VCPUS: usize> PirqTable<VCPUS>
@@ -34,12 +97,21 @@ where
     pub(crate) fn new() -> Self {
         Self {
             entries: [None; { crate::max_intids_for_vcpus(VCPUS) }],
+            v2p: [None; { crate::max_intids_for_vcpus(VCPUS) }],
         }
     }
 
     fn index(&self, pintid: PIntId) -> Result<usize, GicError> {
         let idx = pintid.0 as usize;
         if idx >= self.entries.len() {
+            return Err(GicError::UnsupportedIntId);
+        }
+        Ok(idx)
+    }
+
+    fn vindex(&self, vintid: VIntId) -> Result<usize, GicError> {
+        let idx = vintid.0 as usize;
+        if idx >= self.v2p.len() {
             return Err(GicError::UnsupportedIntId);
         }
         Ok(idx)
@@ -52,7 +124,14 @@ where
 
     pub(crate) fn take(&mut self, pintid: PIntId) -> Result<Option<PirqEntry>, GicError> {
         let idx = self.index(pintid)?;
-        Ok(self.entries[idx].take())
+        let entry = self.entries[idx].take();
+        if let Some(entry) = entry {
+            let v_idx = self.vindex(entry.vintid)?;
+            if matches!(self.v2p[v_idx], Some(existing) if existing == pintid) {
+                self.v2p[v_idx] = None;
+            }
+        }
+        Ok(entry)
     }
 
     pub(crate) fn ensure_entry(
@@ -61,14 +140,36 @@ where
         entry: PirqEntry,
     ) -> Result<bool, GicError> {
         let idx = self.index(pintid)?;
+        let v_idx = self.vindex(entry.vintid)?;
+
+        if let Some(existing_pintid) = self.v2p[v_idx] {
+            if existing_pintid != pintid {
+                return Err(GicError::InvalidState);
+            }
+        }
+
         match self.entries[idx] {
-            Some(existing) if existing == entry => Ok(false),
+            Some(existing) if existing == entry => {
+                self.v2p[v_idx] = Some(pintid);
+                Ok(false)
+            }
             Some(_) => Err(GicError::InvalidState),
             None => {
                 self.entries[idx] = Some(entry);
+                self.v2p[v_idx] = Some(pintid);
                 Ok(true)
             }
         }
+    }
+
+    pub(crate) fn lookup_by_vintid(&self, vintid: VIntId) -> Result<Option<PIntId>, GicError> {
+        let idx = self.vindex(vintid)?;
+        Ok(self.v2p[idx])
+    }
+
+    pub(crate) fn v2p(&self, vintid: VIntId) -> Option<PIntId> {
+        let idx = vintid.0 as usize;
+        self.v2p.get(idx).copied().flatten()
     }
 }
 

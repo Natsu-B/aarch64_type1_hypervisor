@@ -16,7 +16,9 @@ use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::vgic_frontend::Gicv2AccessSize;
 use arch_hal::gic::gicv2::vgic_frontend::Gicv2DistIdRegs;
 use arch_hal::gic::gicv2::vgic_frontend::Gicv2Frontend;
+use arch_hal::gic::vm::PirqHooks;
 use core::cell::SyncUnsafeCell;
+use core::ptr;
 
 use crate::Gicv2Info;
 use crate::UartNode;
@@ -28,6 +30,14 @@ static VGIC_VM: RawSpinLockIrqSave<Option<gic::vm::GicVmModelForVcpus<1>>> =
 static GICD_RANGE: SyncUnsafeCell<Option<(usize, usize)>> = SyncUnsafeCell::new(None);
 static MAINT_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
 static GICD_ID: SyncUnsafeCell<Option<Gicv2DistIdRegs>> = SyncUnsafeCell::new(None);
+
+unsafe fn hook_record_pirq_eoi(_ctx: *mut (), pintid: PIntId) {
+    irq_monitor::record_pirq_eoi(pintid.0);
+}
+
+unsafe fn hook_record_pirq_deactivate(_ctx: *mut (), pintid: PIntId) {
+    irq_monitor::record_pirq_deactivate(pintid.0);
+}
 
 pub fn init(gic: &Gicv2, info: &Gicv2Info, guest_uart: UartNode) -> Result<(), &'static str> {
     let mut vm = gic
@@ -53,6 +63,16 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, guest_uart: UartNode) -> Result<(), &
             )
             .map_err(|_| "vgic: map pirq")?;
         apply_update(&mut vm, gic, update).map_err(|_| "vgic: update")?;
+        let hooks = PirqHooks {
+            ctx: ptr::null_mut(),
+            on_enable: None,
+            on_route: None,
+            on_eoi: Some(hook_record_pirq_eoi),
+            on_deactivate: Some(hook_record_pirq_deactivate),
+            on_resample: None,
+        };
+        vm.set_pirq_hooks(PIntId(pintid), hooks)
+            .map_err(|_| "vgic: hooks")?;
     }
 
     let vcpu = vm.vcpu(VcpuId(0)).map_err(|_| "vgic: vcpu")?;
@@ -130,13 +150,11 @@ pub fn handle_maintenance_irq() -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
-    let vcpu = vm.vcpu(VcpuId(0))?;
-    let update = vcpu.handle_maintenance(
-        gic,
-        &mut |pirq| irq_monitor::record_pirq_eoi(pirq.0),
-        &mut |pirq| irq_monitor::record_pirq_deactivate(pirq.0),
-        &mut |_pirq| {},
-    )?;
+    let (update, notifs) = {
+        let vcpu = vm.vcpu(VcpuId(0))?;
+        vcpu.handle_maintenance_collect(gic)?
+    };
+    vm.dispatch_pirq_notifications(&notifs)?;
     apply_update(vm, gic, update)
 }
 

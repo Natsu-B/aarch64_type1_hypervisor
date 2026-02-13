@@ -403,6 +403,32 @@ where
         }
     }
 
+    pub(crate) fn trigger(
+        &self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+    ) -> Result<TriggerMode, GicError> {
+        let intid = vintid.0 as usize;
+        if !Self::intid_in_range(intid) {
+            return Err(GicError::UnsupportedIntId);
+        }
+        match scope {
+            VgicIrqScope::Local(vcpu) => {
+                if intid >= LOCAL_INTID_COUNT {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let idx = self.vcpu_index(vcpu)?;
+                Ok(self.trigger_local[idx][intid])
+            }
+            VgicIrqScope::Global => {
+                if intid < LOCAL_INTID_COUNT {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                Ok(self.trigger_global[intid - LOCAL_INTID_COUNT])
+            }
+        }
+    }
+
     pub(crate) fn set_group(
         &mut self,
         scope: VgicIrqScope,

@@ -18,6 +18,7 @@ use crate::VgicVcpuModel;
 use crate::VgicVcpuQueue;
 use crate::VgicVmInfo;
 use crate::VgicWork;
+use crate::vm::common::pirq::PirqHooks;
 use crate::vm::vcpu::GicVCpuGeneric;
 
 pub(crate) mod common;
@@ -113,6 +114,64 @@ where
             targets,
             work: VgicWork::REFILL,
         }
+    }
+
+    pub fn set_pirq_hooks(&mut self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
+        self.common.pirq_hooks.set(pintid, hooks)
+    }
+
+    pub fn dispatch_pirq_notifications(
+        &mut self,
+        notifs: &crate::PirqNotifications,
+    ) -> Result<(), GicError> {
+        for pintid in notifs.eoi.iter() {
+            self.call_pirq_signal_hook(pintid, |h| h.on_eoi)?;
+        }
+        for pintid in notifs.deactivate.iter() {
+            self.call_pirq_signal_hook(pintid, |h| h.on_deactivate)?;
+        }
+        for pintid in notifs.resample.iter() {
+            self.call_pirq_signal_hook(pintid, |h| h.on_resample)?;
+        }
+        Ok(())
+    }
+
+    fn call_pirq_enable_hook(&mut self, pintid: PIntId, enable: bool) -> Result<(), GicError> {
+        if let Some(hooks) = self.common.pirq_hooks.get(pintid)? {
+            if let Some(cb) = hooks.on_enable {
+                // SAFETY: hooks run with exclusive access to the VM model; callback must be non-blocking.
+                unsafe {
+                    cb(hooks.ctx, pintid, enable)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn call_pirq_route_hook(&mut self, pintid: PIntId, route: VSpiRouting) -> Result<(), GicError> {
+        if let Some(hooks) = self.common.pirq_hooks.get(pintid)? {
+            if let Some(cb) = hooks.on_route {
+                // SAFETY: hooks run with exclusive access to the VM model; callback must be non-blocking.
+                unsafe {
+                    cb(hooks.ctx, pintid, route)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn call_pirq_signal_hook(
+        &mut self,
+        pintid: PIntId,
+        signal: fn(&PirqHooks) -> Option<unsafe fn(*mut (), PIntId)>,
+    ) -> Result<(), GicError> {
+        if let Some(hooks) = self.common.pirq_hooks.get(pintid)? {
+            if let Some(cb) = signal(&hooks) {
+                // SAFETY: hooks run with exclusive access to the VM model; callback must be non-blocking.
+                unsafe { cb(hooks.ctx, pintid) };
+            }
+        }
+        Ok(())
     }
 }
 
@@ -269,6 +328,11 @@ where
         }
 
         update.combine(&Self::update_for_scope(scope, changed));
+        if changed {
+            if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+                self.call_pirq_enable_hook(pintid, enable)?;
+            }
+        }
         Ok(update)
     }
 
@@ -353,6 +417,9 @@ where
                     }
                 }
             }
+            if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+                self.call_pirq_enable_hook(pintid, true)?;
+            }
         }
 
         update.combine(&Self::update_for_scope(scope, mask != 0));
@@ -377,6 +444,9 @@ where
             }
             let vintid = VIntId(base.0 + bit);
             update.combine(&self.cancel_for_scope(scope, vintid, None)?);
+            if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+                self.call_pirq_enable_hook(pintid, false)?;
+            }
         }
 
         update.combine(&Self::update_for_scope(scope, mask != 0));
@@ -536,6 +606,12 @@ where
                     .common
                     .routing
                     .set_route(vintid, VSpiRouting::Targets(mask))?;
+                if changed {
+                    if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+                        let route = VSpiRouting::Targets(mask);
+                        self.call_pirq_route_hook(pintid, route)?;
+                    }
+                }
                 Ok(Self::update_for_scope(VgicIrqScope::Global, changed))
             }
             VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
@@ -584,6 +660,8 @@ mod tests {
     use crate::VgicSgiRegs;
     use crate::VirtualInterrupt;
     use core::cell::RefCell;
+    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::Ordering;
 
     const TEST_VCPUS: usize = 4;
 
@@ -882,5 +960,117 @@ mod tests {
         let v2_size = core::mem::size_of::<V2SgiState<TEST_VCPUS>>();
         let vm_size = core::mem::size_of_val(&vm);
         assert!(vm_size >= common_size + v2_size);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn pirq_reverse_lookup_updates_on_map_and_unmap() {
+        let mut vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+        vm.map_pirq(
+            pintid,
+            VcpuId(0),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+        assert_eq!(
+            vm.common.pirqs.lookup_by_vintid(vintid).unwrap(),
+            Some(pintid)
+        );
+        vm.unmap_pirq(pintid).unwrap();
+        assert_eq!(vm.common.pirqs.lookup_by_vintid(vintid).unwrap(), None);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn pirq_duplicate_vintid_rejected() {
+        let mut vm = recording_vm(1);
+        let vintid = VIntId(40);
+        vm.map_pirq(
+            PIntId(48),
+            VcpuId(0),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+        let res = vm.map_pirq(
+            PIntId(49),
+            VcpuId(0),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        );
+        assert!(matches!(res, Err(GicError::InvalidState)));
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn pirq_enable_hook_called_on_change() {
+        let mut vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+        vm.map_pirq(
+            pintid,
+            VcpuId(0),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn enable_hook(ctx: *mut (), _p: PIntId, _e: bool) -> Result<(), GicError> {
+            let counter = unsafe { &*(ctx as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        let hooks = PirqHooks {
+            ctx: (&COUNTER as *const AtomicUsize) as *mut (),
+            on_enable: Some(enable_hook),
+            ..PirqHooks::empty()
+        };
+        vm.set_pirq_hooks(pintid, hooks).unwrap();
+        COUNTER.store(0, Ordering::SeqCst);
+        let base = VIntId(32);
+        let bit = vintid.0 - base.0;
+        vm.write_clear_enable_word(VgicIrqScope::Global, base, 1u32 << bit)
+            .unwrap();
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn pirq_route_hook_called_on_route_change() {
+        let mut vm = recording_vm(2);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+        vm.map_pirq(
+            pintid,
+            VcpuId(1),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+        static ROUTE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn route_hook(ctx: *mut (), _p: PIntId, _r: VSpiRouting) -> Result<(), GicError> {
+            let counter = unsafe { &*(ctx as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        let hooks = PirqHooks {
+            ctx: (&ROUTE_COUNTER as *const AtomicUsize) as *mut (),
+            on_route: Some(route_hook),
+            ..PirqHooks::empty()
+        };
+        vm.set_pirq_hooks(pintid, hooks).unwrap();
+        ROUTE_COUNTER.store(0, Ordering::SeqCst);
+        let route = VSpiRouting::Targets(VcpuMask::from_bits(0b10));
+        vm.set_spi_route(vintid, route).unwrap();
+        assert_eq!(ROUTE_COUNTER.load(Ordering::SeqCst), 1);
     }
 }

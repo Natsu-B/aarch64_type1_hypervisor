@@ -19,6 +19,7 @@ use crate::VirtualInterrupt;
 
 use irq_state::IrqAttrs;
 use irq_state::IrqState as IrqStateTable;
+use pirq::PirqHookTable;
 use pirq::PirqTable;
 use routing::SpiRouting;
 use vcpu_array::VcpuArray;
@@ -36,6 +37,7 @@ where
     pub(crate) irq_state: IrqStateTable<VCPUS>,
     pub(crate) routing: SpiRouting<VCPUS>,
     pub(crate) pirqs: PirqTable<VCPUS>,
+    pub(crate) pirq_hooks: PirqHookTable<VCPUS>,
 }
 
 impl<const VCPUS: usize, V: VgicVcpuModel> VmCommon<VCPUS, V>
@@ -50,6 +52,7 @@ where
             irq_state: IrqStateTable::new(vcpu_count),
             routing: SpiRouting::new(),
             pirqs: PirqTable::new(),
+            pirq_hooks: PirqHookTable::new(),
         })
     }
 
@@ -78,6 +81,14 @@ where
         vintid: VIntId,
     ) -> Result<IrqAttrs, GicError> {
         self.irq_state.irq_attrs(scope, vintid)
+    }
+
+    pub(crate) fn irq_trigger(
+        &self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+    ) -> Result<crate::TriggerMode, GicError> {
+        self.irq_state.trigger(scope, vintid)
     }
 
     pub(crate) fn targets_for_global_spi(&self, vintid: VIntId) -> Result<VcpuMask, GicError> {
