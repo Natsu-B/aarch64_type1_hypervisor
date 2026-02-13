@@ -5,6 +5,16 @@ use typestate::ReadOnly;
 use typestate::ReadWrite;
 use typestate::bitregs;
 
+pub mod msix;
+
+bitregs! {
+    pub struct PciCapabilityHead: u32 {
+        pub id@[7:0],
+        pub next_ptr@[15:8],
+        reserved@[31:16] [res0],
+    }
+}
+
 bitregs! {
     /// PCI ID Register (offset 0x00, 32-bit).
     pub struct PciId: u32 {
@@ -126,6 +136,35 @@ bitregs! {
     }
 }
 
+bitregs! {
+    pub struct PciCmdStatus: u32 {
+        pub io_space@[0:0],
+        pub memory_space@[1:1],
+        pub bus_master@[2:2],
+        pub special_cycle@[3:3],
+        pub mem_write_invalidate@[4:4],
+        pub vga_palette_snoop@[5:5],
+        pub parity_error_response@[6:6],
+        reserved@[7:7] [ignore],
+        pub serr_enable@[8:8],
+        pub fast_back_to_back_enable@[9:9],
+        pub interrupt_disable@[10:10],
+        reserved@[18:11] [ignore],
+        pub interrupt_status@[19:19],
+        pub capabilities_list@[20:20],
+        pub capable_66mhz@[21:21],
+        reserved@[22:22] [ignore],
+        pub fast_back_to_back_capable@[23:23],
+        pub master_data_parity_error@[24:24],
+        pub devsel_timing@[26:25],
+        pub signaled_target_abort@[27:27],
+        pub received_target_abort@[28:28],
+        pub received_master_abort@[29:29],
+        pub signaled_system_error@[30:30],
+        pub detected_parity_error@[31:31],
+    }
+}
+
 #[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<PCIConfigRegType0>() == 0x40);
 #[allow(clippy::assertions_on_constants)]
@@ -136,7 +175,7 @@ const _: () = assert!(size_of::<PCIConfigRegType1>() == 0x40);
 #[repr(C)]
 pub struct PCIConfigRegType0 {
     pub id: ReadOnly<PciId>,                        // 0x00
-    cmd_status: ReadWrite<u32>,                     // 0x04
+    pub cmd_status: ReadWrite<PciCmdStatus>,        // 0x04
     pub class_revision: ReadOnly<PciClassRevision>, // 0x08
     pub bhlc: ReadWrite<PciBhlc>,                   // 0x0C
 

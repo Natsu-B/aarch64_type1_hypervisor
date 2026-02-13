@@ -3,11 +3,18 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
+use core::ptr::slice_from_raw_parts;
+use core::ptr::slice_from_raw_parts_mut;
 use pci::PCIConfigRegType0;
 use pci::PCIConfigRegType1;
-use pci::PciBhlc;
-use pci::PciHeaderKind;
-use pci::PciId;
+use pci::PciCapPtr;
+use pci::PciCapabilityHead;
+use pci::PciCmdStatus;
+use pci::msix::PciCapabilityMsiX;
+use pci::msix::PciCapabilityMsiXConfigurations;
+use pci::msix::PciCapabilityMsiXTableOffset;
+use pci::msix::PciMsiXTable;
+use pci::msix::PciMsiXTableVectorControl;
 use print::println;
 use typestate::ReadWrite;
 use typestate::Readable;
@@ -15,6 +22,7 @@ use typestate::Writable;
 use typestate::bitregs;
 
 use crate::bcm2712::Bcm2712Error;
+use crate::bcm2712::MsiXTablePtr;
 
 const _: () = assert!(offset_of!(BrcmStb, reserved_0x1000) == 0x1000);
 const _: () = assert!(offset_of!(BrcmStb, reserved_0x2000) == 0x2000);
@@ -283,51 +291,121 @@ impl BrcmStb {
         Ok(())
     }
 
-    pub(crate) fn read_rp1_pci_bar_address(
-        &self,
-    ) -> Result<(u64 /* bar1 */, u64 /* bar2 */), Bcm2712Error> {
-        // TODO hal lock
-        for bus in 0..=1 {
-            for device in 0..32 {
-                for function in 0..8 {
-                    unsafe { asm!("dmb oshst") };
-                    self.config_address.write(
-                        ConfigAddress::new()
-                            .set(ConfigAddress::bus_num, bus)
-                            .set(ConfigAddress::device_num, device)
-                            .set(ConfigAddress::function_num, function),
-                    );
-                    cpu::dsb_sy();
-                    let config =
-                        unsafe { &mut *(self.config_data.get() as *mut PCIConfigRegType0) };
-                    if config.id.read().bits() == 0xffff {
-                        continue;
-                    }
-                    println!(
-                        "PCIE: Checking bus {} device {} function {}",
-                        bus, device, function
-                    );
-                    println!(
-                        "PCIE: RP1 Vender ID: 0x{:x}",
-                        config.id.read().get(PciId::vendor_id)
-                    );
-                    println!(
-                        "PCIE: RP1 Device ID: 0x{:x}",
-                        config.id.read().get(PciId::device_id)
-                    );
-                    if config
-                        .bhlc
-                        .read()
-                        .get_enum(PciBhlc::header_kind)
-                        .is_none_or(|t: PciHeaderKind| t != PciHeaderKind::Standard)
-                    {
-                        return Err(Bcm2712Error::InvalidPciHeaderType);
-                    }
-                    return Ok((config.bar[1].read() as u64, config.bar[2].read() as u64));
-                }
-            }
+    /// have to ensure that config windows are mapped rp1 config space
+    pub(crate) unsafe fn read_bar_address(&self, num: u8) -> Result<u32, Bcm2712Error> {
+        let config = unsafe { &mut *(self.config_data.get() as *mut PCIConfigRegType0) };
+        return Ok(config.bar[num as usize].read());
+    }
+
+    pub(crate) fn set_config_window(&self) -> Result<&mut PCIConfigRegType0, Bcm2712Error> {
+        unsafe { asm!("dmb oshst") };
+        self.config_address.write(
+            ConfigAddress::new()
+                .set(ConfigAddress::bus_num, 0)
+                .set(ConfigAddress::device_num, 0)
+                .set(ConfigAddress::function_num, 0),
+        );
+        cpu::dsb_sy();
+        let config = unsafe { &mut *(self.config_data.get() as *mut PCIConfigRegType0) };
+        if config.id.read().bits() == !0 || config.bhlc.read().bits() == !0 {
+            return Err(Bcm2712Error::DtbDeviceNotFound);
         }
-        Err(Bcm2712Error::DtbDeviceNotFound)
+        Ok(config)
+    }
+
+    /// return value: PciCapabilityMsiX are only valid until the config window are change
+    pub(crate) unsafe fn get_msi_x_capability(
+        &self,
+    ) -> Result<&'static PciCapabilityMsiX, Bcm2712Error> {
+        let config = self.set_config_window()?;
+        if config
+            .cmd_status
+            .read()
+            .get(PciCmdStatus::capabilities_list)
+            == 0
+        {
+            // if capabilities list is not present, return err
+            println!("PCIE: Capabilities list not present");
+            return Err(Bcm2712Error::InvalidSettings);
+        }
+        let cap = config.cap_ptr.read().get(PciCapPtr::capabilities_ptr);
+        if cap < size_of::<PCIConfigRegType0>() as u32 || cap & 0xffff != 0
+        /* require 32 bit align */
+        {
+            return Err(Bcm2712Error::InvalidSettings);
+        }
+        let config_data =
+            unsafe { &*slice_from_raw_parts_mut(self.config_data.get() as *mut u32, 256) };
+        let mut cap = cap;
+        let mut count = 0;
+        // search MSI-X capability
+        loop {
+            if count > 100 {
+                println!("PCIE: infinite recursion detected");
+                return Err(Bcm2712Error::InvalidSettings);
+            }
+            let capability_header = PciCapabilityHead::from_bits(config_data[cap as usize]);
+            if capability_header.get(PciCapabilityHead::id) == 0x11 {
+                break;
+            }
+            cap = capability_header.get(PciCapabilityHead::next_ptr);
+            count += 1;
+        }
+        PciCapabilityMsiX::from_array(&config_data[cap as usize..(cap as usize + 2)])
+            .ok_or(Bcm2712Error::InvalidWindow)
+    }
+
+    pub(crate) unsafe fn msi_x_table_bar_addr(
+        &self,
+        msi_x: &PciCapabilityMsiX,
+    ) -> Result<u32, Bcm2712Error> {
+        let table_offset = msi_x.table_offset.read();
+        let bir = table_offset.get(PciCapabilityMsiXTableOffset::bir);
+        println!("PCIE: MSI-X bar is bar[{}]", bir);
+        let bar_addr = (unsafe { self.read_bar_address(bir as u8) })?;
+        Ok(bar_addr)
+    }
+
+    pub(crate) unsafe fn init_rp1_msi_x_settings(
+        &self,
+        msi_x: &PciCapabilityMsiX,
+        msi_x_table_addr: u64,
+        msi_x_pci_addr: u64,
+    ) -> Result<MsiXTablePtr, Bcm2712Error> {
+        msi_x.configurations.clear_bits(
+            PciCapabilityMsiXConfigurations::new()
+                .set(PciCapabilityMsiXConfigurations::msi_x_enable, 1),
+        );
+        let size = msi_x
+            .configurations
+            .read()
+            .get(PciCapabilityMsiXConfigurations::table_size) as usize;
+        let msi_x_tables = unsafe {
+            &*slice_from_raw_parts(msi_x_table_addr as usize as *const PciMsiXTable, size)
+        };
+        for (i, table) in msi_x_tables.iter().enumerate() {
+            table.message_address_low.write(msi_x_pci_addr as u32);
+            table
+                .message_address_high
+                .write((msi_x_pci_addr >> 32) as u32);
+            table.message_data.write(i as u32);
+            table.vector_control.clear_bits(
+                PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1),
+            );
+        }
+        // enable msi-x
+        msi_x.configurations.update_bits(
+            PciCapabilityMsiXConfigurations::new()
+                .set(PciCapabilityMsiXConfigurations::msi_x_enable, 1)
+                .set(PciCapabilityMsiXConfigurations::function_mask, 1),
+            PciCapabilityMsiXConfigurations::new()
+                .set(PciCapabilityMsiXConfigurations::msi_x_enable, 1),
+        );
+
+        Ok(MsiXTablePtr {
+            base: msi_x_table_addr as *const PciMsiXTable,
+            len: size,
+        })
     }
 }
 

@@ -1,18 +1,36 @@
 use core::ops::ControlFlow;
+use core::ptr::slice_from_raw_parts;
 
+use crate::bcm2712::brcmstb::BrcmStb;
+use crate::bcm2712::brcmstb::PcieStatus;
 use dtb::DtbNodeView;
 use dtb::DtbParser;
 use dtb::WalkError;
 use dtb::WalkResult;
+use mutex::RawSpinLock;
+use pci::PciBhlc;
+use pci::PciHeaderKind;
+use pci::PciId;
+use pci::msix::PciMsiXTable;
 use print::println;
-
-use crate::bcm2712::brcmstb::BrcmStb;
-use crate::bcm2712::brcmstb::PcieStatus;
 use typestate::Readable;
 
 pub mod brcmstb;
 pub mod mip;
 pub mod rp1_interrupt;
+
+pub(crate) struct MsiXTablePtr {
+    base: *const PciMsiXTable,
+    len: usize,
+}
+
+unsafe impl Send for MsiXTablePtr {}
+
+pub(crate) static MsiXTable: RawSpinLock<Option<MsiXTablePtr>> = RawSpinLock::new(None);
+
+pub(crate) fn get_msi_x_table(table: &MsiXTablePtr) -> &'static [PciMsiXTable] {
+    unsafe { &*slice_from_raw_parts(table.base, table.len) }
+}
 
 pub struct Rp1Config {
     pub peripheral_addr: Option<(u64, u64)>,
@@ -78,16 +96,40 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
                     .map_err(WalkError::Dtb)?;
                 println!("PCIE: MIP addr: 0x{:x}, size: 0x{:x}", mip_reg.0, mip_reg.1);
 
-                // check the pcie are initialized
+                // check the pcie are initialized?
                 if !link_up(brcm_stb) {
                     return Err(Bcm2712Error::PcieIsNotInitialized.into());
                 }
 
                 // check bar address
-                let (bar1, bar2) = brcm_stb.read_rp1_pci_bar_address()?;
+                let config = brcm_stb.set_config_window()?;
+                println!(
+                    "PCIE: RP1 Vender ID: 0x{:x}",
+                    config.id.read().get(PciId::vendor_id)
+                );
+                println!(
+                    "PCIE: RP1 Device ID: 0x{:x}",
+                    config.id.read().get(PciId::device_id)
+                );
+                if config
+                    .bhlc
+                    .read()
+                    .get_enum(PciBhlc::header_kind)
+                    .is_none_or(|t: PciHeaderKind| t != PciHeaderKind::Standard)
+                {
+                    return Err(Bcm2712Error::InvalidPciHeaderType.into());
+                }
+
+                let msi_x = unsafe { brcm_stb.get_msi_x_capability() }?;
+                let msi_x_bar = unsafe {
+                    brcm_stb.msi_x_table_bar_addr(msi_x)?
+                } as u64;
+                let bar1 = unsafe { brcm_stb.read_bar_address(1) }? as u64;
+                let bar2 = unsafe { brcm_stb.read_bar_address(2) }? as u64;
                 println!("PCIE: RP1 Pheripheral BAR addr: 0x{:x}", bar1);
                 println!("PCIE: RP1 Shared SRAM BAR addr: 0x{:x}", bar2);
 
+                let mut msi_x_table_addr = None;
                 let mut peripheral_addr = None;
                 let mut  shared_sram_addr = None;
 
@@ -99,6 +141,9 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
                         "PCIE: outbound window {}: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
                         i, bar.pcie_base, bar.cpu_base, bar.size
                     );
+                    if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&msi_x_bar) {
+                        msi_x_table_addr = Some(msi_x_bar - bar.pcie_base + bar.cpu_base)
+                    ;}
                     if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&bar1) {
                         peripheral_addr = Some((bar1 - bar.pcie_base + bar.cpu_base, 0x40_0000));
                     }
@@ -107,6 +152,12 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
                     }
                 }
                 }
+                let Some(msi_x_table_addr) = msi_x_table_addr else {
+                    println!("PCIE: msi x window are not set");
+                    return Err(Bcm2712Error::InvalidWindow.into());
+                };
+                let mut table = MsiXTable.lock();
+                *table = Some(unsafe { brcm_stb.init_rp1_msi_x_settings(msi_x, msi_x_table_addr, 0xff_ffff_f000) }?);
 
                 rp1_interrupt::init_rp1_interrupt(brcm_stb, mip_reg.0 as u64)?;
 

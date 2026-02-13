@@ -1,9 +1,13 @@
+use pci::msix::PciMsiXTableVectorControl;
 use print::println;
 
 use crate::bcm2712::Bcm2712Error;
+use crate::bcm2712::MsiXTable;
 use crate::bcm2712::brcmstb::BrcmStb;
 use crate::bcm2712::brcmstb::InBoundData;
+use crate::bcm2712::get_msi_x_table;
 use crate::bcm2712::mip::Bcm2712MIP;
+use typestate::Writable;
 
 // TODO read dtb
 const MIP_SPI_OFFSET: u32 = 128;
@@ -53,5 +57,28 @@ pub(crate) fn init_rp1_interrupt(brcm_stb: &BrcmStb, mip_base: u64) -> Result<()
         cpu::dsb_sy();
     }
 
+    Ok(())
+}
+
+pub fn enable_interrupt(spi: u32) -> Result<(), Bcm2712Error> {
+    toggle_interrupt(spi, true)
+}
+
+pub fn disable_interrupt(spi: u32) -> Result<(), Bcm2712Error> {
+    toggle_interrupt(spi, false)
+}
+
+fn toggle_interrupt(spi: u32, enable: bool) -> Result<(), Bcm2712Error> {
+    let offset = spi - MIP_SPI_OFFSET - 32;
+    let msi_x_table = MsiXTable.lock();
+    let Some(msi_x_table) = msi_x_table.as_ref() else {
+        return Err(Bcm2712Error::PcieIsNotInitialized);
+    };
+    let tables = get_msi_x_table(msi_x_table);
+    tables[offset as usize].vector_control.write(if enable {
+        PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 1)
+    } else {
+        PciMsiXTableVectorControl::new()
+    });
     Ok(())
 }

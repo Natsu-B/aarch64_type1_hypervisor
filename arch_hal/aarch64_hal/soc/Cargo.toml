@@ -10,3 +10,4 @@ pci = { path = "../../../pci" }
 dtb = { path = "../../../dtb" }
 print = { path = "../print" }
 cpu = { path = "../cpu" }
+mutex = { path = "../../../mutex" }
