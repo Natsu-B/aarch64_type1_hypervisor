@@ -13,9 +13,6 @@
 use core::ops::Deref;
 use core::ops::DerefMut;
 
-use cpu;
-use mutex;
-
 pub struct RawSpinLockIrqSave<T> {
     inner: mutex::RawSpinLock<T>,
 }

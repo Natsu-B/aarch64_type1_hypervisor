@@ -166,7 +166,7 @@ pub unsafe fn init_current_cpu(
     }
 
     let base = percpu_base.as_ptr() as usize;
-    if base % PERCPU_MIN_ALIGN != 0 {
+    if !base.is_multiple_of(PERCPU_MIN_ALIGN) {
         return Err(TlsInitError::Misaligned {
             required: PERCPU_MIN_ALIGN,
             actual: base % PERCPU_MIN_ALIGN,

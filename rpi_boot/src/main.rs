@@ -58,8 +58,6 @@ use dtb::ValueRef;
 use dtb::WalkError;
 use typestate::Le;
 use typestate::ReadWrite;
-use typestate::Readable;
-use typestate::Writable;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
