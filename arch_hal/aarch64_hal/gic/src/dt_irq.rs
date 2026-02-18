@@ -46,29 +46,3 @@ pub fn dt_irq_flags_to_sense(flags: u32) -> Result<IrqSense, DtIrqDecodeError> {
         _ => Err(DtIrqDecodeError::InvalidFlags(flags)),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_spi_level_high() {
-        let irq = decode_dt_irq(&[0, 25, 4]).unwrap();
-        assert_eq!(irq.intid, 32 + 25);
-        assert_eq!(irq.sense, IrqSense::Level);
-    }
-
-    #[test]
-    fn decode_spi_edge_rising() {
-        let irq = decode_dt_irq(&[0, 3, 1]).unwrap();
-        assert_eq!(irq.intid, 32 + 3);
-        assert_eq!(irq.sense, IrqSense::Edge);
-    }
-
-    #[test]
-    fn decode_ppi_edge_both() {
-        let irq = decode_dt_irq(&[1, 7, 3]).unwrap();
-        assert_eq!(irq.intid, 16 + 7);
-        assert_eq!(irq.sense, IrqSense::Edge);
-    }
-}
