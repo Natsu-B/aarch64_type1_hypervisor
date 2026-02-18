@@ -81,7 +81,9 @@ fn toggle_interrupt(spi: u32, enable: bool) -> Result<(), Bcm2712Error> {
     };
     // SAFETY: `get_msi_x_table` returns a valid MMIO slice covering all MSI-X vectors.
     let tables = get_msi_x_table(msi_x_table);
-    let entry = tables.get(offset as usize).ok_or(Bcm2712Error::InvalidSettings)?;
+    let entry = tables
+        .get(offset as usize)
+        .ok_or(Bcm2712Error::InvalidSettings)?;
     entry.vector_control.write(if enable {
         PciMsiXTableVectorControl::new().set(PciMsiXTableVectorControl::mask, 0)
     } else {

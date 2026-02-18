@@ -44,10 +44,15 @@ SECTIONS
         _BSS_END = .;
     } :data
 
-    . = . + 0x10000;
-
+    . = ALIGN(0x1000);
+    _STACK_BOTTOM = .;
+    . = . + 0x1000;    /* guard page (unmapped in EL2 Stage-1) */
+    . = . + 0x10000;   /* usable stack: 64 KiB */
     _STACK_TOP = .;
     _PROGRAM_END = .;
+    ASSERT((_STACK_BOTTOM & 0xFFF) == 0, "STACK_BOTTOM must be 4KB aligned")
+    ASSERT((_STACK_TOP & 0xFFF) == 0, "STACK_TOP must be 4KB aligned")
+    ASSERT(_STACK_TOP < 0x300000, "Stack overlaps Linux image")
     . = 0x300000;
     _LINUX_IMAGE = .;
 }

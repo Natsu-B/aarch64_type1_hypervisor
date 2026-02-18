@@ -7,6 +7,7 @@ extern crate alloc;
 mod handler;
 mod multicore;
 mod pcie;
+mod stack_overflow;
 mod vgic;
 use alloc::boxed::Box;
 use alloc::format;
@@ -65,6 +66,7 @@ unsafe extern "C" {
     static mut _BSS_END: usize;
     static mut _PROGRAM_START: usize;
     static mut _PROGRAM_END: usize;
+    static mut _STACK_BOTTOM: usize;
     static mut _STACK_TOP: usize;
     static mut _LINUX_IMAGE: usize;
     static mut __el2_tls_bsp_start: usize;
@@ -114,6 +116,8 @@ global_asm!(
 .section ".text.boot"
 
 _start:
+    msr spsel, #1
+    isb
     ldr x0, =_STACK_TOP
     mov sp, x0
 clear_bss:
@@ -351,11 +355,78 @@ extern "C" fn main() -> ! {
         size: ipa_space - memory_last_addr,
         types: EL2Stage1PageTypes::Device,
     });
+
+    let guard_start = &raw const _STACK_BOTTOM as usize;
+    let guard_end = guard_start.checked_add(0x1000).expect("guard end overflow");
+    assert_eq!(guard_start & 0xFFF, 0, "guard start not 4KB aligned");
+    assert_eq!(guard_end & 0xFFF, 0, "guard end not 4KB aligned");
+
+    let mut guard_removed = false;
+    let mut stage1_sanitized = Vec::with_capacity(stage1_paging_data.len().saturating_add(1));
+    for setting in stage1_paging_data.into_iter() {
+        let start = setting.va;
+        let end = start
+            .checked_add(setting.size)
+            .expect("EL2 Stage-1 mapping end overflow");
+        if guard_end <= start || guard_start >= end {
+            stage1_sanitized.push(setting);
+            continue;
+        }
+
+        guard_removed = true;
+        if start < guard_start {
+            let left_size = guard_start
+                .checked_sub(start)
+                .expect("EL2 Stage-1 left size underflow");
+            assert_eq!(start & 0xFFF, 0, "EL2 Stage-1 left start not aligned");
+            assert_eq!(left_size & 0xFFF, 0, "EL2 Stage-1 left size not aligned");
+            stage1_sanitized.push(EL2Stage1PagingSetting {
+                va: start,
+                pa: setting.pa,
+                size: left_size,
+                types: setting.types,
+            });
+        }
+        if guard_end < end {
+            let right_size = end
+                .checked_sub(guard_end)
+                .expect("EL2 Stage-1 right size underflow");
+            let offset = guard_end
+                .checked_sub(start)
+                .expect("EL2 Stage-1 right offset underflow");
+            let right_pa = setting
+                .pa
+                .checked_add(offset)
+                .expect("EL2 Stage-1 right pa overflow");
+            assert_eq!(guard_end & 0xFFF, 0, "EL2 Stage-1 right start not aligned");
+            assert_eq!(right_size & 0xFFF, 0, "EL2 Stage-1 right size not aligned");
+            stage1_sanitized.push(EL2Stage1PagingSetting {
+                va: guard_end,
+                pa: right_pa,
+                size: right_size,
+                types: setting.types,
+            });
+        }
+    }
+    assert!(
+        guard_removed,
+        "guard page mapping was not removed from EL2 Stage-1 settings"
+    );
+    stage1_paging_data = stage1_sanitized;
+
     println!("Stage2Paging: {:#?}", paging_data);
     println!("EL2Stage1Paging: {:#?}", stage1_paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(true, false);
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
+    println!("EL2 Stage-1 paging enabled");
+
+    // SAFETY: emergency stack is initialized after Stage-1 is enabled.
+    // The stack is mapped as Normal memory with identity mapping.
+    unsafe {
+        stack_overflow::init_emergency_stack();
+    }
+    println!("Emergency stack initialized");
     println!("paging success!!!");
 
     // setup gicv2 (with virtualization)
