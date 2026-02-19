@@ -5,12 +5,15 @@
 #   uboot-unit  <package> <testscript> [extra...]       # bare-metal lib tests with custom runner
 #   uefi        <package> <testname> <testscript> [extra...]
 #   uboot       <package> <testname> <testscript> [extra...]
+# Note: When using `cargo xtest -t <name>`, reserved tokens `std`, `unit`,
+# and `uboot-unit` select those categories explicitly.
 
 std allocator
 std dtb
 std intrusive_linked_list
 std mutex
 std typestate
+std xtask
 unit gdb_remote
 
 uefi block-device virtio_blk_modern file/block-device/scripts/run_qemu.sh

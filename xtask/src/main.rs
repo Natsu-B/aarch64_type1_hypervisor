@@ -23,6 +23,9 @@ fn main() {
     let remaining_args: Vec<String> = args.collect();
 
     match command.as_deref() {
+        Some("-h") | Some("--help") => {
+            print_xtask_usage();
+        }
         Some("build") => {
             let _ = build(&remaining_args).unwrap();
         }
@@ -41,6 +44,18 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn print_xtask_usage() {
+    println!("Usage: cargo xtask <command> [args...]");
+    println!();
+    println!("Commands:");
+    println!("  build [rpi5] [cargo args...]");
+    println!("  run [rpi5] [args...]");
+    println!("  test [xtest args...]");
+    println!();
+    println!("Options:");
+    println!("  -h, --help    Show this help");
 }
 
 fn build(args: &[String]) -> Result<String, String> {
@@ -761,41 +776,128 @@ fn run_uboot_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> 
     run_guest_test_with_timeout(cmd, label, timeout_secs, "U-Boot test")
 }
 
-fn test(args: &[String]) {
-    fn parse_test_args(args: &[String]) -> (Vec<String>, Vec<String>) {
-        let mut forward_args = Vec::new();
-        let mut package_filters = Vec::new();
-        let mut i = 0;
+fn parse_xtest_cli_args(
+    args: &[String],
+) -> Result<(Vec<String>, Vec<String>, Vec<String>, bool), String> {
+    let mut forward_args = Vec::new();
+    let mut package_filters = Vec::new();
+    let mut testname_filters = Vec::new();
+    let mut help_requested = false;
+    let mut i = 0;
 
-        while i < args.len() {
-            let arg = &args[i];
-            if arg == "--" {
-                forward_args.extend(args[i..].iter().cloned());
-                break;
-            } else if let Some(pkg) = arg.strip_prefix("--package=") {
-                package_filters.push(pkg.to_string());
-                i += 1;
-                continue;
-            } else if arg == "-p" || arg == "--package" {
-                if let Some(pkg) = args.get(i + 1) {
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            forward_args.extend(args[i..].iter().cloned());
+            break;
+        } else if arg == "-h" || arg == "--help" {
+            help_requested = true;
+            i += 1;
+            continue;
+        } else if let Some(pkg) = arg.strip_prefix("--package=") {
+            package_filters.push(pkg.to_string());
+            i += 1;
+            continue;
+        } else if arg == "-p" || arg == "--package" {
+            match args.get(i + 1) {
+                Some(pkg) if pkg != "--" => {
                     package_filters.push(pkg.clone());
                     i += 2;
                     continue;
                 }
-            } else if arg.starts_with("-p") && arg.len() > 2 {
-                package_filters.push(arg[2..].to_string());
-                i += 1;
-                continue;
+                _ => return Err("Error: -p/--package requires a value".to_string()),
             }
-
-            forward_args.push(arg.clone());
+        } else if arg.starts_with("-p") && arg.len() > 2 {
+            package_filters.push(arg[2..].to_string());
             i += 1;
+            continue;
+        } else if arg == "-t" {
+            match args.get(i + 1) {
+                Some(name) if name != "--" => {
+                    testname_filters.push(name.clone());
+                    i += 2;
+                    continue;
+                }
+                _ => return Err("Error: -t requires a value".to_string()),
+            }
+        } else if arg.starts_with("-t") && arg.len() > 2 {
+            testname_filters.push(arg[2..].to_string());
+            i += 1;
+            continue;
         }
 
-        (forward_args, package_filters)
+        forward_args.push(arg.clone());
+        i += 1;
     }
 
-    let (test_args, package_filters) = parse_test_args(args);
+    Ok((
+        forward_args,
+        package_filters,
+        testname_filters,
+        help_requested,
+    ))
+}
+
+fn apply_testname_filters(
+    std_crates: &mut Vec<(String, Vec<String>)>,
+    unit_crates: &mut Vec<(String, Vec<String>)>,
+    uefi_tests: &mut Vec<(String, String, String, Vec<String>)>,
+    uboot_tests: &mut Vec<(String, String, String, Vec<String>)>,
+    uboot_unit_tests: &mut Vec<(String, String, Vec<String>)>,
+    testname_filters: &[String],
+) {
+    if testname_filters.is_empty() {
+        return;
+    }
+
+    let keep_std = testname_filters.iter().any(|t| t == "std");
+    let keep_unit = testname_filters.iter().any(|t| t == "unit");
+    let keep_uboot_unit = testname_filters.iter().any(|t| t == "uboot-unit");
+
+    if !keep_std {
+        std_crates.clear();
+    }
+    if !keep_unit {
+        unit_crates.clear();
+    }
+
+    uefi_tests.retain(|(_, testname, _, _)| testname_filters.contains(testname));
+    uboot_tests.retain(|(_, testname, _, _)| testname_filters.contains(testname));
+
+    if !keep_uboot_unit {
+        uboot_unit_tests.clear();
+    }
+}
+
+fn print_xtest_usage() {
+    println!("Usage: cargo xtask test [options] [-- <cargo test args...>]");
+    println!();
+    println!("Options (repeatable):");
+    println!("  -p, --package <pkg>   Filter xtest.txt by package");
+    println!("  --package=<pkg>       Filter xtest.txt by package");
+    println!("  -p<pkg>               Shorthand for -p <pkg>");
+    println!("  -t <name>             Filter by UEFI/U-Boot test name");
+    println!("  -t<name>              Shorthand for -t <name>");
+    println!("  -t std                Include host std tests");
+    println!("  -t unit               Include host unit tests");
+    println!("  -t uboot-unit         Include U-Boot unit tests");
+    println!("  -h, --help            Show this help");
+}
+
+fn test(args: &[String]) {
+    let (test_args, package_filters, testname_filters, help_requested) =
+        match parse_xtest_cli_args(args) {
+            Ok(parsed) => parsed,
+            Err(msg) => {
+                eprintln!("{}", msg);
+                std::process::exit(1);
+            }
+        };
+
+    if help_requested {
+        print_xtest_usage();
+        return;
+    }
 
     // Detect host triple
     let host_output = Command::new("rustc")
@@ -1028,6 +1130,40 @@ fn test(args: &[String]) {
         eprintln!(
             "Filtered test plan to packages: {:?} ({} std, {} unit, {} uefi, {} uboot, {} uboot-unit)",
             package_filters,
+            std_crates.len(),
+            unit_crates.len(),
+            uefi_tests.len(),
+            uboot_tests.len(),
+            uboot_unit_tests.len()
+        );
+    }
+
+    if !testname_filters.is_empty() {
+        apply_testname_filters(
+            &mut std_crates,
+            &mut unit_crates,
+            &mut uefi_tests,
+            &mut uboot_tests,
+            &mut uboot_unit_tests,
+            &testname_filters,
+        );
+
+        if std_crates.is_empty()
+            && unit_crates.is_empty()
+            && uefi_tests.is_empty()
+            && uboot_tests.is_empty()
+            && uboot_unit_tests.is_empty()
+        {
+            eprintln!(
+                "No entries in xtest.txt match specified test names: {:?}",
+                testname_filters
+            );
+            std::process::exit(1);
+        }
+
+        eprintln!(
+            "Filtered test plan to test names: {:?} ({} std, {} unit, {} uefi, {} uboot, {} uboot-unit)",
+            testname_filters,
             std_crates.len(),
             unit_crates.len(),
             uefi_tests.len(),
@@ -1401,6 +1537,8 @@ fn test(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::AnsiQueryFilter;
+    use super::apply_testname_filters;
+    use super::parse_xtest_cli_args;
 
     fn filter_chunks(chunks: &[&[u8]]) -> Vec<u8> {
         let mut filter = AnsiQueryFilter::new();
@@ -1410,6 +1548,10 @@ mod tests {
         }
         filter.finish_into(&mut out);
         out
+    }
+
+    fn to_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -1467,5 +1609,99 @@ mod tests {
     fn handles_chunk_boundaries() {
         let out = filter_chunks(&[b"abc\x1b[", b"6nxyz"]);
         assert_eq!(out, b"abcxyz");
+    }
+
+    #[test]
+    fn parses_package_testname_and_forward_args() {
+        let args = to_args(&[
+            "-p",
+            "gdb_remote",
+            "-t",
+            "uefi_packet_size",
+            "--",
+            "--nocapture",
+        ]);
+        let (forward_args, package_filters, testname_filters, help_requested) =
+            parse_xtest_cli_args(&args).expect("parse should succeed");
+
+        assert_eq!(package_filters, vec!["gdb_remote"]);
+        assert_eq!(testname_filters, vec!["uefi_packet_size"]);
+        assert_eq!(forward_args, vec!["--", "--nocapture"]);
+        assert!(!help_requested);
+    }
+
+    #[test]
+    fn parses_compact_testname_flag() {
+        let args = to_args(&["-tgicv2_pending"]);
+        let (_, _, testname_filters, help_requested) =
+            parse_xtest_cli_args(&args).expect("parse should succeed");
+        assert_eq!(testname_filters, vec!["gicv2_pending"]);
+        assert!(!help_requested);
+    }
+
+    #[test]
+    fn rejects_missing_testname() {
+        let args = to_args(&["-t"]);
+        let err = parse_xtest_cli_args(&args).expect_err("missing -t value should error");
+        assert!(err.contains("-t"));
+    }
+
+    #[test]
+    fn parses_help_flag() {
+        let args = to_args(&["--help"]);
+        let (forward_args, package_filters, testname_filters, help_requested) =
+            parse_xtest_cli_args(&args).expect("parse should succeed");
+        assert!(help_requested);
+        assert!(forward_args.is_empty());
+        assert!(package_filters.is_empty());
+        assert!(testname_filters.is_empty());
+    }
+
+    #[test]
+    fn testname_filter_keeps_only_matching_uefi() {
+        let mut std_crates = vec![("gdb_remote".to_string(), Vec::new())];
+        let mut unit_crates = vec![("gdb_remote".to_string(), Vec::new())];
+        let mut uefi_tests = vec![
+            (
+                "gdb_remote".to_string(),
+                "uefi_packet_size".to_string(),
+                "gdb_remote/scripts/run_uefi_gdb_remote_qxfer_test.sh".to_string(),
+                Vec::new(),
+            ),
+            (
+                "gdb_remote".to_string(),
+                "uefi_qxfer_features".to_string(),
+                "gdb_remote/scripts/run_uefi_gdb_remote_qxfer_test.sh".to_string(),
+                Vec::new(),
+            ),
+        ];
+        let mut uboot_tests = vec![(
+            "gdb_remote".to_string(),
+            "gicv2_pending".to_string(),
+            "arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh".to_string(),
+            Vec::new(),
+        )];
+        let mut uboot_unit_tests = vec![(
+            "gdb_remote".to_string(),
+            "arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh".to_string(),
+            Vec::new(),
+        )];
+
+        let testname_filters = vec!["uefi_packet_size".to_string()];
+        apply_testname_filters(
+            &mut std_crates,
+            &mut unit_crates,
+            &mut uefi_tests,
+            &mut uboot_tests,
+            &mut uboot_unit_tests,
+            &testname_filters,
+        );
+
+        assert!(std_crates.is_empty());
+        assert!(unit_crates.is_empty());
+        assert!(uboot_tests.is_empty());
+        assert!(uboot_unit_tests.is_empty());
+        assert_eq!(uefi_tests.len(), 1);
+        assert_eq!(uefi_tests[0].1, "uefi_packet_size");
     }
 }

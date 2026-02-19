@@ -103,6 +103,8 @@ Copy the resulting `kernel_2712.img` to your Pi boot media as appropriate.
 
 ```sh
 cargo xtest
+cargo xtest --help  # show filtering options and arg forwarding
+cargo xtest -p gdb_remote -t uefi_packet_size  # filter xtest.txt by package and test name (UEFI/U-Boot)
 ```
 
 The test plan is defined in `xtest.txt`:
