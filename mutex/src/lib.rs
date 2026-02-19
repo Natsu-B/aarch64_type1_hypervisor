@@ -12,6 +12,11 @@ use core::sync::atomic::Ordering;
 
 pub mod pod;
 
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
+
 static RAW_ATOMICS_ENABLED: SyncUnsafeCell<bool> = SyncUnsafeCell::new(false);
 
 #[inline]
@@ -38,6 +43,23 @@ pub fn enable_raw_atomics() {
     unsafe {
         *RAW_ATOMICS_ENABLED.get() = true;
     }
+}
+
+#[cfg(test)]
+pub(crate) fn with_raw_atomics_mode(enabled: bool, f: impl FnOnce()) {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let prev = raw_atomics_enabled();
+    // SAFETY: the test mutex serializes access and tests are single-threaded in this scope.
+    unsafe {
+        *RAW_ATOMICS_ENABLED.get() = enabled;
+    }
+    f();
+    // SAFETY: restore the prior state while still holding the test mutex.
+    unsafe {
+        *RAW_ATOMICS_ENABLED.get() = prev;
+    }
+    drop(guard);
 }
 
 pub struct SpinLock<T: ?Sized> {
@@ -515,25 +537,7 @@ mod tests {
     use super::*;
     use core::time::Duration;
     use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
     use std::thread;
-
-    fn with_raw_atomics_mode(enabled: bool, f: impl FnOnce()) {
-        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        let guard = TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let prev = raw_atomics_enabled();
-        // SAFETY: the test mutex serializes access and tests are single-threaded in this scope.
-        unsafe {
-            *RAW_ATOMICS_ENABLED.get() = enabled;
-        }
-        f();
-        // SAFETY: restore the prior state while still holding the test mutex.
-        unsafe {
-            *RAW_ATOMICS_ENABLED.get() = prev;
-        }
-        drop(guard);
-    }
 
     #[test]
     fn raw_spinlock_defaults_to_noop_locking() {
@@ -648,6 +652,62 @@ mod tests {
 
             assert!(!lock.is_write_locked());
             assert_eq!(lock.read_count(), 0);
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_fetch_arith_non_atomic() {
+        with_raw_atomics_mode(false, || {
+            let pod = pod::RawAtomicPod::new(u8::MAX);
+
+            assert_eq!(pod.fetch_add(1, Ordering::Relaxed), u8::MAX);
+            assert_eq!(pod.load(Ordering::Relaxed), 0);
+
+            assert_eq!(pod.fetch_sub(1, Ordering::Relaxed), 0);
+            assert_eq!(pod.load(Ordering::Relaxed), u8::MAX);
+
+            let pod_mul = pod::RawAtomicPod::new(20u8);
+            assert_eq!(pod_mul.fetch_mul(20, Ordering::Relaxed), 20);
+            assert_eq!(pod_mul.load(Ordering::Relaxed), 144);
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_fetch_arith_atomic() {
+        with_raw_atomics_mode(true, || {
+            let pod = pod::RawAtomicPod::new(10u32);
+
+            assert_eq!(pod.fetch_add(5, Ordering::AcqRel), 10);
+            assert_eq!(pod.load(Ordering::Acquire), 15);
+
+            assert_eq!(pod.fetch_sub(3, Ordering::AcqRel), 15);
+            assert_eq!(pod.load(Ordering::Acquire), 12);
+
+            assert_eq!(pod.fetch_mul(4, Ordering::AcqRel), 12);
+            assert_eq!(pod.load(Ordering::Acquire), 48);
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_fetch_add_multithreaded() {
+        with_raw_atomics_mode(true, || {
+            let pod = Arc::new(pod::RawAtomicPod::new(0usize));
+            let mut handles = vec![];
+
+            for _ in 0..8 {
+                let pod_clone = Arc::clone(&pod);
+                handles.push(thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        pod_clone.fetch_add(1, Ordering::AcqRel);
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            assert_eq!(pod.load(Ordering::Acquire), 8 * 1_000);
         });
     }
 

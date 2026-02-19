@@ -1,9 +1,13 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
+use core::mem::align_of;
+use core::mem::size_of;
+use core::num::Wrapping;
 use core::sync::atomic::Ordering;
 
 use typestate::RawReg;
 use typestate::atomic_raw::AtomicRaw;
+use typestate::atomic_raw::AtomicRawInt;
 
 // ===== RawAtomicPod =======================================================
 //
@@ -171,6 +175,132 @@ where
 
 impl<T: RawReg> RawAtomicPod<T>
 where
+    T::Raw: AtomicRawInt,
+{
+    #[inline]
+    pub fn fetch_add(&self, val: T, order: Ordering) -> T
+    where
+        T::Raw: core::ops::Add<Output = T::Raw>,
+        Wrapping<T::Raw>: core::ops::Add<Output = Wrapping<T::Raw>>,
+    {
+        if crate::raw_atomics_enabled() {
+            let a = self.atomic_ref();
+            T::from_raw(<T::Raw as AtomicRawInt>::fetch_add(a, val.to_raw(), order))
+        } else {
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            let old = unsafe { *self.raw.get() };
+            let new = (Wrapping(old) + Wrapping(val.to_raw())).0;
+            unsafe { *self.raw.get() = new };
+            T::from_raw(old)
+        }
+    }
+
+    #[inline]
+    pub fn fetch_sub(&self, val: T, order: Ordering) -> T
+    where
+        T::Raw: core::ops::Sub<Output = T::Raw>,
+        Wrapping<T::Raw>: core::ops::Sub<Output = Wrapping<T::Raw>>,
+    {
+        if crate::raw_atomics_enabled() {
+            let a = self.atomic_ref();
+            T::from_raw(<T::Raw as AtomicRawInt>::fetch_sub(a, val.to_raw(), order))
+        } else {
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            let old = unsafe { *self.raw.get() };
+            let new = (Wrapping(old) - Wrapping(val.to_raw())).0;
+            unsafe { *self.raw.get() = new };
+            T::from_raw(old)
+        }
+    }
+
+    #[inline]
+    pub fn fetch_mul(&self, val: T, order: Ordering) -> T
+    where
+        T::Raw: core::ops::Mul<Output = T::Raw>,
+        Wrapping<T::Raw>: core::ops::Mul<Output = Wrapping<T::Raw>>,
+    {
+        if crate::raw_atomics_enabled() {
+            let a = self.atomic_ref();
+            let failure = match order {
+                Ordering::AcqRel => Ordering::Acquire,
+                Ordering::Release => Ordering::Relaxed,
+                _ => order,
+            };
+            let val_raw = val.to_raw();
+            let mut old = <T::Raw as AtomicRaw>::load(a, Ordering::Relaxed);
+            loop {
+                let new = (Wrapping(old) * Wrapping(val_raw)).0;
+                match <T::Raw as AtomicRaw>::compare_exchange_weak(a, old, new, order, failure) {
+                    Ok(prev) => return T::from_raw(prev),
+                    Err(prev) => old = prev,
+                }
+            }
+        } else {
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            let old = unsafe { *self.raw.get() };
+            let new = (Wrapping(old) * Wrapping(val.to_raw())).0;
+            unsafe { *self.raw.get() = new };
+            T::from_raw(old)
+        }
+    }
+
+    #[inline]
+    pub fn fetch_min(&self, val: T, order: Ordering) -> T
+    where
+        T::Raw: Ord,
+    {
+        if crate::raw_atomics_enabled() {
+            let a = self.atomic_ref();
+            T::from_raw(<T::Raw as AtomicRawInt>::fetch_min(a, val.to_raw(), order))
+        } else {
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            let old = unsafe { *self.raw.get() };
+            let val_raw = val.to_raw();
+            let new = core::cmp::min(old, val_raw);
+            unsafe { *self.raw.get() = new };
+            T::from_raw(old)
+        }
+    }
+
+    #[inline]
+    pub fn fetch_max(&self, val: T, order: Ordering) -> T
+    where
+        T::Raw: Ord,
+    {
+        if crate::raw_atomics_enabled() {
+            let a = self.atomic_ref();
+            T::from_raw(<T::Raw as AtomicRawInt>::fetch_max(a, val.to_raw(), order))
+        } else {
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            let old = unsafe { *self.raw.get() };
+            let val_raw = val.to_raw();
+            let new = core::cmp::max(old, val_raw);
+            unsafe { *self.raw.get() = new };
+            T::from_raw(old)
+        }
+    }
+
+    #[inline]
+    pub fn fetch_nand(&self, val: T, order: Ordering) -> T
+    where
+        T::Raw: core::ops::BitAnd<Output = T::Raw> + core::ops::Not<Output = T::Raw>,
+    {
+        if crate::raw_atomics_enabled() {
+            let a = self.atomic_ref();
+            T::from_raw(<T::Raw as AtomicRawInt>::fetch_nand(a, val.to_raw(), order))
+        } else {
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            let old = unsafe { *self.raw.get() };
+            let val_raw = val.to_raw();
+            let new = !(old & val_raw);
+            unsafe { *self.raw.get() = new };
+            T::from_raw(old)
+        }
+    }
+}
+
+impl<T: RawReg> RawAtomicPod<T>
+where
     T::Raw: AtomicRaw + PartialEq,
 {
     #[inline]
@@ -202,5 +332,73 @@ where
                 Err(T::from_raw(cur))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn raw_atomic_pod_non_atomic_fetch_add_wraps() {
+        crate::with_raw_atomics_mode(false, || {
+            let pod = RawAtomicPod::new(0xFFu8);
+            let prev = pod.fetch_add(1u8, Ordering::Relaxed);
+            assert_eq!(prev, 0xFF);
+            assert_eq!(pod.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_non_atomic_fetch_min_max_signed() {
+        crate::with_raw_atomics_mode(false, || {
+            let pod = RawAtomicPod::new(10i32);
+            let prev = pod.fetch_min(3i32, Ordering::Relaxed);
+            assert_eq!(prev, 10);
+            assert_eq!(pod.load(Ordering::Relaxed), 3);
+            let prev = pod.fetch_max(20i32, Ordering::Relaxed);
+            assert_eq!(prev, 3);
+            assert_eq!(pod.load(Ordering::Relaxed), 20);
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_non_atomic_fetch_nand() {
+        crate::with_raw_atomics_mode(false, || {
+            let old = 0b1100u8;
+            let val = 0b1010u8;
+            let pod = RawAtomicPod::new(old);
+            let prev = pod.fetch_nand(val, Ordering::Relaxed);
+            assert_eq!(prev, old);
+            assert_eq!(pod.load(Ordering::Relaxed), !(old & val));
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_atomic_fetch_add_multithreaded() {
+        crate::with_raw_atomics_mode(true, || {
+            let pod = Arc::new(RawAtomicPod::new(0u32));
+            let threads = 4usize;
+            let iters = 1_000usize;
+            let mut handles = Vec::with_capacity(threads);
+
+            for _ in 0..threads {
+                let pod = Arc::clone(&pod);
+                handles.push(thread::spawn(move || {
+                    for _ in 0..iters {
+                        pod.fetch_add(1u32, Ordering::Relaxed);
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            assert_eq!(pod.load(Ordering::Relaxed), (threads * iters) as u32);
+        });
     }
 }
