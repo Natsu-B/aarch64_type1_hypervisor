@@ -8,6 +8,7 @@ use arch_hal::exceptions::memory_hook::MmioError;
 use arch_hal::exceptions::memory_hook::MmioHandler;
 use arch_hal::exceptions::memory_hook::SplitPolicy;
 use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::GicError;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::vgic_frontend::Gicv2AccessSize;
@@ -19,12 +20,14 @@ use arch_hal::psci::{self};
 use core::ffi::c_void;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
+use core::sync::atomic::Ordering;
 use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
 use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
+use mutex::pod::RawAtomicPod;
 
 use crate::GICV2_DRIVER;
 use crate::PL011_UART_ADDR;
@@ -263,6 +266,13 @@ fn gic_access_size_from_bytes(access_bytes: u8) -> Option<Gicv2AccessSize> {
     }
 }
 
+const LOG_MAINT_ERR: u32 = 1 << 0;
+const LOG_PIRQ_ERR: u32 = 1 << 1;
+const LOG_PASSTHROUGH_ERR: u32 = 1 << 2;
+const LOG_EOI_ERR: u32 = 1 << 3;
+const LOG_DEACT_ERR: u32 = 1 << 4;
+static IRQ_LOG_ONCE: RawAtomicPod<u32> = RawAtomicPod::new_raw(0);
+
 fn irq_handler(_regs: &mut cpu::Registers) {
     let Some(gicv2) = gic() else {
         return;
@@ -271,12 +281,42 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         return;
     };
     if Some(irq.intid) == vgic::maintenance_intid() {
-        vgic::handle_maintenance_irq().unwrap();
+        if let Err(err) = vgic::handle_maintenance_irq() {
+            if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
+                println!("vgic: maintenance IRQ failed: {:?}", err);
+            }
+        }
     } else {
-        vgic::on_physical_irq(PIntId(irq.intid), true).unwrap();
+        let level = true;
+        match vgic::on_physical_irq(PIntId(irq.intid), level) {
+            Ok(()) => {}
+            Err(GicError::UnsupportedIntId) => {
+                if let Err(err) = vgic::passthrough_physical_irq(irq.intid, level) {
+                    if IRQ_LOG_ONCE.fetch_or(LOG_PASSTHROUGH_ERR, Ordering::Relaxed)
+                        & LOG_PASSTHROUGH_ERR
+                        == 0
+                    {
+                        println!("vgic: passthrough pIRQ {} failed: {:?}", irq.intid, err);
+                    }
+                }
+            }
+            Err(err) => {
+                if IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0 {
+                    println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
+                }
+            }
+        }
     }
-    gicv2.end_of_interrupt(irq).unwrap();
-    gicv2.deactivate(irq).unwrap();
+    if let Err(err) = gicv2.end_of_interrupt(irq) {
+        if IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0 {
+            println!("gic: end_of_interrupt failed: {:?}", err);
+        }
+    }
+    if let Err(err) = gicv2.deactivate(irq) {
+        if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
+            println!("gic: deactivate failed: {:?}", err);
+        }
+    }
 }
 
 static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {

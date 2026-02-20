@@ -20,7 +20,6 @@ use arch_hal::exceptions;
 use arch_hal::gic::GicCpuConfig;
 use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::GicDistributor;
-use arch_hal::gic::GicPpi;
 use arch_hal::gic::MmioRegion;
 use arch_hal::gic::dt_irq;
 use arch_hal::gic::gicv2::Gicv2;
@@ -58,6 +57,7 @@ use dtb::NodeId;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
 use dtb::WalkError;
+use mutex::pod::RawAtomicPod;
 use typestate::Le;
 use typestate::ReadWrite;
 
@@ -474,17 +474,6 @@ extern "C" fn main() -> ! {
     vgic::init(&gicv2, &gic_info, Some(uart_irq)).unwrap();
 
     println!("vgic setup success!!!");
-
-    // setup timer
-    gicv2
-        .configure_ppi(
-            0xa + 16,
-            arch_hal::gic::IrqGroup::Group1,
-            0x80,
-            arch_hal::gic::TriggerMode::Level,
-            arch_hal::gic::EnableOp::Enable,
-        )
-        .unwrap();
 
     unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
 
@@ -978,11 +967,28 @@ fn write_be_u32s(
     Ok(())
 }
 
+static ALREADY_PANICKED: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    if ALREADY_PANICKED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        loop {}
+    }
     let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR.0, PL011_UART_ADDR.1);
     debug_uart.init(115200);
-    debug_uart.write("core 0 panicked!!!\r\n");
+    debug_uart.write("\r\n\r\n=================================\r\n");
+    debug_uart.write("kernel panicked!!!\r\n\r\n\r\n");
+    if let Some(core_id) = tls::cpu_if() {
+        let _ = debug_uart.write_fmt(format_args!(
+            "core {}({:?
+            }): ",
+            core_id,
+            cpu::get_current_core_id()
+        ));
+    } else {
+        debug_uart.write("core ?: ");
+    }
+    debug_uart.write("panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}
 }

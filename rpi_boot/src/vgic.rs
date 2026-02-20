@@ -7,8 +7,11 @@ use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
+use arch_hal::gic::VgicGuestRegs;
 use arch_hal::gic::VgicHw;
+use arch_hal::gic::VgicIrqScope;
 use arch_hal::gic::VgicPirqModel;
+use arch_hal::gic::VgicTargets;
 use arch_hal::gic::VgicUpdate;
 use arch_hal::gic::VgicVcpuModel;
 use arch_hal::gic::VgicVmInfo;
@@ -27,7 +30,7 @@ use crate::Gicv2Info;
 use crate::RP1_BASE;
 use crate::handler;
 
-static VGIC_VM: RawSpinLockIrqSave<Option<gic::vm::GicVmModelForVcpus<1>>> =
+static VGIC_VM: RawSpinLockIrqSave<Option<gic::vm::GicVmModelForVcpus<4>>> =
     RawSpinLockIrqSave::new(None);
 static GICD_RANGE: SyncUnsafeCell<Option<(usize, usize)>> = SyncUnsafeCell::new(None);
 static MAINT_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
@@ -41,6 +44,10 @@ pub(crate) struct UartIrq {
 const MIP_SPI_OFFSET: u32 = 128;
 const RP1_PCIE_CFG_BASE: usize = RP1_BASE + 0x10_8000 + 0x08;
 const RP1_PCIE_CFG_LEN: usize = 64;
+
+fn current_vcpu_id() -> VcpuId {
+    VcpuId(0)
+}
 
 unsafe fn hook_toggle_rp1_msix(
     _ctx: *mut (),
@@ -82,13 +89,20 @@ fn rp1_msix_iack(pintid: PIntId) {
 }
 
 pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<(), &'static str> {
-    let mut vm = gic
-        .create_vm_model::<1>(1)
-        .map_err(|_| "vgic: create vm failed")?;
-
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
+
+    let mut guard = VGIC_VM.lock_irqsave();
+    if guard.is_some() {
+        return Err("vgic: already initialized");
+    }
+    *guard = Some(
+        gic.create_vm_model::<4>(4)
+            .map_err(|_| "vgic: create vm failed")?,
+    );
+    let vm = guard.as_mut().unwrap();
+
     {
-        let vcpu = vm.vcpu(VcpuId(0)).map_err(|_| "vgic: vcpu")?;
+        let vcpu = vm.vcpu(current_vcpu_id()).map_err(|_| "vgic: vcpu")?;
         vcpu.set_resident(cpu::get_current_core_id())
             .map_err(|_| "vgic: set resident")?;
     }
@@ -104,7 +118,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
                 0x80,
             )
             .map_err(|_| "vgic: map pirq")?;
-        apply_update(&mut vm, gic, update).map_err(|_| "vgic: update")?;
+        apply_update(vm, gic, update).map_err(|_| "vgic: update")?;
         let hooks = PirqHooks {
             ctx: ptr::null_mut(),
             on_enable: Some(hook_toggle_rp1_msix),
@@ -117,7 +131,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             .map_err(|_| "vgic: hooks")?;
     }
 
-    let vcpu = vm.vcpu(VcpuId(0)).map_err(|_| "vgic: vcpu")?;
+    let vcpu = vm.vcpu(current_vcpu_id()).map_err(|_| "vgic: vcpu")?;
     vcpu.refill_lrs(gic).map_err(|_| "vgic: refill")?;
 
     // SAFETY: vGIC state is initialized once before guest entry.
@@ -126,8 +140,6 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         *MAINT_INTID.get() = info.maintenance_intid;
         *GICD_ID.get() = Some(Gicv2DistIdRegs::from_hw_gicd(gic.distributor()));
     }
-    let mut guard = VGIC_VM.lock_irqsave();
-    *guard = Some(vm);
     Ok(())
 }
 
@@ -153,7 +165,7 @@ pub fn handle_gicd_read(addr: usize, access_size: Gicv2AccessSize) -> Result<u32
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
     let mut frontend = Gicv2Frontend::new(vm, dist_id);
-    frontend.handle_distributor_read(VcpuId(0), offset, access_size)
+    frontend.handle_distributor_read(current_vcpu_id(), offset, access_size)
 }
 
 pub fn handle_gicd_write(
@@ -170,21 +182,31 @@ pub fn handle_gicd_write(
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
     let mut frontend = Gicv2Frontend::new(vm, dist_id);
-    let update = frontend.handle_distributor_write(VcpuId(0), offset, access_size, value)?;
+    let update =
+        frontend.handle_distributor_write(current_vcpu_id(), offset, access_size, value)?;
     apply_update(vm, gic, update)
 }
 
 pub fn on_physical_irq(pintid: PIntId, level: bool) -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
-    let update = {
-        let mut guard = VGIC_VM.lock_irqsave();
-        let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
-        let update = vm.on_physical_irq(pintid, level)?;
-        apply_update(vm, gic, update)?;
-        update
+    let mut guard = VGIC_VM.lock_irqsave();
+    let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
+    let update = vm.on_physical_irq(pintid, level)?;
+    apply_update(vm, gic, update)
+}
+
+pub fn passthrough_physical_irq(intid: u32, level: bool) -> Result<(), GicError> {
+    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    let vintid = VIntId(intid);
+    let scope = if intid < 32 {
+        VgicIrqScope::Local(current_vcpu_id())
+    } else {
+        VgicIrqScope::Global
     };
-    let _ = update;
-    Ok(())
+    let mut guard = VGIC_VM.lock_irqsave();
+    let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
+    let update = vm.set_pending(scope, vintid, level)?;
+    apply_update(vm, gic, update)
 }
 
 pub fn handle_maintenance_irq() -> Result<(), GicError> {
@@ -192,7 +214,7 @@ pub fn handle_maintenance_irq() -> Result<(), GicError> {
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
     let (update, notifs) = {
-        let vcpu = vm.vcpu(VcpuId(0))?;
+        let vcpu = vm.vcpu(current_vcpu_id())?;
         vcpu.handle_maintenance_collect(gic)?
     };
     vm.dispatch_pirq_notifications(&notifs)?;
@@ -200,13 +222,29 @@ pub fn handle_maintenance_irq() -> Result<(), GicError> {
 }
 
 fn apply_update(
-    vm: &mut gic::vm::GicVmModelForVcpus<1>,
+    vm: &mut gic::vm::GicVmModelForVcpus<4>,
     gic: &Gicv2,
     update: VgicUpdate,
 ) -> Result<(), GicError> {
-    if let VgicUpdate::Some { .. } = update {
-        let vcpu = vm.vcpu(VcpuId(0))?;
-        let _kick = vcpu.refill_lrs(gic)?;
+    let VgicUpdate::Some { targets, work } = update else {
+        return Ok(());
+    };
+    if !work.refill {
+        return Ok(());
     }
+    let vcpu_id = current_vcpu_id();
+    if !update_targets_include(targets, vcpu_id) {
+        return Ok(());
+    }
+    let vcpu = vm.vcpu(vcpu_id)?;
+    let _kick = vcpu.refill_lrs(gic)?;
     Ok(())
+}
+
+fn update_targets_include(targets: VgicTargets, vcpu_id: VcpuId) -> bool {
+    match targets {
+        VgicTargets::All => true,
+        VgicTargets::One(id) => id == vcpu_id,
+        VgicTargets::Mask(mask) => mask.contains(vcpu_id),
+    }
 }
