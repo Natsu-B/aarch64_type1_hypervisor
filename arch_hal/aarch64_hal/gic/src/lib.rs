@@ -73,6 +73,8 @@ pub enum GicError {
     UnsupportedAffinity,
     /// CPU interface number/mask cannot be encoded or decoded (e.g. not in 0..8, or not one-hot).
     InvalidCpuId,
+    /// CPU INT ID is not yet initialized
+    UninitCpuId,
     /// No free CPU slot exists for registering another CPU interface.
     NoFreeCpuSlot,
     /// Route description is not valid for the given `intid` (or cannot be encoded).

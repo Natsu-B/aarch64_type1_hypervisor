@@ -11,6 +11,7 @@ use crate::gicv2::registers::GicV2VirtualInterfaceControl;
 use cpu::CoreAffinity;
 use mutex::RawRwLock;
 use mutex::RawSpinLock;
+use tls;
 use typestate::Readable;
 
 mod cpu_interface;
@@ -170,26 +171,34 @@ impl Gicv2 {
     }
 
     #[inline]
-    fn cpu_if_and_targets_mask_from_itargetsr0_7(&self, value: u8) -> Result<u8, GicError> {
-        let ncpu = self.gicd.typer.read().get(GICD_TYPER::cpu_number) as u8 + 1;
-
-        // ITARGETSR0-7 are banked/RO; treat returned value as one-hot mask.
-        // On UP systems, these registers can be RAZ/WI and read back as 0.
-        if ncpu == 1 {
-            return Ok(0);
+    pub(crate) fn current_cpu_if(&self) -> Result<u8, GicError> {
+        if let Some(id) = tls::cpu_if() {
+            if id >= 8 {
+                return Err(GicError::InvalidCpuId);
+            }
+            let table = self.affinity_table.read();
+            let entry = table[id as usize].ok_or(GicError::InvalidState)?;
+            if entry.0 != cpu::get_current_core_id() {
+                return Err(GicError::InvalidState);
+            }
+            return Ok(id);
         }
+        self.cpu_id_from_affinity(cpu::get_current_core_id())
+    }
 
-        // Require one-hot encoding (a single bit set).
-        if value == 0 || (value & (value - 1)) != 0 {
-            return Err(GicError::InvalidCpuId);
+    #[inline]
+    pub(crate) fn current_enable_groups(&self) -> Result<(bool, bool), GicError> {
+        if let Some(id) = tls::cpu_if() {
+            if id < 8 {
+                let table = self.affinity_table.read();
+                if let Some(entry) = table[id as usize] {
+                    if entry.0 == cpu::get_current_core_id() {
+                        return Ok((entry.1, entry.2));
+                    }
+                }
+            }
         }
-
-        let cpu_if = value.trailing_zeros() as u8;
-        if cpu_if >= ncpu {
-            return Err(GicError::InvalidCpuId);
-        }
-
-        Ok(cpu_if)
+        self.get_enable_group_from_affinity(cpu::get_current_core_id())
     }
 
     #[inline]

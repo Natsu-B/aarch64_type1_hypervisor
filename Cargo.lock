@@ -182,6 +182,7 @@ dependencies = [
  "exceptions",
  "mutex",
  "print",
+ "tls",
  "typestate",
  "typestate_macro",
 ]
@@ -303,6 +304,7 @@ name = "tls"
 version = "0.1.0"
 dependencies = [
  "cpu",
+ "mutex",
 ]
 
 [[package]]

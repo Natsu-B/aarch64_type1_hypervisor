@@ -11,6 +11,7 @@ use aarch64_test::exit_success;
 use core::arch::asm;
 use core::arch::naked_asm;
 use core::ptr;
+use core::ptr::NonNull;
 use cpu;
 use gic::BinaryPoint;
 use gic::EnableOp;
@@ -28,6 +29,7 @@ use gic::gicv2::GICV2_GICD_FRAME_SIZE;
 use gic::gicv2::Gicv2;
 use print::debug_uart;
 use print::println;
+use tls;
 
 const UART_BASE: usize = 0x900_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
@@ -40,6 +42,13 @@ unsafe extern "C" {
     static __bss_end: u8;
     static __stack_top: u8;
 }
+
+const TLS_BUF_SIZE: usize = 4096;
+
+#[repr(align(64))]
+struct TlsBuf([u8; TLS_BUF_SIZE]);
+
+static mut TLS_BUF: TlsBuf = TlsBuf([0; TLS_BUF_SIZE]);
 
 fn entry() -> ! {
     debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
@@ -65,6 +74,24 @@ extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn rust_entry() -> ! {
     unsafe { clear_bss() };
+    let need = tls::template_size();
+    if TLS_BUF_SIZE < need {
+        println!(
+            "tls buffer too small: need {} bytes, have {} bytes",
+            need, TLS_BUF_SIZE
+        );
+        exit_failure();
+    }
+    // SAFETY: TLS_BUF is a single-core test buffer, 64-byte aligned, and lives
+    // for the duration of the test. No other core aliases it.
+    let tls_result = unsafe {
+        let tls_ptr = core::ptr::addr_of_mut!(TLS_BUF.0).cast::<u8>();
+        tls::init_current_cpu(NonNull::new_unchecked(tls_ptr), TLS_BUF_SIZE)
+    };
+    if let Err(err) = tls_result {
+        println!("tls init failed: {:?}", err);
+        exit_failure();
+    }
     entry()
 }
 
