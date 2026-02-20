@@ -1,19 +1,42 @@
 #![no_std]
 
+use core::cell::Cell;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::ptr::{self};
 
 use cpu::get_tpidr_el2;
 use cpu::set_tpidr_el2;
+use mutex::pod::RawAtomicPod;
 
 /// Minimum alignment required for per-CPU TLS buffers.
 pub const PERCPU_MIN_ALIGN: usize = 64;
 
+#[cfg(not(target_os = "uefi"))]
 unsafe extern "C" {
     static __el2_tls_start: u8;
     static __el2_tls_end: u8;
 }
+
+#[cfg(target_os = "uefi")]
+#[repr(C, align(64))]
+struct El2TlsStart;
+
+#[cfg(target_os = "uefi")]
+#[repr(C)]
+struct El2TlsEnd;
+
+#[cfg(target_os = "uefi")]
+#[used]
+#[unsafe(link_section = ".el2_tls$a")]
+#[unsafe(no_mangle)]
+static __el2_tls_start: El2TlsStart = El2TlsStart;
+
+#[cfg(target_os = "uefi")]
+#[used]
+#[unsafe(link_section = ".el2_tls$z")]
+#[unsafe(no_mangle)]
+static __el2_tls_end: El2TlsEnd = El2TlsEnd;
 
 /// Errors that can occur while initializing per-CPU TLS storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,9 +120,17 @@ macro_rules! percpu {
     ( $(#[$meta:meta])* $vis:vis static $name:ident : $ty:ty = $init:expr ; ) => {
         $(#[$meta])*
         #[used]
-        #[link_section = ".el2_tls"]
+        #[cfg_attr(target_os="uefi", unsafe(link_section = ".el2_tls$m"))]
+        #[cfg_attr(not(target_os="uefi"), unsafe(link_section = ".el2_tls"))]
         $vis static $name: $crate::PerCpu<$ty> = $crate::PerCpu::new($init);
     };
+}
+
+const CPU_IF_UNINIT: u8 = u8::MAX;
+static CPU_IF_COUNTER: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
+
+percpu! {
+    static TLS_CPU_IF: Cell<u8> = Cell::new(CPU_IF_UNINIT);
 }
 
 /// Size in bytes of the TLS template emitted by the linker.
@@ -181,5 +212,17 @@ pub unsafe fn init_current_cpu(
 
     let offset = base.wrapping_sub(template_start());
     write_tpidr_el2(offset);
+    let cpu_if = CPU_IF_COUNTER.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    TLS_CPU_IF.current().set(cpu_if);
     Ok(())
+}
+
+/// Return the current CPU interface ID if it has been set.
+pub fn cpu_if() -> Option<u8> {
+    let value = TLS_CPU_IF.current().get();
+    if value == CPU_IF_UNINIT {
+        None
+    } else {
+        Some(value)
+    }
 }

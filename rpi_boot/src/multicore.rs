@@ -10,6 +10,7 @@ use arch_hal::gic::GicCpuInterface;
 use arch_hal::println;
 use arch_hal::psci::secure_monitor_call;
 use arch_hal::tls;
+use arch_hal::tls::PERCPU_MIN_ALIGN;
 use arch_hal::tls::template_size;
 use core::arch::asm;
 use core::cell::OnceCell;
@@ -76,7 +77,8 @@ pub fn ap_on(regs: &mut cpu::Registers) {
     };
 
     let register_context = unsafe {
-        &mut *((stack_addr - size_of::<HypervisorRegisters>()) as *mut HypervisorRegisters)
+        &mut *((stack_addr - size_of::<HypervisorRegisters>().next_multiple_of(PERCPU_MIN_ALIGN))
+            as *mut HypervisorRegisters)
     };
     register_context.vtcr_el2 = cpu::get_vtcr_el2();
     register_context.vttbr_el2 = cpu::get_vttbr_el2();
@@ -113,17 +115,22 @@ pub fn ap_on(regs: &mut cpu::Registers) {
 #[unsafe(naked)]
 extern "C" fn ap_start() -> ! {
     unsafe extern "C" {
-        static __el2_tls_size: u8;
+        static __el2_tls_start: u8;
+        static __el2_tls_end: u8;
     }
     core::arch::naked_asm!(
         "
-        adrp x2, {TLS_MEM}
-        ldr  x2, [x2, :lo12:{TLS_MEM}]
+        adrp x2, {TLS_END}
+        add  x2, x2, :lo12:{TLS_END}
+        adrp x3, {TLS_START}
+        add  x3, x3, :lo12:{TLS_START}
+        sub  x2, x2, x3
         sub  x1, x0, x2
         mov  sp, x1
         b    {AP_MAIN}
         ",
-        TLS_MEM = sym __el2_tls_size,
+        TLS_START = sym __el2_tls_start,
+        TLS_END = sym __el2_tls_end,
         AP_MAIN = sym ap_main,
     )
 }
