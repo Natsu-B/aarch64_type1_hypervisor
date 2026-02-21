@@ -5,6 +5,7 @@ use core::mem::size_of;
 use core::num::Wrapping;
 use core::sync::atomic::Ordering;
 
+use typestate::AtomicPod;
 use typestate::RawReg;
 use typestate::atomic_raw::AtomicRaw;
 use typestate::atomic_raw::AtomicRawInt;
@@ -29,7 +30,7 @@ use typestate::atomic_raw::AtomicRawInt;
 ///   cause data races or aliasing UB.
 /// - After `enable_raw_atomics()`, you must not perform conflicting non-atomic accesses to the same value.
 ///   (This includes taking `&mut` to the underlying storage while other cores use atomics.)
-pub struct RawAtomicPod<T: RawReg>
+pub struct RawAtomicPod<T: AtomicPod>
 where
     T::Raw: AtomicRaw,
 {
@@ -37,10 +38,10 @@ where
     _phantom: PhantomData<T>,
 }
 
-unsafe impl<T: RawReg> Sync for RawAtomicPod<T> where T::Raw: AtomicRaw + Send {}
-unsafe impl<T: RawReg> Send for RawAtomicPod<T> where T::Raw: AtomicRaw + Send {}
+unsafe impl<T: AtomicPod> Sync for RawAtomicPod<T> where T::Raw: AtomicRaw + Send {}
+unsafe impl<T: AtomicPod> Send for RawAtomicPod<T> where T::Raw: AtomicRaw + Send {}
 
-impl<T: RawReg> RawAtomicPod<T>
+impl<T: AtomicPod> RawAtomicPod<T>
 where
     T::Raw: AtomicRaw,
 {
@@ -54,8 +55,19 @@ where
     };
 
     #[inline]
-    pub const fn new_raw(init: T::Raw) -> Self {
-        Self::_LAYOUT_OK;
+    pub fn new_raw(init: T::Raw) -> Self {
+        let () = Self::_LAYOUT_OK;
+        Self {
+            raw: UnsafeCell::new(T::canonicalize_raw(init)),
+            _phantom: PhantomData,
+        }
+    }
+
+    #[inline]
+    /// # Safety
+    /// Caller must ensure `init` is already canonical for `T`.
+    pub const unsafe fn new_raw_unchecked(init: T::Raw) -> Self {
+        let () = Self::_LAYOUT_OK;
         Self {
             raw: UnsafeCell::new(init),
             _phantom: PhantomData,
@@ -64,9 +76,9 @@ where
 
     #[inline]
     pub fn new(init: T) -> Self {
-        Self::_LAYOUT_OK;
+        let () = Self::_LAYOUT_OK;
         Self {
-            raw: UnsafeCell::new(init.to_raw()),
+            raw: UnsafeCell::new(T::canonicalize_raw(init.to_raw())),
             _phantom: PhantomData,
         }
     }
@@ -84,37 +96,56 @@ where
     pub fn load(&self, order: Ordering) -> T {
         if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
-            T::from_raw(<T::Raw as AtomicRaw>::load(a, order))
+            T::from_raw(T::canonicalize_raw(<T::Raw as AtomicRaw>::load(a, order)))
         } else {
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            T::from_raw(unsafe { *self.raw.get() })
+            T::from_raw(T::canonicalize_raw(unsafe { *self.raw.get() }))
         }
     }
 
     #[inline]
     pub fn store(&self, val: T, order: Ordering) {
+        let val_raw = T::canonicalize_raw(val.to_raw());
         if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
-            <T::Raw as AtomicRaw>::store(a, val.to_raw(), order);
+            <T::Raw as AtomicRaw>::store(a, val_raw, order);
         } else {
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = val.to_raw() };
+            unsafe { *self.raw.get() = val_raw };
         }
     }
 
     #[inline]
     pub fn swap(&self, val: T, order: Ordering) -> T {
+        let val_raw = T::canonicalize_raw(val.to_raw());
         if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
-            T::from_raw(<T::Raw as AtomicRaw>::swap(a, val.to_raw(), order))
+            T::from_raw(T::canonicalize_raw(<T::Raw as AtomicRaw>::swap(
+                a, val_raw, order,
+            )))
         } else {
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
-            unsafe { *self.raw.get() = val.to_raw() };
-            T::from_raw(old)
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+            unsafe { *self.raw.get() = val_raw };
+            T::from_raw(T::canonicalize_raw(old))
         }
     }
 
+    #[inline]
+    pub fn get_mut_raw(&mut self) -> &mut T::Raw {
+        // This is always safe because &mut self guarantees exclusivity.
+        //
+        // Callers must only write canonical values. If non-canonical values are written,
+        // CAS stability is not guaranteed until the value is repaired by a CAS path.
+        self.raw.get_mut()
+    }
+}
+
+impl<T: RawReg + 'static> RawAtomicPod<T>
+where
+    T::Raw: AtomicRaw,
+{
     #[inline]
     pub fn fetch_or(&self, val: T, order: Ordering) -> T
     where
@@ -127,6 +158,7 @@ where
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
             let new = old | val.to_raw();
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -144,6 +176,7 @@ where
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
             let new = old & val.to_raw();
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -161,19 +194,14 @@ where
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
             let new = old ^ val.to_raw();
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
     }
-
-    #[inline]
-    pub fn get_mut_raw(&mut self) -> &mut T::Raw {
-        // This is always safe because &mut self guarantees exclusivity.
-        self.raw.get_mut()
-    }
 }
 
-impl<T: RawReg> RawAtomicPod<T>
+impl<T: RawReg + 'static> RawAtomicPod<T>
 where
     T::Raw: AtomicRawInt,
 {
@@ -190,6 +218,7 @@ where
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
             let new = (Wrapping(old) + Wrapping(val.to_raw())).0;
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -208,6 +237,7 @@ where
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
             let new = (Wrapping(old) - Wrapping(val.to_raw())).0;
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -239,6 +269,7 @@ where
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             let old = unsafe { *self.raw.get() };
             let new = (Wrapping(old) * Wrapping(val.to_raw())).0;
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -257,6 +288,7 @@ where
             let old = unsafe { *self.raw.get() };
             let val_raw = val.to_raw();
             let new = core::cmp::min(old, val_raw);
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -275,6 +307,7 @@ where
             let old = unsafe { *self.raw.get() };
             let val_raw = val.to_raw();
             let new = core::cmp::max(old, val_raw);
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
@@ -293,13 +326,14 @@ where
             let old = unsafe { *self.raw.get() };
             let val_raw = val.to_raw();
             let new = !(old & val_raw);
+            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
             unsafe { *self.raw.get() = new };
             T::from_raw(old)
         }
     }
 }
 
-impl<T: RawReg> RawAtomicPod<T>
+impl<T: AtomicPod> RawAtomicPod<T>
 where
     T::Raw: AtomicRaw + PartialEq,
 {
@@ -311,25 +345,48 @@ where
         success: Ordering,
         failure: Ordering,
     ) -> Result<T, T> {
+        let cur = T::canonicalize_raw(current.to_raw());
+        let new = T::canonicalize_raw(new.to_raw());
+
         if crate::raw_atomics_enabled() {
             let a = self.atomic_ref();
-            <T::Raw as AtomicRaw>::compare_exchange(
-                a,
-                current.to_raw(),
-                new.to_raw(),
-                success,
-                failure,
-            )
-            .map(T::from_raw)
-            .map_err(T::from_raw)
+
+            let mut observed = <T::Raw as AtomicRaw>::load(a, Ordering::Relaxed);
+            loop {
+                let observed_can = T::canonicalize_raw(observed);
+                if observed == observed_can {
+                    break;
+                }
+                match <T::Raw as AtomicRaw>::compare_exchange_weak(
+                    a,
+                    observed,
+                    observed_can,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+
+            <T::Raw as AtomicRaw>::compare_exchange(a, cur, new, success, failure)
+                .map(|prev| T::from_raw(T::canonicalize_raw(prev)))
+                .map_err(|prev| T::from_raw(T::canonicalize_raw(prev)))
         } else {
             // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let cur = unsafe { *self.raw.get() };
-            if cur == current.to_raw() {
-                unsafe { *self.raw.get() = new.to_raw() };
-                Ok(T::from_raw(cur))
+            let stored = unsafe { *self.raw.get() };
+            let stored_can = T::canonicalize_raw(stored);
+            if stored != stored_can {
+                // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+                unsafe { *self.raw.get() = stored_can };
+            }
+
+            if stored_can == cur {
+                // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+                unsafe { *self.raw.get() = new };
+                Ok(T::from_raw(stored_can))
             } else {
-                Err(T::from_raw(cur))
+                Err(T::from_raw(stored_can))
             }
         }
     }
@@ -338,9 +395,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::ptr::NonNull;
     use core::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::thread;
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(transparent)]
+    struct MaskedU32(u32);
+
+    unsafe impl typestate::AtomicPod for MaskedU32 {
+        type Raw = u32;
+
+        #[inline]
+        fn to_raw(self) -> Self::Raw {
+            self.0
+        }
+
+        #[inline]
+        fn from_raw(raw: Self::Raw) -> Self {
+            Self(raw)
+        }
+
+        #[inline]
+        fn canonicalize_raw(raw: Self::Raw) -> Self::Raw {
+            raw & 0xFFFF_FF00
+        }
+    }
 
     #[test]
     fn raw_atomic_pod_non_atomic_fetch_add_wraps() {
@@ -400,5 +481,43 @@ mod tests {
 
             assert_eq!(pod.load(Ordering::Relaxed), (threads * iters) as u32);
         });
+    }
+
+    #[test]
+    fn raw_atomic_pod_canonicalizes_store_and_compare_exchange() {
+        for enabled in [false, true] {
+            crate::with_raw_atomics_mode(enabled, || {
+                let pod = RawAtomicPod::new(MaskedU32(0x1234_5678));
+                assert_eq!(pod.load(Ordering::Relaxed), MaskedU32(0x1234_5600));
+
+                pod.store(MaskedU32(0xABCD_EF12), Ordering::Relaxed);
+                assert_eq!(pod.load(Ordering::Relaxed), MaskedU32(0xABCD_EF00));
+
+                let result = pod.compare_exchange(
+                    MaskedU32(0xABCD_EFFF),
+                    MaskedU32(0xCAFE_BA7F),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                assert_eq!(result, Ok(MaskedU32(0xABCD_EF00)));
+                assert_eq!(pod.load(Ordering::Relaxed), MaskedU32(0xCAFE_BA00));
+            });
+        }
+    }
+
+    #[cfg(target_has_atomic = "ptr")]
+    #[test]
+    fn raw_atomic_pod_option_nonnull_compare_exchange() {
+        for enabled in [false, true] {
+            crate::with_raw_atomics_mode(enabled, || {
+                let pod = RawAtomicPod::new(None::<NonNull<u8>>);
+                let mut x = 42u8;
+                let ptr = Some(NonNull::from(&mut x));
+
+                let result = pod.compare_exchange(None, ptr, Ordering::AcqRel, Ordering::Acquire);
+                assert_eq!(result, Ok(None));
+                assert_eq!(pod.load(Ordering::Relaxed), ptr);
+            });
+        }
     }
 }

@@ -992,7 +992,7 @@ fn write_be_u32s(
     Ok(())
 }
 
-static ALREADY_PANICKED: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static ALREADY_PANICKED: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

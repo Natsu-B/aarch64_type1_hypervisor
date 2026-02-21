@@ -127,7 +127,7 @@ macro_rules! percpu {
 }
 
 const CPU_IF_UNINIT: u8 = u8::MAX;
-static CPU_IF_COUNTER: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
+static CPU_IF_COUNTER: RawAtomicPod<u8> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
 percpu! {
     static TLS_CPU_IF: Cell<u8> = Cell::new(CPU_IF_UNINIT);

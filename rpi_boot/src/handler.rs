@@ -272,7 +272,7 @@ const LOG_PASSTHROUGH_ERR: u32 = 1 << 2;
 const LOG_EOI_ERR: u32 = 1 << 3;
 const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
-static IRQ_LOG_ONCE: RawAtomicPod<u32> = RawAtomicPod::new_raw(0);
+static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
 fn irq_handler(_regs: &mut cpu::Registers) {
     let Some(gicv2) = gic() else {

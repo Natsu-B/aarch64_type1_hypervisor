@@ -18,13 +18,14 @@ const NAK_ATTEMPTS: usize = 32;
 const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
 // Publish debug entry state without relying on higher-level locking.
-static DEBUG_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static DEBUG_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 // Set once a GDB session handshake has completed and we should emit async stop replies.
-static DEBUG_SESSION_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static DEBUG_SESSION_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 // Tracks whether we've completed an initial RSP handshake at least once.
-static DEBUG_SESSION_INITIALIZED: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
-static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
-static ATTACH_REASON: RawAtomicPod<u8> = RawAtomicPod::new_raw(0);
+static DEBUG_SESSION_INITIALIZED: RawAtomicPod<bool> =
+    unsafe { RawAtomicPod::new_raw_unchecked(false) };
+static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
+static ATTACH_REASON: RawAtomicPod<u8> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
 struct RxRing<const N: usize> {
     buf: [u8; N],
@@ -80,7 +81,7 @@ struct GdbUartState<const N: usize> {
 }
 
 // SAFETY: `GDB_UART_READY` publishes initialization completion with Release ordering.
-static GDB_UART_READY: RawAtomicPod<bool> = RawAtomicPod::new_raw(false);
+static GDB_UART_READY: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 // SAFETY: mutated only with interrupts disabled (IRQ-save lock).
 static GDB_UART_STATE: RawSpinLockIrqSave<MaybeUninit<GdbUartState<RX_RING_SIZE>>> =
     RawSpinLockIrqSave::new(MaybeUninit::uninit());

@@ -62,8 +62,8 @@ impl MemoryAccess for Stage2Memory {
 type GdbStub = Aarch64GdbStub<Stage2Memory, MAX_GDB_PKT, MAX_GDB_TX_CAP>;
 
 static GDB_STUB: SyncUnsafeCell<MaybeUninit<GdbStub>> = SyncUnsafeCell::new(MaybeUninit::uninit());
-static GUEST_IPA_BASE: RawAtomicPod<u64> = RawAtomicPod::new_raw(0);
-static GUEST_IPA_SIZE: RawAtomicPod<u64> = RawAtomicPod::new_raw(0);
+static GUEST_IPA_BASE: RawAtomicPod<u64> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
+static GUEST_IPA_SIZE: RawAtomicPod<u64> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 static MEMORY_MAP_BUF: SyncUnsafeCell<[u8; 1024]> = SyncUnsafeCell::new([0; 1024]);
 
 pub fn set_guest_ipa_window(ipa_base: u64, ipa_size: u64) {
