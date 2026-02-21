@@ -11,7 +11,7 @@ use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::GicError;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::gicv2::Gicv2;
-use arch_hal::gic::gicv2::vgic_frontend::Gicv2AccessSize;
+use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::println;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
