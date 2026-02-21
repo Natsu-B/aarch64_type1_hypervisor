@@ -386,6 +386,24 @@ pub trait GicDistributor {
     /// Toggle forwarding of a single SPI only (no attribute changes).
     fn set_spi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError>;
 
+    /// Update routing for a single SPI only (no attribute changes).
+    ///
+    /// This method must only update the routing field (for example, GICv2 `GICD_ITARGETSRn`
+    /// or GICv3 `GICD_IROUTERn`).
+    ///
+    /// Implementations must not:
+    /// - clear pending or active state,
+    /// - change priority,
+    /// - change trigger mode,
+    /// - change interrupt group.
+    ///
+    /// Implementations must validate that `intid` is an SPI (`>= 32` and `< max_intid`) and
+    /// return `GicError::UnsupportedIntId` otherwise.
+    ///
+    /// If the backend cannot represent the requested route mode, it must return
+    /// `GicError::UnsupportedFeature`.
+    fn set_spi_route(&self, intid: u32, route: SpiRoute) -> Result<(), GicError>;
+
     /// Configure a single SPI in the Distributor.
     ///
     /// Implementations may temporarily disable the interrupt while reprogramming attributes.
@@ -405,6 +423,7 @@ pub trait GicDistributor {
         route: SpiRoute,
         enable: EnableOp,
     ) -> Result<(), GicError>;
+
     /// Set or clear the pending state of an interrupt in the Distributor.
     ///
     /// This is primarily intended for:
