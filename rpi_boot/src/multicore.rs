@@ -1,6 +1,7 @@
 use crate::GICV2_DRIVER;
 use crate::GLOBAL_ALLOCATOR;
 use crate::SPSR_EL2_M_EL1H;
+use crate::vgic;
 use alloc::vec;
 use alloc::vec::Vec;
 use arch_hal::cpu;
@@ -182,6 +183,8 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters, tls_space: *
             eoi_mode: arch_hal::gic::EoiMode::DropOnly,
         })
         .unwrap();
+
+    vgic::on_cpu_online(gicv2).unwrap();
 
     cpu::enable_irq_fiq();
     println!("ap_main setup DONE!!!");

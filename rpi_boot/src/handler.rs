@@ -271,6 +271,7 @@ const LOG_PIRQ_ERR: u32 = 1 << 1;
 const LOG_PASSTHROUGH_ERR: u32 = 1 << 2;
 const LOG_EOI_ERR: u32 = 1 << 3;
 const LOG_DEACT_ERR: u32 = 1 << 4;
+const LOG_KICK_ERR: u32 = 1 << 5;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = RawAtomicPod::new_raw(0);
 
 fn irq_handler(_regs: &mut cpu::Registers) {
@@ -280,10 +281,19 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     let Ok(Some(irq)) = gicv2.acknowledge() else {
         return;
     };
+    let mut is_hypervisor_owned = false;
     if Some(irq.intid) == vgic::maintenance_intid() {
+        is_hypervisor_owned = true;
         if let Err(err) = vgic::handle_maintenance_irq() {
             if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
                 println!("vgic: maintenance IRQ failed: {:?}", err);
+            }
+        }
+    } else if irq.intid == vgic::kick_sgi_intid() {
+        is_hypervisor_owned = true;
+        if let Err(err) = vgic::handle_kick_sgi() {
+            if IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0 {
+                println!("vgic: kick SGI handling failed: {:?}", err);
             }
         }
     } else {
@@ -291,6 +301,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         match vgic::on_physical_irq(PIntId(irq.intid), level) {
             Ok(()) => {}
             Err(GicError::UnsupportedIntId) => {
+                is_hypervisor_owned = true;
                 if let Err(err) = vgic::passthrough_physical_irq(irq.intid, level) {
                     if IRQ_LOG_ONCE.fetch_or(LOG_PASSTHROUGH_ERR, Ordering::Relaxed)
                         & LOG_PASSTHROUGH_ERR
@@ -301,6 +312,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
                 }
             }
             Err(err) => {
+                is_hypervisor_owned = true;
                 if IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0 {
                     println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
                 }
@@ -312,9 +324,11 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             println!("gic: end_of_interrupt failed: {:?}", err);
         }
     }
-    if let Err(err) = gicv2.deactivate(irq) {
-        if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
-            println!("gic: deactivate failed: {:?}", err);
+    if is_hypervisor_owned {
+        if let Err(err) = gicv2.deactivate(irq) {
+            if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
+                println!("gic: deactivate failed: {:?}", err);
+            }
         }
     }
 }

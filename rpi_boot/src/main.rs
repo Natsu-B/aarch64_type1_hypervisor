@@ -453,7 +453,7 @@ extern "C" fn main() -> ! {
             enable_group0: caps.supports_group0,
             enable_group1: true,
             binary_point: arch_hal::gic::BinaryPoint::Common(caps.binary_points_min),
-            eoi_mode: arch_hal::gic::EoiMode::DropAndDeactivate,
+            eoi_mode: arch_hal::gic::EoiMode::DropOnly,
         })
         .unwrap();
 
