@@ -1,16 +1,15 @@
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::cpu;
 use arch_hal::gic;
-use arch_hal::gic::EnableOp;
 use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
+use arch_hal::gic::GicPpi;
 use arch_hal::gic::GicSgi;
 use arch_hal::gic::IrqGroup;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::SgiTarget;
 use arch_hal::gic::SpiRoute;
-use arch_hal::gic::TriggerMode;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VSpiRouting;
 use arch_hal::gic::VcpuId;
@@ -55,6 +54,16 @@ const VCPU_COUNT: usize = 4;
 const DEFAULT_SPI_PRIORITY: u8 = 0x80;
 const KICK_SGI_ID: u8 = 15;
 const KICK_INTID: u32 = KICK_SGI_ID as u32;
+
+fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
+    for ppi in 16..32 {
+        if matches!(ppi, 25 | 26 | 29) {
+            continue;
+        }
+        gic.set_ppi_enable(ppi, true)?;
+    }
+    Ok(())
+}
 
 fn current_vcpu_id() -> Result<VcpuId, GicError> {
     let core_id = cpu::get_current_core_id();
@@ -119,19 +128,7 @@ unsafe fn hook_toggle_passthrough_spi(
     let Some(gic) = handler::gic() else {
         return Err(GicError::InvalidState);
     };
-    let enable_op = if enable {
-        EnableOp::Enable
-    } else {
-        EnableOp::Disable
-    };
-    gic.configure_spi(
-        pintid.0,
-        IrqGroup::Group1,
-        DEFAULT_SPI_PRIORITY,
-        TriggerMode::Level,
-        SpiRoute::Specific(cpu::get_current_core_id()),
-        enable_op,
-    )
+    gic.set_spi_enable(pintid.0, enable)
 }
 
 unsafe fn hook_route_passthrough_spi(
@@ -156,18 +153,12 @@ unsafe fn hook_route_passthrough_spi(
         }
     };
     let affinity = vcpu_id_to_affinity(target)?;
-    gic.configure_spi(
-        pintid.0,
-        IrqGroup::Group1,
-        DEFAULT_SPI_PRIORITY,
-        TriggerMode::Level,
-        SpiRoute::Specific(affinity),
-        EnableOp::Keep,
-    )
+    gic.set_spi_route(pintid.0, SpiRoute::Specific(affinity))
 }
 
 pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<(), &'static str> {
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
+    enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
 
     let mut guard = VGIC_VM.lock_irqsave();
     if guard.is_some() {
@@ -253,6 +244,8 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
 }
 
 pub fn on_cpu_online(gic: &Gicv2) -> Result<(), GicError> {
+    enable_guest_ppis(gic)?;
+
     let mut guard = VGIC_VM.lock_irqsave();
     let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
     let vcpu_id = current_vcpu_id()?;

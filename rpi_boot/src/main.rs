@@ -583,6 +583,7 @@ extern "C" fn main() -> ! {
     cpu::clean_dcache_poc(DTB_ADDR.get() as usize, size_of::<usize>());
 
     cpu::invalidate_icache_all();
+    setup_guest_sysreg_passthrough_policy();
 
     let el1_main = el1_main as *const fn() as usize as u64;
     let stack_addr =
@@ -626,6 +627,30 @@ fn be_bytes_to_u64(bytes: &[u8]) -> Option<u64> {
         8 => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
         _ => None,
     }
+}
+
+fn setup_guest_sysreg_passthrough_policy() {
+    const CNTHCTL_EL2_EL1PCTEN: u64 = 1 << 0;
+    const CNTHCTL_EL2_EL1PCEN: u64 = 1 << 1;
+    const MDCR_EL2_TPMCR: u64 = 1 << 5;
+    const MDCR_EL2_TPM: u64 = 1 << 6;
+
+    // Allow EL1 access to the physical counter/timer interface when passing through PPI 30.
+    // This assumes non-VHE (E2H=0); with E2H=1, the CNTHCTL_EL2 field positions shift by 10.
+    let mut cnthctl_el2 = cpu::get_cnthctl_el2();
+    cnthctl_el2 |= CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1PCEN;
+    cpu::set_cnthctl_el2(cnthctl_el2);
+
+    // Keep timer offset policy explicit and consistent across BSP/APs.
+    cpu::set_cntvoff_el2(0);
+
+    // Leave PMU counters control (HPMN, etc.) unchanged, but let EL1/EL0 PMU sysregs run
+    // without trapping if PMU overflow PPI 23 is enabled/passed through.
+    let mut mdcr_el2 = cpu::get_mdcr_el2();
+    mdcr_el2 &= !(MDCR_EL2_TPM | MDCR_EL2_TPMCR);
+    cpu::set_mdcr_el2(mdcr_el2);
+
+    cpu::isb();
 }
 
 fn remove_initrd(tree: &mut DeviceTree<'_>, chosen: NodeId) -> Option<(u64, u64)> {
