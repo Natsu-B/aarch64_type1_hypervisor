@@ -19,7 +19,7 @@ use typestate::Readable;
 use typestate::Writable;
 
 impl Gicv2 {
-    pub fn create_vm_model<const VCPUS: usize>(
+    pub(crate) fn create_vm_model<const VCPUS: usize>(
         &self,
         vcpu_num: u8,
     ) -> Result<GicVmModelForVcpus<VCPUS>, GicError>

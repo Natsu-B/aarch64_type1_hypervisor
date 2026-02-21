@@ -105,13 +105,13 @@ impl<T: Copy, const N: usize> FixedSortedArray<T, N> {
     fn as_slice(&self) -> &[T] {
         // SAFETY:
         // - `self.len <= N` is an invariant of `FixedSortedArray`.
-        // - The first `self.len` entries of `buf` are initialised to valid `T` values by
-        //   insert/remove operations.
-        // - `MaybeUninit<T>` has the same layout as `T`, so casting the pointer is valid.
+        // - The first `self.len` entries of `buf` are initialized by insert/remove operations.
+        // - `MaybeUninit<T>` has the same layout as `T`.
         let ptr = self.buf.as_ptr() as *const T;
         unsafe { core::slice::from_raw_parts(ptr, self.len) }
     }
 
+    #[cfg(test)]
     fn iter(&self) -> core::slice::Iter<'_, T> {
         self.as_slice().iter()
     }

@@ -166,6 +166,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_by_vintid(&self, vintid: VIntId) -> Result<Option<PIntId>, GicError> {
         let idx = self.vindex(vintid)?;
         Ok(self.v2p[idx])

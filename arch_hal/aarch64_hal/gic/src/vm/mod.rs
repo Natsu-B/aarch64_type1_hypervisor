@@ -22,6 +22,7 @@ pub use crate::vm::common::pirq::PirqHooks;
 use crate::vm::vcpu::GicVCpuGeneric;
 
 pub(crate) mod common;
+pub mod manager;
 mod v2_ext;
 pub(crate) mod vcpu;
 
@@ -34,7 +35,7 @@ pub const fn pending_cap_for_vcpus(vcpus: usize) -> usize {
 }
 
 /// Virtual Distributor model: per-vCPU private state for INTIDs 0-31 and shared SPI state for 32+.
-pub struct GicVmModelGeneric<const VCPUS: usize, V: VgicVcpuModel>
+pub(crate) struct GicVmModelGeneric<const VCPUS: usize, V: VgicVcpuModel>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
@@ -43,7 +44,7 @@ where
     v2: V2SgiState<VCPUS>,
 }
 
-pub type GicVmModelForVcpus<const VCPUS: usize> = GicVmModelGeneric<
+pub(crate) type GicVmModelForVcpus<const VCPUS: usize> = GicVmModelGeneric<
     VCPUS,
     GicVCpuGeneric<
         VCPUS,
@@ -69,7 +70,7 @@ where
 {
     /// Construct a VM with vCPU ids fixed to `VcpuId(0..vcpu_count-1)`; callers must not assume
     /// alternative vCPU id mappings when using this backend.
-    pub fn new(vcpu_count: u16) -> Result<Self, GicError> {
+    pub(crate) fn new(vcpu_count: u16) -> Result<Self, GicError> {
         Self::new_with(vcpu_count, |id| GicVCpuGeneric::with_id(id))
     }
 }
@@ -85,7 +86,10 @@ where
 
     /// Construct a VM with vCPU ids fixed to `VcpuId(0..vcpu_count-1)`; custom mappings are not
     /// supported because CPUID fields and banked Distributor state rely on contiguous ids.
-    pub fn new_with(vcpu_count: u16, make: impl FnMut(VcpuId) -> V) -> Result<Self, GicError> {
+    pub(crate) fn new_with(
+        vcpu_count: u16,
+        make: impl FnMut(VcpuId) -> V,
+    ) -> Result<Self, GicError> {
         let vcpu_count_usize = vcpu_count as usize;
         if vcpu_count_usize == 0 {
             return Err(GicError::InvalidVcpuId);
@@ -94,10 +98,10 @@ where
             return Err(GicError::OutOfResources);
         }
 
-        let common = VmCommon::new(vcpu_count_usize, make)?;
-        let v2 = V2SgiState::new();
-
-        Ok(Self { common, v2 })
+        Ok(Self {
+            common: VmCommon::new(vcpu_count_usize, make)?,
+            v2: V2SgiState::new(),
+        })
     }
 
     fn update_for_scope(scope: VgicIrqScope, changed: bool) -> VgicUpdate {
@@ -114,11 +118,15 @@ where
         }
     }
 
-    pub fn set_pirq_hooks(&mut self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
+    pub(crate) fn set_pirq_hooks(
+        &mut self,
+        pintid: PIntId,
+        hooks: PirqHooks,
+    ) -> Result<(), GicError> {
         self.common.pirq_hooks.set(pintid, hooks)
     }
 
-    pub fn dispatch_pirq_notifications(
+    pub(crate) fn dispatch_pirq_notifications(
         &mut self,
         notifs: &crate::PirqNotifications,
     ) -> Result<(), GicError> {

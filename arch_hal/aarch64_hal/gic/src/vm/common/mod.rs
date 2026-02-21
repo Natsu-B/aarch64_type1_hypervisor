@@ -83,14 +83,6 @@ where
         self.irq_state.irq_attrs(scope, vintid)
     }
 
-    pub(crate) fn irq_trigger(
-        &self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-    ) -> Result<crate::TriggerMode, GicError> {
-        self.irq_state.trigger(scope, vintid)
-    }
-
     pub(crate) fn targets_for_global_spi(&self, vintid: VIntId) -> Result<VcpuMask, GicError> {
         self.routing.targets_for_spi(vintid, self.vcpu_count())
     }
