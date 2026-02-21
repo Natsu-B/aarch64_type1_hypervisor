@@ -61,6 +61,7 @@ use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
+use arch_hal::tls;
 use core::alloc::Layout;
 use core::arch::naked_asm;
 use core::cell::SyncUnsafeCell;
@@ -70,7 +71,7 @@ use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
-use core::ptr;
+use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts;
 use core::slice;
 use core::usize;
@@ -92,6 +93,8 @@ unsafe extern "C" {
     static mut _PROGRAM_START: usize;
     static mut _PROGRAM_END: usize;
     static mut _STACK_TOP: usize;
+    static mut __el2_tls_bsp_start: usize;
+    static mut __el2_tls_bsp_end: usize;
 }
 
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
@@ -176,6 +179,8 @@ extern "C" fn _start() {
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let program_start = &raw mut _PROGRAM_START as *const _ as usize;
     let stack_start = &raw mut _STACK_TOP as *const _ as usize;
+    let el2_tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
+    let el2_tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
 
     let args = unsafe { slice::from_raw_parts(argv, argc) };
     let dtb_ptr =
@@ -246,6 +251,16 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
     debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
     gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+    let tls_result = unsafe {
+        tls::init_current_cpu(
+            NonNull::new_unchecked(el2_tls_bsp_start as *mut u8),
+            el2_tls_bsp_start - el2_tls_bsp_end,
+        )
+    };
+    if let Err(err) = tls_result {
+        println!("tls init failed: {:?}", err);
+        panic!("tls init failed");
+    }
     debug::init_gdb_stub();
     println!(
         "debug uart starting (guest console @ 0x{:X})...\r\n",
