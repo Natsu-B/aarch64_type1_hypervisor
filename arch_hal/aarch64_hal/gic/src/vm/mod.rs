@@ -53,8 +53,6 @@ pub type GicVmModelForVcpus<const VCPUS: usize> = GicVmModelGeneric<
     >,
 >;
 
-pub type GicVmModelWithVcpuForVcpus<const VCPUS: usize, V> = GicVmModelGeneric<VCPUS, V>;
-
 impl<const VCPUS: usize>
     GicVmModelGeneric<
         VCPUS,
@@ -748,7 +746,7 @@ mod tests {
         }
     }
 
-    type RecordingVm = GicVmModelWithVcpuForVcpus<TEST_VCPUS, RecordingVcpu>;
+    type RecordingVm = GicVmModelGeneric<TEST_VCPUS, RecordingVcpu>;
 
     fn recording_vm(vcpu_count: u16) -> RecordingVm {
         RecordingVm::new_with(vcpu_count, |id| RecordingVcpu::new(id)).unwrap()
@@ -763,7 +761,7 @@ mod tests {
         assert_wf::<GicVmModelForVcpus<4>>();
         assert_wf::<GicVmModelForVcpus<8>>();
         assert_wf::<GicVmModelForVcpus<16>>();
-        assert_wf::<GicVmModelWithVcpuForVcpus<4, RecordingVcpu>>();
+        assert_wf::<GicVmModelGeneric<4, RecordingVcpu>>();
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
