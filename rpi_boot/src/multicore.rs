@@ -8,6 +8,7 @@ use arch_hal::cpu;
 use arch_hal::cpu::CoreAffinity;
 use arch_hal::gic::GicCpuConfig;
 use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::VgicHw;
 use arch_hal::println;
 use arch_hal::psci::secure_monitor_call;
 use arch_hal::tls;
@@ -184,6 +185,7 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters, tls_space: *
         })
         .unwrap();
 
+    gicv2.hw_init().unwrap();
     vgic::on_cpu_online(gicv2).unwrap();
 
     cpu::enable_irq_fiq();
