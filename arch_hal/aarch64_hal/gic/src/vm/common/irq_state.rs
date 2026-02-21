@@ -431,15 +431,6 @@ where
         self.set_bool(scope, vintid, pending, BoolField::Pending)
     }
 
-    pub(crate) fn set_active(
-        &mut self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-        active: bool,
-    ) -> Result<bool, GicError> {
-        self.set_bool(scope, vintid, active, BoolField::Active)
-    }
-
     pub(crate) fn set_priority(
         &mut self,
         scope: VgicIrqScope,

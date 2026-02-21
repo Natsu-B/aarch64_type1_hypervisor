@@ -367,16 +367,6 @@ where
         Ok(update)
     }
 
-    fn set_active(
-        &mut self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-        active: bool,
-    ) -> Result<VgicUpdate, GicError> {
-        let changed = self.common.irq_state.set_active(scope, vintid, active)?;
-        Ok(Self::update_for_scope(scope, changed))
-    }
-
     fn read_group_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
         self.common.irq_state.read_group_word(scope, base)
     }
@@ -582,19 +572,6 @@ where
         Ok(Self::update_for_scope(scope, changed))
     }
 
-    fn read_nsacr_word(&self, _scope: VgicIrqScope, _base: VIntId) -> Result<u32, GicError> {
-        Ok(0)
-    }
-
-    fn write_nsacr_word(
-        &mut self,
-        _scope: VgicIrqScope,
-        _base: VIntId,
-        _value: u32,
-    ) -> Result<VgicUpdate, GicError> {
-        Ok(VgicUpdate::None)
-    }
-
     fn set_spi_route(
         &mut self,
         vintid: VIntId,
@@ -649,6 +626,7 @@ where
         self.map_pirq_inner(pintid, target, vintid, sense, group, priority)
     }
 
+    #[cfg(test)]
     fn unmap_pirq(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
         self.unmap_pirq_inner(pintid)
     }
@@ -715,10 +693,6 @@ mod tests {
 
     impl VgicVcpuModel for RecordingVcpu {
         fn set_resident(&self, _core: cpu::CoreAffinity) -> Result<(), GicError> {
-            Ok(())
-        }
-
-        fn clear_resident(&self, _core: cpu::CoreAffinity) -> Result<(), GicError> {
             Ok(())
         }
 

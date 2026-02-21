@@ -4,7 +4,6 @@ use super::common::LOCAL_INTID_COUNT;
 use super::pending_cap_for_vcpus;
 use crate::GicDistributor;
 use crate::GicError;
-use crate::GicPpi;
 use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
@@ -225,14 +224,11 @@ where
         })
     }
 
-    pub fn enable_guest_ppis(&self, ppi_if: &dyn GicPpi, ppis: &[u32]) -> Result<(), GicError> {
-        for &ppi in ppis {
-            ppi_if.set_ppi_enable(ppi, true)?;
-        }
-        Ok(())
-    }
-
-    pub fn apply_update<H: VgicHw>(&self, hw: &H, update: VgicUpdate) -> Result<(), GicError> {
+    pub(crate) fn apply_update<H: VgicHw>(
+        &self,
+        hw: &H,
+        update: VgicUpdate,
+    ) -> Result<(), GicError> {
         let VgicUpdate::Some { targets, work } = update else {
             return Ok(());
         };

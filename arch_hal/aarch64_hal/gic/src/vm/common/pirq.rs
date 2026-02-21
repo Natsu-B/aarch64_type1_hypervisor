@@ -126,6 +126,7 @@ where
         Ok(self.entries[idx])
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&mut self, pintid: PIntId) -> Result<Option<PirqEntry>, GicError> {
         let idx = self.index(pintid)?;
         let entry = self.entries[idx].take();
@@ -231,6 +232,7 @@ where
         Ok(update)
     }
 
+    #[cfg(test)]
     pub(crate) fn unmap_pirq_inner(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
         let entry = match self.common.pirqs.take(pintid) {
             Ok(Some(entry)) => entry,

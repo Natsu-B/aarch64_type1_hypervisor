@@ -17,8 +17,10 @@ use typestate::Readable;
 mod cpu_interface;
 mod distributor;
 pub mod registers;
-pub mod vgic_frontend;
+pub(crate) mod vgic_frontend;
 pub mod virtualization;
+pub use vgic_frontend::Gicv2AccessSize;
+pub use vgic_frontend::Gicv2DistIdRegs;
 
 pub const GICV2_GICD_FRAME_SIZE: usize = size_of::<GicV2Distributor>();
 pub const GICV2_GICC_FRAME_SIZE: usize = size_of::<GicV2CpuInterface>();

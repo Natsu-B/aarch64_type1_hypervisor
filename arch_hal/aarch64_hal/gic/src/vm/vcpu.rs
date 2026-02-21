@@ -102,6 +102,7 @@ impl<T: Copy, const N: usize> FixedSortedArray<T, N> {
         self.len == 0
     }
 
+    #[cfg(test)]
     fn as_slice(&self) -> &[T] {
         // SAFETY:
         // - `self.len <= N` is an invariant of `FixedSortedArray`.
@@ -359,18 +360,6 @@ impl<
                 self.need_refill.store(true, AtomicOrdering::Release);
                 Ok(())
             }
-        }
-    }
-
-    fn clear_resident(&self, core: CoreAffinity) -> Result<(), GicError> {
-        let mut inner = self.inner.lock_irqsave();
-        match inner.resident {
-            None => Ok(()),
-            Some(existing) if existing == core => {
-                inner.resident = None;
-                Ok(())
-            }
-            Some(_) => Err(GicError::InvalidState),
         }
     }
 

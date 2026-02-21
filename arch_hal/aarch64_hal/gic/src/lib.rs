@@ -953,7 +953,7 @@ pub enum VSpiRouting {
 }
 
 /// VM identity helpers shared by vGIC traits.
-pub trait VgicVmInfo {
+pub(crate) trait VgicVmInfo {
     type VcpuModel: VgicVcpuModel;
 
     fn vcpu_count(&self) -> u16;
@@ -961,7 +961,7 @@ pub trait VgicVmInfo {
 }
 
 /// Guest-visible virtual register file (Distributor/Redistributor) backed by a VM model.
-pub trait VgicGuestRegs: VgicVmInfo {
+pub(crate) trait VgicGuestRegs: VgicVmInfo {
     fn set_dist_enable(
         &mut self,
         enable_grp0: bool,
@@ -998,12 +998,6 @@ pub trait VgicGuestRegs: VgicVmInfo {
         scope: VgicIrqScope,
         vintid: VIntId,
         pending: bool,
-    ) -> Result<VgicUpdate, GicError>;
-    fn set_active(
-        &mut self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-        active: bool,
     ) -> Result<VgicUpdate, GicError>;
 
     fn read_group_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
@@ -1070,13 +1064,6 @@ pub trait VgicGuestRegs: VgicVmInfo {
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError>;
-    fn read_nsacr_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
-    fn write_nsacr_word(
-        &mut self,
-        scope: VgicIrqScope,
-        base: VIntId,
-        value: u32,
-    ) -> Result<VgicUpdate, GicError>;
 
     fn set_spi_route(
         &mut self,
@@ -1087,7 +1074,7 @@ pub trait VgicGuestRegs: VgicVmInfo {
 }
 
 /// SGI pending source register helpers (CPENDSGIR/SPENDSGIR/SGIR).
-pub trait VgicSgiRegs: VgicVmInfo {
+pub(crate) trait VgicSgiRegs: VgicVmInfo {
     fn read_sgi_pending_sources_word(&self, target: VcpuId, sgi: u8) -> Result<u32, GicError>;
     fn write_set_sgi_pending_sources_word(
         &mut self,
@@ -1101,44 +1088,6 @@ pub trait VgicSgiRegs: VgicVmInfo {
         word: u8,
         sources: u32,
     ) -> Result<VgicUpdate, GicError>;
-
-    fn write_set_sgi_pending_sources(
-        &mut self,
-        target: VcpuId,
-        word: u8,
-        sources: VcpuMask,
-    ) -> Result<VgicUpdate, GicError> {
-        let mut bits = 0u32;
-        for (idx, set) in sources.0.iter().enumerate() {
-            if !*set {
-                continue;
-            }
-            if idx >= u32::BITS as usize {
-                return Err(GicError::InvalidVcpuId);
-            }
-            bits |= 1u32 << idx;
-        }
-        self.write_set_sgi_pending_sources_word(target, word, bits)
-    }
-
-    fn write_clear_sgi_pending_sources(
-        &mut self,
-        target: VcpuId,
-        word: u8,
-        sources: VcpuMask,
-    ) -> Result<VgicUpdate, GicError> {
-        let mut bits = 0u32;
-        for (idx, set) in sources.0.iter().enumerate() {
-            if !*set {
-                continue;
-            }
-            if idx >= u32::BITS as usize {
-                return Err(GicError::InvalidVcpuId);
-            }
-            bits |= 1u32 << idx;
-        }
-        self.write_clear_sgi_pending_sources_word(target, word, bits)
-    }
 
     fn inject_sgi(
         &mut self,
@@ -1172,7 +1121,7 @@ pub trait VgicSgiRegs: VgicVmInfo {
 }
 
 /// Host-side physical IRQ mapping and ingress hooks.
-pub trait VgicPirqModel: VgicVmInfo {
+pub(crate) trait VgicPirqModel: VgicVmInfo {
     fn map_pirq(
         &mut self,
         pintid: PIntId,
@@ -1182,6 +1131,7 @@ pub trait VgicPirqModel: VgicVmInfo {
         group: IrqGroup,
         priority: u8,
     ) -> Result<VgicUpdate, GicError>;
+    #[cfg(test)]
     fn unmap_pirq(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError>;
     fn on_physical_irq(&mut self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError>;
 }
@@ -1192,7 +1142,7 @@ pub trait VgicPirqModel: VgicVmInfo {
 /// - `VgicGuestRegs` for guest-visible register emulation (groups/enables/pending/priority/routing).
 /// - `VgicSgiRegs` for SGI pending-source helpers and SGIR injection.
 /// - `VgicPirqModel` for host-side pIRQ mapping and physical interrupt ingress.
-pub trait VgicVmModel: VgicGuestRegs + VgicSgiRegs + VgicPirqModel {}
+pub(crate) trait VgicVmModel: VgicGuestRegs + VgicSgiRegs + VgicPirqModel {}
 
 impl<T> VgicVmModel for T where T: VgicGuestRegs + VgicSgiRegs + VgicPirqModel {}
 
@@ -1200,7 +1150,7 @@ impl<T> VgicVmModel for T where T: VgicGuestRegs + VgicSgiRegs + VgicPirqModel {
 ///
 /// This API never touches guest-facing MMIO/sysregs directly.
 /// It only decides "what to put into HW LRs" and "whether we must kick a running vCPU".
-pub trait VgicVcpuModel {
+pub(crate) trait VgicVcpuModel {
     /// Refill HW LRs from the software model for this vCPU.
     ///
     /// Returns `true` if the caller should request a "kick" (IPI) because the vCPU
@@ -1225,6 +1175,7 @@ pub trait VgicVcpuModel {
         hw: &H,
     ) -> Result<(VgicUpdate, PirqNotifications), GicError>;
 
+    #[cfg(test)]
     fn handle_maintenance<H: VgicHw>(
         &self,
         hw: &H,
@@ -1251,15 +1202,12 @@ pub trait VgicVcpuModel {
     /// current PE and before invoking `refill_lrs`/`handle_maintenance_*`.
     fn set_resident(&self, core: CoreAffinity) -> Result<(), GicError>;
 
-    /// Clear residency if the vCPU is currently resident on `core`.
-    fn clear_resident(&self, core: CoreAffinity) -> Result<(), GicError>;
-
     /// Switch out this vCPU's HW state from this PE, synchronizing HW to software state.
     fn switch_out_sync<H: VgicHw>(&self, hw: &H) -> Result<(), GicError>;
 }
 
 /// Minimal queue API exposed by vCPU models for the VM model to stage deliverable interrupts.
-pub trait VgicVcpuQueue {
+pub(crate) trait VgicVcpuQueue {
     fn enqueue_irq(&self, irq: VirtualInterrupt) -> Result<VgicWork, GicError>;
     fn cancel_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError>;
 }

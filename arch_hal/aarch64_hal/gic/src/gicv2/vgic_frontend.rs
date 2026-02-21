@@ -113,21 +113,17 @@ fn decode_sgir_targets(
     Ok(VcpuMask::from_bits(mask))
 }
 
-pub struct Gicv2Frontend<'a, M: VgicVmModel> {
+pub(crate) struct Gicv2Frontend<'a, M: VgicVmModel> {
     vgic_model: &'a mut M,
     dist_id: Gicv2DistIdRegs,
 }
 
 impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
-    pub fn new(vgic_model: &'a mut M, dist_id: Gicv2DistIdRegs) -> Self {
+    pub(crate) fn new(vgic_model: &'a mut M, dist_id: Gicv2DistIdRegs) -> Self {
         Self {
             vgic_model,
             dist_id,
         }
-    }
-
-    pub fn new_with_hw_gicd(vgic_model: &'a mut M, gicd: &GicV2Distributor) -> Self {
-        Self::new(vgic_model, Gicv2DistIdRegs::from_hw_gicd(gicd))
     }
 
     #[inline]
@@ -179,7 +175,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     /// Handle a trapped write to the guest vGIC Distributor register.
     ///
     /// 'offset' is byte offset within Distributor, 'value' is zero-extended to u32.
-    pub fn handle_distributor_write(
+    pub(crate) fn handle_distributor_write(
         &mut self,
         vcpu: VcpuId,
         offset: u32,
@@ -452,7 +448,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     /// Handle a trapped read from the guest vGIC Distributor register.
     ///
     /// 'offset' is byte offset within Distributor.
-    pub fn handle_distributor_read(
+    pub(crate) fn handle_distributor_read(
         &mut self,
         vcpu: VcpuId,
         offset: u32,
@@ -860,10 +856,6 @@ mod tests {
             Ok(())
         }
 
-        fn clear_resident(&self, _core: cpu::CoreAffinity) -> Result<(), GicError> {
-            Ok(())
-        }
-
         fn refill_lrs<H: crate::VgicHw>(&self, _hw: &H) -> Result<bool, GicError> {
             Ok(false)
         }
@@ -973,15 +965,6 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
-        fn set_active(
-            &mut self,
-            _scope: VgicIrqScope,
-            _vintid: VIntId,
-            _active: bool,
-        ) -> Result<VgicUpdate, GicError> {
-            Ok(VgicUpdate::None)
-        }
-
         fn read_group_word(&self, _scope: VgicIrqScope, _base: VIntId) -> Result<u32, GicError> {
             Ok(0)
         }
@@ -1079,19 +1062,6 @@ mod tests {
         }
 
         fn write_trigger_word(
-            &mut self,
-            _scope: VgicIrqScope,
-            _base: VIntId,
-            _value: u32,
-        ) -> Result<VgicUpdate, GicError> {
-            Ok(VgicUpdate::None)
-        }
-
-        fn read_nsacr_word(&self, _scope: VgicIrqScope, _base: VIntId) -> Result<u32, GicError> {
-            Ok(0)
-        }
-
-        fn write_nsacr_word(
             &mut self,
             _scope: VgicIrqScope,
             _base: VIntId,
