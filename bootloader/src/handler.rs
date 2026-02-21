@@ -17,7 +17,7 @@ use arch_hal::exceptions::memory_hook::MmioHandler;
 use arch_hal::exceptions::memory_hook::SplitPolicy;
 use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::gicv2::Gicv2;
-use arch_hal::gic::gicv2::vgic_frontend::Gicv2AccessSize;
+use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::println;
 use arch_hal::psci;
 use arch_hal::psci::PsciFunctionId;
