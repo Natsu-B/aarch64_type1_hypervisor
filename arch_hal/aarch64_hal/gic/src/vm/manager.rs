@@ -45,6 +45,7 @@ pub struct VgicManager<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -57,6 +58,7 @@ impl<const VCPUS: usize> VgicManager<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -306,6 +308,7 @@ unsafe fn manager_from_ctx<const VCPUS: usize>(
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -325,6 +328,7 @@ unsafe fn hook_toggle_passthrough_spi<const VCPUS: usize>(
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -345,6 +349,7 @@ unsafe fn hook_route_passthrough_spi<const VCPUS: usize>(
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {

@@ -31,6 +31,7 @@ pub(crate) struct VmCommon<const VCPUS: usize, V: VgicVcpuModel>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) dist_enable: (bool, bool),
     pub(crate) vcpus: VcpuArray<VCPUS, V>,
@@ -44,6 +45,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel> VmCommon<VCPUS, V>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn new(vcpu_count: usize, make: impl FnMut(VcpuId) -> V) -> Result<Self, GicError> {
         Ok(Self {
@@ -92,6 +94,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VmCommon<VCPUS, V>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn build_sw_virq(
         &self,

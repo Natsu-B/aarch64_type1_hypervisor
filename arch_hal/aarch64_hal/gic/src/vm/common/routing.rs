@@ -7,6 +7,7 @@ use crate::vm::common::irq_state::LOCAL_INTID_COUNT;
 pub(crate) struct SpiRouting<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     spi_route: [VSpiRouting; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
 }
@@ -14,6 +15,7 @@ where
 impl<const VCPUS: usize> SpiRouting<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn new() -> Self {
         Self {

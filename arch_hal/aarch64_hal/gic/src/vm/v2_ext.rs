@@ -27,6 +27,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> GicVmModelGeneric<VCP
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn enqueue_sgi_for_target(
         &mut self,
@@ -113,6 +114,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VgicSgiRegs
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT + 31) / 32]:,
 {
     fn read_sgi_pending_sources_word(&self, target: VcpuId, sgi: u8) -> Result<u32, GicError> {
         let idx = self.common.vcpu_index(target)?;

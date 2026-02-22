@@ -28,6 +28,7 @@ impl Gicv2 {
         [(); 16 - VCPUS]:,
         [(); crate::max_intids_for_vcpus(VCPUS)]:,
         [(); crate::max_intids_for_vcpus(VCPUS) - 32]:,
+        [(); (crate::max_intids_for_vcpus(VCPUS) - 32 + 31) / 32]:,
         [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
         [(); crate::vm::pending_cap_for_vcpus(VCPUS)]:,
     {

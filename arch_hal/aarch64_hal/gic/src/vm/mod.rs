@@ -39,6 +39,7 @@ pub(crate) struct GicVmModelGeneric<const VCPUS: usize, V: VgicVcpuModel>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     common: VmCommon<VCPUS, V>,
     v2: V2SgiState<VCPUS>,
@@ -67,6 +68,7 @@ impl<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     /// Construct a VM with vCPU ids fixed to `VcpuId(0..vcpu_count-1)`; callers must not assume
     /// alternative vCPU id mappings when using this backend.
@@ -79,6 +81,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel> GicVmModelGeneric<VCPUS, V>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     const fn global_intids() -> usize {
         crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT
@@ -185,6 +188,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel> VgicVmInfo for GicVmModelGeneric<VCPU
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     type VcpuModel = V;
 
@@ -202,6 +206,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VgicGuestRegs
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     fn set_dist_enable(
         &mut self,
@@ -613,6 +618,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VgicPirqModel
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     fn map_pirq(
         &mut self,
