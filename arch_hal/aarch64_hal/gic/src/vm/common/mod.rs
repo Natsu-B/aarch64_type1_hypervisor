@@ -20,7 +20,6 @@ use aarch64_mutex::RawSpinLockIrqSave;
 
 use irq_state::IrqAttrs;
 use irq_state::IrqState as IrqStateTable;
-use pirq::PirqHookTable;
 use pirq::PirqTable;
 use routing::SpiRouting;
 use vcpu_array::VcpuArray;
@@ -46,7 +45,19 @@ where
 {
     pub(crate) routing: SpiRouting<VCPUS>,
     pub(crate) pirqs: PirqTable<VCPUS>,
-    pub(crate) pirq_hooks: PirqHookTable<VCPUS>,
+    pub(crate) pirq_manager_ctx: *mut (),
+    pub(crate) pirq_hook: Option<common::PirqHookFn>,
+}
+
+// SAFETY: `RoutingState` is only accessed through `routing_lock`, so moving it between threads is
+// synchronized by the lock. `pirq_manager_ctx` is an opaque manager pointer installed during init
+// and only copied/snapshotted before use; dereference happens in explicitly-audited `unsafe` paths.
+unsafe impl<const VCPUS: usize> Send for RoutingState<VCPUS>
+where
+    [(); crate::max_intids_for_vcpus(VCPUS)]:,
+    [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+{
 }
 
 pub(crate) struct VmCommon<const VCPUS: usize, V: VgicVcpuModel>
@@ -79,7 +90,8 @@ where
             routing_lock: RawSpinLockIrqSave::new(RoutingState {
                 routing: SpiRouting::new(),
                 pirqs: PirqTable::new(),
-                pirq_hooks: PirqHookTable::new(),
+                pirq_manager_ctx: core::ptr::null_mut(),
+                pirq_hook: None,
             }),
         })
     }

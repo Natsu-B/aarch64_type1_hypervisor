@@ -5,7 +5,6 @@ use crate::IrqState as IrqStateKind;
 use crate::PIntId;
 use crate::TriggerMode;
 use crate::VIntId;
-use crate::VSpiRouting;
 use crate::VcpuId;
 use crate::VcpuMask;
 use crate::VgicGuestRegs;
@@ -32,71 +31,6 @@ where
 {
     entries: [Option<PirqEntry>; crate::max_intids_for_vcpus(VCPUS)],
     v2p: [Option<PIntId>; crate::max_intids_for_vcpus(VCPUS)],
-}
-
-#[derive(Copy, Clone)]
-pub struct PirqHooks {
-    pub ctx: *mut (),
-    pub on_enable: Option<unsafe fn(*mut (), pintid: PIntId, enable: bool) -> Result<(), GicError>>,
-    pub on_route:
-        Option<unsafe fn(*mut (), pintid: PIntId, route: VSpiRouting) -> Result<(), GicError>>,
-    pub on_eoi: Option<unsafe fn(*mut (), pintid: PIntId)>,
-    pub on_deactivate: Option<unsafe fn(*mut (), pintid: PIntId)>,
-    pub on_resample: Option<unsafe fn(*mut (), pintid: PIntId)>,
-}
-
-// SAFETY: PirqHooks only stores raw context and function pointers.
-// Hook implementations are invoked without VM model locks and must tolerate concurrency.
-unsafe impl Send for PirqHooks {}
-
-impl PirqHooks {
-    pub const fn empty() -> Self {
-        Self {
-            ctx: core::ptr::null_mut(),
-            on_enable: None,
-            on_route: None,
-            on_eoi: None,
-            on_deactivate: None,
-            on_resample: None,
-        }
-    }
-}
-
-pub(crate) struct PirqHookTable<const VCPUS: usize>
-where
-    [(); crate::max_intids_for_vcpus(VCPUS)]:,
-{
-    hooks: [Option<PirqHooks>; crate::max_intids_for_vcpus(VCPUS)],
-}
-
-impl<const VCPUS: usize> PirqHookTable<VCPUS>
-where
-    [(); crate::max_intids_for_vcpus(VCPUS)]:,
-{
-    pub(crate) fn new() -> Self {
-        Self {
-            hooks: [None; crate::max_intids_for_vcpus(VCPUS)],
-        }
-    }
-
-    fn index(&self, pintid: PIntId) -> Result<usize, GicError> {
-        let idx = pintid.0 as usize;
-        if idx >= self.hooks.len() {
-            return Err(GicError::UnsupportedIntId);
-        }
-        Ok(idx)
-    }
-
-    pub(crate) fn set(&mut self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
-        let idx = self.index(pintid)?;
-        self.hooks[idx] = Some(hooks);
-        Ok(())
-    }
-
-    pub(crate) fn get(&self, pintid: PIntId) -> Result<Option<PirqHooks>, GicError> {
-        let idx = self.index(pintid)?;
-        Ok(self.hooks[idx])
-    }
 }
 
 impl<const VCPUS: usize> PirqTable<VCPUS>
@@ -189,6 +123,8 @@ where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+    [(); crate::vm::pending_cap_for_vcpus(VCPUS)]:,
 {
     pub(crate) fn map_pirq_inner(
         &self,

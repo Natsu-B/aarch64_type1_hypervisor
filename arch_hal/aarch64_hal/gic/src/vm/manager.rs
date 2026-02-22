@@ -1,5 +1,4 @@
 use super::GicVmModelForVcpus;
-use super::PirqHooks;
 use super::common::LOCAL_INTID_COUNT;
 use super::pending_cap_for_vcpus;
 use crate::GicDistributor;
@@ -23,6 +22,7 @@ use crate::gicv2::Gicv2;
 use crate::gicv2::vgic_frontend::Gicv2AccessSize;
 use crate::gicv2::vgic_frontend::Gicv2DistIdRegs;
 use crate::gicv2::vgic_frontend::Gicv2Frontend;
+use common::PirqHookFn;
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
@@ -105,6 +105,7 @@ where
             // SAFETY: Caller guarantees one-time single-threaded initialization before publish.
             // `slot` points to the in-place storage owned by this manager and is valid for writes.
             let model_ref = unsafe { (*slot).write(model) };
+            model_ref.set_pirq_manager_ctx(self as *const _ as *mut ());
             NonNull::from(model_ref)
         };
         self.model_ptr.store(Some(ptr), Ordering::Release);
@@ -196,9 +197,10 @@ where
         self.apply_update(hw, update)
     }
 
-    pub fn set_pirq_hooks(&self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
+    pub fn set_pirq_hook(&self, hook: Option<PirqHookFn>) -> Result<(), GicError> {
         let vm = self.model()?;
-        vm.set_pirq_hooks(pintid, hooks)
+        vm.set_pirq_hook(hook);
+        Ok(())
     }
 
     pub fn handle_distributor_read(
@@ -304,17 +306,6 @@ where
         }
         Ok(())
     }
-
-    pub fn passthrough_spi_hooks(&'static self) -> PirqHooks {
-        PirqHooks {
-            ctx: self as *const _ as *mut (),
-            on_enable: Some(hook_toggle_passthrough_spi::<VCPUS>),
-            on_route: Some(hook_route_passthrough_spi::<VCPUS>),
-            on_eoi: None,
-            on_deactivate: None,
-            on_resample: None,
-        }
-    }
 }
 
 unsafe fn manager_from_ctx<const VCPUS: usize>(
@@ -330,12 +321,12 @@ where
     if ctx.is_null() {
         return Err(GicError::InvalidState);
     }
-    // SAFETY: `ctx` was created by `VgicManager::passthrough_spi_hooks` from a stable `'static`
+    // SAFETY: `ctx` is installed by `VgicManager::init_from_gicv2` from a stable `'static`
     // manager reference with the same `VCPUS` parameter.
     Ok(unsafe { &*(ctx as *const VgicManager<VCPUS>) })
 }
 
-unsafe fn hook_toggle_passthrough_spi<const VCPUS: usize>(
+pub(crate) unsafe fn passthrough_spi_enable_from_ctx<const VCPUS: usize>(
     ctx: *mut (),
     pintid: PIntId,
     enable: bool,
@@ -347,8 +338,7 @@ where
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
-    // SAFETY: The callback context is set by `passthrough_spi_hooks` to point to the same static
-    // manager instance for this const-generic instantiation.
+    // SAFETY: `ctx` was installed by `init_from_gicv2` for this manager const instantiation.
     let manager = unsafe { manager_from_ctx::<VCPUS>(ctx)? };
     manager
         .delegate
@@ -356,7 +346,7 @@ where
         .set_spi_enable(pintid.0, enable)
 }
 
-unsafe fn hook_route_passthrough_spi<const VCPUS: usize>(
+pub(crate) unsafe fn passthrough_spi_route_from_ctx<const VCPUS: usize>(
     ctx: *mut (),
     pintid: PIntId,
     route: VSpiRouting,
@@ -368,8 +358,7 @@ where
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
-    // SAFETY: The callback context is set by `passthrough_spi_hooks` to point to the same static
-    // manager instance for this const-generic instantiation.
+    // SAFETY: `ctx` was installed by `init_from_gicv2` for this manager const instantiation.
     let manager = unsafe { manager_from_ctx::<VCPUS>(ctx)? };
     let target = match route {
         VSpiRouting::Targets(mask) => {

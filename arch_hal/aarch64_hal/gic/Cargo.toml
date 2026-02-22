@@ -10,6 +10,7 @@ cpu = { path = "../cpu" }
 mutex = { path = "../../../mutex" }
 aarch64_mutex = { path = "../aarch64_mutex" }
 tls = { path = "../tls" }
+common = { path = "../common" }
 
 [target.'cfg(target_arch = "aarch64")'.dev-dependencies]
 aarch64_test = { path = "../aarch64_test" }

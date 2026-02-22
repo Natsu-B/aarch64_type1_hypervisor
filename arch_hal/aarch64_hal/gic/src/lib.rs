@@ -33,6 +33,8 @@ pub mod dt_irq;
 
 pub mod vm;
 
+pub use common::IrqSense;
+pub use common::TriggerMode;
 use cpu::CoreAffinity;
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -159,19 +161,6 @@ pub enum IrqGroup {
 enum AckKind {
     Iar,
     Aiar,
-}
-
-/// Trigger configuration for an interrupt (where configurable).
-///
-/// For GICv2 SPIs, this typically maps to `GICD_ICFGR` fields:
-/// - Level: field = `0b00`
-/// - Edge : field = `0b10`
-///
-/// Backends must return `UnsupportedFeature` if the trigger mode cannot be programmed for `intid`.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum TriggerMode {
-    Level,
-    Edge,
 }
 
 /// Routing policy for an SPI.
@@ -723,13 +712,6 @@ impl PirqNotifications {
             resample: PirqList::new(),
         }
     }
-}
-
-/// Edge/level semantics for injection bookkeeping (esp. mapped pIRQs).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum IrqSense {
-    Edge,
-    Level,
 }
 
 /// Host-side vGIC HW backend (GICv2: GICH_* / GICv3: ICH_*).

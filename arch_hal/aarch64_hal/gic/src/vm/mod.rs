@@ -9,6 +9,7 @@ use crate::TriggerMode;
 use crate::VIntId;
 use crate::VSpiRouting;
 use crate::VcpuId;
+use crate::VcpuMask;
 use crate::VgicGuestRegs;
 use crate::VgicIrqScope;
 use crate::VgicPirqModel;
@@ -18,8 +19,10 @@ use crate::VgicVcpuModel;
 use crate::VgicVcpuQueue;
 use crate::VgicVmInfo;
 use crate::VgicWork;
-pub use crate::vm::common::pirq::PirqHooks;
 use crate::vm::vcpu::GicVCpuGeneric;
+pub use ::common::PirqHookError;
+pub use ::common::PirqHookFn;
+pub use ::common::PirqHookOp;
 use aarch64_mutex::RawSpinLockIrqSave;
 
 pub(crate) mod common;
@@ -122,14 +125,38 @@ where
         }
     }
 
-    pub(crate) fn set_pirq_hooks(&self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
+    pub(crate) fn set_pirq_manager_ctx(&self, ctx: *mut ()) {
         let mut routing = self.common.routing_lock.lock_irqsave();
-        routing.pirq_hooks.set(pintid, hooks)
+        routing.pirq_manager_ctx = ctx;
     }
 
-    fn hooks_for_pirq(&self, pintid: PIntId) -> Result<Option<PirqHooks>, GicError> {
+    pub(crate) fn set_pirq_hook(&self, hook: Option<PirqHookFn>) {
+        let mut routing = self.common.routing_lock.lock_irqsave();
+        routing.pirq_hook = hook;
+    }
+
+    fn pirq_hook_snapshot(&self) -> (*mut (), Option<PirqHookFn>) {
         let routing = self.common.routing_lock.lock_irqsave();
-        routing.pirq_hooks.get(pintid)
+        (routing.pirq_manager_ctx, routing.pirq_hook)
+    }
+
+    fn map_pirq_hook_error(err: PirqHookError) -> GicError {
+        match err {
+            PirqHookError::InvalidState => GicError::InvalidState,
+            PirqHookError::Unsupported => GicError::UnsupportedFeature,
+            PirqHookError::InvalidInput => GicError::UnsupportedIntId,
+        }
+    }
+
+    fn route_targets_to_bits(mask: VcpuMask) -> Result<u32, PirqHookError> {
+        let mut bits = 0u32;
+        for target in mask.iter() {
+            if target.0 >= 32 {
+                return Err(PirqHookError::Unsupported);
+            }
+            bits |= 1u32 << target.0;
+        }
+        Ok(bits)
     }
 
     pub(crate) fn dispatch_pirq_notifications(
@@ -137,54 +164,83 @@ where
         notifs: &crate::PirqNotifications,
     ) -> Result<(), GicError> {
         for pintid in notifs.eoi.iter() {
-            self.call_pirq_signal_hook(pintid, |h| h.on_eoi)?;
+            self.call_pirq_signal_hook(pintid, PirqHookOp::Eoi)?;
         }
         for pintid in notifs.deactivate.iter() {
-            self.call_pirq_signal_hook(pintid, |h| h.on_deactivate)?;
+            self.call_pirq_signal_hook(pintid, PirqHookOp::Deactivate)?;
         }
         for pintid in notifs.resample.iter() {
-            self.call_pirq_signal_hook(pintid, |h| h.on_resample)?;
+            self.call_pirq_signal_hook(pintid, PirqHookOp::Resample)?;
         }
         Ok(())
     }
 
-    fn call_pirq_enable_hook(&self, pintid: PIntId, enable: bool) -> Result<(), GicError> {
-        if let Some(hooks) = self.hooks_for_pirq(pintid)? {
-            if let Some(cb) = hooks.on_enable {
-                // SAFETY: The hook runs without holding VM model locks. Hook code must be
-                // non-blocking and tolerate concurrent VM operations.
+    fn call_pirq_enable_hook(&self, pintid: PIntId, enable: bool) -> Result<(), GicError>
+    where
+        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+        [(); pending_cap_for_vcpus(VCPUS)]:,
+    {
+        let (ctx, hook) = self.pirq_hook_snapshot();
+        if enable {
+            if !ctx.is_null() {
+                // SAFETY: `ctx` is installed by the manager and points to a stable `VgicManager`
+                // for this VM model instance. This call happens after dropping VM locks.
                 unsafe {
-                    cb(hooks.ctx, pintid, enable)?;
+                    manager::passthrough_spi_enable_from_ctx::<VCPUS>(ctx, pintid, true)?;
+                }
+            }
+            if let Some(hook) = hook {
+                hook(pintid.0, PirqHookOp::Enable { enable: true })
+                    .map_err(Self::map_pirq_hook_error)?;
+            }
+        } else {
+            if let Some(hook) = hook {
+                hook(pintid.0, PirqHookOp::Enable { enable: false })
+                    .map_err(Self::map_pirq_hook_error)?;
+            }
+            if !ctx.is_null() {
+                // SAFETY: `ctx` is installed by the manager and points to a stable `VgicManager`
+                // for this VM model instance. This call happens after dropping VM locks.
+                unsafe {
+                    manager::passthrough_spi_enable_from_ctx::<VCPUS>(ctx, pintid, false)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn call_pirq_route_hook(&self, pintid: PIntId, route: VSpiRouting) -> Result<(), GicError> {
-        if let Some(hooks) = self.hooks_for_pirq(pintid)? {
-            if let Some(cb) = hooks.on_route {
-                // SAFETY: The hook runs without holding VM model locks. Hook code must be
-                // non-blocking and tolerate concurrent VM operations.
-                unsafe {
-                    cb(hooks.ctx, pintid, route)?;
-                }
+    fn call_pirq_route_hook(&self, pintid: PIntId, route: VSpiRouting) -> Result<(), GicError>
+    where
+        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+        [(); pending_cap_for_vcpus(VCPUS)]:,
+    {
+        let (ctx, hook) = self.pirq_hook_snapshot();
+        if !ctx.is_null() {
+            // SAFETY: `ctx` is installed by the manager and points to a stable `VgicManager`
+            // for this VM model instance. This call happens after dropping VM locks.
+            unsafe {
+                manager::passthrough_spi_route_from_ctx::<VCPUS>(ctx, pintid, route)?;
             }
+        }
+
+        if let Some(hook) = hook {
+            let targets = match route {
+                VSpiRouting::Targets(mask) => {
+                    Self::route_targets_to_bits(mask).map_err(Self::map_pirq_hook_error)?
+                }
+                VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
+                    return Err(GicError::UnsupportedFeature);
+                }
+            };
+            hook(pintid.0, PirqHookOp::Route { targets }).map_err(Self::map_pirq_hook_error)?;
         }
         Ok(())
     }
 
-    fn call_pirq_signal_hook(
-        &self,
-        pintid: PIntId,
-        signal: fn(&PirqHooks) -> Option<unsafe fn(*mut (), PIntId)>,
-    ) -> Result<(), GicError> {
-        if let Some(hooks) = self.hooks_for_pirq(pintid)? {
-            if let Some(cb) = signal(&hooks) {
-                // SAFETY: The hook runs without holding VM model locks. Hook code must be
-                // non-blocking and tolerate concurrent VM operations.
-                unsafe { cb(hooks.ctx, pintid) };
-            }
+    fn call_pirq_signal_hook(&self, pintid: PIntId, op: PirqHookOp) -> Result<(), GicError> {
+        let (_, hook) = self.pirq_hook_snapshot();
+        if let Some(hook) = hook {
+            hook(pintid.0, op).map_err(Self::map_pirq_hook_error)?;
         }
         Ok(())
     }
@@ -218,6 +274,8 @@ where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+    [(); pending_cap_for_vcpus(VCPUS)]:,
 {
     fn set_dist_enable(
         &self,
@@ -667,6 +725,8 @@ where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+    [(); pending_cap_for_vcpus(VCPUS)]:,
 {
     fn map_pirq(
         &self,
@@ -1063,17 +1123,13 @@ mod tests {
         )
         .unwrap();
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        unsafe fn enable_hook(ctx: *mut (), _p: PIntId, _e: bool) -> Result<(), GicError> {
-            let counter = unsafe { &*(ctx as *const AtomicUsize) };
-            counter.fetch_add(1, Ordering::SeqCst);
+        fn enable_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+            if int_id == 48 && matches!(op, PirqHookOp::Enable { .. }) {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
-        let hooks = PirqHooks {
-            ctx: (&COUNTER as *const AtomicUsize) as *mut (),
-            on_enable: Some(enable_hook),
-            ..PirqHooks::empty()
-        };
-        vm.set_pirq_hooks(pintid, hooks).unwrap();
+        vm.set_pirq_hook(Some(enable_hook));
         COUNTER.store(0, Ordering::SeqCst);
         let base = VIntId(32);
         let bit = vintid.0 - base.0;
@@ -1097,17 +1153,13 @@ mod tests {
         )
         .unwrap();
         static ROUTE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-        unsafe fn route_hook(ctx: *mut (), _p: PIntId, _r: VSpiRouting) -> Result<(), GicError> {
-            let counter = unsafe { &*(ctx as *const AtomicUsize) };
-            counter.fetch_add(1, Ordering::SeqCst);
+        fn route_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+            if int_id == 48 && matches!(op, PirqHookOp::Route { .. }) {
+                ROUTE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
-        let hooks = PirqHooks {
-            ctx: (&ROUTE_COUNTER as *const AtomicUsize) as *mut (),
-            on_route: Some(route_hook),
-            ..PirqHooks::empty()
-        };
-        vm.set_pirq_hooks(pintid, hooks).unwrap();
+        vm.set_pirq_hook(Some(route_hook));
         ROUTE_COUNTER.store(0, Ordering::SeqCst);
         let route = VSpiRouting::Targets(VcpuMask::from_bits(0b10));
         vm.set_spi_route(vintid, route).unwrap();
