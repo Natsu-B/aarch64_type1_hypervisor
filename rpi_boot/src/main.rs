@@ -174,10 +174,7 @@ extern "C" fn main() -> ! {
         sense: arch_hal::gic::IrqSense::Edge,
     };
     let uart_irq_pintid = uart_irq.pintid;
-    let uart_irq_flags = match uart_irq.sense {
-        arch_hal::gic::IrqSense::Edge => 1,
-        arch_hal::gic::IrqSense::Level => 4,
-    };
+    let uart_irq_sense = uart_irq.sense;
 
     let mut systimer = SystemTimer::new();
     systimer.init();
@@ -505,7 +502,16 @@ extern "C" fn main() -> ! {
     }
 
     // check rp1
-    let rp1 = bcm2712::init_rp1(&dtb).unwrap();
+    let rp1 = match bcm2712::init_rp1(&dtb) {
+        Ok(config) => {
+            vgic::set_pirq_hook(Some(bcm2712::pirq_hook)).unwrap();
+            config
+        }
+        Err(err) => {
+            let _ = vgic::set_pirq_hook(None);
+            panic!("rp1 init failed: {:?}", err);
+        }
+    };
     println!(
         "RP1: Peripheral addr: 0x{:x} SRAM addr: 0x{:x}",
         rp1.peripheral_addr.unwrap().0,
@@ -581,7 +587,7 @@ extern "C" fn main() -> ! {
             size: 0x1000,
             uartclk_hz: PL011_UART_ADDR.1 as u32,
             pintid: uart_irq_pintid,
-            irq_flags: uart_irq_flags,
+            irq_sense: uart_irq_sense,
         },
     )
     .unwrap();

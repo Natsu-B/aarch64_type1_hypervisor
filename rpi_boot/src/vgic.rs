@@ -13,17 +13,12 @@ use arch_hal::gic::VgicHw;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::gic::gicv2::Gicv2DistIdRegs;
-use arch_hal::gic::vm::PirqHooks;
+use arch_hal::gic::vm::PirqHookFn;
 use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
-use arch_hal::soc::bcm2712::rp1_interrupt;
 use core::cell::SyncUnsafeCell;
-use core::ptr;
-use core::ptr::slice_from_raw_parts_mut;
-use typestate::ReadWrite;
 
 use crate::Gicv2Info;
-use crate::RP1_BASE;
 use crate::handler;
 
 pub(crate) struct UartIrq {
@@ -32,8 +27,6 @@ pub(crate) struct UartIrq {
 }
 
 const MIP_SPI_OFFSET: u32 = 128;
-const RP1_PCIE_CFG_BASE: usize = RP1_BASE + 0x10_8000 + 0x08;
-const RP1_PCIE_CFG_LEN: usize = 64;
 const VCPU_COUNT: usize = 4;
 const DEFAULT_SPI_PRIORITY: u8 = 0x80;
 const KICK_SGI_ID: u8 = 15;
@@ -105,45 +98,6 @@ fn vcpu_id_to_affinity(vcpu_id: VcpuId) -> Result<cpu::CoreAffinity, GicError> {
     Ok(cpu::CoreAffinity::new(aff0, 0, 0, 0))
 }
 
-unsafe fn hook_toggle_rp1_msix(
-    _ctx: *mut (),
-    pintid: PIntId,
-    enable: bool,
-) -> Result<(), GicError> {
-    // SAFETY: Called by the vGIC without holding VM model locks; the hook performs bounded,
-    // non-blocking MMIO updates and tolerates concurrent VM activity.
-    let res = if enable {
-        rp1_interrupt::enable_interrupt(pintid.0)
-    } else {
-        rp1_interrupt::disable_interrupt(pintid.0)
-    };
-    res.map_err(|_| GicError::InvalidState)?;
-    Ok(())
-}
-
-unsafe fn hook_rp1_msix_eoi(_ctx: *mut (), pintid: PIntId) {
-    // SAFETY: Called by the vGIC without holding VM model locks; this hook performs a bounded
-    // MMIO write to acknowledge the MSI-X vector.
-    rp1_msix_iack(pintid);
-}
-
-fn rp1_msix_iack(pintid: PIntId) {
-    let Some(vector) = pintid.0.checked_sub(MIP_SPI_OFFSET + 32) else {
-        return;
-    };
-    let Ok(idx) = usize::try_from(vector) else {
-        return;
-    };
-    if idx >= RP1_PCIE_CFG_LEN {
-        return;
-    }
-    // SAFETY: RP1 PCIe config window is MMIO-mapped at a fixed address; index is bounds-checked.
-    let pcie_config = unsafe {
-        &*slice_from_raw_parts_mut(RP1_PCIE_CFG_BASE as *mut ReadWrite<u32>, RP1_PCIE_CFG_LEN)
-    };
-    pcie_config[idx].set_bits(0b0100);
-}
-
 pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<(), &'static str> {
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
     enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
@@ -170,20 +124,8 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             DEFAULT_SPI_PRIORITY,
         )
         .map_err(|_| "vgic: map pirq")?;
-
-        let hooks = PirqHooks {
-            ctx: ptr::null_mut(),
-            on_enable: Some(hook_toggle_rp1_msix),
-            on_route: None,
-            on_eoi: Some(hook_rp1_msix_eoi),
-            on_deactivate: None,
-            on_resample: None,
-        };
-        VGIC.set_pirq_hooks(PIntId(uart_irq.pintid), hooks)
-            .map_err(|_| "vgic: hooks")?;
     }
 
-    let generic_hooks = VGIC.passthrough_spi_hooks();
     for intid in 32..1020 {
         if intid >= MIP_SPI_OFFSET + 32 {
             continue;
@@ -202,8 +144,6 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             Err(GicError::InvalidState) => continue,
             Err(_) => return Err("vgic: map pirq"),
         }
-        VGIC.set_pirq_hooks(pintid, generic_hooks)
-            .map_err(|_| "vgic: hooks")?;
     }
 
     // SAFETY: vGIC state is initialized once before guest entry.
@@ -213,6 +153,10 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         *GICD_ID.get() = Some(Gicv2DistIdRegs::from_hw_gicd(gic.distributor()));
     }
     Ok(())
+}
+
+pub fn set_pirq_hook(hook: Option<PirqHookFn>) -> Result<(), GicError> {
+    VGIC.set_pirq_hook(hook)
 }
 
 pub fn on_cpu_online(gic: &Gicv2) -> Result<(), GicError> {
