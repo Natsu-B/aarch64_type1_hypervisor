@@ -57,6 +57,7 @@ use dtb::NodeId;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
 use dtb::WalkError;
+use dtb::patch::Pl011Spec;
 use mutex::pod::RawAtomicPod;
 use typestate::Le;
 use typestate::ReadWrite;
@@ -171,6 +172,11 @@ extern "C" fn main() -> ! {
     let uart_irq = vgic::UartIrq {
         pintid: 128 + 25 + 32,
         sense: arch_hal::gic::IrqSense::Edge,
+    };
+    let uart_irq_pintid = uart_irq.pintid;
+    let uart_irq_flags = match uart_irq.sense {
+        arch_hal::gic::IrqSense::Edge => 1,
+        arch_hal::gic::IrqSense::Level => 4,
     };
 
     let mut systimer = SystemTimer::new();
@@ -566,6 +572,19 @@ extern "C" fn main() -> ! {
     let initrd_range = remove_initrd(&mut tree, chosen_id);
     remove_initrd_memreserve(&mut tree, initrd_range);
     append_reserved_memory(&mut tree, &reserved_memory);
+    dtb::patch::detach_by_compatible(&mut tree, "brcm,bcm2712-pcie").unwrap();
+    dtb::patch::detach_by_node_name(&mut tree, "rp1").unwrap();
+    dtb::patch::inject_standalone_pl011(
+        &mut tree,
+        Pl011Spec {
+            base: PL011_UART_ADDR.0 as u64,
+            size: 0x1000,
+            uartclk_hz: PL011_UART_ADDR.1 as u32,
+            pintid: uart_irq_pintid,
+            irq_flags: uart_irq_flags,
+        },
+    )
+    .unwrap();
     configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR.0).unwrap();
     if let Some(gicv) = gic_info.gicv {
         update_gicv2_cpu_interface_reg(&mut tree, gicv).unwrap();

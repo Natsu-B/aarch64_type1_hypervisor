@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod ast;
 pub(crate) mod dtb_parser;
 pub mod overlay;
+pub mod patch;
 
 pub use dtb_parser::DtbGenerator;
 pub use dtb_parser::DtbNodeView;
