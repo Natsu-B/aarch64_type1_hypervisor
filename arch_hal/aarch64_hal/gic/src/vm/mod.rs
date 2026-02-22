@@ -20,6 +20,7 @@ use crate::VgicVmInfo;
 use crate::VgicWork;
 pub use crate::vm::common::pirq::PirqHooks;
 use crate::vm::vcpu::GicVCpuGeneric;
+use aarch64_mutex::RawSpinLockIrqSave;
 
 pub(crate) mod common;
 pub mod manager;
@@ -42,7 +43,7 @@ where
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     common: VmCommon<VCPUS, V>,
-    v2: V2SgiState<VCPUS>,
+    v2: RawSpinLockIrqSave<V2SgiState<VCPUS>>,
 }
 
 pub(crate) type GicVmModelForVcpus<const VCPUS: usize> = GicVmModelGeneric<
@@ -103,7 +104,7 @@ where
 
         Ok(Self {
             common: VmCommon::new(vcpu_count_usize, make)?,
-            v2: V2SgiState::new(),
+            v2: RawSpinLockIrqSave::new(V2SgiState::new()),
         })
     }
 
@@ -121,16 +122,18 @@ where
         }
     }
 
-    pub(crate) fn set_pirq_hooks(
-        &mut self,
-        pintid: PIntId,
-        hooks: PirqHooks,
-    ) -> Result<(), GicError> {
-        self.common.pirq_hooks.set(pintid, hooks)
+    pub(crate) fn set_pirq_hooks(&self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
+        let mut routing = self.common.routing_lock.lock_irqsave();
+        routing.pirq_hooks.set(pintid, hooks)
+    }
+
+    fn hooks_for_pirq(&self, pintid: PIntId) -> Result<Option<PirqHooks>, GicError> {
+        let routing = self.common.routing_lock.lock_irqsave();
+        routing.pirq_hooks.get(pintid)
     }
 
     pub(crate) fn dispatch_pirq_notifications(
-        &mut self,
+        &self,
         notifs: &crate::PirqNotifications,
     ) -> Result<(), GicError> {
         for pintid in notifs.eoi.iter() {
@@ -145,10 +148,11 @@ where
         Ok(())
     }
 
-    fn call_pirq_enable_hook(&mut self, pintid: PIntId, enable: bool) -> Result<(), GicError> {
-        if let Some(hooks) = self.common.pirq_hooks.get(pintid)? {
+    fn call_pirq_enable_hook(&self, pintid: PIntId, enable: bool) -> Result<(), GicError> {
+        if let Some(hooks) = self.hooks_for_pirq(pintid)? {
             if let Some(cb) = hooks.on_enable {
-                // SAFETY: hooks run with exclusive access to the VM model; callback must be non-blocking.
+                // SAFETY: The hook runs without holding VM model locks. Hook code must be
+                // non-blocking and tolerate concurrent VM operations.
                 unsafe {
                     cb(hooks.ctx, pintid, enable)?;
                 }
@@ -157,10 +161,11 @@ where
         Ok(())
     }
 
-    fn call_pirq_route_hook(&mut self, pintid: PIntId, route: VSpiRouting) -> Result<(), GicError> {
-        if let Some(hooks) = self.common.pirq_hooks.get(pintid)? {
+    fn call_pirq_route_hook(&self, pintid: PIntId, route: VSpiRouting) -> Result<(), GicError> {
+        if let Some(hooks) = self.hooks_for_pirq(pintid)? {
             if let Some(cb) = hooks.on_route {
-                // SAFETY: hooks run with exclusive access to the VM model; callback must be non-blocking.
+                // SAFETY: The hook runs without holding VM model locks. Hook code must be
+                // non-blocking and tolerate concurrent VM operations.
                 unsafe {
                     cb(hooks.ctx, pintid, route)?;
                 }
@@ -170,17 +175,23 @@ where
     }
 
     fn call_pirq_signal_hook(
-        &mut self,
+        &self,
         pintid: PIntId,
         signal: fn(&PirqHooks) -> Option<unsafe fn(*mut (), PIntId)>,
     ) -> Result<(), GicError> {
-        if let Some(hooks) = self.common.pirq_hooks.get(pintid)? {
+        if let Some(hooks) = self.hooks_for_pirq(pintid)? {
             if let Some(cb) = signal(&hooks) {
-                // SAFETY: hooks run with exclusive access to the VM model; callback must be non-blocking.
+                // SAFETY: The hook runs without holding VM model locks. Hook code must be
+                // non-blocking and tolerate concurrent VM operations.
                 unsafe { cb(hooks.ctx, pintid) };
             }
         }
         Ok(())
+    }
+
+    fn pirq_for_vintid(&self, vintid: VIntId) -> Option<PIntId> {
+        let routing = self.common.routing_lock.lock_irqsave();
+        routing.pirqs.v2p(vintid)
     }
 }
 
@@ -209,16 +220,20 @@ where
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     fn set_dist_enable(
-        &mut self,
+        &self,
         enable_grp0: bool,
         enable_grp1: bool,
     ) -> Result<VgicUpdate, GicError> {
-        let prev = self.common.dist_enable;
-        let changed = prev != (enable_grp0, enable_grp1);
-        self.common.dist_enable = (enable_grp0, enable_grp1);
+        let (prev, changed) = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            let prev = regs.dist_enable;
+            let next = (enable_grp0, enable_grp1);
+            let changed = prev != next;
+            regs.dist_enable = next;
+            (prev, changed)
+        };
 
         let mut update = VgicUpdate::None;
-
         if (!prev.0 && enable_grp0) || (!prev.1 && enable_grp1) {
             for vcpu_idx in 0..self.common.vcpu_count() {
                 let vcpu = VcpuId(vcpu_idx as u16);
@@ -276,49 +291,59 @@ where
     }
 
     fn dist_enable(&self) -> Result<(bool, bool), GicError> {
-        Ok(self.common.dist_enable)
+        let regs = self.common.regs_lock.lock_irqsave();
+        Ok(regs.dist_enable)
     }
 
     fn set_group(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         group: IrqGroup,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self.common.irq_state.set_group(scope, vintid, group)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.set_group(scope, vintid, group)?
+        };
         Ok(Self::update_for_scope(scope, changed))
     }
 
     fn set_priority(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         priority: u8,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self
-            .common
-            .irq_state
-            .set_priority(scope, vintid, priority)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.set_priority(scope, vintid, priority)?
+        };
         Ok(Self::update_for_scope(scope, changed))
     }
 
     fn set_trigger(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         trigger: TriggerMode,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self.common.irq_state.set_trigger(scope, vintid, trigger)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.set_trigger(scope, vintid, trigger)?
+        };
         Ok(Self::update_for_scope(scope, changed))
     }
 
     fn set_enable(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         enable: bool,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self.common.irq_state.set_enable(scope, vintid, enable)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.set_enable(scope, vintid, enable)?
+        };
         let mut update = VgicUpdate::None;
         let intid = vintid.0 as usize;
 
@@ -340,7 +365,7 @@ where
 
         update.combine(&Self::update_for_scope(scope, changed));
         if changed {
-            if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+            if let Some(pintid) = self.pirq_for_vintid(vintid) {
                 self.call_pirq_enable_hook(pintid, enable)?;
             }
         }
@@ -348,12 +373,15 @@ where
     }
 
     fn set_pending(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         pending: bool,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self.common.irq_state.set_pending(scope, vintid, pending)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.set_pending(scope, vintid, pending)?
+        };
         let mut update = VgicUpdate::None;
         let intid = vintid.0 as usize;
 
@@ -373,33 +401,39 @@ where
     }
 
     fn read_group_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
-        self.common.irq_state.read_group_word(scope, base)
+        let regs = self.common.regs_lock.lock_irqsave();
+        regs.irq_state.read_group_word(scope, base)
     }
 
     fn write_group_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self.common.irq_state.write_group_word(scope, base, value)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.write_group_word(scope, base, value)?
+        };
         Ok(Self::update_for_scope(scope, changed))
     }
 
     fn read_enable_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
-        self.common.irq_state.read_enable_word(scope, base)
+        let regs = self.common.regs_lock.lock_irqsave();
+        regs.irq_state.read_enable_word(scope, base)
     }
 
     fn write_set_enable_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let mask = self
-            .common
-            .irq_state
-            .write_set_enable_word(scope, base, set_bits)?;
+        let mask = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_set_enable_word(scope, base, set_bits)?
+        };
         let mut update = VgicUpdate::None;
 
         for bit in 0..32 {
@@ -418,7 +452,7 @@ where
                     }
                 }
             }
-            if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+            if let Some(pintid) = self.pirq_for_vintid(vintid) {
                 self.call_pirq_enable_hook(pintid, true)?;
             }
         }
@@ -428,15 +462,16 @@ where
     }
 
     fn write_clear_enable_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         clear_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let mask = self
-            .common
-            .irq_state
-            .write_clear_enable_word(scope, base, clear_bits)?;
+        let mask = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_clear_enable_word(scope, base, clear_bits)?
+        };
         let mut update = VgicUpdate::None;
 
         for bit in 0..32 {
@@ -445,7 +480,7 @@ where
             }
             let vintid = VIntId(base.0 + bit);
             update.combine(&self.cancel_for_scope(scope, vintid, None)?);
-            if let Some(pintid) = self.common.pirqs.v2p(vintid) {
+            if let Some(pintid) = self.pirq_for_vintid(vintid) {
                 self.call_pirq_enable_hook(pintid, false)?;
             }
         }
@@ -455,19 +490,21 @@ where
     }
 
     fn read_pending_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
-        self.common.irq_state.read_pending_word(scope, base)
+        let regs = self.common.regs_lock.lock_irqsave();
+        regs.irq_state.read_pending_word(scope, base)
     }
 
     fn write_set_pending_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let mask = self
-            .common
-            .irq_state
-            .write_set_pending_word(scope, base, set_bits)?;
+        let mask = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_set_pending_word(scope, base, set_bits)?
+        };
         let mut update = VgicUpdate::None;
 
         for bit in 0..32 {
@@ -488,15 +525,16 @@ where
     }
 
     fn write_clear_pending_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         clear_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let mask = self
-            .common
-            .irq_state
-            .write_clear_pending_word(scope, base, clear_bits)?;
+        let mask = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_clear_pending_word(scope, base, clear_bits)?
+        };
         let mut update = VgicUpdate::None;
 
         for bit in 0..32 {
@@ -512,76 +550,77 @@ where
     }
 
     fn read_active_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
-        self.common.irq_state.read_active_word(scope, base)
+        let regs = self.common.regs_lock.lock_irqsave();
+        regs.irq_state.read_active_word(scope, base)
     }
 
     fn write_set_active_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let mask = self
-            .common
-            .irq_state
-            .write_set_active_word(scope, base, set_bits)?;
+        let mask = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_set_active_word(scope, base, set_bits)?
+        };
         Ok(Self::update_for_scope(scope, mask != 0))
     }
 
     fn write_clear_active_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         clear_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let mask = self
-            .common
-            .irq_state
-            .write_clear_active_word(scope, base, clear_bits)?;
+        let mask = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_clear_active_word(scope, base, clear_bits)?
+        };
         Ok(Self::update_for_scope(scope, mask != 0))
     }
 
     fn read_priority_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
-        self.common
-            .irq_state
+        let regs = self.common.regs_lock.lock_irqsave();
+        regs.irq_state
             .read_priority_word_raw(scope, base.0 as usize)
     }
 
     fn write_priority_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let changed =
-            self.common
-                .irq_state
-                .write_priority_word_raw(scope, base.0 as usize, value)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state
+                .write_priority_word_raw(scope, base.0 as usize, value)?
+        };
         Ok(Self::update_for_scope(scope, changed))
     }
 
     fn read_trigger_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError> {
-        self.common.irq_state.read_trigger_word(scope, base)
+        let regs = self.common.regs_lock.lock_irqsave();
+        regs.irq_state.read_trigger_word(scope, base)
     }
 
     fn write_trigger_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let changed = self
-            .common
-            .irq_state
-            .write_trigger_word(scope, base, value)?;
+        let changed = {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            regs.irq_state.write_trigger_word(scope, base, value)?
+        };
         Ok(Self::update_for_scope(scope, changed))
     }
 
-    fn set_spi_route(
-        &mut self,
-        vintid: VIntId,
-        targets: VSpiRouting,
-    ) -> Result<VgicUpdate, GicError> {
+    fn set_spi_route(&self, vintid: VIntId, targets: VSpiRouting) -> Result<VgicUpdate, GicError> {
         match targets {
             VSpiRouting::Targets(mask) => {
                 let vcpu_count = self.common.vcpu_count();
@@ -590,16 +629,24 @@ where
                         return Err(GicError::InvalidVcpuId);
                     }
                 }
-                let changed = self
-                    .common
-                    .routing
-                    .set_route(vintid, VSpiRouting::Targets(mask))?;
-                if changed {
-                    if let Some(pintid) = self.common.pirqs.v2p(vintid) {
-                        let route = VSpiRouting::Targets(mask);
-                        self.call_pirq_route_hook(pintid, route)?;
-                    }
+
+                let (changed, pintid) = {
+                    let mut routing = self.common.routing_lock.lock_irqsave();
+                    let changed = routing
+                        .routing
+                        .set_route(vintid, VSpiRouting::Targets(mask))?;
+                    let pintid = if changed {
+                        routing.pirqs.v2p(vintid)
+                    } else {
+                        None
+                    };
+                    (changed, pintid)
+                };
+
+                if let Some(pintid) = pintid {
+                    self.call_pirq_route_hook(pintid, VSpiRouting::Targets(mask))?;
                 }
+
                 Ok(Self::update_for_scope(VgicIrqScope::Global, changed))
             }
             VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
@@ -609,7 +656,8 @@ where
     }
 
     fn get_spi_route(&self, vintid: VIntId) -> Result<VSpiRouting, GicError> {
-        self.common.routing.get_route(vintid)
+        let routing = self.common.routing_lock.lock_irqsave();
+        routing.routing.get_route(vintid)
     }
 }
 
@@ -621,7 +669,7 @@ where
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     fn map_pirq(
-        &mut self,
+        &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
@@ -633,11 +681,11 @@ where
     }
 
     #[cfg(test)]
-    fn unmap_pirq(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
+    fn unmap_pirq(&self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
         self.unmap_pirq_inner(pintid)
     }
 
-    fn on_physical_irq(&mut self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError> {
+    fn on_physical_irq(&self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError> {
         self.on_physical_irq_inner(pintid, level)
     }
 }
@@ -962,12 +1010,18 @@ mod tests {
             0x20,
         )
         .unwrap();
-        assert_eq!(
-            vm.common.pirqs.lookup_by_vintid(vintid).unwrap(),
-            Some(pintid)
-        );
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            assert_eq!(
+                routing.pirqs.lookup_by_vintid(vintid).unwrap(),
+                Some(pintid)
+            );
+        }
         vm.unmap_pirq(pintid).unwrap();
-        assert_eq!(vm.common.pirqs.lookup_by_vintid(vintid).unwrap(), None);
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            assert_eq!(routing.pirqs.lookup_by_vintid(vintid).unwrap(), None);
+        }
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]

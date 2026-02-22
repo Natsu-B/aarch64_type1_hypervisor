@@ -110,8 +110,8 @@ unsafe fn hook_toggle_rp1_msix(
     pintid: PIntId,
     enable: bool,
 ) -> Result<(), GicError> {
-    // SAFETY: Called by the vGIC with exclusive access to VM state; the RP1 MSI-X table is
-    // initialized before guest entry, and this hook performs only non-blocking MMIO updates.
+    // SAFETY: Called by the vGIC without holding VM model locks; the hook performs bounded,
+    // non-blocking MMIO updates and tolerates concurrent VM activity.
     let res = if enable {
         rp1_interrupt::enable_interrupt(pintid.0)
     } else {
@@ -122,8 +122,8 @@ unsafe fn hook_toggle_rp1_msix(
 }
 
 unsafe fn hook_rp1_msix_eoi(_ctx: *mut (), pintid: PIntId) {
-    // SAFETY: Called by the vGIC with exclusive access to VM state; this hook performs a
-    // bounded MMIO write to acknowledge the MSI-X vector.
+    // SAFETY: Called by the vGIC without holding VM model locks; this hook performs a bounded
+    // MMIO write to acknowledge the MSI-X vector.
     rp1_msix_iack(pintid);
 }
 
@@ -148,8 +148,12 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
     enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
 
-    VGIC.init_from_gicv2(gic, VCPU_COUNT as u8)
-        .map_err(|_| "vgic: create vm failed")?;
+    // SAFETY: Called exactly once on BSP during single-core bring-up before concurrent vGIC use.
+    // `VGIC` is a `'static` manager, so in-place model storage has a stable address for lifetime.
+    unsafe {
+        VGIC.init_from_gicv2(gic, VCPU_COUNT as u8)
+            .map_err(|_| "vgic: create vm failed")?
+    };
 
     let boot_vcpu_id = current_vcpu_id().map_err(|_| "vgic: invalid vcpu id")?;
     VGIC.switch_in(gic, boot_vcpu_id, cpu::get_current_core_id())

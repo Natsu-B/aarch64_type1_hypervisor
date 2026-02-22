@@ -76,8 +76,9 @@ pub(crate) fn init(
 ) -> Result<(), &'static str> {
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
 
-    VGIC.init_from_gicv2(gic, 1)
-        .map_err(|_| "vgic: create vm failed")?;
+    // SAFETY: Boot path initializes vGIC once on the BSP before exposing concurrent access.
+    // `VGIC` is a static manager, so model storage address remains stable for program lifetime.
+    unsafe { VGIC.init_from_gicv2(gic, 1) }.map_err(|_| "vgic: create vm failed")?;
 
     VGIC.switch_in(gic, VcpuId(0), cpu::get_current_core_id())
         .map_err(|_| "vgic: switch in")?;

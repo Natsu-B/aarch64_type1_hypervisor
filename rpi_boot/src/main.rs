@@ -429,6 +429,10 @@ extern "C" fn main() -> ! {
     println!("Emergency stack initialized");
     println!("paging success!!!");
 
+    // Raw atomics are unsynchronized; enable only once during BSP bring-up after paging/caches.
+    // IRQ/FIQ remain masked at this point and are unmasked later via `msr daifclr`.
+    mutex::enable_raw_atomics();
+
     // setup gicv2 (with virtualization)
     println!("setup gicv2...");
     let virt = match (gic_info.gich, gic_info.gicv, gic_info.maintenance_intid) {

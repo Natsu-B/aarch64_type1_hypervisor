@@ -962,39 +962,36 @@ pub(crate) trait VgicVmInfo {
 
 /// Guest-visible virtual register file (Distributor/Redistributor) backed by a VM model.
 pub(crate) trait VgicGuestRegs: VgicVmInfo {
-    fn set_dist_enable(
-        &mut self,
-        enable_grp0: bool,
-        enable_grp1: bool,
-    ) -> Result<VgicUpdate, GicError>;
+    fn set_dist_enable(&self, enable_grp0: bool, enable_grp1: bool)
+    -> Result<VgicUpdate, GicError>;
     fn dist_enable(&self) -> Result<(bool, bool), GicError>;
 
     fn set_group(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         group: IrqGroup,
     ) -> Result<VgicUpdate, GicError>;
     fn set_priority(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         priority: u8,
     ) -> Result<VgicUpdate, GicError>;
     fn set_trigger(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         trigger: TriggerMode,
     ) -> Result<VgicUpdate, GicError>;
     fn set_enable(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         enable: bool,
     ) -> Result<VgicUpdate, GicError>;
     fn set_pending(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         vintid: VIntId,
         pending: bool,
@@ -1002,7 +999,7 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
 
     fn read_group_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     fn write_group_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         value: u32,
@@ -1010,13 +1007,13 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
 
     fn read_enable_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     fn write_set_enable_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError>;
     fn write_clear_enable_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         clear_bits: u32,
@@ -1024,13 +1021,13 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
 
     fn read_pending_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     fn write_set_pending_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError>;
     fn write_clear_pending_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         clear_bits: u32,
@@ -1038,13 +1035,13 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
 
     fn read_active_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     fn write_set_active_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError>;
     fn write_clear_active_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         clear_bits: u32,
@@ -1052,24 +1049,20 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
 
     fn read_priority_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     fn write_priority_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError>;
     fn read_trigger_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     fn write_trigger_word(
-        &mut self,
+        &self,
         scope: VgicIrqScope,
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError>;
 
-    fn set_spi_route(
-        &mut self,
-        vintid: VIntId,
-        targets: VSpiRouting,
-    ) -> Result<VgicUpdate, GicError>;
+    fn set_spi_route(&self, vintid: VIntId, targets: VSpiRouting) -> Result<VgicUpdate, GicError>;
     fn get_spi_route(&self, vintid: VIntId) -> Result<VSpiRouting, GicError>;
 }
 
@@ -1077,20 +1070,20 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
 pub(crate) trait VgicSgiRegs: VgicVmInfo {
     fn read_sgi_pending_sources_word(&self, target: VcpuId, sgi: u8) -> Result<u32, GicError>;
     fn write_set_sgi_pending_sources_word(
-        &mut self,
+        &self,
         target: VcpuId,
         word: u8,
         sources: u32,
     ) -> Result<VgicUpdate, GicError>;
     fn write_clear_sgi_pending_sources_word(
-        &mut self,
+        &self,
         target: VcpuId,
         word: u8,
         sources: u32,
     ) -> Result<VgicUpdate, GicError>;
 
     fn inject_sgi(
-        &mut self,
+        &self,
         sender: VcpuId,
         targets: VcpuMask,
         sgi: u8,
@@ -1123,7 +1116,7 @@ pub(crate) trait VgicSgiRegs: VgicVmInfo {
 /// Host-side physical IRQ mapping and ingress hooks.
 pub(crate) trait VgicPirqModel: VgicVmInfo {
     fn map_pirq(
-        &mut self,
+        &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
@@ -1132,8 +1125,8 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         priority: u8,
     ) -> Result<VgicUpdate, GicError>;
     #[cfg(test)]
-    fn unmap_pirq(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError>;
-    fn on_physical_irq(&mut self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError>;
+    fn unmap_pirq(&self, pintid: PIntId) -> Result<VgicUpdate, GicError>;
+    fn on_physical_irq(&self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError>;
 }
 
 /// VM logical state model marker (version-independent core).

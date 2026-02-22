@@ -23,12 +23,17 @@ use crate::gicv2::Gicv2;
 use crate::gicv2::vgic_frontend::Gicv2AccessSize;
 use crate::gicv2::vgic_frontend::Gicv2DistIdRegs;
 use crate::gicv2::vgic_frontend::Gicv2Frontend;
-use aarch64_mutex::RawSpinLockIrqSave;
+use core::cell::SyncUnsafeCell;
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 use cpu::CoreAffinity;
+use mutex::pod::RawAtomicPod;
 
 /// Platform policy callbacks used by [`VgicManager`].
 ///
-/// All methods must be non-blocking because they can be called while the VM model spinlock is held.
+/// Callbacks can run concurrently with VM model operations and are never invoked while a global
+/// manager lock is held.
 pub trait VgicDelegate: Send + Sync {
     fn distributor(&self) -> Result<&'static dyn GicDistributor, GicError>;
     fn get_resident_affinity(
@@ -51,7 +56,8 @@ where
 {
     delegate: &'static dyn VgicDelegate,
     vm_id: usize,
-    model: RawSpinLockIrqSave<Option<GicVmModelForVcpus<VCPUS>>>,
+    model_ptr: RawAtomicPod<Option<NonNull<GicVmModelForVcpus<VCPUS>>>>,
+    model_storage: SyncUnsafeCell<MaybeUninit<GicVmModelForVcpus<VCPUS>>>,
 }
 
 impl<const VCPUS: usize> VgicManager<VCPUS>
@@ -66,35 +72,53 @@ where
         Self {
             delegate,
             vm_id,
-            model: RawSpinLockIrqSave::new(None),
+            model_ptr: unsafe {
+                // SAFETY: `Option<NonNull<T>>` canonical raw encoding uses 0 for `None`.
+                RawAtomicPod::new_raw_unchecked(0usize)
+            },
+            model_storage: SyncUnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
-    fn init(&self, model: GicVmModelForVcpus<VCPUS>) -> Result<(), GicError> {
-        let mut guard = self.model.lock_irqsave();
-        if guard.is_some() {
-            return Err(GicError::InvalidState);
-        }
-        *guard = Some(model);
-        Ok(())
-    }
-
-    pub fn init_from_gicv2(&self, gic: &Gicv2, vcpu_count: u8) -> Result<(), GicError>
+    /// Initialize this manager from a GICv2 backend.
+    ///
+    /// # Safety
+    /// - Must be called exactly once.
+    /// - Must be called from single-threaded bring-up (BSP only), before any concurrent vGIC access.
+    /// - `self` must have a stable address for the whole program lifetime (typically a `'static`).
+    pub unsafe fn init_from_gicv2(
+        &'static self,
+        gic: &Gicv2,
+        vcpu_count: u8,
+    ) -> Result<(), GicError>
     where
         [(); VCPUS - 1]:,
         [(); 16 - VCPUS]:,
     {
+        if self.model_ptr.load(Ordering::Relaxed).is_some() {
+            return Err(GicError::InvalidState);
+        }
+
         let model = gic.create_vm_model::<VCPUS>(vcpu_count)?;
-        self.init(model)
+        let ptr = {
+            let slot = self.model_storage.get();
+            // SAFETY: Caller guarantees one-time single-threaded initialization before publish.
+            // `slot` points to the in-place storage owned by this manager and is valid for writes.
+            let model_ref = unsafe { (*slot).write(model) };
+            NonNull::from(model_ref)
+        };
+        self.model_ptr.store(Some(ptr), Ordering::Release);
+        Ok(())
     }
 
-    fn with_model_mut<R>(
-        &self,
-        f: impl FnOnce(&mut GicVmModelForVcpus<VCPUS>) -> Result<R, GicError>,
-    ) -> Result<R, GicError> {
-        let mut guard = self.model.lock_irqsave();
-        let vm = guard.as_mut().ok_or(GicError::InvalidState)?;
-        f(vm)
+    fn model(&self) -> Result<&GicVmModelForVcpus<VCPUS>, GicError> {
+        let ptr = self
+            .model_ptr
+            .load(Ordering::Acquire)
+            .ok_or(GicError::InvalidState)?;
+        // SAFETY: Pointer is published with `Release` only after in-place initialization, and
+        // points into `model_storage` owned by this manager at a stable address.
+        Ok(unsafe { ptr.as_ref() })
     }
 
     pub fn switch_in<H: VgicHw>(
@@ -103,21 +127,18 @@ where
         vcpu: VcpuId,
         core: CoreAffinity,
     ) -> Result<(), GicError> {
-        self.with_model_mut(|vm| {
-            let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
-            vcpu_model.set_resident(core)?;
-            let _kick = vcpu_model.refill_lrs(hw)?;
-            Ok(())
-        })?;
+        let vm = self.model()?;
+        let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
+        vcpu_model.set_resident(core)?;
+        let _kick = vcpu_model.refill_lrs(hw)?;
         hw.set_enabled(true)?;
         Ok(())
     }
 
     pub fn switch_out_sync<H: VgicHw>(&self, hw: &H, vcpu: VcpuId) -> Result<(), GicError> {
-        self.with_model_mut(|vm| {
-            let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
-            vcpu_model.switch_out_sync(hw)
-        })
+        let vm = self.model()?;
+        let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
+        vcpu_model.switch_out_sync(hw)
     }
 
     pub fn handle_physical_irq<H: VgicHw>(
@@ -126,7 +147,8 @@ where
         pintid: PIntId,
         level: bool,
     ) -> Result<(), GicError> {
-        let update = self.with_model_mut(|vm| vm.on_physical_irq(pintid, level))?;
+        let vm = self.model()?;
+        let update = vm.on_physical_irq(pintid, level)?;
         self.apply_update(hw, update)
     }
 
@@ -136,10 +158,9 @@ where
         ppi_intid: u32,
         level: bool,
     ) -> Result<(), GicError> {
+        let vm = self.model()?;
         let current = self.delegate.get_current_vcpu(self.vm_id)?;
-        let update = self.with_model_mut(|vm| {
-            vm.set_pending(VgicIrqScope::Local(current), VIntId(ppi_intid), level)
-        })?;
+        let update = vm.set_pending(VgicIrqScope::Local(current), VIntId(ppi_intid), level)?;
         self.apply_update(hw, update)
     }
 
@@ -149,13 +170,14 @@ where
         intid: u32,
         level: bool,
     ) -> Result<(), GicError> {
+        let vm = self.model()?;
         let current = self.delegate.get_current_vcpu(self.vm_id)?;
         let scope = if intid < LOCAL_INTID_COUNT as u32 {
             VgicIrqScope::Local(current)
         } else {
             VgicIrqScope::Global
         };
-        let update = self.with_model_mut(|vm| vm.set_pending(scope, VIntId(intid), level))?;
+        let update = vm.set_pending(scope, VIntId(intid), level)?;
         self.apply_update(hw, update)
     }
 
@@ -169,13 +191,14 @@ where
         group: IrqGroup,
         priority: u8,
     ) -> Result<(), GicError> {
-        let update =
-            self.with_model_mut(|vm| vm.map_pirq(pintid, target, vintid, sense, group, priority))?;
+        let vm = self.model()?;
+        let update = vm.map_pirq(pintid, target, vintid, sense, group, priority)?;
         self.apply_update(hw, update)
     }
 
     pub fn set_pirq_hooks(&self, pintid: PIntId, hooks: PirqHooks) -> Result<(), GicError> {
-        self.with_model_mut(|vm| vm.set_pirq_hooks(pintid, hooks))
+        let vm = self.model()?;
+        vm.set_pirq_hooks(pintid, hooks)
     }
 
     pub fn handle_distributor_read(
@@ -185,10 +208,9 @@ where
         offset: u32,
         access_size: Gicv2AccessSize,
     ) -> Result<u32, GicError> {
-        self.with_model_mut(|vm| {
-            let mut frontend = Gicv2Frontend::new(vm, dist_id);
-            frontend.handle_distributor_read(vcpu, offset, access_size)
-        })
+        let vm = self.model()?;
+        let frontend = Gicv2Frontend::new(vm, dist_id);
+        frontend.handle_distributor_read(vcpu, offset, access_size)
     }
 
     pub fn handle_distributor_write<H: VgicHw>(
@@ -200,30 +222,26 @@ where
         access_size: Gicv2AccessSize,
         value: u32,
     ) -> Result<(), GicError> {
-        let update = self.with_model_mut(|vm| {
-            let mut frontend = Gicv2Frontend::new(vm, dist_id);
-            frontend.handle_distributor_write(vcpu, offset, access_size, value)
-        })?;
+        let vm = self.model()?;
+        let frontend = Gicv2Frontend::new(vm, dist_id);
+        let update = frontend.handle_distributor_write(vcpu, offset, access_size, value)?;
         self.apply_update(hw, update)
     }
 
     pub fn handle_maintenance<H: VgicHw>(&self, hw: &H, vcpu: VcpuId) -> Result<(), GicError> {
-        let update = self.with_model_mut(|vm| {
-            let (update, notifs) = {
-                let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
-                vcpu_model.handle_maintenance_collect(hw)?
-            };
-            vm.dispatch_pirq_notifications(&notifs)?;
-            Ok(update)
-        })?;
+        let vm = self.model()?;
+        let (update, notifs) = {
+            let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
+            vcpu_model.handle_maintenance_collect(hw)?
+        };
+        vm.dispatch_pirq_notifications(&notifs)?;
         self.apply_update(hw, update)
     }
 
     pub fn refill_vcpu<H: VgicHw>(&self, hw: &H, vcpu: VcpuId) -> Result<bool, GicError> {
-        self.with_model_mut(|vm| {
-            let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
-            vcpu_model.refill_lrs(hw)
-        })
+        let vm = self.model()?;
+        let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
+        vcpu_model.refill_lrs(hw)
     }
 
     pub(crate) fn apply_update<H: VgicHw>(
@@ -238,51 +256,48 @@ where
             return Ok(());
         }
 
+        let vm = self.model()?;
         let current = self.delegate.get_current_vcpu(self.vm_id)?;
         let mut kick_targets: [Option<CoreAffinity>; VCPUS] = [None; VCPUS];
         let mut kick_count = 0usize;
 
-        self.with_model_mut(|vm| {
-            let mut maybe_queue_kick = |target: VcpuId| -> Result<(), GicError> {
-                let vcpu = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, target)?;
-                let needs_kick = vcpu.refill_lrs(hw)?;
-                if target == current || (!work.kick && !needs_kick) {
-                    return Ok(());
-                }
-                let Some(affinity) = self.delegate.get_resident_affinity(self.vm_id, target.0)?
-                else {
-                    return Ok(());
-                };
-
-                if kick_count >= kick_targets.len() {
-                    return Err(GicError::OutOfResources);
-                }
-                if kick_targets[..kick_count]
-                    .iter()
-                    .any(|existing| *existing == Some(affinity))
-                {
-                    return Ok(());
-                }
-                kick_targets[kick_count] = Some(affinity);
-                kick_count += 1;
-                Ok(())
+        let mut maybe_queue_kick = |target: VcpuId| -> Result<(), GicError> {
+            let vcpu = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, target)?;
+            let needs_kick = vcpu.refill_lrs(hw)?;
+            if target == current || (!work.kick && !needs_kick) {
+                return Ok(());
+            }
+            let Some(affinity) = self.delegate.get_resident_affinity(self.vm_id, target.0)? else {
+                return Ok(());
             };
 
-            match targets {
-                VgicTargets::One(id) => maybe_queue_kick(id)?,
-                VgicTargets::Mask(mask) => {
-                    for id in mask.iter() {
-                        maybe_queue_kick(id)?;
-                    }
-                }
-                VgicTargets::All => {
-                    for id in 0..vm.vcpu_count() {
-                        maybe_queue_kick(VcpuId(id))?;
-                    }
+            if kick_count >= kick_targets.len() {
+                return Err(GicError::OutOfResources);
+            }
+            if kick_targets[..kick_count]
+                .iter()
+                .any(|existing| *existing == Some(affinity))
+            {
+                return Ok(());
+            }
+            kick_targets[kick_count] = Some(affinity);
+            kick_count += 1;
+            Ok(())
+        };
+
+        match targets {
+            VgicTargets::One(id) => maybe_queue_kick(id)?,
+            VgicTargets::Mask(mask) => {
+                for id in mask.iter() {
+                    maybe_queue_kick(id)?;
                 }
             }
-            Ok(())
-        })?;
+            VgicTargets::All => {
+                for id in 0..vm.vcpu_count() {
+                    maybe_queue_kick(VcpuId(id))?;
+                }
+            }
+        }
 
         for affinity in kick_targets.into_iter().take(kick_count).flatten() {
             self.delegate.kick_pcpu(affinity)?;

@@ -30,7 +30,7 @@ where
     [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn enqueue_sgi_for_target(
-        &mut self,
+        &self,
         target: VcpuId,
         sgi: usize,
     ) -> Result<VgicUpdate, GicError> {
@@ -40,7 +40,10 @@ where
         if word >= 4 || sgi >= SGI_COUNT {
             return Err(GicError::UnsupportedIntId);
         }
-        let sources = (self.v2.sgi_sources[idx][word] >> (lane * 8)) & 0xff;
+        let sources = {
+            let v2 = self.v2.lock_irqsave();
+            (v2.sgi_sources[idx][word] >> (lane * 8)) & 0xff
+        };
         if sources == 0 {
             return self.common.maybe_enqueue_irq(
                 VgicIrqScope::Local(target),
@@ -78,7 +81,10 @@ where
                     let sgi = vintid.0 as usize;
                     let word = sgi / 4;
                     let lane = sgi % 4;
-                    let lane_mask = (self.v2.sgi_sources[idx][word] >> (lane * 8)) & 0xff;
+                    let lane_mask = {
+                        let v2 = self.v2.lock_irqsave();
+                        (v2.sgi_sources[idx][word] >> (lane * 8)) & 0xff
+                    };
                     for sender in 0..self.common.vcpu_count() {
                         if (lane_mask & (1 << sender)) == 0 {
                             continue;
@@ -122,11 +128,12 @@ where
         if word >= 4 {
             return Err(GicError::UnsupportedIntId);
         }
-        Ok(self.v2.sgi_sources[idx][word])
+        let v2 = self.v2.lock_irqsave();
+        Ok(v2.sgi_sources[idx][word])
     }
 
     fn write_set_sgi_pending_sources_word(
-        &mut self,
+        &self,
         target: VcpuId,
         sgi: u8,
         sources: u32,
@@ -138,62 +145,61 @@ where
         }
 
         let mut update = VgicUpdate::None;
-        let mut entry = self.v2.sgi_sources[idx][word];
-        let prev = entry;
-        let new_bits = sources & !entry;
+        let mut pending_enqueues: [(u8, VcpuId); 32] = [(0, VcpuId(0)); 32];
+        let mut pending_enqueue_count = 0usize;
+        let (new_entry, changed) = {
+            let mut v2 = self.v2.lock_irqsave();
+            let prev = v2.sgi_sources[idx][word];
+            let new_bits = sources & !prev;
 
-        for bit in 0..32 {
-            if (new_bits & (1u32 << bit)) == 0 {
-                continue;
+            for bit in 0..32 {
+                if (new_bits & (1u32 << bit)) == 0 {
+                    continue;
+                }
+                let lane = bit / 8;
+                let sender = bit % 8;
+                if sender as usize >= self.common.vcpu_count() || sender >= 8 {
+                    return Err(GicError::InvalidVcpuId);
+                }
+                if lane >= 4 {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let sgi_id = word * 4 + lane;
+                if sgi_id >= SGI_COUNT {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                pending_enqueues[pending_enqueue_count] = (sgi_id as u8, VcpuId(sender as u16));
+                pending_enqueue_count += 1;
             }
-            let lane = bit / 8;
-            let sender = bit % 8;
-            if sender as usize >= self.common.vcpu_count() || sender >= 8 {
-                return Err(GicError::InvalidVcpuId);
-            }
-            if lane >= 4 {
-                return Err(GicError::UnsupportedIntId);
-            }
-            let sgi_id = word * 4 + lane;
-            if sgi_id >= SGI_COUNT {
-                return Err(GicError::UnsupportedIntId);
-            }
+            let new_entry = prev | sources;
+            let changed = new_entry != prev;
+            v2.sgi_sources[idx][word] = new_entry;
+            (new_entry, changed)
+        };
 
-            let _ = self.common.irq_state.set_pending(
-                VgicIrqScope::Local(target),
-                VIntId(sgi_id as u32),
-                true,
-            )?;
-            update.combine(&self.common.maybe_enqueue_irq(
-                VgicIrqScope::Local(target),
-                VIntId(sgi_id as u32),
-                Some(VcpuId(sender as u16)),
-            )?);
-        }
-
-        entry |= sources;
-        for lane in 0..4 {
-            let lane_mask = 0xff << (lane * 8);
-            let sgi_id = word * 4 + lane;
-            if sgi_id < SGI_COUNT {
-                let has_pending = (entry & lane_mask) != 0;
-                let _ = self.common.irq_state.set_pending(
-                    VgicIrqScope::Local(target),
-                    VIntId(sgi_id as u32),
-                    has_pending,
-                )?;
-                if !has_pending {
-                    update.combine(&self.cancel_for_scope(
+        {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            for lane in 0..4 {
+                let lane_mask = 0xff << (lane * 8);
+                let sgi_id = word * 4 + lane;
+                if sgi_id < SGI_COUNT {
+                    let _ = regs.irq_state.set_pending(
                         VgicIrqScope::Local(target),
                         VIntId(sgi_id as u32),
-                        None,
-                    )?);
+                        (new_entry & lane_mask) != 0,
+                    )?;
                 }
             }
         }
 
-        let changed = entry != prev;
-        self.v2.sgi_sources[idx][word] = entry;
+        for (sgi_id, sender) in pending_enqueues.into_iter().take(pending_enqueue_count) {
+            update.combine(&self.common.maybe_enqueue_irq(
+                VgicIrqScope::Local(target),
+                VIntId(sgi_id as u32),
+                Some(sender),
+            )?);
+        }
+
         update.combine(&GicVmModelGeneric::<VCPUS, V>::update_for_scope(
             VgicIrqScope::Local(target),
             changed,
@@ -202,7 +208,7 @@ where
     }
 
     fn write_clear_sgi_pending_sources_word(
-        &mut self,
+        &self,
         target: VcpuId,
         sgi: u8,
         sources: u32,
@@ -213,52 +219,65 @@ where
             return Err(GicError::UnsupportedIntId);
         }
 
-        let mut entry = self.v2.sgi_sources[idx][word];
-        let prev = entry;
-        let cleared_bits = prev & sources;
-
         let mut update = VgicUpdate::None;
-        for bit in 0..32 {
-            if (cleared_bits & (1u32 << bit)) == 0 {
-                continue;
-            }
-            let lane = bit / 8;
-            let sender = bit % 8;
-            if sender as usize >= self.common.vcpu_count() || sender >= 8 {
-                return Err(GicError::InvalidVcpuId);
-            }
-            if lane >= 4 {
-                return Err(GicError::UnsupportedIntId);
-            }
-            let sgi_id = word * 4 + lane;
-            if sgi_id >= SGI_COUNT {
-                return Err(GicError::UnsupportedIntId);
-            }
+        let mut cancellations: [(u8, VcpuId); 32] = [(0, VcpuId(0)); 32];
+        let mut cancellation_count = 0usize;
+        let (new_entry, changed) = {
+            let mut v2 = self.v2.lock_irqsave();
+            let prev = v2.sgi_sources[idx][word];
+            let cleared_bits = prev & sources;
 
+            for bit in 0..32 {
+                if (cleared_bits & (1u32 << bit)) == 0 {
+                    continue;
+                }
+                let lane = bit / 8;
+                let sender = bit % 8;
+                if sender as usize >= self.common.vcpu_count() || sender >= 8 {
+                    return Err(GicError::InvalidVcpuId);
+                }
+                if lane >= 4 {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let sgi_id = word * 4 + lane;
+                if sgi_id >= SGI_COUNT {
+                    return Err(GicError::UnsupportedIntId);
+                }
+
+                cancellations[cancellation_count] = (sgi_id as u8, VcpuId(sender as u16));
+                cancellation_count += 1;
+            }
+            let new_entry = prev & !sources;
+            let changed = new_entry != prev;
+            v2.sgi_sources[idx][word] = new_entry;
+            (new_entry, changed)
+        };
+
+        for (sgi_id, sender) in cancellations.into_iter().take(cancellation_count) {
             self.common
                 .vcpu(target)?
-                .cancel_irq(VIntId(sgi_id as u32), Some(VcpuId(sender as u16)))?;
+                .cancel_irq(VIntId(sgi_id as u32), Some(sender))?;
             update.combine(&VgicUpdate::Some {
                 targets: VgicTargets::One(target),
                 work: VgicWork::REFILL,
             });
         }
 
-        entry &= !sources;
-        for lane in 0..4 {
-            let lane_mask = 0xff << (lane * 8);
-            let sgi_id = word * 4 + lane;
-            if sgi_id < SGI_COUNT {
-                let _ = self.common.irq_state.set_pending(
-                    VgicIrqScope::Local(target),
-                    VIntId(sgi_id as u32),
-                    (entry & lane_mask) != 0,
-                )?;
+        {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            for lane in 0..4 {
+                let lane_mask = 0xff << (lane * 8);
+                let sgi_id = word * 4 + lane;
+                if sgi_id < SGI_COUNT {
+                    let _ = regs.irq_state.set_pending(
+                        VgicIrqScope::Local(target),
+                        VIntId(sgi_id as u32),
+                        (new_entry & lane_mask) != 0,
+                    )?;
+                }
             }
         }
 
-        let changed = entry != prev;
-        self.v2.sgi_sources[idx][word] = entry;
         update.combine(&GicVmModelGeneric::<VCPUS, V>::update_for_scope(
             VgicIrqScope::Local(target),
             changed,

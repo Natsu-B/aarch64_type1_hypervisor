@@ -1,16 +1,21 @@
 use crate::GicError;
 use crate::IrqGroup;
 use crate::IrqSense;
+use crate::IrqState as IrqStateKind;
 use crate::PIntId;
 use crate::TriggerMode;
 use crate::VIntId;
 use crate::VSpiRouting;
 use crate::VcpuId;
+use crate::VcpuMask;
 use crate::VgicGuestRegs;
 use crate::VgicIrqScope;
+use crate::VgicTargets;
 use crate::VgicUpdate;
 use crate::VgicVcpuModel;
 use crate::VgicVcpuQueue;
+use crate::VgicWork;
+use crate::VirtualInterrupt;
 use crate::vm::GicVmModelGeneric;
 use crate::vm::common::LOCAL_INTID_COUNT;
 
@@ -40,8 +45,8 @@ pub struct PirqHooks {
     pub on_resample: Option<unsafe fn(*mut (), pintid: PIntId)>,
 }
 
-// SAFETY: PirqHooks only stores raw context and function pointers; callers must
-// ensure hook implementations are safe to invoke under the VM's locking rules.
+// SAFETY: PirqHooks only stores raw context and function pointers.
+// Hook implementations are invoked without VM model locks and must tolerate concurrency.
 unsafe impl Send for PirqHooks {}
 
 impl PirqHooks {
@@ -186,7 +191,7 @@ where
     [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn map_pirq_inner(
-        &mut self,
+        &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
@@ -201,10 +206,13 @@ where
             vintid,
             sense,
         };
-        let existing = self.common.pirqs.get(pintid)?;
-        if let Some(prev) = existing {
-            if prev != entry {
-                return Err(GicError::InvalidState);
+        {
+            let routing = self.common.routing_lock.lock_irqsave();
+            let existing = routing.pirqs.get(pintid)?;
+            if let Some(prev) = existing {
+                if prev != entry {
+                    return Err(GicError::InvalidState);
+                }
             }
         }
 
@@ -227,19 +235,29 @@ where
         )?);
         update.combine(&self.set_enable(scope, vintid, true)?);
 
-        if existing.is_none() {
-            let _ = self.common.pirqs.ensure_entry(pintid, entry)?;
+        let commit_result = {
+            let mut routing = self.common.routing_lock.lock_irqsave();
+            routing.pirqs.ensure_entry(pintid, entry).map(|_| ())
+        };
+        if let Err(err) = commit_result {
+            // Roll back virtual enable if another mapping raced us after Phase 1 validation.
+            update.combine(&self.set_enable(scope, vintid, false)?);
+            return Err(err);
         }
+
         Ok(update)
     }
 
     #[cfg(test)]
-    pub(crate) fn unmap_pirq_inner(&mut self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
-        let entry = match self.common.pirqs.take(pintid) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Ok(VgicUpdate::None),
-            Err(GicError::UnsupportedIntId) => return Ok(VgicUpdate::None),
-            Err(err) => return Err(err),
+    pub(crate) fn unmap_pirq_inner(&self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
+        let entry = {
+            let mut routing = self.common.routing_lock.lock_irqsave();
+            match routing.pirqs.take(pintid) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return Ok(VgicUpdate::None),
+                Err(GicError::UnsupportedIntId) => return Ok(VgicUpdate::None),
+                Err(err) => return Err(err),
+            }
         };
         let scope = if entry.vintid.0 < LOCAL_INTID_COUNT as u32 {
             VgicIrqScope::Local(entry.target)
@@ -250,12 +268,23 @@ where
     }
 
     pub(crate) fn on_physical_irq_inner(
-        &mut self,
+        &self,
         pintid: PIntId,
         level: bool,
     ) -> Result<VgicUpdate, GicError> {
-        let Some(entry) = self.common.pirqs.get(pintid)? else {
-            return Err(GicError::UnsupportedIntId);
+        let (entry, global_targets) = {
+            let routing = self.common.routing_lock.lock_irqsave();
+            let Some(entry) = routing.pirqs.get(pintid)? else {
+                return Err(GicError::UnsupportedIntId);
+            };
+            let targets = if entry.vintid.0 >= LOCAL_INTID_COUNT as u32 {
+                routing
+                    .routing
+                    .targets_for_spi(entry.vintid, self.common.vcpu_count())?
+            } else {
+                VcpuMask::EMPTY
+            };
+            (entry, targets)
         };
 
         let scope = if entry.vintid.0 < LOCAL_INTID_COUNT as u32 {
@@ -265,6 +294,8 @@ where
         };
 
         let mut update = VgicUpdate::None;
+        let mut changed = false;
+        let mut enqueue_irq: Option<VirtualInterrupt> = None;
 
         // NOTE: `level` semantics for pIRQ ingress:
         // - For level-sensitive pIRQs, `level=true` means the line is asserted, `level=false`
@@ -277,40 +308,74 @@ where
             IrqSense::Level => level,
         };
 
-        if set_pending {
-            let changed = self
-                .common
-                .irq_state
-                .set_pending(scope, entry.vintid, true)?;
-            let attrs = self.common.irq_attrs(scope, entry.vintid)?;
-            if attrs.pending && attrs.enable && self.common.dist_enabled(attrs.group) {
-                let irq = self.common.build_hw_virq(scope, entry.vintid, pintid)?;
-                match scope {
-                    VgicIrqScope::Local(target) => {
-                        update.combine(&self.common.enqueue_to_target(target, irq)?)
-                    }
-                    VgicIrqScope::Global => {
-                        let targets = self.common.targets_for_global_spi(entry.vintid)?;
-                        for target in targets.iter() {
-                            update.combine(&self.common.enqueue_to_target(target, irq)?);
-                        }
+        {
+            let mut regs = self.common.regs_lock.lock_irqsave();
+            if set_pending {
+                changed = regs.irq_state.set_pending(scope, entry.vintid, true)?;
+                let attrs = regs.irq_state.irq_attrs(scope, entry.vintid)?;
+                let dist_enabled = match attrs.group {
+                    IrqGroup::Group0 => regs.dist_enable.0,
+                    IrqGroup::Group1 => regs.dist_enable.1,
+                };
+                if attrs.pending && attrs.enable && dist_enabled {
+                    let state = if attrs.pending && attrs.active {
+                        IrqStateKind::PendingActive
+                    } else if attrs.pending {
+                        IrqStateKind::Pending
+                    } else if attrs.active {
+                        IrqStateKind::Active
+                    } else {
+                        IrqStateKind::Inactive
+                    };
+                    enqueue_irq = Some(VirtualInterrupt::Hardware {
+                        vintid: entry.vintid.0,
+                        pintid: pintid.0,
+                        priority: attrs.priority,
+                        group: attrs.group,
+                        state,
+                        source: None,
+                    });
+                }
+            } else if matches!(entry.sense, IrqSense::Level) {
+                changed = regs.irq_state.set_pending(scope, entry.vintid, false)?;
+            }
+        }
+
+        if let Some(irq) = enqueue_irq {
+            match scope {
+                VgicIrqScope::Local(target) => {
+                    update.combine(&self.common.enqueue_to_target(target, irq)?);
+                }
+                VgicIrqScope::Global => {
+                    for target in global_targets.iter() {
+                        update.combine(&self.common.enqueue_to_target(target, irq)?);
                     }
                 }
             }
-            update.combine(&GicVmModelGeneric::<VCPUS, V>::update_for_scope(
-                scope, changed,
-            ));
-        } else if matches!(entry.sense, IrqSense::Level) {
-            let changed = self
-                .common
-                .irq_state
-                .set_pending(scope, entry.vintid, false)?;
-            update.combine(&self.cancel_for_scope(scope, entry.vintid, None)?);
-            update.combine(&GicVmModelGeneric::<VCPUS, V>::update_for_scope(
-                scope, changed,
-            ));
+        } else if !set_pending && matches!(entry.sense, IrqSense::Level) {
+            match scope {
+                VgicIrqScope::Local(target) => {
+                    self.common.vcpu(target)?.cancel_irq(entry.vintid, None)?;
+                    update.combine(&VgicUpdate::Some {
+                        targets: VgicTargets::One(target),
+                        work: VgicWork::REFILL,
+                    });
+                }
+                VgicIrqScope::Global => {
+                    for target in global_targets.iter() {
+                        self.common.vcpu(target)?.cancel_irq(entry.vintid, None)?;
+                        update.combine(&VgicUpdate::Some {
+                            targets: VgicTargets::One(target),
+                            work: VgicWork::REFILL,
+                        });
+                    }
+                }
+            }
         }
 
+        update.combine(&GicVmModelGeneric::<VCPUS, V>::update_for_scope(
+            scope, changed,
+        ));
         Ok(update)
     }
 }
