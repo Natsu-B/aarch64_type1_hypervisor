@@ -2,6 +2,7 @@
 
 use alloc::format;
 use alloc::vec;
+use common::IrqSense;
 
 use crate::ast::DeviceTree;
 use crate::ast::DeviceTreeEditExt;
@@ -18,7 +19,14 @@ pub struct Pl011Spec {
     pub size: u64,
     pub uartclk_hz: u32,
     pub pintid: u32,
-    pub irq_flags: u32,
+    pub irq_sense: IrqSense,
+}
+
+const fn gic_dt_irq_flags_from_sense(sense: IrqSense) -> u32 {
+    match sense {
+        IrqSense::Edge => 1,
+        IrqSense::Level => 4,
+    }
 }
 
 pub fn detach_by_compatible(
@@ -107,7 +115,11 @@ pub fn inject_standalone_pl011(
     let mut interrupts = vec![0u8; 12];
     write_be_u32(&mut interrupts, 0, 0)?;
     write_be_u32(&mut interrupts, 4, spi)?;
-    write_be_u32(&mut interrupts, 8, spec.irq_flags)?;
+    write_be_u32(
+        &mut interrupts,
+        8,
+        gic_dt_irq_flags_from_sense(spec.irq_sense),
+    )?;
 
     let clock_path = if tree.find_node_by_path("/clocks").is_some() {
         "/clocks/hv-pl011-uartclk"
@@ -365,7 +377,7 @@ mod tests {
                 size: 0x1000,
                 uartclk_hz: 48_000_000,
                 pintid: 185,
-                irq_flags: 1,
+                irq_sense: IrqSense::Edge,
             },
         )
         .unwrap();
