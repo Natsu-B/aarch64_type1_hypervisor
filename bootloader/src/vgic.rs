@@ -10,11 +10,11 @@ use arch_hal::gic::VgicHw;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::gic::gicv2::Gicv2DistIdRegs;
-use arch_hal::gic::vm::PirqHooks;
+use arch_hal::gic::vm::PirqHookError;
+use arch_hal::gic::vm::PirqHookOp;
 use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
 use core::cell::SyncUnsafeCell;
-use core::ptr;
 
 use crate::Gicv2Info;
 use crate::UartNode;
@@ -61,12 +61,13 @@ impl VgicDelegate for BootVgicDelegate {
     }
 }
 
-unsafe fn hook_record_pirq_eoi(_ctx: *mut (), pintid: PIntId) {
-    irq_monitor::record_pirq_eoi(pintid.0);
-}
-
-unsafe fn hook_record_pirq_deactivate(_ctx: *mut (), pintid: PIntId) {
-    irq_monitor::record_pirq_deactivate(pintid.0);
+fn boot_pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+    match op {
+        PirqHookOp::Eoi => irq_monitor::record_pirq_eoi(int_id),
+        PirqHookOp::Deactivate => irq_monitor::record_pirq_deactivate(int_id),
+        PirqHookOp::Enable { .. } | PirqHookOp::Route { .. } | PirqHookOp::Resample => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn init(
@@ -94,18 +95,9 @@ pub(crate) fn init(
             0x80,
         )
         .map_err(|_| "vgic: map pirq")?;
-
-        let hooks = PirqHooks {
-            ctx: ptr::null_mut(),
-            on_enable: None,
-            on_route: None,
-            on_eoi: Some(hook_record_pirq_eoi),
-            on_deactivate: Some(hook_record_pirq_deactivate),
-            on_resample: None,
-        };
-        VGIC.set_pirq_hooks(PIntId(pintid), hooks)
-            .map_err(|_| "vgic: hooks")?;
     }
+    VGIC.set_pirq_hook(Some(boot_pirq_hook))
+        .map_err(|_| "vgic: hooks")?;
 
     // SAFETY: vGIC state is initialized once before guest entry.
     unsafe {
