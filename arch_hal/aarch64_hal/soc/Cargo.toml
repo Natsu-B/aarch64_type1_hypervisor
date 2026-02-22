@@ -11,3 +11,4 @@ dtb = { path = "../../../dtb" }
 print = { path = "../print" }
 cpu = { path = "../cpu" }
 mutex = { path = "../../../mutex" }
+common = { path = "../common" }

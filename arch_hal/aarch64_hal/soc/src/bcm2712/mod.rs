@@ -17,7 +17,9 @@ use typestate::Readable;
 
 pub mod brcmstb;
 pub mod mip;
+pub mod pirq_hook;
 pub mod rp1_interrupt;
+pub use pirq_hook::pirq_hook;
 
 pub(crate) struct MsiXTablePtr {
     base: *const PciMsiXTable,
@@ -46,7 +48,12 @@ pub fn init_rp1(dtb: &DtbParser) -> Result<Rp1Config, Bcm2712Error> {
     let result =
         dtb.find_nodes_by_compatible_view("brcm,bcm2712-pcie", &mut |view, _name| search_rp1(view));
     match result {
-        Ok(ControlFlow::Break(config)) => Ok(config),
+        Ok(ControlFlow::Break(config)) => {
+            let base = config.peripheral_addr.map(|(addr, _)| addr as usize);
+            // SAFETY: RP1 base configuration is only mutated during initialization.
+            unsafe { pirq_hook::set_rp1_peripheral_base(base) };
+            Ok(config)
+        }
         Ok(ControlFlow::Continue(())) => Err(Bcm2712Error::DtbDeviceNotFound),
         Err(WalkError::Dtb(err)) => Err(Bcm2712Error::DtbParseError(err)),
         Err(WalkError::User(err)) => Err(err),
