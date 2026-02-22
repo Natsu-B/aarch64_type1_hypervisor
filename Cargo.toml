@@ -20,6 +20,7 @@ members = [
 
 [profile.release]
 panic = 'abort'
+debug = true
 [profile.dev]
 panic = 'abort'
 [profile.test]
