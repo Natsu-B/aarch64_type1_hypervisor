@@ -8,6 +8,7 @@ cpu = { path = "../cpu" }
 allocator = { path = "../../../allocator" }
 typestate = { path = "../../../typestate" }
 typestate_macro = { path = "../../../typestate_macro" }
+common = { path = "../common" }
 
 [dev-dependencies]
 print = { path = "../print" }

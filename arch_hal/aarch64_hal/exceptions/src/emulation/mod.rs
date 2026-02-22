@@ -27,8 +27,8 @@ pub mod store;
 
 /// Stage-2 page size in bytes. Must match the configured stage-2 granule.
 /// TODO: plumb this from the paging configuration rather than hard-coding.
-const STAGE2_PAGE_SIZE: u64 = 4096;
-const MIN_GUEST_PAGE_SIZE: u64 = 4096;
+const STAGE2_PAGE_SIZE: u64 = common::mem::PAGE_SIZE_4K_U64;
+const MIN_GUEST_PAGE_SIZE: u64 = common::mem::PAGE_SIZE_4K_U64;
 
 #[cfg(test)]
 static TEST_ELR: AtomicU64 = AtomicU64::new(0);

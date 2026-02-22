@@ -1,33 +1,32 @@
 #![no_std]
 
-/// Trigger configuration for an interrupt (where configurable).
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum TriggerMode {
-    Level,
-    Edge,
-}
+#[cfg(test)]
+extern crate std;
 
-/// Edge/level semantics for injection bookkeeping.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum IrqSense {
-    Edge,
-    Level,
-}
+pub mod addr;
+pub mod irq;
+pub mod mem;
+pub mod mmio;
+pub mod mmio_hook;
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum PirqHookOp {
-    Enable { enable: bool },
-    Route { targets: u32 },
-    Eoi,
-    Deactivate,
-    Resample,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum PirqHookError {
-    InvalidState,
-    Unsupported,
-    InvalidInput,
-}
-
-pub type PirqHookFn = fn(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError>;
+pub use addr::IpaAddr;
+pub use addr::PhysAddr;
+pub use addr::VirtAddr;
+pub use irq::IrqSense;
+pub use irq::PirqHookError;
+pub use irq::PirqHookFn;
+pub use irq::PirqHookOp;
+pub use irq::TriggerMode;
+pub use mem::PAGE_SIZE_4K;
+pub use mem::PAGE_SIZE_4K_U64;
+pub use mem::align_down_u64;
+pub use mem::align_down_usize;
+pub use mem::align_up_u64;
+pub use mem::align_up_usize;
+pub use mem::is_aligned_u64;
+pub use mem::is_aligned_usize;
+pub use mmio::MmioRegion;
+pub use mmio_hook::AccessClass;
+pub use mmio_hook::MmioError;
+pub use mmio_hook::MmioHandler;
+pub use mmio_hook::SplitPolicy;

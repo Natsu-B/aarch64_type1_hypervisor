@@ -8,6 +8,7 @@ use crate::gicv2::registers::GicV2CpuInterface;
 use crate::gicv2::registers::GicV2Distributor;
 use crate::gicv2::registers::GicV2VirtualCpuInterface;
 use crate::gicv2::registers::GicV2VirtualInterfaceControl;
+use common::mem::PAGE_SIZE_4K;
 use cpu::CoreAffinity;
 use mutex::RawRwLock;
 use mutex::RawSpinLock;
@@ -76,10 +77,13 @@ impl Gicv2 {
         virtualization: Option<Gicv2VirtualizationRegion>,
         gicv2m_reg: Option<&[Gicv2mFrameArgs]>,
     ) -> Result<Self, GicError> {
-        if !gicd_reg.base.is_multiple_of(0x1000) || gicd_reg.size != size_of::<GicV2Distributor>() {
+        if !gicd_reg.base.is_multiple_of(PAGE_SIZE_4K)
+            || gicd_reg.size != size_of::<GicV2Distributor>()
+        {
             return Err(GicError::InvalidSize);
         }
-        if !gicc_reg.base.is_multiple_of(0x1000) || gicc_reg.size != size_of::<GicV2CpuInterface>()
+        if !gicc_reg.base.is_multiple_of(PAGE_SIZE_4K)
+            || gicc_reg.size != size_of::<GicV2CpuInterface>()
         {
             return Err(GicError::InvalidSize);
         }
@@ -87,12 +91,12 @@ impl Gicv2 {
             let gich = virtualization.gich;
             let gicv = virtualization.gicv;
             let interrupt_id = virtualization.maintenance_interrupt_id;
-            if !gich.base.is_multiple_of(0x1000)
+            if !gich.base.is_multiple_of(PAGE_SIZE_4K)
                 || gich.size != size_of::<GicV2VirtualInterfaceControl>()
             {
                 return Err(GicError::InvalidSize);
             }
-            if !gicv.base.is_multiple_of(0x1000)
+            if !gicv.base.is_multiple_of(PAGE_SIZE_4K)
                 || gicv.size != size_of::<GicV2VirtualCpuInterface>()
             {
                 return Err(GicError::InvalidSize);
@@ -103,7 +107,7 @@ impl Gicv2 {
         }
         if let Some(frames) = gicv2m_reg {
             for f in frames {
-                if !f.reg.base.is_multiple_of(0x1000) || f.reg.size == 0 {
+                if !f.reg.base.is_multiple_of(PAGE_SIZE_4K) || f.reg.size == 0 {
                     return Err(GicError::InvalidSize);
                 }
                 match (f.msi_base_spi, f.msi_num_spis) {
