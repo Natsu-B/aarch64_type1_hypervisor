@@ -1,9 +1,12 @@
 use arch_hal::cpu;
 use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
+use arch_hal::gic::GicPpi;
+use arch_hal::gic::GicSgi;
 use arch_hal::gic::IrqGroup;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
+use arch_hal::gic::SgiTarget;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
 use arch_hal::gic::VgicHw;
@@ -22,6 +25,12 @@ use crate::handler;
 use crate::irq_monitor;
 
 struct BootVgicDelegate;
+
+const MIP_SPI_OFFSET: u32 = 128;
+const PASSTHROUGH_SPI_COUNT: u32 = 32;
+const DEFAULT_SPI_PRIORITY: u8 = 0x80;
+const KICK_SGI_ID: u8 = 15;
+const KICK_INTID: u32 = KICK_SGI_ID as u32;
 
 static DELEGATE: BootVgicDelegate = BootVgicDelegate;
 static VGIC: VgicManager<1> = VgicManager::new(&DELEGATE, 0);
@@ -56,9 +65,21 @@ impl VgicDelegate for BootVgicDelegate {
         Ok(VcpuId(0))
     }
 
-    fn kick_pcpu(&self, _target: cpu::CoreAffinity) -> Result<(), GicError> {
-        Ok(())
+    fn kick_pcpu(&self, target: cpu::CoreAffinity) -> Result<(), GicError> {
+        let gic = handler::gic().ok_or(GicError::InvalidState)?;
+        let targets = [target];
+        gic.send_sgi(KICK_SGI_ID, SgiTarget::Specific(&targets))
     }
+}
+
+fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
+    for ppi in 16..32 {
+        if matches!(ppi, 25 | 26 | 29) {
+            continue;
+        }
+        gic.set_ppi_enable(ppi, true)?;
+    }
+    Ok(())
 }
 
 fn boot_pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
@@ -76,6 +97,7 @@ pub(crate) fn init(
     guest_uart: UartNode,
 ) -> Result<(), &'static str> {
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
+    enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
 
     // SAFETY: Boot path initializes vGIC once on the BSP before exposing concurrent access.
     // `VGIC` is a static manager, so model storage address remains stable for program lifetime.
@@ -92,10 +114,30 @@ pub(crate) fn init(
             VIntId(pintid),
             IrqSense::Level,
             IrqGroup::Group1,
-            0x80,
+            DEFAULT_SPI_PRIORITY,
         )
         .map_err(|_| "vgic: map pirq")?;
     }
+
+    for intid in 32..1020 {
+        if intid >= MIP_SPI_OFFSET + PASSTHROUGH_SPI_COUNT {
+            continue;
+        }
+        match VGIC.map_pirq(
+            gic,
+            PIntId(intid),
+            VcpuId(0),
+            VIntId(intid),
+            IrqSense::Level,
+            IrqGroup::Group1,
+            DEFAULT_SPI_PRIORITY,
+        ) {
+            Ok(()) => {}
+            Err(GicError::InvalidState) => continue,
+            Err(_) => return Err("vgic: map pirq"),
+        }
+    }
+
     VGIC.set_pirq_hook(Some(boot_pirq_hook))
         .map_err(|_| "vgic: hooks")?;
 
@@ -111,6 +153,10 @@ pub(crate) fn init(
 pub(crate) fn maintenance_intid() -> Option<u32> {
     // SAFETY: set during vGIC initialization and then read-only.
     unsafe { *MAINT_INTID.get() }
+}
+
+pub(crate) fn kick_sgi_intid() -> u32 {
+    KICK_INTID
 }
 
 pub(crate) fn handles_gicd(addr: usize) -> bool {
@@ -144,9 +190,16 @@ pub(crate) fn handle_gicd_write(
     VGIC.handle_distributor_write(gic, VcpuId(0), dist_id, offset, access_size, value)
 }
 
-pub(crate) fn on_physical_irq(intid: u32) -> Result<(), GicError> {
+pub(crate) fn on_physical_irq(intid: u32, level: bool) -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
-    let result = VGIC.handle_physical_irq(gic, PIntId(intid), true);
+    let result = VGIC.handle_physical_irq(gic, PIntId(intid), level);
+    irq_monitor::record_injected_pirq(intid, result.is_ok());
+    result
+}
+
+pub(crate) fn passthrough_physical_irq(intid: u32, level: bool) -> Result<(), GicError> {
+    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    let result = VGIC.inject_physical_irq_as_pending(gic, intid, level);
     irq_monitor::record_injected_pirq(intid, result.is_ok());
     result
 }
@@ -154,4 +207,10 @@ pub(crate) fn on_physical_irq(intid: u32) -> Result<(), GicError> {
 pub(crate) fn handle_maintenance_irq() -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     VGIC.handle_maintenance(gic, VcpuId(0))
+}
+
+pub(crate) fn handle_kick_sgi() -> Result<(), GicError> {
+    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    let _kick = VGIC.refill_vcpu(gic, VcpuId(0))?;
+    Ok(())
 }

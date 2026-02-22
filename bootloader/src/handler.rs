@@ -16,6 +16,7 @@ use arch_hal::exceptions::memory_hook::MmioError;
 use arch_hal::exceptions::memory_hook::MmioHandler;
 use arch_hal::exceptions::memory_hook::SplitPolicy;
 use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::GicError;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::println;
@@ -677,7 +678,10 @@ fn irq_handler(regs: &mut cpu::Registers) {
     // SAFETY: GDB UART INTID is written once during boot and then read-only.
     let gdb_intid = unsafe { *GDB_UART_INTID.get() };
     let maintenance_intid = vgic::maintenance_intid();
-    let count_for_storm = Some(ack.intid) != gdb_intid && Some(ack.intid) != maintenance_intid;
+    let kick_intid = vgic::kick_sgi_intid();
+    let count_for_storm = Some(ack.intid) != gdb_intid
+        && Some(ack.intid) != maintenance_intid
+        && ack.intid != kick_intid;
     irq_monitor::record_ack(ack.intid, count_for_storm);
     if gdb_uart::is_debug_active() {
         if Some(ack.intid) == gdb_intid {
@@ -691,8 +695,22 @@ fn irq_handler(regs: &mut cpu::Registers) {
         gdb_uart::handle_irq();
     } else if Some(ack.intid) == vgic::maintenance_intid() {
         vgic::handle_maintenance_irq().unwrap();
+    } else if ack.intid == vgic::kick_sgi_intid() {
+        vgic::handle_kick_sgi().unwrap();
     } else {
-        vgic::on_physical_irq(ack.intid).unwrap();
+        let level = true;
+        match vgic::on_physical_irq(ack.intid, level) {
+            Ok(()) => {}
+            Err(GicError::UnsupportedIntId) => {
+                vgic::passthrough_physical_irq(ack.intid, level).unwrap();
+            }
+            Err(err) => {
+                panic!(
+                    "irq_handler: failed to handle physical irq intid {}: {:?}",
+                    ack.intid, err
+                );
+            }
+        }
     }
     gic.end_of_interrupt(ack).unwrap();
 
