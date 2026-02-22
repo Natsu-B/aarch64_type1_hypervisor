@@ -333,17 +333,32 @@ impl<
     }
 
     pub(crate) fn cancel(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError> {
-        let key = LrKey { vintid, source };
-        let mut inner = self.inner.lock_irqsave();
-        let mut removed = inner.pending.remove(key)?;
-        if let Some(idx) = inner.in_lr.iter().position(|entry| *entry == Some(key)) {
-            if idx < u64::BITS as usize {
-                inner.invalidate_lrs |= 1u64 << idx;
-            }
-            inner.lr_updates[idx] = None;
-            removed = true;
+        self.cancel_many(&[(vintid, source)])
+    }
+
+    pub(crate) fn cancel_many(&self, irqs: &[(VIntId, Option<VcpuId>)]) -> Result<(), GicError> {
+        if irqs.is_empty() {
+            return Ok(());
         }
-        if removed {
+
+        let mut inner = self.inner.lock_irqsave();
+        let mut any_removed = false;
+
+        for (vintid, source) in irqs.iter().copied() {
+            let key = LrKey { vintid, source };
+            let mut removed = inner.pending.remove(key)?;
+            if let Some(idx) = inner.in_lr.iter().position(|entry| *entry == Some(key)) {
+                if idx < u64::BITS as usize {
+                    inner.invalidate_lrs |= 1u64 << idx;
+                }
+                inner.lr_updates[idx] = None;
+                removed = true;
+            }
+            if removed {
+                any_removed = true;
+            }
+        }
+        if any_removed {
             self.need_refill.store(true, AtomicOrdering::Release);
         }
         Ok(())
@@ -417,6 +432,10 @@ impl<
 
     fn cancel_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError> {
         self.cancel(vintid, source)
+    }
+
+    fn cancel_irqs(&self, irqs: &[(VIntId, Option<VcpuId>)]) -> Result<(), GicError> {
+        self.cancel_many(irqs)
     }
 }
 

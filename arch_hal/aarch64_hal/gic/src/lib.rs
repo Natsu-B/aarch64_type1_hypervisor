@@ -1203,6 +1203,16 @@ pub(crate) trait VgicVcpuModel {
 pub(crate) trait VgicVcpuQueue {
     fn enqueue_irq(&self, irq: VirtualInterrupt) -> Result<VgicWork, GicError>;
     fn cancel_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError>;
+
+    /// Cancel multiple queued IRQ keys.
+    ///
+    /// Implementations may override this to process all cancellations under a single lock.
+    fn cancel_irqs(&self, irqs: &[(VIntId, Option<VcpuId>)]) -> Result<(), GicError> {
+        for (vintid, source) in irqs.iter().copied() {
+            self.cancel_irq(vintid, source)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]

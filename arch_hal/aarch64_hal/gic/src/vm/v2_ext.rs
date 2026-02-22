@@ -76,6 +76,7 @@ where
         let mut update = VgicUpdate::None;
         match scope {
             VgicIrqScope::Local(vcpu) => {
+                let target_vcpu = self.common.vcpu(vcpu)?;
                 if (vintid.0 as usize) < SGI_COUNT && source.is_none() {
                     let idx = self.common.vcpu_index(vcpu)?;
                     let sgi = vintid.0 as usize;
@@ -85,16 +86,21 @@ where
                         let v2 = self.v2.lock_irqsave();
                         (v2.sgi_sources[idx][word] >> (lane * 8)) & 0xff
                     };
+                    let mut bulk: [(VIntId, Option<VcpuId>); 9] = [(vintid, None); 9];
+                    let mut bulk_count = 0usize;
                     for sender in 0..self.common.vcpu_count() {
                         if (lane_mask & (1 << sender)) == 0 {
                             continue;
                         }
-                        self.common
-                            .vcpu(vcpu)?
-                            .cancel_irq(vintid, Some(VcpuId(sender as u16)))?;
+                        bulk[bulk_count] = (vintid, Some(VcpuId(sender as u16)));
+                        bulk_count += 1;
                     }
+                    bulk[bulk_count] = (vintid, None);
+                    bulk_count += 1;
+                    target_vcpu.cancel_irqs(&bulk[..bulk_count])?;
+                } else {
+                    target_vcpu.cancel_irq(vintid, source)?;
                 }
-                self.common.vcpu(vcpu)?.cancel_irq(vintid, source)?;
                 update.combine(&VgicUpdate::Some {
                     targets: VgicTargets::One(vcpu),
                     work: VgicWork::REFILL,
@@ -253,10 +259,17 @@ where
             (new_entry, changed)
         };
 
-        for (sgi_id, sender) in cancellations.into_iter().take(cancellation_count) {
-            self.common
-                .vcpu(target)?
-                .cancel_irq(VIntId(sgi_id as u32), Some(sender))?;
+        if cancellation_count != 0 {
+            let mut bulk: [(VIntId, Option<VcpuId>); 32] = [(VIntId(0), None); 32];
+            for (idx, (sgi_id, sender)) in cancellations
+                .into_iter()
+                .take(cancellation_count)
+                .enumerate()
+            {
+                bulk[idx] = (VIntId(sgi_id as u32), Some(sender));
+            }
+            let target_vcpu = self.common.vcpu(target)?;
+            target_vcpu.cancel_irqs(&bulk[..cancellation_count])?;
             update.combine(&VgicUpdate::Some {
                 targets: VgicTargets::One(target),
                 work: VgicWork::REFILL,
