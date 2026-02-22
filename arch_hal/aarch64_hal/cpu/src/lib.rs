@@ -236,7 +236,7 @@ pub fn irq_save() -> u64 {
     let flags = read_daif();
     // Mask IRQs.
     unsafe {
-        asm!("msr daifset, #2", options(nostack));
+        asm!("msr daifset, #3", options(nostack));
     }
     // Prevent compiler/CPU reordering across the mask boundary.
     isb();
