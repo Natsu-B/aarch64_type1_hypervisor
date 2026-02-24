@@ -2,7 +2,7 @@ use pci::msix::PciMsiXTableVectorControl;
 use print::println;
 
 use crate::bcm2712::Bcm2712Error;
-use crate::bcm2712::MsiXTable;
+use crate::bcm2712::MSIX_TABLE;
 use crate::bcm2712::brcmstb::BrcmStb;
 use crate::bcm2712::brcmstb::InBoundData;
 use crate::bcm2712::get_msi_x_table;
@@ -75,7 +75,7 @@ fn toggle_interrupt(spi: u32, enable: bool) -> Result<(), Bcm2712Error> {
     else {
         return Err(Bcm2712Error::InvalidSettings);
     };
-    let msi_x_table = MsiXTable.lock();
+    let msi_x_table = MSIX_TABLE.lock();
     let Some(msi_x_table) = msi_x_table.as_ref() else {
         return Err(Bcm2712Error::PcieIsNotInitialized);
     };

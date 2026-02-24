@@ -28,7 +28,7 @@ pub(crate) struct MsiXTablePtr {
 
 unsafe impl Send for MsiXTablePtr {}
 
-pub(crate) static MsiXTable: RawSpinLock<Option<MsiXTablePtr>> = RawSpinLock::new(None);
+pub(crate) static MSIX_TABLE: RawSpinLock<Option<MsiXTablePtr>> = RawSpinLock::new(None);
 
 pub(crate) fn get_msi_x_table(table: &MsiXTablePtr) -> &'static [PciMsiXTable] {
     // SAFETY: `MsiXTablePtr` is created from a valid, MMIO-mapped MSI-X table during RP1 init
@@ -165,7 +165,7 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
                     println!("PCIE: msi x window are not set");
                     return Err(Bcm2712Error::InvalidWindow.into());
                 };
-                let mut table = MsiXTable.lock();
+                let mut table = MSIX_TABLE.lock();
                 *table = Some(unsafe { brcm_stb.init_rp1_msi_x_settings(msi_x, msi_x_table_addr, 0xff_ffff_f000) }?);
 
                 rp1_interrupt::init_rp1_interrupt(brcm_stb, mip_reg.0 as u64)?;
