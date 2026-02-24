@@ -21,7 +21,7 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use mutex::SpinLock;
 
-static AP_STACK_SIZE: usize = 0x1000;
+static AP_STACK_SIZE: usize = 0x100000;
 
 static STACK_MEM_FOR_EACH_CPU: SpinLock<OnceCell<Vec<(CoreAffinity, usize)>>> =
     SpinLock::new(OnceCell::new());
