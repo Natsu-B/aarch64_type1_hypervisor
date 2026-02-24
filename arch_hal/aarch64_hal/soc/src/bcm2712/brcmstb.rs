@@ -12,7 +12,6 @@ use pci::PciCapabilityHead;
 use pci::PciCmdStatus;
 use pci::msix::PciCapabilityMsiX;
 use pci::msix::PciCapabilityMsiXConfigurations;
-use pci::msix::PciCapabilityMsiXTableOffset;
 use pci::msix::PciMsiXTable;
 use pci::msix::PciMsiXTableVectorControl;
 use print::println;
@@ -292,9 +291,43 @@ impl BrcmStb {
     }
 
     /// have to ensure that config windows are mapped rp1 config space
-    pub(crate) unsafe fn read_bar_address(&self, num: u8) -> Result<u32, Bcm2712Error> {
+    unsafe fn read_bar_raw_u32(&self, num: u8) -> Result<u32, Bcm2712Error> {
+        if num > 5 {
+            return Err(Bcm2712Error::InvalidSettings);
+        }
+        // SAFETY: `set_config_window` must have selected RP1 config space beforehand and
+        // `config_data` points to that 4KB PCIe config region for function 0.
         let config = unsafe { &mut *(self.config_data.get() as *mut PCIConfigRegType0) };
-        return Ok(config.bar[num as usize].read());
+        Ok(config.bar[num as usize].read())
+    }
+
+    /// have to ensure that config windows are mapped rp1 config space
+    pub(crate) unsafe fn read_bar_address(&self, num: u8) -> Result<u64, Bcm2712Error> {
+        if num > 5 {
+            return Err(Bcm2712Error::InvalidSettings);
+        }
+
+        let raw = unsafe { self.read_bar_raw_u32(num) }?;
+        if raw == 0 {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+        if (raw & 0x1) != 0 {
+            return Err(Bcm2712Error::InvalidSettings);
+        }
+
+        let bar_type = (raw >> 1) & 0x3;
+        match bar_type {
+            0b00 => Ok((raw & 0xffff_fff0) as u64),
+            0b10 => {
+                if num >= 5 {
+                    return Err(Bcm2712Error::InvalidSettings);
+                }
+                let hi = unsafe { self.read_bar_raw_u32(num + 1) }?;
+                Ok(((hi as u64) << 32) | ((raw & 0xffff_fff0) as u64))
+            }
+            0b01 | 0b11 => Err(Bcm2712Error::InvalidSettings),
+            _ => Err(Bcm2712Error::InvalidSettings),
+        }
     }
 
     pub(crate) fn set_config_window(&self) -> Result<&mut PCIConfigRegType0, Bcm2712Error> {
@@ -360,12 +393,18 @@ impl BrcmStb {
     pub(crate) unsafe fn msi_x_table_bar_addr(
         &self,
         msi_x: &PciCapabilityMsiX,
-    ) -> Result<u32, Bcm2712Error> {
+    ) -> Result<u64, Bcm2712Error> {
         let table_offset = msi_x.table_offset.read();
-        let bir = table_offset.get(PciCapabilityMsiXTableOffset::bir);
+        let bir = table_offset.get(pci::msix::PciCapabilityMsiXTableOffset::bir);
+        if bir > 5 {
+            return Err(Bcm2712Error::InvalidSettings);
+        }
+        let offset_bytes = table_offset.offset_bytes() as u64;
         println!("PCIE: MSI-X bar is bar[{}]", bir);
+        println!("PCIE: MSI-X table offset bytes: 0x{:x}", offset_bytes);
         let bar_addr = (unsafe { self.read_bar_address(bir as u8) })?;
-        Ok(bar_addr + table_offset.get_raw(PciCapabilityMsiXTableOffset::offset))
+        println!("PCIE: MSI-X bar decoded base: 0x{:x}", bar_addr);
+        Ok(bar_addr + offset_bytes)
     }
 
     pub(crate) unsafe fn init_rp1_msi_x_settings(
@@ -378,12 +417,14 @@ impl BrcmStb {
             PciCapabilityMsiXConfigurations::new()
                 .set(PciCapabilityMsiXConfigurations::msi_x_enable, 1),
         );
-        let size = msi_x
-            .configurations
-            .read()
-            .get(PciCapabilityMsiXConfigurations::table_size) as usize
-            + 1;
+        let size = msi_x.configurations.read().table_entry_count();
+        if size == 0 || size > 2048 {
+            return Err(Bcm2712Error::InvalidSettings);
+        }
         let msi_x_tables = unsafe {
+            // SAFETY: `msi_x_table_addr` is an MMIO mapping to the RP1 MSI-X table BAR and
+            // `size` is validated from MSI-X capability (1..=2048 entries), so the range
+            // covers `size * size_of::<PciMsiXTable>()` bytes of properly aligned table entries.
             &*slice_from_raw_parts(msi_x_table_addr as usize as *const PciMsiXTable, size)
         };
         for (i, table) in msi_x_tables.iter().enumerate() {

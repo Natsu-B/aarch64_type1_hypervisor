@@ -14,10 +14,22 @@ bitregs! {
     }
 }
 
+impl PciCapabilityMsiXConfigurations {
+    pub fn table_entry_count(&self) -> usize {
+        (self.get(PciCapabilityMsiXConfigurations::table_size) as usize) + 1
+    }
+}
+
 bitregs! {
     pub struct PciCapabilityMsiXTableOffset: u32 {
         pub bir@[2:0],
         pub offset@[31:3],
+    }
+}
+
+impl PciCapabilityMsiXTableOffset {
+    pub fn offset_bytes(&self) -> u32 {
+        self.get_raw(PciCapabilityMsiXTableOffset::offset)
     }
 }
 
@@ -64,5 +76,30 @@ impl PciMsiXTable {
         let (head, _) =
             array.split_at_checked(size as usize * size_of::<PciMsiXTable>() / size_of::<u32>())?;
         Some(unsafe { &*slice_from_raw_parts(head.as_ptr() as *const Self, size as usize) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PciCapabilityMsiXConfigurations;
+    use super::PciCapabilityMsiXTableOffset;
+
+    #[test]
+    fn msix_table_offset_decoding() {
+        let x = 0xDEAD_BEEF;
+        let table_offset = PciCapabilityMsiXTableOffset::from_bits(x);
+        assert_eq!(table_offset.offset_bytes(), x & !0x7);
+        assert_eq!(table_offset.get(PciCapabilityMsiXTableOffset::bir), x & 0x7);
+    }
+
+    #[test]
+    fn msix_table_entry_count_decoding() {
+        let zero = PciCapabilityMsiXConfigurations::new()
+            .set(PciCapabilityMsiXConfigurations::table_size, 0);
+        assert_eq!(zero.table_entry_count(), 1);
+
+        let max = PciCapabilityMsiXConfigurations::new()
+            .set(PciCapabilityMsiXConfigurations::table_size, 2047);
+        assert_eq!(max.table_entry_count(), 2048);
     }
 }

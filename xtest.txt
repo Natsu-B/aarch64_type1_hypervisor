@@ -11,6 +11,7 @@ std common
 std dtb
 std intrusive_linked_list
 std mutex
+std pci
 std typestate
 unit gdb_remote
 
