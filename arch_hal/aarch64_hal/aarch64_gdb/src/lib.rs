@@ -1131,6 +1131,9 @@ pub enum DebugEntryCause {
     DebugException(ExceptionClass),
     AttachDollar,
     CtrlC,
+    Signal {
+        signal: u8,
+    },
     Watchpoint {
         kind: WatchpointKind,
         addr: u64,
@@ -1146,6 +1149,16 @@ pub enum DebugEntryCause {
     CtrlCWithWatchpoint {
         kind: WatchpointKind,
         addr: u64,
+    },
+
+    /// Attach is in progress (first RSP frame may already be buffered),
+    /// so do NOT send an unsolicited stop-reply before responding to the buffered request.
+    /// The stop reason is reported via `?` (GdbServer last_stop), e.g. `S02` for memfault.
+    AttachDollarWithSignal {
+        signal: u8,
+    },
+    CtrlCWithSignal {
+        signal: u8,
     },
 }
 
@@ -1241,6 +1254,10 @@ pub fn debug_exception_entry(regs: &mut Registers, ec: ExceptionClass) {
 
 pub fn debug_watchpoint_entry(regs: &mut Registers, kind: WatchpointKind, addr: u64) {
     debug_entry(regs, DebugEntryCause::Watchpoint { kind, addr });
+}
+
+pub fn debug_signal_entry(regs: &mut Registers, signal: u8) {
+    debug_entry(regs, DebugEntryCause::Signal { signal });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1356,6 +1373,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         #[derive(Clone, Copy)]
         enum StopReply {
             Sigtrap,
+            Signal { signal: u8 },
             Watchpoint { kind: WatchpointKind, addr: u64 },
         }
 
@@ -1395,6 +1413,11 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 self.server.set_last_stop_watch(kind, addr);
                 Some(StopReply::Watchpoint { kind, addr })
             }
+            DebugEntryCause::Signal { signal } => {
+                STOP_REPLY_QUEUED.fetch_add(1, Ordering::Relaxed);
+                self.server.set_last_stop_signal(signal);
+                Some(StopReply::Signal { signal })
+            }
             DebugEntryCause::AttachDollar | DebugEntryCause::CtrlC => {
                 self.server.set_last_stop_sigtrap();
                 None
@@ -1404,6 +1427,11 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 self.server.set_last_stop_watch(kind, addr);
                 None
             }
+            DebugEntryCause::AttachDollarWithSignal { signal }
+            | DebugEntryCause::CtrlCWithSignal { signal } => {
+                self.server.set_last_stop_signal(signal);
+                None
+            }
         };
         let mut tx_hold = None;
         let outcome = 'debug: loop {
@@ -1411,9 +1439,10 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             let mut progress = false;
 
             if let Some(reply) = pending_stop_reply {
-                // Breakpoint: pending stop-reply send (watchpoint/sigtrap).
+                // Breakpoint: pending stop-reply send (watchpoint/sigtrap/signal).
                 let send_result = match reply {
                     StopReply::Sigtrap => self.server.notify_stop_sigtrap(),
+                    StopReply::Signal { signal } => self.server.notify_stop_signal(signal),
                     StopReply::Watchpoint { kind, addr } => {
                         self.server.notify_stop_watch(kind, addr)
                     }

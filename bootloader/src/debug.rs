@@ -176,8 +176,8 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
 
 pub(crate) fn enter_debug_from_memfault(
     regs: &mut cpu::Registers,
-    kind: WatchpointKind,
-    addr: u64,
+    _kind: WatchpointKind,
+    _addr: u64,
 ) -> bool {
     if gdb_uart::is_debug_active() {
         return false;
@@ -194,7 +194,7 @@ pub(crate) fn enter_debug_from_memfault(
         if gdb_uart::is_debug_session_initialized() {
             // Session was initialized previously; treat as active to emit async stop reply.
             gdb_uart::set_debug_session_active(true);
-            aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
+            aarch64_gdb::debug_signal_entry(regs, 2);
             cpu::irq_restore(saved_daif);
             return true;
         }
@@ -216,20 +216,20 @@ pub(crate) fn enter_debug_from_memfault(
 
         // IMPORTANT:
         // - The first RSP frame (e.g. qSupported) may already be buffered by prefetch.
-        // - Do NOT send an unsolicited stop-reply (T05watch...) before replying to that request.
+        // - Do NOT send an unsolicited stop-reply (S02) before replying to that request.
         // - Report the memfault stop reason via `?` using server last_stop.
         let cause = match attach_reason {
-            2 => aarch64_gdb::DebugEntryCause::CtrlCWithWatchpoint { kind, addr },
-            _ => aarch64_gdb::DebugEntryCause::AttachDollarWithWatchpoint { kind, addr },
+            2 => aarch64_gdb::DebugEntryCause::CtrlCWithSignal { signal: 2 },
+            _ => aarch64_gdb::DebugEntryCause::AttachDollarWithSignal { signal: 2 },
         };
         aarch64_gdb::debug_entry(regs, cause);
         cpu::irq_restore(saved_daif);
         return true;
     }
 
-    // Session already active: send a normal asynchronous watchpoint stop-reply.
-    // Breakpoint: watchpoint stop reply path (async watchpoint stop).
-    aarch64_gdb::debug_watchpoint_entry(regs, kind, addr);
+    // Session already active: send a normal asynchronous SIGINT stop-reply.
+    // Breakpoint: signal stop reply path (async SIGINT stop).
+    aarch64_gdb::debug_signal_entry(regs, 2);
     cpu::irq_restore(saved_daif);
     true
 }

@@ -32,6 +32,7 @@ HPBT_AUTO_ON_STOP_IF_PRESENT = False
 HPSEMI_AUTO_ON_STOP = True
 HPSEMI_READ_CHUNK = 512
 HPSEMI_MAX_WRITE0 = 65536
+HPMEM_AUTO_ON_STOP = True
 
 # ----------------------------
 # Internal state
@@ -364,6 +365,35 @@ def _semihost_handle_stop() -> bool:
     finally:
         _semihost_busy = False
 
+def _memfault_query() -> Optional[str]:
+    out = _monitor("hp memfault?").strip()
+    if not out:
+        raise RuntimeError("memfault?: empty reply")
+    if out.startswith("no"):
+        return None
+    if out.startswith("yes"):
+        return out
+    raise RuntimeError(f"memfault?: bad reply '{out}'")
+
+def _memfault_handle_stop(event) -> bool:
+    if not HPMEM_AUTO_ON_STOP:
+        return False
+    signal_event_t = getattr(gdb, "SignalEvent", None)
+    if signal_event_t is None or not isinstance(event, signal_event_t):
+        return False
+    if getattr(event, "stop_signal", None) != "SIGINT":
+        return False
+    try:
+        info = _memfault_query()
+    except Exception as exc:
+        gdb.write(f"(memfault) error: {exc}\n")
+        return False
+    if info is None:
+        return False
+    gdb.write(_c("(memfault) pending memfault stop detected.\n", "yellow", "bold"))
+    gdb.write(f"(memfault) {info}\n")
+    return True
+
 def _bt_meta() -> Optional[Dict[str, object]]:
     try:
         out = _monitor("hp vbar bt?").strip()
@@ -589,6 +619,8 @@ def _on_stop(event) -> None:
     if HPSEMI_AUTO_ON_STOP:
         if _semihost_handle_stop():
             return
+    if _memfault_handle_stop(event):
+        return
     if not HPBT_AUTO_ON_STOP_IF_PRESENT:
         return
     try:

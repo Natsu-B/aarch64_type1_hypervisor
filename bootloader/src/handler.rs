@@ -489,7 +489,7 @@ fn data_abort_handler(
                 );
             }
         } else {
-            // Breakpoint: trap decision reached (watchpoint stop expected here).
+            // Breakpoint: trap decision reached (SIGINT stop expected here).
             did_trap = debug::enter_debug_from_memfault(regs, stop_kind, addr_u64);
             if did_trap {
                 return;

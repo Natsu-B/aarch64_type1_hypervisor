@@ -1,7 +1,5 @@
 #![no_std]
 
-use core::mem;
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LastStopKind {
@@ -14,6 +12,7 @@ enum LastStopKind {
 #[derive(Clone, Copy, Debug)]
 struct LastStop {
     kind: LastStopKind,
+    signal: u8,
     addr: u64,
 }
 
@@ -21,6 +20,15 @@ impl LastStop {
     const fn sigtrap() -> Self {
         Self {
             kind: LastStopKind::Sigtrap,
+            signal: 5,
+            addr: 0,
+        }
+    }
+
+    const fn signal(signal: u8) -> Self {
+        Self {
+            kind: LastStopKind::Sigtrap,
+            signal,
             addr: 0,
         }
     }
@@ -422,10 +430,12 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
     }
 
-    pub fn notify_stop_sigtrap(&mut self) -> Result<(), GdbError<Infallible, Infallible>> {
-        self.last_stop = LastStop::sigtrap();
+    pub fn notify_stop_signal(
+        &mut self,
+        signal: u8,
+    ) -> Result<(), GdbError<Infallible, Infallible>> {
+        self.last_stop = LastStop::signal(signal);
         let out_cap = self.out_payload_cap();
-        let signal = 5u8;
         let payload = [
             b'S',
             HEX[(signal >> 4) as usize],
@@ -437,6 +447,10 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, &payload).map_err(|_| GdbError::TxOverflow)
     }
 
+    pub fn notify_stop_sigtrap(&mut self) -> Result<(), GdbError<Infallible, Infallible>> {
+        self.notify_stop_signal(5)
+    }
+
     pub fn notify_stop_watch(
         &mut self,
         kind: WatchpointKind,
@@ -444,6 +458,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
     ) -> Result<(), GdbError<Infallible, Infallible>> {
         self.last_stop = LastStop {
             kind: LastStopKind::from_watch(kind),
+            signal: 5,
             addr,
         };
         let out_cap = self.out_payload_cap();
@@ -502,20 +517,31 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
     }
 
+    pub fn set_last_stop_signal(&mut self, signal: u8) {
+        self.last_stop = LastStop::signal(signal);
+    }
+
     pub fn set_last_stop_sigtrap(&mut self) {
-        self.last_stop = LastStop::sigtrap();
+        self.set_last_stop_signal(5);
     }
 
     pub fn set_last_stop_watch(&mut self, kind: WatchpointKind, addr: u64) {
         self.last_stop = LastStop {
             kind: LastStopKind::from_watch(kind),
+            signal: 5,
             addr,
         };
     }
 
     fn send_last_stop_reply<T: Target>(&mut self) -> Result<(), GdbServerError<T>> {
         let Some(wk) = self.last_stop.kind.to_watch() else {
-            self.send::<T>(b"S05")?;
+            let signal = self.last_stop.signal;
+            let payload = [
+                b'S',
+                HEX[(signal >> 4) as usize],
+                HEX[(signal & 0xF) as usize],
+            ];
+            self.send::<T>(&payload)?;
             return Ok(());
         };
         // Mirror notify_stop_watch payload format.
@@ -2826,6 +2852,41 @@ mod tests {
         let packets = parse_packets(&tx);
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].payload, b"T05watch:1a2b;");
+    }
+
+    #[test]
+    fn stop_reply_signal_format() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        server.notify_stop_signal(2).expect("stop reply failed");
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload, b"S02");
+    }
+
+    #[test]
+    fn stop_reply_query_uses_last_signal() {
+        let mut server: GdbServer<256, 256> = GdbServer::new();
+        let mut target = DummyTarget;
+        server.set_last_stop_signal(2);
+
+        let frame = build_frame(b"?");
+        for &byte in &frame {
+            server
+                .on_rx_byte_irq(&mut target, byte)
+                .expect("rsp handling failed");
+        }
+
+        let tx = drain_tx(&mut server);
+        let packets = parse_packets(&tx)
+            .into_iter()
+            .filter(|packet| !is_console_packet(packet))
+            .collect::<Vec<_>>();
+        assert!(
+            packets.iter().any(|packet| packet.payload == b"S02"),
+            "missing S02 stop reply in '?' path"
+        );
     }
 
     #[test]
