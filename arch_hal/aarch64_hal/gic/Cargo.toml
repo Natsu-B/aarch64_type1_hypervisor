@@ -17,6 +17,8 @@ aarch64_test = { path = "../aarch64_test" }
 aarch64_unit_test = { path = "../aarch64_unit_test" }
 exceptions = { path = "../exceptions" }
 print = { path = "../print" }
+allocator = { path = "../../../allocator" }
+paging = { path = "../paging" }
 
 [[test]]
 name = "gicv2_pending"
@@ -36,4 +38,14 @@ path = "tests/vgic_types.rs"
 [[test]]
 name = "gicv2_ppi_enable"
 path = "tests/gicv2_ppi_enable.rs"
+harness = false
+
+[[test]]
+name = "vgic_e2e_poll"
+path = "tests/vgic_e2e_poll.rs"
+harness = false
+
+[[test]]
+name = "vgic_e2e_irq"
+path = "tests/vgic_e2e_irq.rs"
 harness = false

@@ -874,7 +874,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pending_and_enabled_irq_is_enqueued() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         vm.set_dist_enable(true, true).unwrap();
         vm.set_enable(VgicIrqScope::Local(VcpuId(0)), VIntId(5), true)
             .unwrap();
@@ -902,7 +902,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pending_queued_after_enable() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         vm.set_dist_enable(true, true).unwrap();
         vm.set_pending(VgicIrqScope::Local(VcpuId(0)), VIntId(7), true)
             .unwrap();
@@ -918,7 +918,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn sgi_sources_enqueue_with_sender() {
-        let mut vm = recording_vm(2);
+        let vm = recording_vm(2);
         vm.set_dist_enable(true, true).unwrap();
         vm.set_enable(VgicIrqScope::Local(VcpuId(1)), VIntId(0), true)
             .unwrap();
@@ -938,7 +938,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn hardware_irq_enqueues_hw_entry() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         vm.set_dist_enable(true, true).unwrap();
         vm.map_pirq(
             PIntId(48),
@@ -963,7 +963,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn map_pirq_does_not_touch_spi_route() {
-        let mut vm = recording_vm(2);
+        let vm = recording_vm(2);
         let vintid = VIntId(40);
         vm.set_spi_route(vintid, VSpiRouting::Targets(VcpuMask::from_bits(0b10)))
             .unwrap();
@@ -984,7 +984,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn map_pirq_applies_group_and_priority_without_storing() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         vm.map_pirq(
             PIntId(50),
             VcpuId(0),
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn map_pirq_rejects_invalid_target_vcpu() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         let res = vm.map_pirq(
             PIntId(48),
             VcpuId(2),
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn map_pirq_rejects_invalid_ids() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         let max_intids = crate::max_intids_for_vcpus(TEST_VCPUS) as u32;
         let bad_pintid = PIntId(max_intids);
         let res = vm.map_pirq(
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pirq_reverse_lookup_updates_on_map_and_unmap() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         let pintid = PIntId(48);
         let vintid = VIntId(40);
         vm.map_pirq(
@@ -1086,7 +1086,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pirq_duplicate_vintid_rejected() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         let vintid = VIntId(40);
         vm.map_pirq(
             PIntId(48),
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pirq_enable_hook_called_on_change() {
-        let mut vm = recording_vm(1);
+        let vm = recording_vm(1);
         let pintid = PIntId(48);
         let vintid = VIntId(40);
         vm.map_pirq(
@@ -1139,8 +1139,71 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn map_pirq_calls_enable_hook_on_initial_map() {
+        let vm = recording_vm(1);
+        static ENABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        fn enable_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+            if int_id == 48 && matches!(op, PirqHookOp::Enable { enable: true }) {
+                ENABLE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        vm.set_pirq_hook(Some(enable_hook));
+        ENABLE_COUNTER.store(0, Ordering::SeqCst);
+
+        vm.map_pirq(
+            PIntId(48),
+            VcpuId(0),
+            VIntId(40),
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+
+        assert_eq!(ENABLE_COUNTER.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn map_pirq_calls_route_hook_on_initial_map() {
+        let vm = recording_vm(2);
+        let vintid = VIntId(40);
+        static ROUTE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        static ROUTE_TARGETS: AtomicUsize = AtomicUsize::new(0);
+
+        fn route_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+            if int_id == 48 {
+                if let PirqHookOp::Route { targets } = op {
+                    ROUTE_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    ROUTE_TARGETS.store(targets as usize, Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }
+
+        vm.set_spi_route(vintid, VSpiRouting::Targets(VcpuMask::from_bits(0b10)))
+            .unwrap();
+        vm.set_pirq_hook(Some(route_hook));
+        ROUTE_COUNTER.store(0, Ordering::SeqCst);
+        ROUTE_TARGETS.store(0, Ordering::SeqCst);
+
+        vm.map_pirq(
+            PIntId(48),
+            VcpuId(1),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+
+        assert_eq!(ROUTE_COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(ROUTE_TARGETS.load(Ordering::SeqCst), 0b10);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pirq_route_hook_called_on_route_change() {
-        let mut vm = recording_vm(2);
+        let vm = recording_vm(2);
         let pintid = PIntId(48);
         let vintid = VIntId(40);
         vm.map_pirq(

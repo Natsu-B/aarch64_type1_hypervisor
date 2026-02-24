@@ -173,12 +173,25 @@ where
 
         let commit_result = {
             let mut routing = self.common.routing_lock.lock_irqsave();
-            routing.pirqs.ensure_entry(pintid, entry).map(|_| ())
+            routing.pirqs.ensure_entry(pintid, entry)
         };
-        if let Err(err) = commit_result {
-            // Roll back virtual enable if another mapping raced us after Phase 1 validation.
-            update.combine(&self.set_enable(scope, vintid, false)?);
-            return Err(err);
+        let inserted = match commit_result {
+            Ok(inserted) => inserted,
+            Err(err) => {
+                // Roll back virtual enable if another mapping raced us after Phase 1 validation.
+                update.combine(&self.set_enable(scope, vintid, false)?);
+                return Err(err);
+            }
+        };
+
+        // `set_enable` above can run before pIRQ commit, so initial map needs an explicit
+        // passthrough sync for route/enable when this entry is first installed.
+        if inserted {
+            if matches!(scope, VgicIrqScope::Global) {
+                let route = self.get_spi_route(vintid)?;
+                self.call_pirq_route_hook(pintid, route)?;
+            }
+            self.call_pirq_enable_hook(pintid, true)?;
         }
 
         Ok(update)

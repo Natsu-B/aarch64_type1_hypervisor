@@ -80,10 +80,6 @@ where
         }
     }
 
-    pub(crate) fn vcpu_count(&self) -> usize {
-        self.vcpu_count
-    }
-
     pub(crate) fn vcpu_index(&self, id: VcpuId) -> Result<usize, GicError> {
         if (id.0 as usize) < self.vcpu_count {
             Ok(id.0 as usize)

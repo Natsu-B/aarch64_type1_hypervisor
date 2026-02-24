@@ -6,7 +6,6 @@ pub(crate) mod vcpu_array;
 use crate::GicError;
 use crate::IrqGroup;
 use crate::IrqState as IrqStateKind;
-use crate::PIntId;
 use crate::VIntId;
 use crate::VcpuId;
 use crate::VcpuMask;
@@ -120,11 +119,6 @@ where
         }
     }
 
-    pub(crate) fn dist_enabled(&self, group: IrqGroup) -> bool {
-        let regs = self.regs_lock.lock_irqsave();
-        Self::dist_enabled_from(regs.dist_enable, group)
-    }
-
     pub(crate) fn irq_attrs(
         &self,
         scope: VgicIrqScope,
@@ -157,40 +151,6 @@ where
         } else {
             IrqStateKind::Inactive
         }
-    }
-
-    pub(crate) fn build_sw_virq(
-        &self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-        source: Option<VcpuId>,
-    ) -> Result<VirtualInterrupt, GicError> {
-        let attrs = self.irq_attrs(scope, vintid)?;
-        Ok(VirtualInterrupt::Software {
-            vintid: vintid.0,
-            eoi_maintenance: false,
-            priority: attrs.priority,
-            group: attrs.group,
-            state: Self::state_from_attrs(attrs),
-            source,
-        })
-    }
-
-    pub(crate) fn build_hw_virq(
-        &self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-        pintid: PIntId,
-    ) -> Result<VirtualInterrupt, GicError> {
-        let attrs = self.irq_attrs(scope, vintid)?;
-        Ok(VirtualInterrupt::Hardware {
-            vintid: vintid.0,
-            pintid: pintid.0,
-            priority: attrs.priority,
-            group: attrs.group,
-            state: Self::state_from_attrs(attrs),
-            source: None,
-        })
     }
 
     pub(crate) fn enqueue_to_target(
