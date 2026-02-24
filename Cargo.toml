@@ -10,6 +10,7 @@ members = [
     "gdb_remote",
     "intrusive_linked_list",
     "mutex",
+    "pci",
     "rpi_boot",
     "typestate",
     "typestate_macro",
@@ -19,6 +20,7 @@ members = [
 
 [profile.release]
 panic = 'abort'
+debug = true
 [profile.dev]
 panic = 'abort'
 [profile.test]

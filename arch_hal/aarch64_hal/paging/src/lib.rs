@@ -14,7 +14,7 @@ pub mod stage2;
 pub use stage1::*;
 pub use stage2::*;
 
-const PAGE_TABLE_SIZE: usize = 1usize << 12; // 4KiB
+const PAGE_TABLE_SIZE: usize = common::mem::PAGE_SIZE_4K;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagingErr {

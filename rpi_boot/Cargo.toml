@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 dtb = { path = "../dtb" }
 allocator = { path = "../allocator" }
+typestate_macro = { path = "../typestate_macro" }
 typestate = { path = "../typestate" }
 file = { path = "../file" }
 elf = { path = "../elf" }

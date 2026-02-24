@@ -31,6 +31,7 @@ TEXT_EXTENSIONS = {
     ".S",
     ".sh",
     ".lds",
+    ".py",
 }
 
 

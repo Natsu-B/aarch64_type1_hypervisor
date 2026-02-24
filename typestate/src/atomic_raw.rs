@@ -38,6 +38,18 @@ pub trait AtomicRaw: Copy + 'static {
     fn fetch_xor(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 }
 
+pub trait AtomicRawInt: AtomicRaw {
+    fn fetch_add(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
+
+    fn fetch_sub(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
+
+    fn fetch_min(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
+
+    fn fetch_max(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
+
+    fn fetch_nand(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
+}
+
 macro_rules! impl_atomic_raw {
     ($raw:ty, $atomic:ty) => {
         impl AtomicRaw for $raw {
@@ -104,6 +116,37 @@ macro_rules! impl_atomic_raw {
     };
 }
 
+macro_rules! impl_atomic_raw_int {
+    ($raw:ty, $atomic:ty) => {
+        impl AtomicRawInt for $raw {
+            #[inline(always)]
+            fn fetch_add(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
+                a.fetch_add(v, order)
+            }
+
+            #[inline(always)]
+            fn fetch_sub(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
+                a.fetch_sub(v, order)
+            }
+
+            #[inline(always)]
+            fn fetch_min(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
+                a.fetch_min(v, order)
+            }
+
+            #[inline(always)]
+            fn fetch_max(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
+                a.fetch_max(v, order)
+            }
+
+            #[inline(always)]
+            fn fetch_nand(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
+                a.fetch_nand(v, order)
+            }
+        }
+    };
+}
+
 #[cfg(target_has_atomic = "8")]
 mod impl8 {
     use super::*;
@@ -114,6 +157,8 @@ mod impl8 {
     impl_atomic_raw!(bool, AtomicBool);
     impl_atomic_raw!(u8, AtomicU8);
     impl_atomic_raw!(i8, AtomicI8);
+    impl_atomic_raw_int!(u8, AtomicU8);
+    impl_atomic_raw_int!(i8, AtomicI8);
 }
 
 #[cfg(target_has_atomic = "16")]
@@ -124,6 +169,8 @@ mod impl16 {
 
     impl_atomic_raw!(u16, AtomicU16);
     impl_atomic_raw!(i16, AtomicI16);
+    impl_atomic_raw_int!(u16, AtomicU16);
+    impl_atomic_raw_int!(i16, AtomicI16);
 }
 
 #[cfg(target_has_atomic = "32")]
@@ -134,6 +181,8 @@ mod impl32 {
 
     impl_atomic_raw!(u32, AtomicU32);
     impl_atomic_raw!(i32, AtomicI32);
+    impl_atomic_raw_int!(u32, AtomicU32);
+    impl_atomic_raw_int!(i32, AtomicI32);
 }
 
 #[cfg(target_has_atomic = "64")]
@@ -144,6 +193,8 @@ mod impl64 {
 
     impl_atomic_raw!(u64, AtomicU64);
     impl_atomic_raw!(i64, AtomicI64);
+    impl_atomic_raw_int!(u64, AtomicU64);
+    impl_atomic_raw_int!(i64, AtomicI64);
 }
 
 #[cfg(target_has_atomic = "ptr")]
@@ -154,4 +205,6 @@ mod implptr {
 
     impl_atomic_raw!(usize, AtomicUsize);
     impl_atomic_raw!(isize, AtomicIsize);
+    impl_atomic_raw_int!(usize, AtomicUsize);
+    impl_atomic_raw_int!(isize, AtomicIsize);
 }

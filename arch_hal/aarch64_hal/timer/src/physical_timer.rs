@@ -17,6 +17,12 @@ pub struct El2PhysicalTimer {
     counter_frequency: NonZeroU64,
 }
 
+impl Default for El2PhysicalTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl El2PhysicalTimer {
     /// Read CNTFRQ_EL0 and construct the timer wrapper (panics if zero).
     pub fn new() -> Self {

@@ -15,10 +15,8 @@ use crate::VgicVcpuQueue;
 use crate::VgicWork;
 use crate::VirtualInterrupt;
 use crate::vm::common::LOCAL_INTID_COUNT;
+use crate::vm::common::SGI_COUNT;
 use aarch64_mutex::RawSpinLockIrqSave;
-use core::cmp::Ordering;
-use core::mem::MaybeUninit;
-use core::ptr;
 use core::sync::atomic::Ordering as AtomicOrdering;
 use cpu::CoreAffinity;
 use mutex::pod::RawAtomicPod;
@@ -56,144 +54,228 @@ struct PendingEntry {
     irq: VirtualInterrupt,
 }
 
-/// Ordering for PendingEntry
-/// - Higher priority first (lower numeric value)
-///
-/// This ordering is a deterministic software policy. The architecture does not define a strict
-/// tie-break across equal priorities, and some backends quantize priority for HW arbitration.
-impl Ord for PendingEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Note: ordering is based on the guest-visible 8-bit priority even though GICv2 LRs store
-        // only the upper 5 bits (`priority >> 3`), so lower-bit ties may not match hardware.
-        other
-            .irq
-            .priority()
-            .cmp(&self.irq.priority())
-            .then_with(|| other.key.vintid.0.cmp(&self.key.vintid.0))
-            .then_with(|| {
-                let other_src = other.key.source.map(|s| s.0);
-                let self_src = self.key.source.map(|s| s.0);
-                other_src.cmp(&self_src)
-            })
+const NO_SLOT: usize = usize::MAX;
+
+const fn pending_placeholder_irq() -> VirtualInterrupt {
+    VirtualInterrupt::Software {
+        vintid: 0,
+        eoi_maintenance: false,
+        priority: 0,
+        group: IrqGroup::Group0,
+        state: IrqState::Inactive,
+        source: None,
     }
 }
 
-impl PartialOrd for PendingEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+#[derive(Copy, Clone)]
+struct PendingNode {
+    key: LrKey,
+    irq: VirtualInterrupt,
+    prev: usize,
+    next: usize,
+    in_queue: bool,
+    priority: u8,
 }
 
-// Capacity accounts for each INTID plus per-SGI source bookkeeping on all vCPUs.
-struct FixedSortedArray<T: Copy, const N: usize> {
+impl PendingNode {
+    const EMPTY: Self = Self {
+        key: LrKey {
+            vintid: VIntId(0),
+            source: None,
+        },
+        irq: pending_placeholder_irq(),
+        prev: NO_SLOT,
+        next: NO_SLOT,
+        in_queue: false,
+        priority: 0,
+    };
+}
+
+// Pending queue with O(1) key lookup and bounded O(1) best-priority selection.
+struct PendingQueue<const MAX_VCPUS: usize, const MAX_INTIDS: usize, const PENDING_CAP: usize> {
+    nodes: [PendingNode; PENDING_CAP],
+    bucket_heads: [usize; 256],
+    bucket_tails: [usize; 256],
+    non_empty: [u64; 4],
     len: usize,
-    buf: [MaybeUninit<T>; N],
 }
 
-impl<T: Copy, const N: usize> FixedSortedArray<T, N> {
+impl<const MAX_VCPUS: usize, const MAX_INTIDS: usize, const PENDING_CAP: usize>
+    PendingQueue<MAX_VCPUS, MAX_INTIDS, PENDING_CAP>
+{
     fn new() -> Self {
-        // SAFETY: `[MaybeUninit<T>; N]` is backing storage for up to `N` elements. `len` starts
-        // at 0 so no uninitialised slot will be dropped or read until we explicitly write it.
-        let buf: [MaybeUninit<T>; N] = unsafe { MaybeUninit::uninit().assume_init() };
-        Self { len: 0, buf }
+        Self {
+            nodes: [PendingNode::EMPTY; PENDING_CAP],
+            bucket_heads: [NO_SLOT; 256],
+            bucket_tails: [NO_SLOT; 256],
+            non_empty: [0; 4],
+            len: 0,
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    fn as_slice(&self) -> &[T] {
-        // SAFETY:
-        // - `self.len <= N` is an invariant of `FixedSortedArray`.
-        // - The first `self.len` entries of `buf` are initialised to valid `T` values by
-        //   insert/remove operations.
-        // - `MaybeUninit<T>` has the same layout as `T`, so casting the pointer is valid.
-        let ptr = self.buf.as_ptr() as *const T;
-        unsafe { core::slice::from_raw_parts(ptr, self.len) }
-    }
+    fn slot_for_key(key: LrKey) -> Result<usize, GicError> {
+        let vintid = key.vintid.0 as usize;
+        if vintid >= MAX_INTIDS {
+            return Err(GicError::UnsupportedIntId);
+        }
 
-    fn iter(&self) -> core::slice::Iter<'_, T> {
-        self.as_slice().iter()
-    }
-
-    fn peek_best(&self) -> Option<&T> {
-        if self.len == 0 {
-            None
+        let slot = if vintid < SGI_COUNT {
+            let sender_idx = key.source.map(|src| src.0 as usize).unwrap_or(0);
+            if sender_idx >= MAX_VCPUS {
+                return Err(GicError::InvalidVcpuId);
+            }
+            // `source=None` intentionally aliases the same slot as `source=Some(VcpuId(0))`
+            // because pending capacity is `SGI_COUNT * vcpu_count` (no extra "none source" slot).
+            vintid
+                .checked_mul(MAX_VCPUS)
+                .and_then(|base| base.checked_add(sender_idx))
+                .ok_or(GicError::OutOfResources)?
         } else {
-            // SAFETY: `len > 0` guarantees the last element is within the initialised prefix and
-            // we only produce a shared reference.
-            Some(unsafe { self.buf[self.len - 1].assume_init_ref() })
-        }
-    }
+            SGI_COUNT
+                .checked_mul(MAX_VCPUS)
+                .and_then(|sgi_slots| sgi_slots.checked_add(vintid - SGI_COUNT))
+                .ok_or(GicError::OutOfResources)?
+        };
 
-    fn pop_best(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        // SAFETY: after decrementing, the old last element still lies in the initialised prefix.
-        // `assume_init_read` moves it out to avoid double-drop; the slot is now considered
-        // uninitialised until rewritten.
-        Some(unsafe { self.buf[self.len].assume_init_read() })
-    }
-
-    fn insert_sorted(&mut self, value: T) -> Result<(), GicError>
-    where
-        T: Ord,
-    {
-        if self.len == N {
+        if slot >= PENDING_CAP {
             return Err(GicError::OutOfResources);
         }
-        let mut insert_idx = self.len;
-        for i in 0..self.len {
-            // SAFETY: `i < len` so the slot is initialised; we only read a shared reference for
-            // ordering without mutating the element.
-            let existing = unsafe { self.buf[i].assume_init_ref() };
-            if existing.cmp(&value) == Ordering::Greater {
-                insert_idx = i;
-                break;
+        Ok(slot)
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: LrKey) -> bool {
+        let Ok(slot) = Self::slot_for_key(key) else {
+            return false;
+        };
+        self.nodes[slot].in_queue
+    }
+
+    fn set_non_empty(&mut self, priority: usize) {
+        let word = priority / 64;
+        let bit = priority % 64;
+        self.non_empty[word] |= 1u64 << bit;
+    }
+
+    fn clear_non_empty(&mut self, priority: usize) {
+        let word = priority / 64;
+        let bit = priority % 64;
+        self.non_empty[word] &= !(1u64 << bit);
+    }
+
+    fn best_priority(&self) -> Option<usize> {
+        for word in 0..self.non_empty.len() {
+            let bits = self.non_empty[word];
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize);
             }
         }
-        // SAFETY: `len < N` ensures there is free capacity; we shift the initialised suffix
-        // `[insert_idx, len)` one slot to the right to make space. The regions may overlap, which
-        // `ptr::copy` handles like `memmove`, and both source and destination lie within the
-        // allocated buffer.
-        unsafe {
-            ptr::copy(
-                self.buf.as_ptr().add(insert_idx),
-                self.buf.as_mut_ptr().add(insert_idx + 1),
-                self.len - insert_idx,
-            );
+        None
+    }
+
+    fn push_tail(&mut self, slot: usize, priority: usize) {
+        let tail = self.bucket_tails[priority];
+        self.nodes[slot].prev = tail;
+        self.nodes[slot].next = NO_SLOT;
+        self.nodes[slot].priority = priority as u8;
+
+        if tail == NO_SLOT {
+            self.bucket_heads[priority] = slot;
+            self.bucket_tails[priority] = slot;
+            self.set_non_empty(priority);
+        } else {
+            self.nodes[tail].next = slot;
+            self.bucket_tails[priority] = slot;
         }
-        self.buf[insert_idx] = MaybeUninit::new(value);
-        self.len += 1;
+    }
+
+    fn unlink_slot(&mut self, slot: usize) {
+        let priority = self.nodes[slot].priority as usize;
+        let prev = self.nodes[slot].prev;
+        let next = self.nodes[slot].next;
+
+        if prev == NO_SLOT {
+            self.bucket_heads[priority] = next;
+        } else {
+            self.nodes[prev].next = next;
+        }
+        if next == NO_SLOT {
+            self.bucket_tails[priority] = prev;
+        } else {
+            self.nodes[next].prev = prev;
+        }
+
+        self.nodes[slot].prev = NO_SLOT;
+        self.nodes[slot].next = NO_SLOT;
+        if self.bucket_heads[priority] == NO_SLOT {
+            self.clear_non_empty(priority);
+        }
+    }
+
+    fn upsert(&mut self, key: LrKey, irq: VirtualInterrupt) -> Result<(), GicError> {
+        let slot = Self::slot_for_key(key)?;
+        let priority = irq.priority() as usize;
+        let was_queued = self.nodes[slot].in_queue;
+
+        if was_queued {
+            if self.nodes[slot].priority as usize != priority {
+                self.unlink_slot(slot);
+                self.push_tail(slot, priority);
+            }
+        } else {
+            self.push_tail(slot, priority);
+            self.nodes[slot].in_queue = true;
+            self.len += 1;
+        }
+
+        self.nodes[slot].key = key;
+        self.nodes[slot].irq = irq;
+        self.nodes[slot].priority = priority as u8;
         Ok(())
     }
 
-    fn remove_first(&mut self, mut pred: impl FnMut(&T) -> bool) -> bool {
-        for i in 0..self.len {
-            let matches = {
-                // SAFETY: first `len` elements are initialised; we borrow a shared reference to
-                // test the predicate without mutating the element.
-                let elem = unsafe { self.buf[i].assume_init_ref() };
-                pred(elem)
-            };
-            if matches {
-                // SAFETY: `T: Copy`, so shifting elements with `ptr::copy` is sufficient and does
-                // not require dropping any value explicitly. This shifts the initialised suffix
-                // `[i + 1, len)` down by one slot.
-                unsafe {
-                    ptr::copy(
-                        self.buf.as_ptr().add(i + 1),
-                        self.buf.as_mut_ptr().add(i),
-                        self.len - i - 1,
-                    );
-                }
-                self.len -= 1;
-                return true;
-            }
+    fn remove(&mut self, key: LrKey) -> Result<bool, GicError> {
+        let slot = Self::slot_for_key(key)?;
+        if !self.nodes[slot].in_queue {
+            return Ok(false);
         }
-        false
+        self.unlink_slot(slot);
+        self.nodes[slot].in_queue = false;
+        self.len -= 1;
+        Ok(true)
+    }
+
+    fn peek_best(&self) -> Option<PendingEntry> {
+        let priority = self.best_priority()?;
+        let slot = self.bucket_heads[priority];
+        if slot == NO_SLOT {
+            return None;
+        }
+        let node = &self.nodes[slot];
+        Some(PendingEntry {
+            key: node.key,
+            irq: node.irq,
+        })
+    }
+
+    fn pop_best(&mut self) -> Option<PendingEntry> {
+        let priority = self.best_priority()?;
+        let slot = self.bucket_heads[priority];
+        if slot == NO_SLOT {
+            return None;
+        }
+        let entry = PendingEntry {
+            key: self.nodes[slot].key,
+            irq: self.nodes[slot].irq,
+        };
+        self.unlink_slot(slot);
+        self.nodes[slot].in_queue = false;
+        self.len -= 1;
+        Some(entry)
     }
 }
 
@@ -203,7 +285,7 @@ struct Inner<
     const MAX_LRS: usize,
     const PENDING_CAP: usize,
 > {
-    pending: FixedSortedArray<PendingEntry, PENDING_CAP>,
+    pending: PendingQueue<MAX_VCPUS, MAX_INTIDS, PENDING_CAP>,
     in_lr: [Option<LrKey>; MAX_LRS],
     lr_state: [IrqState; MAX_LRS],
     lr_updates: [Option<VirtualInterrupt>; MAX_LRS],
@@ -236,7 +318,7 @@ impl<
         Self {
             id,
             inner: RawSpinLockIrqSave::new(Inner {
-                pending: FixedSortedArray::new(),
+                pending: PendingQueue::new(),
                 in_lr: [None; MAX_LRS],
                 lr_state: [IrqState::Inactive; MAX_LRS],
                 lr_updates: [None; MAX_LRS],
@@ -251,20 +333,32 @@ impl<
     }
 
     pub(crate) fn cancel(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError> {
-        let key = LrKey { vintid, source };
+        self.cancel_many(&[(vintid, source)])
+    }
+
+    pub(crate) fn cancel_many(&self, irqs: &[(VIntId, Option<VcpuId>)]) -> Result<(), GicError> {
+        if irqs.is_empty() {
+            return Ok(());
+        }
+
         let mut inner = self.inner.lock_irqsave();
-        let mut removed = false;
-        while inner.pending.remove_first(|entry| entry.key == key) {
-            removed = true;
-        }
-        if let Some(idx) = inner.in_lr.iter().position(|entry| *entry == Some(key)) {
-            if idx < u64::BITS as usize {
-                inner.invalidate_lrs |= 1u64 << idx;
+        let mut any_removed = false;
+
+        for (vintid, source) in irqs.iter().copied() {
+            let key = LrKey { vintid, source };
+            let mut removed = inner.pending.remove(key)?;
+            if let Some(idx) = inner.in_lr.iter().position(|entry| *entry == Some(key)) {
+                if idx < u64::BITS as usize {
+                    inner.invalidate_lrs |= 1u64 << idx;
+                }
+                inner.lr_updates[idx] = None;
+                removed = true;
             }
-            inner.lr_updates[idx] = None;
-            removed = true;
+            if removed {
+                any_removed = true;
+            }
         }
-        if removed {
+        if any_removed {
             self.need_refill.store(true, AtomicOrdering::Release);
         }
         Ok(())
@@ -280,11 +374,10 @@ impl<
             irq.set_state(IrqState::Pending);
         }
         normalize_sw_irq(&mut irq);
-        while inner.pending.remove_first(|entry| entry.key == key) {}
         if let Some(idx) = inner.in_lr.iter().position(|entry| *entry == Some(key)) {
             inner.lr_updates[idx] = Some(irq);
         } else {
-            inner.pending.insert_sorted(PendingEntry { key, irq })?;
+            inner.pending.upsert(key, irq)?;
         }
         self.need_refill.store(true, AtomicOrdering::Release);
         let current = cpu::get_current_core_id();
@@ -340,6 +433,10 @@ impl<
     fn cancel_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> Result<(), GicError> {
         self.cancel(vintid, source)
     }
+
+    fn cancel_irqs(&self, irqs: &[(VIntId, Option<VcpuId>)]) -> Result<(), GicError> {
+        self.cancel_many(irqs)
+    }
 }
 
 impl<
@@ -359,18 +456,6 @@ impl<
                 self.need_refill.store(true, AtomicOrdering::Release);
                 Ok(())
             }
-        }
-    }
-
-    fn clear_resident(&self, core: CoreAffinity) -> Result<(), GicError> {
-        let mut inner = self.inner.lock_irqsave();
-        match inner.resident {
-            None => Ok(()),
-            Some(existing) if existing == core => {
-                inner.resident = None;
-                Ok(())
-            }
-            Some(_) => Err(GicError::InvalidState),
         }
     }
 
@@ -431,11 +516,7 @@ impl<
                 inner.lr_pintid[idx] = update_irq.pintid().map(PIntId);
                 inner.sw_empty_lrs &= !(1u64 << idx);
             } else {
-                while inner.pending.remove_first(|entry| entry.key == update_key) {}
-                inner.pending.insert_sorted(PendingEntry {
-                    key: update_key,
-                    irq: update_irq,
-                })?;
+                inner.pending.upsert(update_key, update_irq)?;
             }
             inner.lr_updates[idx] = None;
         }
@@ -471,7 +552,7 @@ impl<
 
         // If no free LR and still pending work, consider eviction/spill.
         if empty == 0 && !inner.pending.is_empty() && can_spill {
-            let best_pending = inner.pending.peek_best().cloned();
+            let best_pending = inner.pending.peek_best();
             if let Some(best_entry) = best_pending {
                 // KVM rule: active or HW-backed entries must never be evicted; only pending SW LRs
                 // are candidates for replacement.
@@ -522,10 +603,7 @@ impl<
                     let mut victim_pending_irq = victim_irq;
                     victim_pending_irq.set_state(IrqState::Pending);
                     normalize_sw_irq(&mut victim_pending_irq);
-                    inner.pending.insert_sorted(PendingEntry {
-                        key: victim_key,
-                        irq: victim_pending_irq,
-                    })?;
+                    inner.pending.upsert(victim_key, victim_pending_irq)?;
                     // Install best entry into LR.
                     let mut irq = best_entry.irq;
                     if irq.state() == IrqState::Inactive {
@@ -700,10 +778,12 @@ impl<
                 let mut irq = hw.read_lr(idx)?;
                 let new = irq.state();
 
-                // EISR is architecturally meaningful only for SW-composed LRs, and may be broken
-                // on some implementations. Treat it as a hint and fall back to state transitions.
+                // EISR is architecturally meaningful only for SW-composed LRs; HW-backed LRs do
+                // not set EISR status bits. For HW entries we therefore infer EOI from observed
+                // state transitions under EOI maintenance handling, while ELRSR remains the
+                // authoritative signal for LR disappearance.
                 let eoi_event = if irq.is_hw() {
-                    old != new && old != IrqState::Inactive
+                    old != new && matches!(old, IrqState::Active | IrqState::PendingActive)
                 } else {
                     sw_eoi || (old != new && old != IrqState::Inactive)
                 };
@@ -900,16 +980,6 @@ mod tests {
         { MAX_LRS },
         { crate::vm::pending_cap_for_vcpus(TEST_VCPUS) },
     >;
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn fixed_sorted_array_signals_overflow() {
-        let mut arr: FixedSortedArray<u8, 1> = FixedSortedArray::new();
-        arr.insert_sorted(1).unwrap();
-        assert!(matches!(
-            arr.insert_sorted(2),
-            Err(GicError::OutOfResources)
-        ));
-    }
 
     fn invalid_irq() -> VirtualInterrupt {
         VirtualInterrupt::Software {
@@ -1325,7 +1395,7 @@ mod tests {
         drop(st);
 
         let inner = vcpu.inner.lock_irqsave();
-        assert!(!inner.pending.iter().any(|entry| entry.key == key));
+        assert!(!inner.pending.contains_key(key));
         assert!(inner.lr_updates[0].is_none());
     }
 
@@ -1399,7 +1469,7 @@ mod tests {
         vcpu.refill_lrs(&hw).unwrap();
 
         let inner = vcpu.inner.lock_irqsave();
-        assert!(inner.pending.iter().any(|entry| entry.key == key));
+        assert!(inner.pending.contains_key(key));
         assert!(inner.lr_updates[0].is_none());
         drop(inner);
 
@@ -1610,6 +1680,45 @@ mod tests {
         let st = hw.state.borrow();
         assert_eq!(eoi.as_slice(), &[77]);
         assert_ne!(st.elrsr & 1, 0); // LR marked empty
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn hw_pending_to_active_does_not_emit_eoi() {
+        let vcpu = TestVcpu::with_id(VcpuId(0));
+        let hw = FakeHw::new(1);
+        vcpu.set_resident(cpu::get_current_core_id()).unwrap();
+        vcpu.enqueue(make_irq(78, 0x20, true, Some(78))).unwrap();
+        vcpu.refill_lrs(&hw).unwrap();
+
+        {
+            let mut inner = vcpu.inner.lock_irqsave();
+            inner.lr_state[0] = IrqState::Pending;
+        }
+        {
+            let mut irq = hw.read_lr(0).unwrap();
+            irq.set_state(IrqState::Active);
+            hw.write_lr(0, irq).unwrap();
+            let mut st = hw.state.borrow_mut();
+            st.eisr = 0;
+            st.misr = MaintenanceReasons(MaintenanceReasons::EOI);
+        }
+
+        let mut eoi = CallbackLog::<4>::new();
+        let mut deactivate = CallbackLog::<4>::new();
+        let mut resample = CallbackLog::<4>::new();
+        let update = vcpu
+            .handle_maintenance(
+                &hw,
+                &mut |id| eoi.push(id.0),
+                &mut |id| deactivate.push(id.0),
+                &mut |id| resample.push(id.0),
+            )
+            .unwrap();
+
+        assert!(eoi.as_slice().is_empty());
+        assert!(deactivate.as_slice().is_empty());
+        assert!(resample.as_slice().is_empty());
+        assert!(matches!(update, VgicUpdate::None));
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]

@@ -21,7 +21,11 @@ SECTIONS
         *(.text*)
     } :text
 
-    .rodata ALIGN(8) : {
+    .rodata ALIGN(64) : {
+        __el2_tls_start = .;
+        KEEP(*(.el2_tls .el2_tls.*))
+        __el2_tls_end = .;
+        __el2_tls_size = __el2_tls_end - __el2_tls_start;
         *(.rodata*)
     } : rodata
 
@@ -32,14 +36,23 @@ SECTIONS
     .bss ALIGN(8) : {
         _BSS_START = .;
         *(.bss*)
+        . = ALIGN(64);
+        __el2_tls_bsp_start = .;
+        . = . + __el2_tls_size;
+        __el2_tls_bsp_end = .;
         . = ALIGN(8);
         _BSS_END = .;
     } :data
 
-    . = . + 0x10000;
-
+    . = ALIGN(0x1000);
+    _STACK_BOTTOM = .;
+    . = . + 0x1000;    /* guard page (unmapped in EL2 Stage-1) */
+    . = . + 0x1600000;
     _STACK_TOP = .;
     _PROGRAM_END = .;
-    . = 0x300000;
+    ASSERT((_STACK_BOTTOM & 0xFFF) == 0, "STACK_BOTTOM must be 4KB aligned")
+    ASSERT((_STACK_TOP & 0xFFF) == 0, "STACK_TOP must be 4KB aligned")
+    ASSERT(_STACK_TOP < 0x3000000, "Stack overlaps Linux image")
+    . = 0x3000000;
     _LINUX_IMAGE = .;
 }

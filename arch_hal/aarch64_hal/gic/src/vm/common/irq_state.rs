@@ -29,19 +29,20 @@ pub(crate) struct IrqState<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     vcpu_count: usize,
-    group_local: [[bool; LOCAL_INTID_COUNT]; VCPUS],
-    enable_local: [[bool; LOCAL_INTID_COUNT]; VCPUS],
-    pending_local: [[bool; LOCAL_INTID_COUNT]; VCPUS],
-    active_local: [[bool; LOCAL_INTID_COUNT]; VCPUS],
+    group_local: [u32; VCPUS],
+    enable_local: [u32; VCPUS],
+    pending_local: [u32; VCPUS],
+    active_local: [u32; VCPUS],
     priority_local: [[u8; LOCAL_INTID_COUNT]; VCPUS],
     trigger_local: [[TriggerMode; LOCAL_INTID_COUNT]; VCPUS],
 
-    group_global: [bool; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
-    enable_global: [bool; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
-    pending_global: [bool; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
-    active_global: [bool; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
+    group_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+    enable_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+    pending_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+    active_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
     priority_global: [u8; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
     trigger_global: [TriggerMode; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
 }
@@ -50,6 +51,7 @@ impl<const VCPUS: usize> IrqState<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
 {
     pub(crate) fn new(vcpu_count: usize) -> Self {
         let mut trigger_local = [[TriggerMode::Level; LOCAL_INTID_COUNT]; VCPUS];
@@ -58,29 +60,24 @@ where
                 t[intid] = TriggerMode::Edge;
             }
         }
-
         Self {
             vcpu_count,
-            group_local: [[false; LOCAL_INTID_COUNT]; VCPUS],
-            enable_local: [[false; LOCAL_INTID_COUNT]; VCPUS],
-            pending_local: [[false; LOCAL_INTID_COUNT]; VCPUS],
-            active_local: [[false; LOCAL_INTID_COUNT]; VCPUS],
+            group_local: [0; VCPUS],
+            enable_local: [0; VCPUS],
+            pending_local: [0; VCPUS],
+            active_local: [0; VCPUS],
             priority_local: [[0u8; LOCAL_INTID_COUNT]; VCPUS],
             trigger_local,
 
-            group_global: [false; { crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT }],
-            enable_global: [false; { crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT }],
-            pending_global: [false; { crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT }],
-            active_global: [false; { crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT }],
+            group_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+            enable_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+            pending_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+            active_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
             priority_global: [0u8; { crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT }],
             trigger_global: [TriggerMode::Level; {
                 crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT
             }],
         }
-    }
-
-    pub(crate) fn vcpu_count(&self) -> usize {
-        self.vcpu_count
     }
 
     pub(crate) fn vcpu_index(&self, id: VcpuId) -> Result<usize, GicError> {
@@ -95,7 +92,93 @@ where
         intid < crate::max_intids_for_vcpus(VCPUS)
     }
 
-    fn select_bool_slices(&self, field: BoolField) -> (&[[bool; LOCAL_INTID_COUNT]], &[bool]) {
+    #[inline(always)]
+    fn lsb_mask(bits: usize) -> u32 {
+        if bits >= u32::BITS as usize {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        }
+    }
+
+    #[inline(always)]
+    fn valid_window_bits(base: usize) -> usize {
+        crate::max_intids_for_vcpus(VCPUS)
+            .saturating_sub(base)
+            .min(32)
+    }
+
+    #[inline(always)]
+    fn local_bit_mask(intid: usize) -> u32 {
+        1u32 << intid
+    }
+
+    #[inline(always)]
+    fn global_bit_index(intid: usize) -> usize {
+        intid - LOCAL_INTID_COUNT
+    }
+
+    #[inline(always)]
+    fn global_word_and_mask(intid: usize) -> (usize, u32) {
+        let bit_index = Self::global_bit_index(intid);
+        (bit_index / 32, 1u32 << (bit_index % 32))
+    }
+
+    fn local_window(base: usize) -> Result<Option<(usize, u32, u32)>, GicError> {
+        if !Self::intid_in_range(base) {
+            return Ok(None);
+        }
+        if base >= LOCAL_INTID_COUNT {
+            return Err(GicError::UnsupportedIntId);
+        }
+        let valid_bits = Self::valid_window_bits(base);
+        if base + valid_bits > LOCAL_INTID_COUNT {
+            return Err(GicError::UnsupportedIntId);
+        }
+        let valid_mask = Self::lsb_mask(valid_bits);
+        Ok(Some((base, valid_mask, valid_mask << base)))
+    }
+
+    fn global_window(base: usize) -> Result<Option<(usize, usize, u32)>, GicError> {
+        if !Self::intid_in_range(base) {
+            return Ok(None);
+        }
+        if base < LOCAL_INTID_COUNT {
+            return Err(GicError::UnsupportedIntId);
+        }
+        let bit_index = Self::global_bit_index(base);
+        let valid_bits = Self::valid_window_bits(base);
+        let valid_mask = Self::lsb_mask(valid_bits);
+        Ok(Some((bit_index / 32, bit_index % 32, valid_mask)))
+    }
+
+    #[inline(always)]
+    fn read_u64_pair(words: &[u32], word_index: usize) -> u64 {
+        let w0 = words[word_index] as u64;
+        let w1 = words.get(word_index + 1).copied().unwrap_or(0) as u64;
+        w0 | (w1 << 32)
+    }
+
+    #[inline(always)]
+    fn write_u64_pair(words: &mut [u32], word_index: usize, pair: u64) {
+        words[word_index] = pair as u32;
+        if let Some(next) = words.get_mut(word_index + 1) {
+            *next = (pair >> 32) as u32;
+        }
+    }
+
+    #[inline(always)]
+    fn read_window_from_pair(pair: u64, shift: usize) -> u32 {
+        ((pair >> shift) & (u32::MAX as u64)) as u32
+    }
+
+    #[inline(always)]
+    fn write_window_to_pair(pair: u64, shift: usize, valid_mask: u32, window: u32) -> u64 {
+        let bit_mask = (valid_mask as u64) << shift;
+        (pair & !bit_mask) | (((window & valid_mask) as u64) << shift)
+    }
+
+    fn select_bool_slices(&self, field: BoolField) -> (&[u32], &[u32]) {
         match field {
             BoolField::Group => (&self.group_local[..self.vcpu_count], &self.group_global),
             BoolField::Enable => (&self.enable_local[..self.vcpu_count], &self.enable_global),
@@ -104,7 +187,7 @@ where
         }
     }
 
-    fn select_bool_local_mut(&mut self, field: BoolField) -> &mut [[bool; LOCAL_INTID_COUNT]] {
+    fn select_bool_local_mut(&mut self, field: BoolField) -> &mut [u32] {
         match field {
             BoolField::Group => &mut self.group_local[..self.vcpu_count],
             BoolField::Enable => &mut self.enable_local[..self.vcpu_count],
@@ -113,12 +196,12 @@ where
         }
     }
 
-    fn select_bool_global_mut(&mut self, field: BoolField) -> &mut [bool] {
+    fn select_bool_global_mut(&mut self, field: BoolField) -> &mut [u32] {
         match field {
-            BoolField::Group => &mut self.group_global,
-            BoolField::Enable => &mut self.enable_global,
-            BoolField::Pending => &mut self.pending_global,
-            BoolField::Active => &mut self.active_global,
+            BoolField::Group => &mut self.group_global[..],
+            BoolField::Enable => &mut self.enable_global[..],
+            BoolField::Pending => &mut self.pending_global[..],
+            BoolField::Active => &mut self.active_global[..],
         }
     }
 
@@ -128,41 +211,24 @@ where
         base: usize,
         field: BoolField,
     ) -> Result<u32, GicError> {
-        let mut value = 0u32;
         let (local, global) = self.select_bool_slices(field);
-
         match scope {
             VgicIrqScope::Local(vcpu) => {
                 let idx = self.vcpu_index(vcpu)?;
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if intid >= LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    if local[idx][intid] {
-                        value |= 1u32 << bit;
-                    }
-                }
+                let Some((shift, valid_mask, _)) = Self::local_window(base)? else {
+                    return Ok(0);
+                };
+                Ok((local[idx] >> shift) & valid_mask)
             }
             VgicIrqScope::Global => {
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if intid < LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    if global[intid - LOCAL_INTID_COUNT] {
-                        value |= 1u32 << bit;
-                    }
-                }
+                let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
+                    return Ok(0);
+                };
+                let pair = Self::read_u64_pair(global, word_index);
+                let window = Self::read_window_from_pair(pair, shift);
+                Ok(window & valid_mask)
             }
         }
-        Ok(value)
     }
 
     fn write_bool_word(
@@ -172,46 +238,33 @@ where
         bits: u32,
         field: BoolField,
     ) -> Result<bool, GicError> {
-        let mut changed = false;
         match scope {
             VgicIrqScope::Local(vcpu) => {
                 let idx = self.vcpu_index(vcpu)?;
+                let Some((shift, valid_mask, word_mask)) = Self::local_window(base)? else {
+                    return Ok(false);
+                };
                 let local = self.select_bool_local_mut(field);
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if intid >= LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    let set = (bits & (1u32 << bit)) != 0;
-                    if local[idx][intid] != set {
-                        local[idx][intid] = set;
-                        changed = true;
-                    }
-                }
+                let slot = &mut local[idx];
+                let write_bits = (bits & valid_mask) << shift;
+                let changed = ((*slot ^ write_bits) & word_mask) != 0;
+                *slot = (*slot & !word_mask) | write_bits;
+                Ok(changed)
             }
             VgicIrqScope::Global => {
+                let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
+                    return Ok(false);
+                };
                 let global = self.select_bool_global_mut(field);
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if intid < LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    let set = (bits & (1u32 << bit)) != 0;
-                    let slot = &mut global[intid - LOCAL_INTID_COUNT];
-                    if *slot != set {
-                        *slot = set;
-                        changed = true;
-                    }
-                }
+                let pair = Self::read_u64_pair(global, word_index);
+                let current_window = Self::read_window_from_pair(pair, shift);
+                let write_window = bits & valid_mask;
+                let changed = ((current_window ^ write_window) & valid_mask) != 0;
+                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, write_window);
+                Self::write_u64_pair(global, word_index, new_pair);
+                Ok(changed)
             }
         }
-        Ok(changed)
     }
 
     fn set_bool(
@@ -232,9 +285,15 @@ where
                 }
                 let idx = self.vcpu_index(vcpu)?;
                 let local = self.select_bool_local_mut(field);
-                let slot = &mut local[idx][intid];
-                let changed = *slot != val;
-                *slot = val;
+                let bit = Self::local_bit_mask(intid);
+                let slot = &mut local[idx];
+                let old = (*slot & bit) != 0;
+                let changed = old != val;
+                if val {
+                    *slot |= bit;
+                } else {
+                    *slot &= !bit;
+                }
                 Ok(changed)
             }
             VgicIrqScope::Global => {
@@ -242,9 +301,15 @@ where
                     return Err(GicError::UnsupportedIntId);
                 }
                 let global = self.select_bool_global_mut(field);
-                let slot = &mut global[intid - LOCAL_INTID_COUNT];
-                let changed = *slot != val;
-                *slot = val;
+                let (word_index, bit) = Self::global_word_and_mask(intid);
+                let slot = &mut global[word_index];
+                let old = (*slot & bit) != 0;
+                let changed = old != val;
+                if val {
+                    *slot |= bit;
+                } else {
+                    *slot &= !bit;
+                }
                 Ok(changed)
             }
         }
@@ -257,50 +322,34 @@ where
         bits: u32,
         field: BoolField,
     ) -> Result<u32, GicError> {
-        let mut changed = 0u32;
         match scope {
             VgicIrqScope::Local(vcpu) => {
                 let idx = self.vcpu_index(vcpu)?;
+                let Some((shift, valid_mask, _)) = Self::local_window(base)? else {
+                    return Ok(0);
+                };
                 let local = self.select_bool_local_mut(field);
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if (bits & (1u32 << bit)) == 0 {
-                        continue;
-                    }
-                    if intid >= LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    if !local[idx][intid] {
-                        local[idx][intid] = true;
-                        changed |= 1u32 << bit;
-                    }
-                }
+                let slot = &mut local[idx];
+                let set_segment = (bits & valid_mask) << shift;
+                let changed_segment = (!*slot) & set_segment;
+                *slot |= set_segment;
+                Ok((changed_segment >> shift) & valid_mask)
             }
             VgicIrqScope::Global => {
+                let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
+                    return Ok(0);
+                };
                 let global = self.select_bool_global_mut(field);
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if (bits & (1u32 << bit)) == 0 {
-                        continue;
-                    }
-                    if intid < LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    let slot = &mut global[intid - LOCAL_INTID_COUNT];
-                    if !*slot {
-                        *slot = true;
-                        changed |= 1u32 << bit;
-                    }
-                }
+                let pair = Self::read_u64_pair(global, word_index);
+                let current_window = Self::read_window_from_pair(pair, shift);
+                let set_window = bits & valid_mask;
+                let changed = (!current_window) & set_window & valid_mask;
+                let new_window = current_window | set_window;
+                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, new_window);
+                Self::write_u64_pair(global, word_index, new_pair);
+                Ok(changed)
             }
         }
-        Ok(changed)
     }
 
     fn write_clear_bool_word_mask(
@@ -310,50 +359,34 @@ where
         bits: u32,
         field: BoolField,
     ) -> Result<u32, GicError> {
-        let mut changed = 0u32;
         match scope {
             VgicIrqScope::Local(vcpu) => {
                 let idx = self.vcpu_index(vcpu)?;
+                let Some((shift, valid_mask, _)) = Self::local_window(base)? else {
+                    return Ok(0);
+                };
                 let local = self.select_bool_local_mut(field);
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if (bits & (1u32 << bit)) == 0 {
-                        continue;
-                    }
-                    if intid >= LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    if local[idx][intid] {
-                        local[idx][intid] = false;
-                        changed |= 1u32 << bit;
-                    }
-                }
+                let slot = &mut local[idx];
+                let clear_segment = (bits & valid_mask) << shift;
+                let changed_segment = *slot & clear_segment;
+                *slot &= !clear_segment;
+                Ok((changed_segment >> shift) & valid_mask)
             }
             VgicIrqScope::Global => {
+                let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
+                    return Ok(0);
+                };
                 let global = self.select_bool_global_mut(field);
-                for bit in 0..32 {
-                    let intid = base + bit;
-                    if !Self::intid_in_range(intid) {
-                        break;
-                    }
-                    if (bits & (1u32 << bit)) == 0 {
-                        continue;
-                    }
-                    if intid < LOCAL_INTID_COUNT {
-                        return Err(GicError::UnsupportedIntId);
-                    }
-                    let slot = &mut global[intid - LOCAL_INTID_COUNT];
-                    if *slot {
-                        *slot = false;
-                        changed |= 1u32 << bit;
-                    }
-                }
+                let pair = Self::read_u64_pair(global, word_index);
+                let current_window = Self::read_window_from_pair(pair, shift);
+                let clear_window = bits & valid_mask;
+                let changed = current_window & clear_window & valid_mask;
+                let new_window = current_window & !clear_window;
+                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, new_window);
+                Self::write_u64_pair(global, word_index, new_pair);
+                Ok(changed)
             }
         }
-        Ok(changed)
     }
 
     pub(crate) fn irq_attrs(
@@ -371,11 +404,15 @@ where
                     return Err(GicError::UnsupportedIntId);
                 }
                 let idx = self.vcpu_index(vcpu)?;
+                let group = (self.group_local[idx] & Self::local_bit_mask(intid)) != 0;
+                let enable = (self.enable_local[idx] & Self::local_bit_mask(intid)) != 0;
+                let pending = (self.pending_local[idx] & Self::local_bit_mask(intid)) != 0;
+                let active = (self.active_local[idx] & Self::local_bit_mask(intid)) != 0;
                 Ok(IrqAttrs {
-                    pending: self.pending_local[idx][intid],
-                    active: self.active_local[idx][intid],
-                    enable: self.enable_local[idx][intid],
-                    group: if self.group_local[idx][intid] {
+                    pending,
+                    active,
+                    enable,
+                    group: if group {
                         IrqGroup::Group1
                     } else {
                         IrqGroup::Group0
@@ -387,12 +424,17 @@ where
                 if intid < LOCAL_INTID_COUNT {
                     return Err(GicError::UnsupportedIntId);
                 }
+                let (word_index, bit) = Self::global_word_and_mask(intid);
+                let group = (self.group_global[word_index] & bit) != 0;
+                let enable = (self.enable_global[word_index] & bit) != 0;
+                let pending = (self.pending_global[word_index] & bit) != 0;
+                let active = (self.active_global[word_index] & bit) != 0;
                 let idx = intid - LOCAL_INTID_COUNT;
                 Ok(IrqAttrs {
-                    pending: self.pending_global[idx],
-                    active: self.active_global[idx],
-                    enable: self.enable_global[idx],
-                    group: if self.group_global[idx] {
+                    pending,
+                    active,
+                    enable,
+                    group: if group {
                         IrqGroup::Group1
                     } else {
                         IrqGroup::Group0
@@ -429,15 +471,6 @@ where
         pending: bool,
     ) -> Result<bool, GicError> {
         self.set_bool(scope, vintid, pending, BoolField::Pending)
-    }
-
-    pub(crate) fn set_active(
-        &mut self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-        active: bool,
-    ) -> Result<bool, GicError> {
-        self.set_bool(scope, vintid, active, BoolField::Active)
     }
 
     pub(crate) fn set_priority(

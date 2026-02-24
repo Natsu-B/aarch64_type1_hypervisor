@@ -11,6 +11,12 @@ pub struct SystemTimer {
     counter_frequency: Option<NonZeroU64>,
 }
 
+impl Default for SystemTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemTimer {
     /// Create an uninitialized timer (call `init` before use).
     pub const fn new() -> Self {

@@ -61,6 +61,7 @@ use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
+use arch_hal::tls;
 use core::alloc::Layout;
 use core::arch::naked_asm;
 use core::cell::SyncUnsafeCell;
@@ -70,7 +71,7 @@ use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
-use core::ptr;
+use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts;
 use core::slice;
 use core::usize;
@@ -83,6 +84,7 @@ use dtb::NameRef;
 use dtb::NodeEditExt;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
+use dtb::WalkError;
 use file::AlignedSliceBox;
 
 unsafe extern "C" {
@@ -91,6 +93,8 @@ unsafe extern "C" {
     static mut _PROGRAM_START: usize;
     static mut _PROGRAM_END: usize;
     static mut _STACK_TOP: usize;
+    static mut __el2_tls_bsp_start: usize;
+    static mut __el2_tls_bsp_end: usize;
 }
 
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
@@ -175,6 +179,8 @@ extern "C" fn _start() {
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let program_start = &raw mut _PROGRAM_START as *const _ as usize;
     let stack_start = &raw mut _STACK_TOP as *const _ as usize;
+    let el2_tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
+    let el2_tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
 
     let args = unsafe { slice::from_raw_parts(argv, argc) };
     let dtb_ptr =
@@ -182,55 +188,79 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             .unwrap();
     let dtb = DtbParser::init(dtb_ptr).unwrap();
     let mut i = 0;
-    dtb.find_nodes_by_compatible_view("arm,pl011", &mut |view, _| {
-        match i {
-            0 => unsafe {
-                let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
-                *GUEST_UART.get() = Some(UartNode {
-                    base: tmp.0,
-                    size: tmp.1,
-                    irq: {
-                        let mut tmp = None;
-                        view.for_each_interrupt_specifier(&mut |cells| {
-                            tmp = Some(
-                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"),
-                            );
-                            ControlFlow::Break(())
-                        })
-                        .unwrap();
-                        tmp
-                    },
-                });
-                *DEBUG_UART_ADDR.get() = Some(tmp.0);
-            },
-            1 => unsafe {
-                let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
-                *GDB_UART.get() = Some(UartNode {
-                    base: tmp.0,
-                    size: tmp.1,
-                    irq: {
-                        let mut tmp = None;
-                        view.for_each_interrupt_specifier(&mut |cells| {
-                            tmp = Some(
-                                irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"),
-                            );
-                            ControlFlow::Break(())
-                        })
-                        .unwrap();
-                        tmp
-                    },
-                });
-            },
-            _ => return ControlFlow::Break(()),
-        }
-        i += 1;
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+    let _ = dtb
+        .find_nodes_by_compatible_view("arm,pl011", &mut |view,
+                                                          _|
+         -> Result<
+            ControlFlow<()>,
+            WalkError<()>,
+        > {
+            match i {
+                0 => unsafe {
+                    let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
+                    *GUEST_UART.get() = Some(UartNode {
+                        base: tmp.0,
+                        size: tmp.1,
+                        irq: {
+                            let mut tmp = None;
+                            let _ = view
+                                .for_each_interrupt_specifier(
+                                    &mut |cells| -> Result<ControlFlow<()>, WalkError<()>> {
+                                        tmp = Some(
+                                            irq_decode::dt_irq_to_pintid(cells)
+                                                .expect("uart: bad IRQ spec"),
+                                        );
+                                        Ok(ControlFlow::Break(()))
+                                    },
+                                )
+                                .unwrap();
+                            tmp
+                        },
+                    });
+                    *DEBUG_UART_ADDR.get() = Some(tmp.0);
+                },
+                1 => unsafe {
+                    let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
+                    *GDB_UART.get() = Some(UartNode {
+                        base: tmp.0,
+                        size: tmp.1,
+                        irq: {
+                            let mut tmp = None;
+                            let _ = view
+                                .for_each_interrupt_specifier(
+                                    &mut |cells| -> Result<ControlFlow<()>, WalkError<()>> {
+                                        tmp = Some(
+                                            irq_decode::dt_irq_to_pintid(cells)
+                                                .expect("uart: bad IRQ spec"),
+                                        );
+                                        Ok(ControlFlow::Break(()))
+                                    },
+                                )
+                                .unwrap();
+                            tmp
+                        },
+                    });
+                },
+                _ => return Ok(ControlFlow::Break(())),
+            }
+            i += 1;
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
     let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
     let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
     debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
     gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+    let tls_result = unsafe {
+        tls::init_current_cpu(
+            NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
+            el2_tls_bsp_end.checked_sub(el2_tls_bsp_start).unwrap(),
+        )
+    };
+    if let Err(err) = tls_result {
+        println!("tls init failed: {:?}", err);
+        panic!("tls init failed");
+    }
     debug::init_gdb_stub();
     println!(
         "debug uart starting (guest console @ 0x{:X})...\r\n",
@@ -248,34 +278,45 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     );
     println!("setup allocator");
     GLOBAL_ALLOCATOR.init();
-    dtb.find_node(Some("memory"), None, &mut |addr, size| {
-        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
-        record_memory_region(addr, size);
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+    let _ = dtb
+        .find_node(Some("memory"), None, &mut |addr,
+                                               size|
+         -> Result<
+            ControlFlow<()>,
+            WalkError<()>,
+        > {
+            GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
+            record_memory_region(addr, size);
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
     dtb.find_memory_reservation_block(&mut |addr, size| {
         GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
-    dtb.find_reserved_memory_node(
+    let result = dtb.find_reserved_memory_node(
         &mut |addr, size| {
-            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
-            ControlFlow::Continue(())
+            GLOBAL_ALLOCATOR
+                .add_reserved_region(addr, size)
+                .map_err(|_| WalkError::User(()))?;
+            Ok(ControlFlow::Continue(()))
         },
-        &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
-            if GLOBAL_ALLOCATOR
+        &mut |size, align, alloc_range| {
+            let allocated = GLOBAL_ALLOCATOR
                 .allocate_dynamic_reserved_region(size, align, alloc_range)
-                .unwrap()
-                .is_some()
-            {
+                .map_err(|_| WalkError::User(()))?;
+            if allocated.is_some() {
                 Ok(ControlFlow::Continue(()))
             } else {
-                Err(())
+                Err(WalkError::User(()))
             }
         },
-    )
-    .unwrap();
+    );
+    match result {
+        Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("reserved-memory: allocator error"),
+    }
     GLOBAL_ALLOCATOR
         .add_reserved_region(program_start, stack_start - program_start)
         .unwrap();
@@ -757,7 +798,7 @@ fn record_guest_mmio_allowlist_from_dtb(
         denylist: &GuestMmioDenyList,
         ranges: &mut Vec<GuestMmioRange>,
         stats: &mut GuestMmioScanStats,
-    ) -> Result<ControlFlow<()>, &'static str> {
+    ) -> Result<ControlFlow<()>, WalkError<&'static str>> {
         let name = node.name();
         let in_reserved = in_reserved || name == "reserved-memory";
         if in_reserved {
@@ -815,55 +856,21 @@ fn record_guest_mmio_allowlist_from_dtb(
             }
         }
 
-        let mut result: Result<ControlFlow<()>, &'static str> = Ok(ControlFlow::Continue(()));
-        let mut should_break = false;
-        node.for_each_child_view(&mut |child| match walk(
-            child,
-            in_reserved,
-            in_cpus,
-            denylist,
-            ranges,
-            stats,
-        ) {
-            Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
-            Ok(ControlFlow::Break(())) => {
-                should_break = true;
-                ControlFlow::Break(())
-            }
-            Err(err) => {
-                result = Err(err);
-                ControlFlow::Break(())
-            }
-        })?;
-        let _ = result?;
-        if should_break {
-            return Ok(ControlFlow::Break(()));
-        }
-        Ok(ControlFlow::Continue(()))
+        node.for_each_child_view(&mut |child| {
+            walk(child, in_reserved, in_cpus, denylist, ranges, stats)
+        })
     }
 
     let result = (|| -> Result<(), &'static str> {
         let root = dtb.root_node_view()?;
-        let mut error: Option<&'static str> = None;
-        root.for_each_child_view(&mut |child| match walk(
-            child,
-            false,
-            false,
-            &denylist,
-            &mut ranges,
-            &mut stats,
-        ) {
-            Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
-            Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
-            Err(err) => {
-                error = Some(err);
-                ControlFlow::Break(())
-            }
-        })?;
-        if let Some(err) = error {
-            return Err(err);
+        let result = root.for_each_child_view(&mut |child| {
+            walk(child, false, false, &denylist, &mut ranges, &mut stats)
+        });
+        match result {
+            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => Ok(()),
+            Err(WalkError::Dtb(err)) => Err(err),
+            Err(WalkError::User(err)) => Err(err),
         }
-        Ok(())
     })();
 
     if let Err(err) = result {
@@ -922,22 +929,20 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
         "qcom,msm-qgic2",
     ];
     let mut found: Option<Gicv2Info> = None;
-    let mut error = None;
     for compat in COMPATS {
-        dtb.find_nodes_by_compatible_view(compat, &mut |view, name| {
+        let result = dtb.find_nodes_by_compatible_view(compat, &mut |view,
+                                                                     _name|
+         -> Result<
+            ControlFlow<()>,
+            WalkError<()>,
+        > {
             println!("found GICv2 node: {}", compat);
-            let mut regs = match view.reg_iter() {
-                Ok(it) => it,
-                Err(e) => {
-                    error = Some(e);
-                    return ControlFlow::Break(());
-                }
-            };
+            let mut regs = view.reg_iter().map_err(WalkError::Dtb)?;
             let Some(Ok((dist_base, _dist_size))) = regs.next() else {
-                return ControlFlow::Continue(());
+                return Ok(ControlFlow::Continue(()));
             };
             let Some(Ok((cpu_base, _cpu_size))) = regs.next() else {
-                return ControlFlow::Continue(());
+                return Ok(ControlFlow::Continue(()));
             };
             let gich = regs
                 .next()
@@ -948,18 +953,18 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
                 .and_then(|r| r.ok())
                 .map(|(base, _size)| gic::MmioRegion { base, size: 0x2000 });
             let mut maintenance_intid = None;
-            if let Err(e) = view.for_each_interrupt_specifier(&mut |cells| {
+            let _ = view.for_each_interrupt_specifier(&mut |cells| -> Result<
+                ControlFlow<()>,
+                WalkError<()>,
+            > {
                 if maintenance_intid.is_some() {
-                    return ControlFlow::Break(());
+                    return Ok(ControlFlow::Break(()));
                 }
                 if let Ok(intid) = irq_decode::dt_irq_to_pintid(cells) {
                     maintenance_intid = Some(intid);
                 }
-                ControlFlow::Break(())
-            }) {
-                error = Some(e);
-                return ControlFlow::Break(());
-            }
+                Ok(ControlFlow::Break(()))
+            })?;
 
             found = Some(Gicv2Info {
                 dist: gic::MmioRegion {
@@ -974,14 +979,16 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
                 gicv,
                 maintenance_intid,
             });
-            ControlFlow::Break(())
-        })?;
+            Ok(ControlFlow::Break(()))
+        });
+        match result {
+            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+            Err(WalkError::Dtb(err)) => return Err(err),
+            Err(WalkError::User(())) => return Err("gic: unexpected user error"),
+        }
         if found.is_some() {
             break;
         }
-    }
-    if let Some(err) = error {
-        return Err(err);
     }
     found.ok_or("gic: missing GICv2 node")
 }

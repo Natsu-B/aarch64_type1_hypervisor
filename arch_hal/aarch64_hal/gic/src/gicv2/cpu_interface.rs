@@ -44,11 +44,10 @@ impl GicCpuInterface for Gicv2 {
 
         // set affinity to cpu_id table
         let affinity = cpu::get_current_core_id();
-        let mut itargetsr = 0;
-        for v in self.gicd.itargetsr0_7.iter().flatten() {
-            itargetsr |= v.read();
+        let cpu_if = tls::cpu_if().ok_or(GicError::UninitCpuId)?;
+        if cpu_if >= 8 {
+            return Err(GicError::InvalidCpuId);
         }
-        let cpu_if = self.cpu_if_and_targets_mask_from_itargetsr0_7(itargetsr)?;
         {
             let mut table = self.affinity_table.write();
             let slot = &mut table[cpu_if as usize];
@@ -246,7 +245,7 @@ impl GicCpuInterface for Gicv2 {
             );
         };
 
-        let cpu_if = self.cpu_id_from_affinity(cpu::get_current_core_id())?;
+        let cpu_if = self.current_cpu_if()?;
         let mut table = self.affinity_table.write();
         let slot = &mut table[cpu_if as usize];
         match slot {
@@ -270,7 +269,7 @@ impl GicCpuInterface for Gicv2 {
     }
 
     fn acknowledge(&self) -> Result<Option<crate::AckedIrq>, crate::GicError> {
-        let enable_group = self.get_enable_group_from_affinity(cpu::get_current_core_id())?;
+        let enable_group = self.current_enable_groups()?;
         if self.is_security_extension_implemented() {
             if !enable_group.1 {
                 return Err(GicError::InvalidState);

@@ -5,6 +5,7 @@ pub use aarch64_test::*;
 
 pub use aarch64_gdb;
 pub use aarch64_mutex;
+pub use common;
 pub use cpu;
 pub use exceptions;
 pub use gic;
@@ -12,4 +13,6 @@ pub use gic;
 pub use paging;
 pub use print::*;
 pub use psci;
+pub use soc;
 pub use timer;
+pub use tls;

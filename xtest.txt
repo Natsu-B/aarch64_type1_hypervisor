@@ -9,9 +9,11 @@
 # and `uboot-unit` select those categories explicitly.
 
 std allocator
+std common
 std dtb
 std intrusive_linked_list
 std mutex
+std pci
 std typestate
 std xtask
 unit gdb_remote
@@ -27,6 +29,8 @@ uboot gic gicv2_pending arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.
 uboot gic gicv2_vgic_pending arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot gic vgic_types arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot gic gicv2_ppi_enable arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot gic vgic_e2e_poll arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot gic vgic_e2e_irq arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uefi gdb_remote uefi_basic_handshake gdb_remote/scripts/run_uefi_gdb_remote_test.sh
 uefi gdb_remote uefi_packet_size gdb_remote/scripts/run_uefi_gdb_remote_qxfer_test.sh
 uefi gdb_remote uefi_qxfer_features gdb_remote/scripts/run_uefi_gdb_remote_qxfer_test.sh

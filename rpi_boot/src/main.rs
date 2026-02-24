@@ -1,10 +1,14 @@
 #![no_std]
 #![no_main]
+#![feature(generic_const_exprs)]
 #![feature(sync_unsafe_cell)]
 
 extern crate alloc;
 mod handler;
 mod multicore;
+mod pcie;
+mod stack_overflow;
+mod vgic;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -13,6 +17,12 @@ use allocator::define_global_allocator;
 use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::exceptions;
+use arch_hal::gic::GicCpuConfig;
+use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::GicDistributor;
+use arch_hal::gic::MmioRegion;
+use arch_hal::gic::dt_irq;
+use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::paging::EL2Stage1PageTypes;
 use arch_hal::paging::EL2Stage1Paging;
 use arch_hal::paging::EL2Stage1PagingSetting;
@@ -22,7 +32,9 @@ use arch_hal::paging::Stage2Paging;
 use arch_hal::paging::Stage2PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+use arch_hal::soc::bcm2712;
 use arch_hal::timer::SystemTimer;
+use arch_hal::tls;
 use core::alloc::Layout;
 use core::arch::global_asm;
 use core::cell::SyncUnsafeCell;
@@ -32,7 +44,8 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
-use core::usize;
+use core::ptr::NonNull;
+use core::ptr::slice_from_raw_parts_mut;
 use dtb::DeviceTree;
 use dtb::DeviceTreeEditExt;
 use dtb::DeviceTreeQueryExt;
@@ -43,25 +56,40 @@ use dtb::NodeEditExt;
 use dtb::NodeId;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
+use dtb::WalkError;
+use dtb::patch::Pl011Spec;
+use mutex::pod::RawAtomicPod;
 use typestate::Le;
+use typestate::ReadWrite;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
     static mut _BSS_END: usize;
     static mut _PROGRAM_START: usize;
     static mut _PROGRAM_END: usize;
+    static mut _STACK_BOTTOM: usize;
     static mut _STACK_TOP: usize;
     static mut _LINUX_IMAGE: usize;
+    static mut __el2_tls_bsp_start: usize;
+    static mut __el2_tls_bsp_end: usize;
 }
 
 pub(crate) const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
 static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
-static RP1_BASE: usize = 0x1c_0000_0000;
-static RP1_GPIO: usize = RP1_BASE + 0xd_0000;
-static RP1_PAD: usize = RP1_BASE + 0xf_0000;
-static PL011_UART_ADDR: usize = RP1_BASE + 0x3_0000;
-// static PL011_UART_ADDR: usize = 0x10_7D00_1000;
+pub(crate) static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
+pub(crate) const RP1_BASE: usize = 0x1c_0000_0000;
+pub(crate) const PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
+// static PL011_UART_ADDR: (usize, u64) = (0x10_7D00_1000, 44 * 1000 * 1000);
+
+#[derive(Copy, Clone, Debug)]
+struct Gicv2Info {
+    dist: MmioRegion,
+    cpu: MmioRegion,
+    gich: Option<MmioRegion>,
+    gicv: Option<MmioRegion>,
+    maintenance_intid: Option<u32>,
+}
 
 #[repr(C)]
 struct LinuxHeader {
@@ -89,6 +117,8 @@ global_asm!(
 .section ".text.boot"
 
 _start:
+    msr spsel, #1
+    isb
     ldr x0, =_STACK_TOP
     mov sp, x0
 clear_bss:
@@ -113,9 +143,19 @@ extern "C" fn main() -> ! {
     let program_end = &raw mut _PROGRAM_END as *const _ as usize;
     let linux_image = &raw mut _LINUX_IMAGE as *const _ as usize;
     let stack_top = &raw mut _STACK_TOP as *const _ as usize;
+    let tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
+    let tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
 
-    debug_uart::init(PL011_UART_ADDR, 48 * 1000 * 1000, 115200);
-    // debug_uart::init(PL011_UART_ADDR, 44 * 1000 * 1000, 115200);
+    // setup tls
+    unsafe {
+        tls::init_current_cpu(
+            NonNull::new(tls_bsp_start as *mut u8).unwrap(),
+            tls_bsp_end.checked_sub(tls_bsp_start).unwrap(),
+        )
+        .unwrap()
+    };
+
+    debug_uart::init(PL011_UART_ADDR.0, PL011_UART_ADDR.1, 115200);
     cpu::isb();
     cpu::dsb_ish();
     debug_uart::write("HelloWorld!!!");
@@ -128,6 +168,13 @@ extern "C" fn main() -> ! {
     const DTB_PTR: usize = 0x2000_0000;
     let dtb = DtbParser::init(DTB_PTR).unwrap();
     assert_eq!(cpu::get_current_el(), 2);
+    let gic_info = find_gicv2_info(&dtb).unwrap();
+    let uart_irq = vgic::UartIrq {
+        pintid: 128 + 25 + 32,
+        sense: arch_hal::gic::IrqSense::Edge,
+    };
+    let uart_irq_pintid = uart_irq.pintid;
+    let uart_irq_sense = uart_irq.sense;
 
     let mut systimer = SystemTimer::new();
     systimer.init();
@@ -137,43 +184,54 @@ extern "C" fn main() -> ! {
     );
     println!("setup allocator");
     GLOBAL_ALLOCATOR.init();
-    dtb.find_node(Some("memory"), None, &mut |addr, size| {
+    let result = dtb.find_node(Some("memory"), None, &mut |addr, size| {
         println!("available region addr=0x{:X}, size=0x{:X}", addr, size);
-        GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        GLOBAL_ALLOCATOR
+            .add_available_region(addr, size)
+            .map_err(|_| WalkError::User(()))?;
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("find_node: allocator error"),
+    }
     dtb.find_memory_reservation_block(&mut |addr, size| {
         println!("reserved (memreserve) addr=0x{:X}, size=0x{:X}", addr, size);
         GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
     });
-    dtb.find_reserved_memory_node(
+    let result = dtb.find_reserved_memory_node(
         &mut |addr, size| {
             println!(
                 "reserved (node static) addr=0x{:X}, size=0x{:X}",
                 addr, size
             );
-            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
-            ControlFlow::Continue(())
+            GLOBAL_ALLOCATOR
+                .add_reserved_region(addr, size)
+                .map_err(|_| WalkError::User(()))?;
+            Ok(ControlFlow::Continue(()))
         },
-        &mut |size, align, alloc_range| -> Result<ControlFlow<()>, ()> {
+        &mut |size, align, alloc_range| {
             println!(
                 "reserved (node dynamic) size=0x{:X}, align={:?}, range={:?}",
                 size, align, alloc_range
             );
-            if GLOBAL_ALLOCATOR
+            let allocated = GLOBAL_ALLOCATOR
                 .allocate_dynamic_reserved_region(size, align, alloc_range)
-                .unwrap()
-                .is_some()
-            {
+                .map_err(|_| WalkError::User(()))?;
+            if allocated.is_some() {
                 Ok(ControlFlow::Continue(()))
             } else {
-                Err(())
+                Err(WalkError::User(()))
             }
         },
-    )
-    .unwrap();
+    );
+    match result {
+        Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("reserved-memory: allocator error"),
+    }
     println!(
         "reserved program image addr=0x{:X}, size=0x{:X}",
         program_start,
@@ -235,7 +293,7 @@ extern "C" fn main() -> ! {
     let ipa_space = 1usize << parange;
     let mut paging_data: Vec<Stage2PagingSetting> = Vec::new();
     let mut stage1_paging_data: Vec<EL2Stage1PagingSetting> = Vec::new();
-    dtb.find_node(Some("memory"), None, &mut |addr, size| {
+    let result = dtb.find_node(Some("memory"), None, &mut |addr, size| {
         let memory_last = paging_data.last();
         let memory_last_addr = if let Some(memory_last) = memory_last {
             memory_last.ipa + memory_last.size
@@ -271,22 +329,26 @@ extern "C" fn main() -> ! {
             size,
             types: EL2Stage1PageTypes::Normal,
         });
-        ControlFlow::Continue(())
-    })
-    .unwrap();
+        Ok(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("find_node: paging allocator error"),
+    }
     let memory_last = paging_data.last().unwrap();
     let memory_last_addr = memory_last.ipa + memory_last.size;
     paging_data.push(Stage2PagingSetting {
         ipa: memory_last_addr,
         pa: memory_last_addr,
-        size: PL011_UART_ADDR - memory_last_addr,
+        size: PL011_UART_ADDR.0 - memory_last_addr,
         types: Stage2PageTypes::Device,
         perm: Stage2AccessPermission::ReadWrite,
     });
     paging_data.push(Stage2PagingSetting {
-        ipa: PL011_UART_ADDR + 0x1000,
-        pa: PL011_UART_ADDR + 0x1000,
-        size: ipa_space - PL011_UART_ADDR - 0x1000,
+        ipa: PL011_UART_ADDR.0 + 0x1000,
+        pa: PL011_UART_ADDR.0 + 0x1000,
+        size: ipa_space - PL011_UART_ADDR.0 - 0x1000,
         types: Stage2PageTypes::Device,
         perm: Stage2AccessPermission::ReadWrite,
     });
@@ -296,12 +358,194 @@ extern "C" fn main() -> ! {
         size: ipa_space - memory_last_addr,
         types: EL2Stage1PageTypes::Device,
     });
+
+    let guard_start = &raw const _STACK_BOTTOM as usize;
+    let guard_end = guard_start.checked_add(0x1000).expect("guard end overflow");
+    assert_eq!(guard_start & 0xFFF, 0, "guard start not 4KB aligned");
+    assert_eq!(guard_end & 0xFFF, 0, "guard end not 4KB aligned");
+
+    let mut guard_removed = false;
+    let mut stage1_sanitized = Vec::with_capacity(stage1_paging_data.len().saturating_add(1));
+    for setting in stage1_paging_data.into_iter() {
+        let start = setting.va;
+        let end = start
+            .checked_add(setting.size)
+            .expect("EL2 Stage-1 mapping end overflow");
+        if guard_end <= start || guard_start >= end {
+            stage1_sanitized.push(setting);
+            continue;
+        }
+
+        guard_removed = true;
+        if start < guard_start {
+            let left_size = guard_start
+                .checked_sub(start)
+                .expect("EL2 Stage-1 left size underflow");
+            assert_eq!(start & 0xFFF, 0, "EL2 Stage-1 left start not aligned");
+            assert_eq!(left_size & 0xFFF, 0, "EL2 Stage-1 left size not aligned");
+            stage1_sanitized.push(EL2Stage1PagingSetting {
+                va: start,
+                pa: setting.pa,
+                size: left_size,
+                types: setting.types,
+            });
+        }
+        if guard_end < end {
+            let right_size = end
+                .checked_sub(guard_end)
+                .expect("EL2 Stage-1 right size underflow");
+            let offset = guard_end
+                .checked_sub(start)
+                .expect("EL2 Stage-1 right offset underflow");
+            let right_pa = setting
+                .pa
+                .checked_add(offset)
+                .expect("EL2 Stage-1 right pa overflow");
+            assert_eq!(guard_end & 0xFFF, 0, "EL2 Stage-1 right start not aligned");
+            assert_eq!(right_size & 0xFFF, 0, "EL2 Stage-1 right size not aligned");
+            stage1_sanitized.push(EL2Stage1PagingSetting {
+                va: guard_end,
+                pa: right_pa,
+                size: right_size,
+                types: setting.types,
+            });
+        }
+    }
+    assert!(
+        guard_removed,
+        "guard page mapping was not removed from EL2 Stage-1 settings"
+    );
+    stage1_paging_data = stage1_sanitized;
+
     println!("Stage2Paging: {:#?}", paging_data);
     println!("EL2Stage1Paging: {:#?}", stage1_paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(true, false);
     EL2Stage1Paging::init_stage1paging(&stage1_paging_data).unwrap();
+    println!("EL2 Stage-1 paging enabled");
+
+    // SAFETY: emergency stack is initialized after Stage-1 is enabled.
+    // The stack is mapped as Normal memory with identity mapping.
+    unsafe {
+        stack_overflow::init_emergency_stack();
+    }
+    println!("Emergency stack initialized");
     println!("paging success!!!");
+
+    // Raw atomics are unsynchronized; enable only once during BSP bring-up after paging/caches.
+    // IRQ/FIQ remain masked at this point and are unmasked later via `msr daifclr`.
+    mutex::enable_raw_atomics();
+
+    // setup gicv2 (with virtualization)
+    println!("setup gicv2...");
+    let virt = match (gic_info.gich, gic_info.gicv, gic_info.maintenance_intid) {
+        (Some(gich), Some(gicv), Some(maint)) => {
+            Some(arch_hal::gic::gicv2::Gicv2VirtualizationRegion {
+                gich,
+                gicv,
+                maintenance_interrupt_id: maint,
+            })
+        }
+        _ => None,
+    }
+    .expect("gic: missing virtualization region or maintenance interrupt");
+    println!("gic v2: {:?}", gic_info);
+    let gicv2 = Gicv2::new(gic_info.dist, gic_info.cpu, Some(virt), None).unwrap();
+    gicv2.init_distributor().unwrap();
+    let caps = gicv2.init_cpu_interface().unwrap();
+    println!("GICv2 CPU Interface capabilities: {:?}", caps);
+    gicv2
+        .configure(&GicCpuConfig {
+            priority_mask: 0xff,
+            enable_group0: caps.supports_group0,
+            enable_group1: true,
+            binary_point: arch_hal::gic::BinaryPoint::Common(caps.binary_points_min),
+            eoi_mode: arch_hal::gic::EoiMode::DropOnly,
+        })
+        .unwrap();
+
+    // setup pl011 interrupts
+    gicv2
+        .configure_spi(
+            uart_irq.pintid,
+            arch_hal::gic::IrqGroup::Group1,
+            0x80,
+            arch_hal::gic::TriggerMode::Edge,
+            arch_hal::gic::SpiRoute::Specific(cpu::get_current_core_id()),
+            arch_hal::gic::EnableOp::Enable,
+        )
+        .unwrap();
+
+    println!("setup vgic...");
+
+    vgic::init(&gicv2, &gic_info, Some(uart_irq)).unwrap();
+
+    println!("vgic setup success!!!");
+
+    unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
+
+    debug_uart::enable_rx_interrupts(arch_hal::pl011::FifoLevel::OneEighth, true);
+
+    println!("gicv2 setup success!!!");
+
+    unsafe {
+        core::arch::asm!("msr daifclr, #3", options(nostack, preserves_flags)); // enable irq
+    }
+
+    let result = dtb.find_nodes_by_compatible_view("brcm,bcm2712-pcie", &mut |view, _name| {
+        pcie::init_pcie_with_node(view)
+    });
+    match result {
+        Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+        Err(WalkError::Dtb(err)) => panic!("{}", err),
+        Err(WalkError::User(())) => panic!("pcie: unexpected user error"),
+    }
+
+    // check rp1
+    let rp1 = match bcm2712::init_rp1(&dtb) {
+        Ok(config) => {
+            vgic::set_pirq_hook(Some(bcm2712::pirq_hook)).unwrap();
+            config
+        }
+        Err(err) => {
+            let _ = vgic::set_pirq_hook(None);
+            panic!("rp1 init failed: {:?}", err);
+        }
+    };
+    println!(
+        "RP1: Peripheral addr: 0x{:x} SRAM addr: 0x{:x}",
+        rp1.peripheral_addr.unwrap().0,
+        rp1.shared_sram_addr.unwrap().0
+    );
+
+    debug_assert_eq!(rp1.peripheral_addr.unwrap().0, RP1_BASE as u64);
+
+    let io_config = unsafe {
+        &*slice_from_raw_parts_mut(
+            (rp1.peripheral_addr.unwrap().0 + 0xd_0000) as *mut ReadWrite<u32>,
+            56,
+        )
+    };
+    io_config[29].update_bits(0b1111, 0b100);
+
+    let gpio_config = unsafe {
+        &*slice_from_raw_parts_mut(
+            (rp1.peripheral_addr.unwrap().0 + 0xf_0000 + 0x04) as *mut ReadWrite<u32>,
+            28,
+        )
+    };
+    // input enable
+    gpio_config[15].set_bits(0b100_1000);
+
+    // setup rp1 uart0 interrupt
+    // SAFETY: RP1 peripheral MMIO is mapped; the table is sized for the index used below.
+    let pcie_config = unsafe {
+        &*slice_from_raw_parts_mut(
+            (rp1.peripheral_addr.unwrap().0 + 0x10_8000 + 0x08) as *mut ReadWrite<u32>,
+            64,
+        )
+    };
+    pcie_config[25].set_bits(0b1001);
 
     multicore::setup_multicore(stack_top);
 
@@ -334,7 +578,25 @@ extern "C" fn main() -> ! {
     let initrd_range = remove_initrd(&mut tree, chosen_id);
     remove_initrd_memreserve(&mut tree, initrd_range);
     append_reserved_memory(&mut tree, &reserved_memory);
-    configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR).unwrap();
+    dtb::patch::detach_by_compatible(&mut tree, "brcm,bcm2712-pcie").unwrap();
+    dtb::patch::detach_by_node_name(&mut tree, "rp1").unwrap();
+    dtb::patch::inject_standalone_pl011(
+        &mut tree,
+        Pl011Spec {
+            base: PL011_UART_ADDR.0 as u64,
+            size: 0x1000,
+            uartclk_hz: PL011_UART_ADDR.1 as u32,
+            pintid: uart_irq_pintid,
+            irq_sense: uart_irq_sense,
+        },
+    )
+    .unwrap();
+    configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR.0).unwrap();
+    if let Some(gicv) = gic_info.gicv {
+        update_gicv2_cpu_interface_reg(&mut tree, gicv).unwrap();
+    } else {
+        panic!("gic: missing GICV region for DT update");
+    }
 
     let dtb_box = tree.into_dtb_box().unwrap();
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
@@ -350,6 +612,7 @@ extern "C" fn main() -> ! {
     cpu::clean_dcache_poc(DTB_ADDR.get() as usize, size_of::<usize>());
 
     cpu::invalidate_icache_all();
+    setup_guest_sysreg_passthrough_policy();
 
     let el1_main = el1_main as *const fn() as usize as u64;
     let stack_addr =
@@ -371,7 +634,7 @@ extern "C" fn main() -> ! {
 extern "C" fn el1_main() {
     let hello = "hello world from el1_main\n";
     for i in hello.as_bytes() {
-        unsafe { ptr::write_volatile(PL011_UART_ADDR as *mut u8, *i) };
+        unsafe { ptr::write_volatile(PL011_UART_ADDR.0 as *mut u8, *i) };
     }
 
     // jump linux
@@ -393,6 +656,30 @@ fn be_bytes_to_u64(bytes: &[u8]) -> Option<u64> {
         8 => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
         _ => None,
     }
+}
+
+fn setup_guest_sysreg_passthrough_policy() {
+    const CNTHCTL_EL2_EL1PCTEN: u64 = 1 << 0;
+    const CNTHCTL_EL2_EL1PCEN: u64 = 1 << 1;
+    const MDCR_EL2_TPMCR: u64 = 1 << 5;
+    const MDCR_EL2_TPM: u64 = 1 << 6;
+
+    // Allow EL1 access to the physical counter/timer interface when passing through PPI 30.
+    // This assumes non-VHE (E2H=0); with E2H=1, the CNTHCTL_EL2 field positions shift by 10.
+    let mut cnthctl_el2 = cpu::get_cnthctl_el2();
+    cnthctl_el2 |= CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1PCEN;
+    cpu::set_cnthctl_el2(cnthctl_el2);
+
+    // Keep timer offset policy explicit and consistent across BSP/APs.
+    cpu::set_cntvoff_el2(0);
+
+    // Leave PMU counters control (HPMN, etc.) unchanged, but let EL1/EL0 PMU sysregs run
+    // without trapping if PMU overflow PPI 23 is enabled/passed through.
+    let mut mdcr_el2 = cpu::get_mdcr_el2();
+    mdcr_el2 &= !(MDCR_EL2_TPM | MDCR_EL2_TPMCR);
+    cpu::set_mdcr_el2(mdcr_el2);
+
+    cpu::isb();
 }
 
 fn remove_initrd(tree: &mut DeviceTree<'_>, chosen: NodeId) -> Option<(u64, u64)> {
@@ -526,12 +813,238 @@ fn update_bootargs(
     Ok(())
 }
 
+fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
+    const COMPATS: [&str; 13] = [
+        "arm,arm1176jzf-devchip-gic",
+        "arm,arm11mp-gic",
+        "arm,cortex-a15-gic",
+        "arm,cortex-a7-gic",
+        "arm,cortex-a9-gic",
+        "arm,eb11mp-gic",
+        "arm,gic-400",
+        "arm,pl390",
+        "arm,tc11mp-gic",
+        "brcm,brahma-b15-gic",
+        "nvidia,tegra210-agic",
+        "qcom,msm-8660-qgic",
+        "qcom,msm-qgic2",
+    ];
+    let mut found: Option<Gicv2Info> = None;
+    for compat in COMPATS {
+        let result = dtb.find_nodes_by_compatible_view(compat, &mut |view,
+                                                                     _name|
+         -> Result<
+            ControlFlow<()>,
+            WalkError<()>,
+        > {
+            println!("found GICv2 node: {}", compat);
+            let mut regs = view.reg_iter().map_err(WalkError::Dtb)?;
+            let Some(Ok((dist_base, _dist_size))) = regs.next() else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let Some(Ok((cpu_base, _cpu_size))) = regs.next() else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let gich = regs
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(base, _size)| MmioRegion { base, size: 0x1000 });
+            let gicv = regs
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(base, _size)| MmioRegion { base, size: 0x2000 });
+            let mut maintenance_intid = None;
+            let _ = view.for_each_interrupt_specifier(&mut |cells| -> Result<
+                ControlFlow<()>,
+                WalkError<()>,
+            > {
+                if maintenance_intid.is_some() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                let decoded = dt_irq::decode_dt_irq(cells)
+                    .map_err(|_| WalkError::Dtb("gic: invalid maintenance interrupt"))?;
+                maintenance_intid = Some(decoded.intid);
+                Ok(ControlFlow::Break(()))
+            })?;
+
+            found = Some(Gicv2Info {
+                dist: MmioRegion {
+                    base: dist_base,
+                    size: 0x1000,
+                },
+                cpu: MmioRegion {
+                    base: cpu_base,
+                    size: 0x2000,
+                },
+                gich,
+                gicv,
+                maintenance_intid,
+            });
+            Ok(ControlFlow::Break(()))
+        });
+        match result {
+            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => {}
+            Err(WalkError::Dtb(err)) => return Err(err),
+            Err(WalkError::User(())) => return Err("gic: unexpected user error"),
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    found.ok_or("gic: missing GICv2 node")
+}
+
+fn update_gicv2_cpu_interface_reg(
+    tree: &mut DeviceTree<'_>,
+    gicv: MmioRegion,
+) -> Result<(), &'static str> {
+    const COMPATS: [&str; 2] = ["arm,gic-400", "arm,cortex-a15-gic"];
+    let mut gic_node = None;
+    for id in 0..tree.nodes.len() {
+        for compat in COMPATS {
+            if node_compatible_contains(tree, id, compat)? {
+                gic_node = Some(id);
+                break;
+            }
+        }
+        if gic_node.is_some() {
+            break;
+        }
+    }
+    let Some(node_id) = gic_node else {
+        return Ok(());
+    };
+
+    let parent = tree
+        .node(node_id)
+        .and_then(|n| n.parent)
+        .unwrap_or(tree.root);
+    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
+    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
+    let stride = (addr_cells + size_cells) * 4;
+    let Some(node) = tree.node(node_id) else {
+        return Ok(());
+    };
+    let Some(reg) = node.property("reg") else {
+        return Ok(());
+    };
+    let mut bytes = reg.value.as_slice().to_vec();
+    if bytes.len() < stride * 2 {
+        return Err("gic: reg property too short");
+    }
+    let base_off = stride;
+    write_be_u32s(&mut bytes, base_off, addr_cells, gicv.base as u64)?;
+    write_be_u32s(
+        &mut bytes,
+        base_off + addr_cells * 4,
+        size_cells,
+        gicv.size as u64,
+    )?;
+
+    if let Some(node) = tree.node_mut(node_id) {
+        node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
+    }
+    Ok(())
+}
+
+fn node_compatible_contains(
+    tree: &DeviceTree<'_>,
+    node_id: usize,
+    needle: &str,
+) -> Result<bool, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(false);
+    };
+    let Some(prop) = node.property("compatible") else {
+        return Ok(false);
+    };
+    let bytes = prop.value.as_slice();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| start + p)
+            .unwrap_or(bytes.len());
+        if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
+            if entry == needle {
+                return Ok(true);
+            }
+        }
+        start = end + 1;
+    }
+    Ok(false)
+}
+
+fn property_u32(
+    tree: &DeviceTree<'_>,
+    node_id: usize,
+    key: &str,
+) -> Result<Option<u32>, &'static str> {
+    let Some(node) = tree.node(node_id) else {
+        return Ok(None);
+    };
+    let Some(prop) = node.property(key) else {
+        return Ok(None);
+    };
+    let bytes = prop.value.as_slice();
+    if bytes.len() != 4 {
+        return Ok(None);
+    }
+    Ok(Some(read_be_u32(bytes, 0)?))
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
+    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
+    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
+    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
+    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
+    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
+    slice.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn write_be_u32s(
+    bytes: &mut [u8],
+    offset: usize,
+    cells: usize,
+    value: u64,
+) -> Result<(), &'static str> {
+    for i in 0..cells {
+        let shift = 32 * (cells - 1 - i);
+        let cell = ((value >> shift) & 0xffff_ffff) as u32;
+        write_be_u32(bytes, offset + i * 4, cell)?;
+    }
+    Ok(())
+}
+
+static ALREADY_PANICKED: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 48_000_000);
-    // let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR, 44_000_000);
+    if ALREADY_PANICKED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        loop {}
+    }
+    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR.0, PL011_UART_ADDR.1);
     debug_uart.init(115200);
-    debug_uart.write("core 0 panicked!!!\r\n");
+    debug_uart.write("\r\n\r\n=================================\r\n");
+    debug_uart.write("kernel panicked!!!\r\n\r\n\r\n");
+    if let Some(core_id) = tls::cpu_if_maybe_uninit() {
+        let _ = debug_uart.write("core ");
+        // # Safety rpi5 core_id must be 0~3
+        let _ = debug_uart.write_char((core_id + b'0') as char);
+        let _ = debug_uart.write_fmt(format_args!(
+            "({:?
+            }): ",
+            cpu::get_current_core_id()
+        ));
+    } else {
+        debug_uart.write("core ?: ");
+    }
+    debug_uart.write("panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
     loop {}
 }

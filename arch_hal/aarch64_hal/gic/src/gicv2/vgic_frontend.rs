@@ -113,21 +113,17 @@ fn decode_sgir_targets(
     Ok(VcpuMask::from_bits(mask))
 }
 
-pub struct Gicv2Frontend<'a, M: VgicVmModel> {
-    vgic_model: &'a mut M,
+pub(crate) struct Gicv2Frontend<'a, M: VgicVmModel> {
+    vgic_model: &'a M,
     dist_id: Gicv2DistIdRegs,
 }
 
 impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
-    pub fn new(vgic_model: &'a mut M, dist_id: Gicv2DistIdRegs) -> Self {
+    pub(crate) fn new(vgic_model: &'a M, dist_id: Gicv2DistIdRegs) -> Self {
         Self {
             vgic_model,
             dist_id,
         }
-    }
-
-    pub fn new_with_hw_gicd(vgic_model: &'a mut M, gicd: &GicV2Distributor) -> Self {
-        Self::new(vgic_model, Gicv2DistIdRegs::from_hw_gicd(gicd))
     }
 
     #[inline]
@@ -179,8 +175,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     /// Handle a trapped write to the guest vGIC Distributor register.
     ///
     /// 'offset' is byte offset within Distributor, 'value' is zero-extended to u32.
-    pub fn handle_distributor_write(
-        &mut self,
+    pub(crate) fn handle_distributor_write(
+        &self,
         vcpu: VcpuId,
         offset: u32,
         size: Gicv2AccessSize,
@@ -452,8 +448,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     /// Handle a trapped read from the guest vGIC Distributor register.
     ///
     /// 'offset' is byte offset within Distributor.
-    pub fn handle_distributor_read(
-        &mut self,
+    pub(crate) fn handle_distributor_read(
+        &self,
         vcpu: VcpuId,
         offset: u32,
         size: Gicv2AccessSize,
@@ -813,6 +809,7 @@ mod tests {
     use crate::VgicSgiRegs;
     use crate::VgicVcpuModel;
     use crate::VgicVmInfo;
+    use core::cell::Cell;
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn sgir_cpu_target_masks_nonexistent_vcpus() {
@@ -860,10 +857,6 @@ mod tests {
             Ok(())
         }
 
-        fn clear_resident(&self, _core: cpu::CoreAffinity) -> Result<(), GicError> {
-            Ok(())
-        }
-
         fn refill_lrs<H: crate::VgicHw>(&self, _hw: &H) -> Result<bool, GicError> {
             Ok(false)
         }
@@ -881,8 +874,8 @@ mod tests {
     }
 
     struct FakeModel {
-        dist_enable: (bool, bool),
-        last_sgi: Option<(VcpuId, VcpuMask, u8)>,
+        dist_enable: Cell<(bool, bool)>,
+        last_sgi: Cell<Option<(VcpuId, VcpuMask, u8)>>,
         vcpu_count: u16,
         vcpu: DummyVcpu,
     }
@@ -890,8 +883,8 @@ mod tests {
     impl FakeModel {
         fn new(vcpu_count: u16) -> Self {
             Self {
-                dist_enable: (false, false),
-                last_sgi: None,
+                dist_enable: Cell::new((false, false)),
+                last_sgi: Cell::new(None),
                 vcpu_count,
                 vcpu: DummyVcpu,
             }
@@ -916,20 +909,20 @@ mod tests {
 
     impl VgicGuestRegs for FakeModel {
         fn set_dist_enable(
-            &mut self,
+            &self,
             enable_grp0: bool,
             enable_grp1: bool,
         ) -> Result<VgicUpdate, GicError> {
-            self.dist_enable = (enable_grp0, enable_grp1);
+            self.dist_enable.set((enable_grp0, enable_grp1));
             Ok(VgicUpdate::None)
         }
 
         fn dist_enable(&self) -> Result<(bool, bool), GicError> {
-            Ok(self.dist_enable)
+            Ok(self.dist_enable.get())
         }
 
         fn set_group(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _vintid: VIntId,
             _group: IrqGroup,
@@ -938,7 +931,7 @@ mod tests {
         }
 
         fn set_priority(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _vintid: VIntId,
             _priority: u8,
@@ -947,7 +940,7 @@ mod tests {
         }
 
         fn set_trigger(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _vintid: VIntId,
             _trigger: TriggerMode,
@@ -956,7 +949,7 @@ mod tests {
         }
 
         fn set_enable(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _vintid: VIntId,
             _enable: bool,
@@ -965,19 +958,10 @@ mod tests {
         }
 
         fn set_pending(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _vintid: VIntId,
             _pending: bool,
-        ) -> Result<VgicUpdate, GicError> {
-            Ok(VgicUpdate::None)
-        }
-
-        fn set_active(
-            &mut self,
-            _scope: VgicIrqScope,
-            _vintid: VIntId,
-            _active: bool,
         ) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }
@@ -987,7 +971,7 @@ mod tests {
         }
 
         fn write_group_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _value: u32,
@@ -1000,7 +984,7 @@ mod tests {
         }
 
         fn write_set_enable_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _set_bits: u32,
@@ -1009,7 +993,7 @@ mod tests {
         }
 
         fn write_clear_enable_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _clear_bits: u32,
@@ -1022,7 +1006,7 @@ mod tests {
         }
 
         fn write_set_pending_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _set_bits: u32,
@@ -1031,7 +1015,7 @@ mod tests {
         }
 
         fn write_clear_pending_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _clear_bits: u32,
@@ -1044,7 +1028,7 @@ mod tests {
         }
 
         fn write_set_active_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _set_bits: u32,
@@ -1053,7 +1037,7 @@ mod tests {
         }
 
         fn write_clear_active_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _clear_bits: u32,
@@ -1066,7 +1050,7 @@ mod tests {
         }
 
         fn write_priority_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _value: u32,
@@ -1079,20 +1063,7 @@ mod tests {
         }
 
         fn write_trigger_word(
-            &mut self,
-            _scope: VgicIrqScope,
-            _base: VIntId,
-            _value: u32,
-        ) -> Result<VgicUpdate, GicError> {
-            Ok(VgicUpdate::None)
-        }
-
-        fn read_nsacr_word(&self, _scope: VgicIrqScope, _base: VIntId) -> Result<u32, GicError> {
-            Ok(0)
-        }
-
-        fn write_nsacr_word(
-            &mut self,
+            &self,
             _scope: VgicIrqScope,
             _base: VIntId,
             _value: u32,
@@ -1101,7 +1072,7 @@ mod tests {
         }
 
         fn set_spi_route(
-            &mut self,
+            &self,
             _vintid: VIntId,
             _targets: VSpiRouting,
         ) -> Result<VgicUpdate, GicError> {
@@ -1123,7 +1094,7 @@ mod tests {
         }
 
         fn write_set_sgi_pending_sources_word(
-            &mut self,
+            &self,
             _target: VcpuId,
             _word: u8,
             _sources: u32,
@@ -1132,7 +1103,7 @@ mod tests {
         }
 
         fn write_clear_sgi_pending_sources_word(
-            &mut self,
+            &self,
             _target: VcpuId,
             _word: u8,
             _sources: u32,
@@ -1141,19 +1112,19 @@ mod tests {
         }
 
         fn inject_sgi(
-            &mut self,
+            &self,
             sender: VcpuId,
             targets: VcpuMask,
             sgi: u8,
         ) -> Result<VgicUpdate, GicError> {
-            self.last_sgi = Some((sender, targets, sgi));
+            self.last_sgi.set(Some((sender, targets, sgi)));
             Ok(VgicUpdate::None)
         }
     }
 
     impl VgicPirqModel for FakeModel {
         fn map_pirq(
-            &mut self,
+            &self,
             _pintid: PIntId,
             _target: VcpuId,
             _vintid: VIntId,
@@ -1164,24 +1135,20 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
-        fn unmap_pirq(&mut self, _pintid: PIntId) -> Result<VgicUpdate, GicError> {
+        fn unmap_pirq(&self, _pintid: PIntId) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }
 
-        fn on_physical_irq(
-            &mut self,
-            _pintid: PIntId,
-            _level: bool,
-        ) -> Result<VgicUpdate, GicError> {
+        fn on_physical_irq(&self, _pintid: PIntId, _level: bool) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn ctlr_write_and_read_roundtrip() {
-        let mut model = FakeModel::new(2);
+        let model = FakeModel::new(2);
         let read_back = {
-            let mut frontend = Gicv2Frontend::new(&mut model, Gicv2DistIdRegs::ZERO);
+            let frontend = Gicv2Frontend::new(&model, Gicv2DistIdRegs::ZERO);
             let offset = offset_of!(GicV2Distributor, ctlr) as u32;
             let value = GICD_CTLR::new()
                 .set(GICD_CTLR::enable_grp0, 1)
@@ -1194,14 +1161,14 @@ mod tests {
                 .handle_distributor_read(VcpuId(0), offset, Gicv2AccessSize::U32)
                 .unwrap()
         };
-        assert_eq!(model.dist_enable, (true, true));
+        assert_eq!(model.dist_enable.get(), (true, true));
         assert_eq!(read_back & 0x3, 0x3);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn sgir_write_injects_expected_targets() {
-        let mut model = FakeModel::new(4);
-        let mut frontend = Gicv2Frontend::new(&mut model, Gicv2DistIdRegs::ZERO);
+        let model = FakeModel::new(4);
+        let frontend = Gicv2Frontend::new(&model, Gicv2DistIdRegs::ZERO);
         let offset = offset_of!(GicV2Distributor, sgir) as u32;
         let sgir = GICD_SGIR::new()
             .set(GICD_SGIR::sgi_int_id, 5)
@@ -1215,7 +1182,7 @@ mod tests {
             .handle_distributor_write(VcpuId(0), offset, Gicv2AccessSize::U32, sgir.bits())
             .unwrap();
 
-        let (sender, targets, sgi) = model.last_sgi.expect("SGI should be recorded");
+        let (sender, targets, sgi) = model.last_sgi.get().expect("SGI should be recorded");
         assert_eq!(sender, VcpuId(0));
         assert_eq!(targets, VcpuMask::from_bits(0b0010));
         assert_eq!(sgi, 5);

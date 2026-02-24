@@ -1,19 +1,27 @@
+use crate::GICV2_DRIVER;
 use crate::GLOBAL_ALLOCATOR;
 use crate::SPSR_EL2_M_EL1H;
+use crate::vgic;
 use alloc::vec;
 use alloc::vec::Vec;
 use arch_hal::cpu;
 use arch_hal::cpu::CoreAffinity;
+use arch_hal::gic::GicCpuConfig;
+use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::VgicHw;
 use arch_hal::println;
 use arch_hal::psci::secure_monitor_call;
+use arch_hal::tls;
+use arch_hal::tls::PERCPU_MIN_ALIGN;
+use arch_hal::tls::template_size;
 use core::arch::asm;
-use core::arch::naked_asm;
 use core::cell::OnceCell;
 use core::mem::size_of;
 use core::ops::ControlFlow;
+use core::ptr::NonNull;
 use mutex::SpinLock;
 
-static AP_STACK_SIZE: usize = 0x1000;
+static AP_STACK_SIZE: usize = 0x100000;
 
 static STACK_MEM_FOR_EACH_CPU: SpinLock<OnceCell<Vec<(CoreAffinity, usize)>>> =
     SpinLock::new(OnceCell::new());
@@ -37,7 +45,6 @@ pub struct HypervisorRegisters {
 }
 
 pub fn setup_multicore(stack: usize) {
-    mutex::enable_raw_atomics();
     let cpu_id = cpu::get_current_core_id();
     let stack_list = STACK_MEM_FOR_EACH_CPU.lock();
     stack_list.set(vec![(cpu_id, stack)]).unwrap();
@@ -71,7 +78,8 @@ pub fn ap_on(regs: &mut cpu::Registers) {
     };
 
     let register_context = unsafe {
-        &mut *((stack_addr - size_of::<HypervisorRegisters>()) as *mut HypervisorRegisters)
+        &mut *((stack_addr - size_of::<HypervisorRegisters>().next_multiple_of(PERCPU_MIN_ALIGN))
+            as *mut HypervisorRegisters)
     };
     register_context.vtcr_el2 = cpu::get_vtcr_el2();
     register_context.vttbr_el2 = cpu::get_vttbr_el2();
@@ -106,15 +114,33 @@ pub fn ap_on(regs: &mut cpu::Registers) {
 }
 
 #[unsafe(naked)]
-extern "C" fn ap_start() {
-    naked_asm!("
-    mov sp, x0
-    b {AP_MAIN}
-    ",
-    AP_MAIN = sym ap_main)
+extern "C" fn ap_start() -> ! {
+    unsafe extern "C" {
+        static __el2_tls_start: u8;
+        static __el2_tls_end: u8;
+    }
+    core::arch::naked_asm!(
+        "
+        adrp x2, {TLS_END}
+        add  x2, x2, :lo12:{TLS_END}
+        adrp x3, {TLS_START}
+        add  x3, x3, :lo12:{TLS_START}
+        sub  x2, x2, x3
+        add  x2, x2, #63
+        and  x2, x2, #~63
+        sub  x1, x0, x2
+        mov  sp, x1
+        b    {AP_MAIN}
+        ",
+        TLS_START = sym __el2_tls_start,
+        TLS_END = sym __el2_tls_end,
+        AP_MAIN = sym ap_main,
+    )
 }
 
-extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
+extern "C" fn ap_main(register_context: *const HypervisorRegisters, tls_space: *mut u8) -> ! {
+    // mask irq/fiq
+    cpu::mask_irq_fiq();
     let register_context = unsafe { &*register_context };
     // Stage-2 translation tables
     cpu::set_vtcr_el2(register_context.vtcr_el2);
@@ -146,6 +172,24 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters) -> ! {
 
     cpu::isb();
 
+    unsafe { tls::init_current_cpu(NonNull::new_unchecked(tls_space), template_size()).unwrap() };
+
+    let gicv2 = unsafe { GICV2_DRIVER.get().as_ref().unwrap().as_ref().unwrap() };
+    let caps = gicv2.init_cpu_interface().unwrap();
+    gicv2
+        .configure(&GicCpuConfig {
+            priority_mask: 0xff,
+            enable_group0: false,
+            enable_group1: true,
+            binary_point: arch_hal::gic::BinaryPoint::Common(caps.binary_points_min),
+            eoi_mode: arch_hal::gic::EoiMode::DropOnly,
+        })
+        .unwrap();
+
+    gicv2.hw_init().unwrap();
+    vgic::on_cpu_online(gicv2).unwrap();
+
+    cpu::enable_irq_fiq();
     println!("ap_main setup DONE!!!");
 
     unsafe {

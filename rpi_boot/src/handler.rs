@@ -7,6 +7,11 @@ use arch_hal::exceptions::memory_hook::AccessClass;
 use arch_hal::exceptions::memory_hook::MmioError;
 use arch_hal::exceptions::memory_hook::MmioHandler;
 use arch_hal::exceptions::memory_hook::SplitPolicy;
+use arch_hal::gic::GicCpuInterface;
+use arch_hal::gic::GicError;
+use arch_hal::gic::PIntId;
+use arch_hal::gic::gicv2::Gicv2;
+use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::println;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
@@ -15,18 +20,23 @@ use arch_hal::psci::{self};
 use core::ffi::c_void;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
+use core::sync::atomic::Ordering;
 use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
 use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
+use mutex::pod::RawAtomicPod;
 
+use crate::GICV2_DRIVER;
 use crate::PL011_UART_ADDR;
 use crate::multicore::ap_on;
+use crate::vgic;
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
+    exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // intercept guest PSCI CPU_ON for hypervisor-controlled AP bring-up.
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, ap_on);
@@ -37,6 +47,11 @@ pub(crate) fn setup_handler() {
     psci::set_psci_handler(PsciFunctionId::CpuDefaultSuspendSmc64, deny_handler);
 
     psci::set_unknown_psci_handler(unknown_psci_handler);
+}
+
+pub(crate) fn gic() -> Option<&'static Gicv2> {
+    // SAFETY: GICV2_DRIVER is initialized once during boot and then treated as read-only.
+    unsafe { &*GICV2_DRIVER.get() }.as_ref()
 }
 
 fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
@@ -65,7 +80,7 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
 }
 
 fn passthrough_probe(_ctx: *const (), _ipa: u64, size: u8, _is_write: bool) -> bool {
-    matches!(size, 1 | 2 | 4 | 8)
+    matches!(size, 1 | 2 | 4 | 8) && !vgic::handles_gicd(_ipa as usize)
 }
 
 fn data_abort_handler(
@@ -75,6 +90,9 @@ fn data_abort_handler(
     decoded: Option<&MmioDecoded>,
 ) {
     if let Some(plan) = decoded {
+        if handle_gicd_decoded(plan, regs) {
+            return;
+        }
         log_uart_write(plan, regs);
         match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
             EmulationOutcome::Handled => return,
@@ -109,6 +127,38 @@ fn data_abort_handler(
     let reg_size: InstructionRegisterSize = access.reg_size;
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
+    let access_bytes = match access_width {
+        SyndromeAccessSize::Byte => 1,
+        SyndromeAccessSize::HalfWord => 2,
+        SyndromeAccessSize::Word => 4,
+        SyndromeAccessSize::DoubleWord => 8,
+    };
+
+    if vgic::handles_gicd(address as usize) {
+        let Some(gic_access) = gic_access_size_from_bytes(access_bytes) else {
+            panic!("gicd: unsupported access size {}", access_bytes);
+        };
+        match write_access {
+            WriteNotRead::ReadingMemoryAbort => {
+                let value =
+                    vgic::handle_gicd_read(address as usize, gic_access).expect("gicd read failed");
+                *register = match reg_size {
+                    InstructionRegisterSize::Instruction32bit => value as u64 & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => value as u64,
+                };
+            }
+            WriteNotRead::WritingMemoryAbort => {
+                let reg_val = match reg_size {
+                    InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => *register,
+                };
+                vgic::handle_gicd_write(address as usize, gic_access, reg_val as u32)
+                    .expect("gicd write failed");
+            }
+        }
+        cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+        return;
+    }
 
     unsafe {
         match write_access {
@@ -131,7 +181,7 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
-                let uart = PL011_UART_ADDR;
+                let uart = PL011_UART_ADDR.0;
                 if (uart..uart + 0x1000).contains(&(address as usize)) {
                     if uart == address as usize && reg_val == b'\n' as u64 {
                         println!("\nhypervisor: alive");
@@ -166,6 +216,123 @@ fn data_abort_handler(
     cpu::set_elr_el2(cpu::get_elr_el2() + 4);
 }
 
+fn handle_gicd_decoded(plan: &MmioDecoded, regs: &mut cpu::Registers) -> bool {
+    match plan {
+        MmioDecoded::Single {
+            desc, ipa, split, ..
+        } => {
+            if !vgic::handles_gicd(*ipa as usize) {
+                return false;
+            }
+            if split.is_some() {
+                panic!("gicd: split access not supported");
+            }
+            let Some(access) = gic_access_size_from_bytes(desc.size) else {
+                panic!("gicd: unsupported access size {}", desc.size);
+            };
+            if desc.is_store {
+                let reg_val = store_value(desc, regs);
+                vgic::handle_gicd_write(*ipa as usize, access, reg_val as u32)
+                    .expect("gicd write failed");
+            } else {
+                let value =
+                    vgic::handle_gicd_read(*ipa as usize, access).expect("gicd read failed");
+                let Some(register) = regs.gpr_mut(desc.rt) else {
+                    panic!("gicd: invalid register {}", desc.rt);
+                };
+                *register = match desc.rt_size {
+                    InstructionRegisterSize::Instruction32bit => value as u64 & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => value as u64,
+                };
+            }
+            cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+            true
+        }
+        MmioDecoded::Pair { ipa0, ipa1, .. } => {
+            if vgic::handles_gicd(*ipa0 as usize) || vgic::handles_gicd(*ipa1 as usize) {
+                panic!("gicd: pair access not supported");
+            }
+            false
+        }
+        MmioDecoded::Prefetch { .. } => false,
+    }
+}
+
+fn gic_access_size_from_bytes(access_bytes: u8) -> Option<Gicv2AccessSize> {
+    match access_bytes {
+        1 => Some(Gicv2AccessSize::U8),
+        4 => Some(Gicv2AccessSize::U32),
+        _ => None,
+    }
+}
+
+const LOG_MAINT_ERR: u32 = 1 << 0;
+const LOG_PIRQ_ERR: u32 = 1 << 1;
+const LOG_PASSTHROUGH_ERR: u32 = 1 << 2;
+const LOG_EOI_ERR: u32 = 1 << 3;
+const LOG_DEACT_ERR: u32 = 1 << 4;
+const LOG_KICK_ERR: u32 = 1 << 5;
+static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
+
+fn irq_handler(_regs: &mut cpu::Registers) {
+    let Some(gicv2) = gic() else {
+        return;
+    };
+    let Ok(Some(irq)) = gicv2.acknowledge() else {
+        return;
+    };
+    let mut is_hypervisor_owned = false;
+    if Some(irq.intid) == vgic::maintenance_intid() {
+        is_hypervisor_owned = true;
+        if let Err(err) = vgic::handle_maintenance_irq() {
+            if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
+                println!("vgic: maintenance IRQ failed: {:?}", err);
+            }
+        }
+    } else if irq.intid == vgic::kick_sgi_intid() {
+        is_hypervisor_owned = true;
+        if let Err(err) = vgic::handle_kick_sgi() {
+            if IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0 {
+                println!("vgic: kick SGI handling failed: {:?}", err);
+            }
+        }
+    } else {
+        let level = true;
+        match vgic::on_physical_irq(PIntId(irq.intid), level) {
+            Ok(()) => {}
+            Err(GicError::UnsupportedIntId) => {
+                is_hypervisor_owned = true;
+                if let Err(err) = vgic::passthrough_physical_irq(irq.intid, level) {
+                    if IRQ_LOG_ONCE.fetch_or(LOG_PASSTHROUGH_ERR, Ordering::Relaxed)
+                        & LOG_PASSTHROUGH_ERR
+                        == 0
+                    {
+                        println!("vgic: passthrough pIRQ {} failed: {:?}", irq.intid, err);
+                    }
+                }
+            }
+            Err(err) => {
+                is_hypervisor_owned = true;
+                if IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0 {
+                    println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
+                }
+            }
+        }
+    }
+    if let Err(err) = gicv2.end_of_interrupt(irq) {
+        if IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0 {
+            println!("gic: end_of_interrupt failed: {:?}", err);
+        }
+    }
+    if is_hypervisor_owned {
+        if let Err(err) = gicv2.deactivate(irq) {
+            if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
+                println!("gic: deactivate failed: {:?}", err);
+            }
+        }
+    }
+}
+
 static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
     ctx: core::ptr::null(),
     read: passthrough_read,
@@ -192,11 +359,12 @@ fn log_uart_write(plan: &MmioDecoded, regs: &cpu::Registers) {
         } if desc.is_store => (*ipa as usize, desc),
         _ => return,
     };
-    if !(PL011_UART_ADDR..PL011_UART_ADDR + 0x1000).contains(&ipa) {
+    let uart = PL011_UART_ADDR.0;
+    if !(uart..uart + 0x1000).contains(&ipa) {
         return;
     }
     let value = store_value(desc, regs);
-    if ipa == PL011_UART_ADDR && value == b'\n' as u64 {
+    if ipa == uart && value == b'\n' as u64 {
         println!("\nhypervisor: alive");
     }
 }

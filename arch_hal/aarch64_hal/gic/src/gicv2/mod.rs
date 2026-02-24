@@ -8,16 +8,20 @@ use crate::gicv2::registers::GicV2CpuInterface;
 use crate::gicv2::registers::GicV2Distributor;
 use crate::gicv2::registers::GicV2VirtualCpuInterface;
 use crate::gicv2::registers::GicV2VirtualInterfaceControl;
+use common::mem::PAGE_SIZE_4K;
 use cpu::CoreAffinity;
 use mutex::RawRwLock;
 use mutex::RawSpinLock;
+use tls;
 use typestate::Readable;
 
 mod cpu_interface;
 mod distributor;
 pub mod registers;
-pub mod vgic_frontend;
+pub(crate) mod vgic_frontend;
 pub mod virtualization;
+pub use vgic_frontend::Gicv2AccessSize;
+pub use vgic_frontend::Gicv2DistIdRegs;
 
 pub const GICV2_GICD_FRAME_SIZE: usize = size_of::<GicV2Distributor>();
 pub const GICV2_GICC_FRAME_SIZE: usize = size_of::<GicV2CpuInterface>();
@@ -73,10 +77,13 @@ impl Gicv2 {
         virtualization: Option<Gicv2VirtualizationRegion>,
         gicv2m_reg: Option<&[Gicv2mFrameArgs]>,
     ) -> Result<Self, GicError> {
-        if !gicd_reg.base.is_multiple_of(0x1000) || gicd_reg.size != size_of::<GicV2Distributor>() {
+        if !gicd_reg.base.is_multiple_of(PAGE_SIZE_4K)
+            || gicd_reg.size != size_of::<GicV2Distributor>()
+        {
             return Err(GicError::InvalidSize);
         }
-        if !gicc_reg.base.is_multiple_of(0x1000) || gicc_reg.size != size_of::<GicV2CpuInterface>()
+        if !gicc_reg.base.is_multiple_of(PAGE_SIZE_4K)
+            || gicc_reg.size != size_of::<GicV2CpuInterface>()
         {
             return Err(GicError::InvalidSize);
         }
@@ -84,12 +91,12 @@ impl Gicv2 {
             let gich = virtualization.gich;
             let gicv = virtualization.gicv;
             let interrupt_id = virtualization.maintenance_interrupt_id;
-            if !gich.base.is_multiple_of(0x1000)
+            if !gich.base.is_multiple_of(PAGE_SIZE_4K)
                 || gich.size != size_of::<GicV2VirtualInterfaceControl>()
             {
                 return Err(GicError::InvalidSize);
             }
-            if !gicv.base.is_multiple_of(0x1000)
+            if !gicv.base.is_multiple_of(PAGE_SIZE_4K)
                 || gicv.size != size_of::<GicV2VirtualCpuInterface>()
             {
                 return Err(GicError::InvalidSize);
@@ -100,7 +107,7 @@ impl Gicv2 {
         }
         if let Some(frames) = gicv2m_reg {
             for f in frames {
-                if !f.reg.base.is_multiple_of(0x1000) || f.reg.size == 0 {
+                if !f.reg.base.is_multiple_of(PAGE_SIZE_4K) || f.reg.size == 0 {
                     return Err(GicError::InvalidSize);
                 }
                 match (f.msi_base_spi, f.msi_num_spis) {
@@ -170,26 +177,34 @@ impl Gicv2 {
     }
 
     #[inline]
-    fn cpu_if_and_targets_mask_from_itargetsr0_7(&self, value: u8) -> Result<u8, GicError> {
-        let ncpu = self.gicd.typer.read().get(GICD_TYPER::cpu_number) as u8 + 1;
-
-        // ITARGETSR0-7 are banked/RO; treat returned value as one-hot mask.
-        // On UP systems, these registers can be RAZ/WI and read back as 0.
-        if ncpu == 1 {
-            return Ok(0);
+    pub(crate) fn current_cpu_if(&self) -> Result<u8, GicError> {
+        if let Some(id) = tls::cpu_if() {
+            if id >= 8 {
+                return Err(GicError::InvalidCpuId);
+            }
+            let table = self.affinity_table.read();
+            let entry = table[id as usize].ok_or(GicError::InvalidState)?;
+            if entry.0 != cpu::get_current_core_id() {
+                return Err(GicError::InvalidState);
+            }
+            return Ok(id);
         }
+        self.cpu_id_from_affinity(cpu::get_current_core_id())
+    }
 
-        // Require one-hot encoding (a single bit set).
-        if value == 0 || (value & (value - 1)) != 0 {
-            return Err(GicError::InvalidCpuId);
+    #[inline]
+    pub(crate) fn current_enable_groups(&self) -> Result<(bool, bool), GicError> {
+        if let Some(id) = tls::cpu_if() {
+            if id < 8 {
+                let table = self.affinity_table.read();
+                if let Some(entry) = table[id as usize] {
+                    if entry.0 == cpu::get_current_core_id() {
+                        return Ok((entry.1, entry.2));
+                    }
+                }
+            }
         }
-
-        let cpu_if = value.trailing_zeros() as u8;
-        if cpu_if >= ncpu {
-            return Err(GicError::InvalidCpuId);
-        }
-
-        Ok(cpu_if)
+        self.get_enable_group_from_affinity(cpu::get_current_core_id())
     }
 
     #[inline]

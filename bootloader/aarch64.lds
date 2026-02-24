@@ -49,6 +49,14 @@ SECTIONS {
 
   .rodata : ALIGN(_ALIGN_SIZE) {
     __rodata_start = .;
+    __el2_tls_start = .;
+    KEEP(*(.el2_tls .el2_tls.*))
+    __el2_tls_end = .;
+    __el2_tls_size = __el2_tls_end - __el2_tls_start;
+    . = ALIGN(64);
+    __el2_tls_bsp_start = .;
+    . = . + __el2_tls_size;
+    __el2_tls_bsp_end = .;
     *(.rodata .rodata.*)
     __rodata_end = .;
   }

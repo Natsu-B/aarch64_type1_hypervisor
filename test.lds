@@ -11,7 +11,7 @@ PHDRS
 
 _ALIGN_SIZE = 0x1000;
 _IMAGE_BASE = 0x40400000;
-_STACK_SIZE = 0x100000;
+_STACK_SIZE = 0x10000000;
 
 SECTIONS
 {
@@ -28,6 +28,9 @@ SECTIONS
   }
 
   .rodata : ALIGN(_ALIGN_SIZE) {
+    __el2_tls_start = .;
+    KEEP(*(.el2_tls .el2_tls.*))
+    __el2_tls_end = .;
     *(.rodata .rodata.*)
   }
 

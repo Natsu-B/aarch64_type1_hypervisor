@@ -5,6 +5,7 @@ use crate::GicPpi;
 use crate::GicSgi;
 use crate::IrqGroup;
 use crate::SgiTarget;
+use crate::SpiRoute;
 use crate::TriggerMode;
 use crate::gicv2::Gicv2;
 use crate::gicv2::registers::GICD_CTLR;
@@ -44,6 +45,33 @@ impl Gicv2 {
         cpu::dsb_sy();
         cpu::isb();
 
+        Ok(())
+    }
+
+    fn set_spi_route_inner(&self, intid: u32, route: SpiRoute) -> Result<(), GicError> {
+        if intid < 32 || intid >= self.max_intid() {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let cpu_targets = match route {
+            SpiRoute::Specific(affinity) => self.cpu_targets_mask_from_affinity(affinity)?,
+            SpiRoute::AnyParticipating => return Err(GicError::UnsupportedFeature),
+        };
+
+        let spi = (intid - 32) as usize;
+        let reg = spi / 4;
+        let byte = spi % 4;
+        let target = self
+            .gicd
+            .itargetsr
+            .get(reg)
+            .and_then(|entry| entry.get(byte))
+            .ok_or(GicError::UnsupportedIntId)?;
+
+        // SAFETY: The Distributor MMIO frame is validated and mapped by `Gicv2::new`, `intid`
+        // has been checked as an SPI in-range for this GIC instance, and this byte write targets
+        // only the ITARGETSR slot for the selected SPI without modifying other interrupt state.
+        target.write(cpu_targets);
         Ok(())
     }
 }
@@ -276,6 +304,14 @@ impl GicDistributor for Gicv2 {
         Ok(())
     }
 
+    fn set_spi_route(&self, intid: u32, route: SpiRoute) -> Result<(), GicError> {
+        self.set_spi_route_inner(intid, route)?;
+
+        cpu::dsb_sy();
+        cpu::isb();
+        Ok(())
+    }
+
     fn configure_spi(
         &self,
         intid: u32,
@@ -331,18 +367,7 @@ impl GicDistributor for Gicv2 {
 
         self.gicd.ipriorityr[intid as usize / 4][intid as usize % 4].write(priority);
 
-        match route {
-            crate::SpiRoute::Specific(core_affinity) => {
-                let cpu_targets = self.cpu_targets_mask_from_affinity(core_affinity)?;
-                let spi = (intid as usize)
-                    .checked_sub(32)
-                    .ok_or(GicError::UnsupportedIntId)?;
-                let reg = spi / 4;
-                let byte = spi % 4;
-                self.gicd.itargetsr[reg][byte].write(cpu_targets);
-            }
-            crate::SpiRoute::AnyParticipating => return Err(GicError::UnsupportedFeature),
-        }
+        self.set_spi_route_inner(intid, route)?;
 
         self.gicd.icfgr[intid as usize / 16].clear_bits(0b11 << ((intid as usize % 16) * 2));
         self.gicd.icfgr[intid as usize / 16].set_bits(
