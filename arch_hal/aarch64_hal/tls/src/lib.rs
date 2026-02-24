@@ -188,6 +188,7 @@ pub unsafe fn init_current_cpu(
     percpu_base: NonNull<u8>,
     percpu_len: usize,
 ) -> Result<(), TlsInitError> {
+    write_tpidr_el2(0);
     let need = template_size();
     if percpu_len < need {
         return Err(TlsInitError::BufferTooSmall {
@@ -225,4 +226,12 @@ pub fn cpu_if() -> Option<u8> {
     } else {
         Some(value)
     }
+}
+
+pub fn cpu_if_maybe_uninit() -> Option<u8> {
+    if read_tpidr_el2() == 0 {
+        return None; // TLS is not initialized on this CPU
+    }
+    let v = TLS_CPU_IF.current().get();
+    if v == CPU_IF_UNINIT { None } else { Some(v) }
 }

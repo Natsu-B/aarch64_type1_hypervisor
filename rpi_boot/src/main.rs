@@ -1032,11 +1032,13 @@ fn panic(info: &PanicInfo) -> ! {
     debug_uart.init(115200);
     debug_uart.write("\r\n\r\n=================================\r\n");
     debug_uart.write("kernel panicked!!!\r\n\r\n\r\n");
-    if let Some(core_id) = tls::cpu_if() {
+    if let Some(core_id) = tls::cpu_if_maybe_uninit() {
+        let _ = debug_uart.write("core ");
+        // # Safety rpi5 core_id must be 0~3
+        let _ = debug_uart.write_char((core_id + b'0') as char);
         let _ = debug_uart.write_fmt(format_args!(
-            "core {}({:?
+            "({:?
             }): ",
-            core_id,
             cpu::get_current_core_id()
         ));
     } else {
