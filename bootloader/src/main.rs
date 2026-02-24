@@ -254,7 +254,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let tls_result = unsafe {
         tls::init_current_cpu(
             NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
-            el2_tls_bsp_start.checked_sub(el2_tls_bsp_end).unwrap(),
+            el2_tls_bsp_end.checked_sub(el2_tls_bsp_start).unwrap(),
         )
     };
     if let Err(err) = tls_result {
