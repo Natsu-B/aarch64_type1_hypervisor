@@ -374,8 +374,16 @@ impl BrcmStb {
         let mut count = 0;
         // search MSI-X capability
         loop {
-            if count > 100 {
-                println!("PCIE: infinite recursion detected");
+            if count > 48 {
+                println!("PCIE: capability list TTL exceeded");
+                return Err(Bcm2712Error::InvalidSettings);
+            }
+            if cap == 0 {
+                println!("PCIE: MSI-X capability not found (end-of-list)");
+                return Err(Bcm2712Error::InvalidSettings);
+            }
+            if cap < size_of::<PCIConfigRegType0>() as u32 || (cap & 0b11) != 0 || cap >= 0x100 {
+                println!("PCIE: invalid capability pointer: 0x{:x}", cap);
                 return Err(Bcm2712Error::InvalidSettings);
             }
             let capability_header =
@@ -384,6 +392,10 @@ impl BrcmStb {
                 break;
             }
             cap = capability_header.get(PciCapabilityHead::next_ptr);
+            if cap == 0 {
+                println!("PCIE: MSI-X capability not found (end-of-list)");
+                return Err(Bcm2712Error::InvalidSettings);
+            }
             count += 1;
         }
         PciCapabilityMsiX::from_array(&config_data[cap as usize / size_of::<u32>()..])
