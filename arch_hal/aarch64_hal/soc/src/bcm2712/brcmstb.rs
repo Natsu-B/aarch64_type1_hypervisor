@@ -381,7 +381,8 @@ impl BrcmStb {
         let size = msi_x
             .configurations
             .read()
-            .get(PciCapabilityMsiXConfigurations::table_size) as usize;
+            .get(PciCapabilityMsiXConfigurations::table_size) as usize
+            + 1;
         let msi_x_tables = unsafe {
             &*slice_from_raw_parts(msi_x_table_addr as usize as *const PciMsiXTable, size)
         };
