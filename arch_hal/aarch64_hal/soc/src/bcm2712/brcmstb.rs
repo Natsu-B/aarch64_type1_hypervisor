@@ -365,7 +365,7 @@ impl BrcmStb {
         let bir = table_offset.get(PciCapabilityMsiXTableOffset::bir);
         println!("PCIE: MSI-X bar is bar[{}]", bir);
         let bar_addr = (unsafe { self.read_bar_address(bir as u8) })?;
-        Ok(bar_addr)
+        Ok(bar_addr + table_offset.get_raw(PciCapabilityMsiXTableOffset::offset))
     }
 
     pub(crate) unsafe fn init_rp1_msi_x_settings(
