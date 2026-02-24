@@ -149,8 +149,8 @@ extern "C" fn main() -> ! {
     // setup tls
     unsafe {
         tls::init_current_cpu(
-            NonNull::new_unchecked(tls_bsp_start as *mut u8),
-            tls_bsp_end - tls_bsp_start,
+            NonNull::new(tls_bsp_start as *mut u8).unwrap(),
+            tls_bsp_end.checked_sub(tls_bsp_start).unwrap(),
         )
         .unwrap()
     };

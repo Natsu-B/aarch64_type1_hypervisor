@@ -253,8 +253,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
     let tls_result = unsafe {
         tls::init_current_cpu(
-            NonNull::new_unchecked(el2_tls_bsp_start as *mut u8),
-            el2_tls_bsp_start - el2_tls_bsp_end,
+            NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
+            el2_tls_bsp_start.checked_sub(el2_tls_bsp_end).unwrap(),
         )
     };
     if let Err(err) = tls_result {
