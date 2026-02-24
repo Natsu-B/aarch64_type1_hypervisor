@@ -126,8 +126,8 @@ extern "C" fn ap_start() -> ! {
         adrp x3, {TLS_START}
         add  x3, x3, :lo12:{TLS_START}
         sub  x2, x2, x3
-        add  x2, x2, #15
-        and  x2, x2, #~15
+        add  x2, x2, #63
+        and  x2, x2, #~63
         sub  x1, x0, x2
         mov  sp, x1
         b    {AP_MAIN}
