@@ -405,7 +405,7 @@ impl BrcmStb {
     pub(crate) unsafe fn msi_x_table_bar_addr(
         &self,
         msi_x: &PciCapabilityMsiX,
-    ) -> Result<u64, Bcm2712Error> {
+    ) -> Result<(u64 /* bar_addr */, u64 /* entries */), Bcm2712Error> {
         let table_offset = msi_x.table_offset.read();
         let bir = table_offset.get(pci::msix::PciCapabilityMsiXTableOffset::bir);
         if bir > 5 {
@@ -416,7 +416,10 @@ impl BrcmStb {
         println!("PCIE: MSI-X table offset bytes: 0x{:x}", offset_bytes);
         let bar_addr = (unsafe { self.read_bar_address(bir as u8) })?;
         println!("PCIE: MSI-X bar decoded base: 0x{:x}", bar_addr);
-        Ok(bar_addr + offset_bytes)
+        Ok((
+            bar_addr + offset_bytes,
+            msi_x.configurations.read().table_entry_count() as u64,
+        ))
     }
 
     pub(crate) unsafe fn init_rp1_msi_x_settings(
