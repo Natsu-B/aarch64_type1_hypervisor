@@ -40,6 +40,7 @@ extern "C" fn guest_entry_poll(shared: *mut common::Shared) -> ! {
     let gic = common::GuestGic::default_layout();
     common::guest_init_virtual_interfaces(&gic);
 
+    common::guest_set_group1_intid(&gic, common::SGI_ID);
     common::guest_enable_intid(&gic, common::SGI_ID);
     common::guest_send_sgi_self(&gic, common::SGI_ID);
     let sgi_raw = common::guest_poll_for_intid(
@@ -60,6 +61,7 @@ extern "C" fn guest_entry_poll(shared: *mut common::Shared) -> ! {
         common::FAIL_POLL_SGI_DUPLICATE,
     );
 
+    common::guest_set_group1_intid(&gic, common::TIMER_TEST_PPI_INTID);
     common::guest_enable_intid(&gic, common::TIMER_TEST_PPI_INTID);
     common::guest_set_pending_intid(&gic, common::TIMER_TEST_PPI_INTID);
     let ppi_raw = common::guest_poll_for_intid(
@@ -81,6 +83,7 @@ extern "C" fn guest_entry_poll(shared: *mut common::Shared) -> ! {
         common::FAIL_POLL_PPI_DUPLICATE,
     );
 
+    common::guest_set_group1_intid(&gic, common::UART_SPI_INTID);
     common::guest_configure_spi(&gic, common::UART_SPI_INTID, 0x80, 0x01);
     common::guest_clear_pending_intid(&gic, common::UART_SPI_INTID);
     common::guest_uart_enable_tx_irq();

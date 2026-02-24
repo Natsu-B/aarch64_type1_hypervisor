@@ -148,6 +148,7 @@ extern "C" fn guest_entry_irq(shared: *mut common::Shared) -> ! {
         asm!("msr daifclr, #0b0010", options(nostack, preserves_flags));
     }
 
+    common::guest_set_group1_intid(&gic, common::SGI_ID);
     common::guest_enable_intid(&gic, common::SGI_ID);
     common::guest_send_sgi_self(&gic, common::SGI_ID);
     common::guest_wait_for_irq_count(
@@ -158,6 +159,7 @@ extern "C" fn guest_entry_irq(shared: *mut common::Shared) -> ! {
         common::FAIL_IRQ_SGI_WAIT_TIMEOUT,
     );
 
+    common::guest_set_group1_intid(&gic, common::TIMER_TEST_PPI_INTID);
     common::guest_enable_intid(&gic, common::TIMER_TEST_PPI_INTID);
     common::guest_set_pending_intid(&gic, common::TIMER_TEST_PPI_INTID);
     common::guest_wait_for_irq_count(
@@ -168,6 +170,7 @@ extern "C" fn guest_entry_irq(shared: *mut common::Shared) -> ! {
         common::FAIL_IRQ_PPI_WAIT_TIMEOUT,
     );
 
+    common::guest_set_group1_intid(&gic, common::UART_SPI_INTID);
     common::guest_configure_spi(&gic, common::UART_SPI_INTID, 0x80, 0x01);
     common::guest_clear_pending_intid(&gic, common::UART_SPI_INTID);
     common::guest_uart_enable_tx_irq();
@@ -193,9 +196,9 @@ extern "C" fn guest_irq_handler_trampoline() {
 
     let gic = common::GuestGic::default_layout();
     let iar_raw = common::guest_ack_virtual_irq(&gic);
-    let intid = iar_raw & 0x3ff;
+    let intid = common::guest_acked_intid(iar_raw);
 
-    if intid == common::SPURIOUS_INTID {
+    if intid == common::SPURIOUS_INTID || intid == common::ALT_SPURIOUS_INTID {
         return;
     }
 

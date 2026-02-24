@@ -65,7 +65,6 @@ where
         Ok(self.entries[idx])
     }
 
-    #[cfg(test)]
     pub(crate) fn take(&mut self, pintid: PIntId) -> Result<Option<PirqEntry>, GicError> {
         let idx = self.index(pintid)?;
         let entry = self.entries[idx].take();
@@ -142,15 +141,6 @@ where
             vintid,
             sense,
         };
-        {
-            let routing = self.common.routing_lock.lock_irqsave();
-            let existing = routing.pirqs.get(pintid)?;
-            if let Some(prev) = existing {
-                if prev != entry {
-                    return Err(GicError::InvalidState);
-                }
-            }
-        }
 
         let scope = if vintid.0 < LOCAL_INTID_COUNT as u32 {
             VgicIrqScope::Local(target)
@@ -158,40 +148,56 @@ where
             VgicIrqScope::Global
         };
 
-        let mut update = VgicUpdate::None;
-        update.combine(&self.set_group(scope, vintid, group)?);
-        update.combine(&self.set_priority(scope, vintid, priority)?);
-        update.combine(&self.set_trigger(
-            scope,
-            vintid,
-            match sense {
-                IrqSense::Edge => TriggerMode::Edge,
-                IrqSense::Level => TriggerMode::Level,
-            },
-        )?);
-        update.combine(&self.set_enable(scope, vintid, true)?);
+        let max = crate::max_intids_for_vcpus(VCPUS) as u32;
+        if vintid.0 >= max || pintid.0 >= max {
+            return Err(GicError::UnsupportedIntId);
+        }
 
-        let commit_result = {
+        let (inserted, route_to_apply) = {
             let mut routing = self.common.routing_lock.lock_irqsave();
-            routing.pirqs.ensure_entry(pintid, entry)
+            let existing = routing.pirqs.get(pintid)?;
+            if let Some(prev) = existing {
+                if prev != entry {
+                    return Err(GicError::InvalidState);
+                }
+            }
+            let inserted = routing.pirqs.ensure_entry(pintid, entry)?;
+            let route = if inserted && matches!(scope, VgicIrqScope::Global) {
+                Some(routing.routing.get_route(vintid)?)
+            } else {
+                None
+            };
+            (inserted, route)
         };
-        let inserted = match commit_result {
-            Ok(inserted) => inserted,
-            Err(err) => {
-                // Roll back virtual enable if another mapping raced us after Phase 1 validation.
-                update.combine(&self.set_enable(scope, vintid, false)?);
+
+        if let Some(route) = route_to_apply {
+            if let Err(err) = self.call_pirq_route_hook(pintid, route) {
+                let mut routing = self.common.routing_lock.lock_irqsave();
+                let _ = routing.pirqs.take(pintid);
                 return Err(err);
             }
+        }
+
+        let trigger = match sense {
+            IrqSense::Edge => TriggerMode::Edge,
+            IrqSense::Level => TriggerMode::Level,
         };
 
-        // `set_enable` above can run before pIRQ commit, so initial map needs an explicit
-        // passthrough sync for route/enable when this entry is first installed.
-        if inserted {
-            if matches!(scope, VgicIrqScope::Global) {
-                let route = self.get_spi_route(vintid)?;
-                self.call_pirq_route_hook(pintid, route)?;
+        let mut update = VgicUpdate::None;
+        let apply_result: Result<(), GicError> = (|| {
+            update.combine(&self.set_group(scope, vintid, group)?);
+            update.combine(&self.set_priority(scope, vintid, priority)?);
+            update.combine(&self.set_trigger(scope, vintid, trigger)?);
+            update.combine(&self.set_enable(scope, vintid, true)?);
+            Ok(())
+        })();
+        if let Err(err) = apply_result {
+            if inserted {
+                let _ = self.set_enable(scope, vintid, false);
+                let mut routing = self.common.routing_lock.lock_irqsave();
+                let _ = routing.pirqs.take(pintid);
             }
-            self.call_pirq_enable_hook(pintid, true)?;
+            return Err(err);
         }
 
         Ok(update)

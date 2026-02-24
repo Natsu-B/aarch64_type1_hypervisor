@@ -70,6 +70,7 @@ pub const SGI_ID: u32 = 1;
 pub const MAINT_INTID: u32 = 25;
 pub const TIMER_TEST_PPI_INTID: u32 = 27;
 pub const UART_SPI_INTID: u32 = 33;
+pub const ALT_SPURIOUS_INTID: u32 = 1022;
 pub const SPURIOUS_INTID: u32 = 1023;
 
 pub const KICK_SGI_ID: u8 = 15;
@@ -113,6 +114,7 @@ pub const FAIL_IRQ_UART_WAIT_TIMEOUT: u32 = 0x3021;
 pub const FAIL_IRQ_UNEXPECTED_INTID: u32 = 0x3031;
 
 const GICD_CTLR_OFF: usize = 0x000;
+const GICD_IGROUPR0_OFF: usize = 0x080;
 const GICD_ISENABLER0_OFF: usize = 0x100;
 const GICD_ICENABLER0_OFF: usize = 0x180;
 const GICD_ICPENDR0_OFF: usize = 0x280;
@@ -446,14 +448,14 @@ fn init_gic_and_vgic() -> Result<(), &'static str> {
         VcpuId(0),
         VIntId(UART_SPI_INTID),
         IrqSense::Level,
-        IrqGroup::Group0,
+        IrqGroup::Group1,
         0x80,
     )
     .map_err(|_| "vgic map_pirq failed")?;
 
     gic.configure_spi(
         UART_SPI_INTID,
-        IrqGroup::Group0,
+        IrqGroup::Group1,
         0x80,
         TriggerMode::Level,
         SpiRoute::Specific(cpu::get_current_core_id()),
@@ -778,12 +780,24 @@ pub fn shared_read_irq_seen(shared: *mut Shared, idx: usize) -> u32 {
 }
 
 pub fn guest_fail(shared: *mut Shared, code: u32) -> ! {
+    let gic = GuestGic::default_layout();
+    guest_uart_disable_tx_irq();
+    gic.gicv_write32(GICV_CTLR_OFF, 0);
+    gic.gicd_write32(GICD_CTLR_OFF, 0);
+    cpu::dsb_sy();
+    cpu::isb();
     shared_set_fail_if_unset(shared, code);
     shared_set_done(shared, 1);
     guest_wfi_loop()
 }
 
 pub fn guest_finish(shared: *mut Shared) -> ! {
+    let gic = GuestGic::default_layout();
+    guest_uart_disable_tx_irq();
+    gic.gicv_write32(GICV_CTLR_OFF, 0);
+    gic.gicd_write32(GICD_CTLR_OFF, 0);
+    cpu::dsb_sy();
+    cpu::isb();
     shared_set_done(shared, 1);
     guest_wfi_loop()
 }
@@ -844,10 +858,18 @@ fn mmio_write32(addr: usize, value: u32) {
 pub fn guest_init_virtual_interfaces(gic: &GuestGic) {
     gic.gicv_write32(GICV_PMR_OFF, 0xff);
     gic.gicv_write32(GICV_BPR_OFF, 0);
-    gic.gicv_write32(GICV_CTLR_OFF, 0x3);
-    gic.gicd_write32(GICD_CTLR_OFF, 0x3);
+    // Group1-only delivery with AckCtl=1 so guest can use IAR/EOIR for all virtual IRQs.
+    gic.gicv_write32(GICV_CTLR_OFF, 0x6);
+    gic.gicd_write32(GICD_CTLR_OFF, 0x2);
     cpu::dsb_sy();
     cpu::isb();
+}
+
+pub fn guest_set_group1_intid(gic: &GuestGic, intid: u32) {
+    let reg_off = GICD_IGROUPR0_OFF + ((intid as usize / 32) * 4);
+    let bit = 1u32 << (intid % 32);
+    let value = gic.gicd_read32(reg_off) | bit;
+    gic.gicd_write32(reg_off, value);
 }
 
 pub fn guest_enable_intid(gic: &GuestGic, intid: u32) {
@@ -880,6 +902,7 @@ pub fn guest_send_sgi_self(gic: &GuestGic, sgi_id: u32) {
 }
 
 pub fn guest_configure_spi(gic: &GuestGic, intid: u32, priority: u8, target_mask: u8) {
+    guest_set_group1_intid(gic, intid);
     set_gicd_byte(gic, GICD_IPRIORITYR_OFF, intid, priority);
     // Force a route transition so the vGIC route hook always runs even when
     // the default route already matches `target_mask`.
@@ -930,8 +953,8 @@ pub fn guest_poll_for_intid(
     unexpected_fail: u32,
 ) -> u32 {
     for _ in 0..timeout_iters {
-        let raw = gic.gicv_read32(GICV_IAR_OFF);
-        let intid = raw & 0x3ff;
+        let raw = guest_ack_virtual_irq(gic);
+        let intid = guest_acked_intid(raw);
 
         if intid == expected_intid {
             shared_set_last_intid(shared, intid);
@@ -939,14 +962,14 @@ pub fn guest_poll_for_intid(
             return raw;
         }
 
-        if intid == SPURIOUS_INTID {
+        if is_spurious_intid(intid) {
             cpu::isb();
             continue;
         }
 
         shared_set_unexpected_intid(shared, intid);
         shared_set_last_iar_raw(shared, raw);
-        gic.gicv_write32(GICV_EOIR_OFF, raw);
+        guest_eoi_virtual_irq(gic, raw);
         guest_fail(shared, unexpected_fail);
     }
 
@@ -961,10 +984,10 @@ pub fn guest_assert_not_redelivered(
     duplicate_fail: u32,
 ) {
     for _ in 0..check_iters {
-        let raw = gic.gicv_read32(GICV_IAR_OFF);
-        let intid = raw & 0x3ff;
+        let raw = guest_ack_virtual_irq(gic);
+        let intid = guest_acked_intid(raw);
 
-        if intid == SPURIOUS_INTID {
+        if is_spurious_intid(intid) {
             cpu::isb();
             continue;
         }
@@ -979,6 +1002,11 @@ pub fn guest_assert_not_redelivered(
 
         guest_fail(shared, duplicate_fail);
     }
+}
+
+#[inline]
+fn is_spurious_intid(intid: u32) -> bool {
+    intid == ALT_SPURIOUS_INTID || intid == SPURIOUS_INTID
 }
 
 pub fn guest_wait_for_irq_count(
@@ -1010,4 +1038,9 @@ pub fn guest_ack_virtual_irq(gic: &GuestGic) -> u32 {
 
 pub fn guest_eoi_virtual_irq(gic: &GuestGic, iar_raw: u32) {
     gic.gicv_write32(GICV_EOIR_OFF, iar_raw);
+}
+
+#[inline]
+pub fn guest_acked_intid(iar_raw: u32) -> u32 {
+    iar_raw & 0x3ff
 }
