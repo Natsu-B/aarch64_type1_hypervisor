@@ -26,13 +26,13 @@ mod registers;
 pub struct EL2Stage1Paging;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EL2Stage1PageTypes {
     Normal = 0b0,
     Device = 0b1,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct EL2Stage1PagingSetting {
     pub va: usize,
     pub pa: usize,

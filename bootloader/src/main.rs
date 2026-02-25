@@ -72,7 +72,6 @@ use arch_hal::soc::bcm2711::gpio::gpio_mmio_from_dtb;
 use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
 use arch_hal::tls;
-use core::alloc::Layout;
 use core::arch::naked_asm;
 use core::cell::SyncUnsafeCell;
 use core::ffi::CStr;
@@ -83,6 +82,7 @@ use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts;
+use core::ptr::write_volatile;
 use core::slice;
 use core::usize;
 use dtb::DeviceTree;
@@ -115,6 +115,7 @@ static DEBUG_UART_ADDR: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None
 
 const MAX_MEM_REGIONS: usize = 8;
 const PAGE_SIZE: usize = 0x1000;
+const EL1_STACK_BYTES: usize = 0x4000; // 16 KiB EL1 stack
 static MEM_REGION_COUNT: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static MEM_REGIONS: SyncUnsafeCell<[MemoryRegion; MAX_MEM_REGIONS]> =
     SyncUnsafeCell::new([MemoryRegion { base: 0, size: 0 }; MAX_MEM_REGIONS]);
@@ -306,308 +307,350 @@ extern "C" fn _start() {
 #[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
-    let program_start = &raw mut _PROGRAM_START as *const _ as usize;
-    let stack_start = &raw mut _STACK_TOP as *const _ as usize;
-    let el2_tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
-    let el2_tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
+    let sp_el1 = {
+        let program_start = &raw mut _PROGRAM_START as *const _ as usize;
+        let stack_start = &raw mut _STACK_TOP as *const _ as usize;
+        let el2_tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
+        let el2_tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
 
-    let dtb_ptr = if cfg!(feature = "rpi4") {
-        0x2000_0000
-    } else {
-        let args = unsafe { slice::from_raw_parts(argv, argc) };
-        str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() }).unwrap()
-    };
+        let dtb_ptr = if cfg!(feature = "rpi4") {
+            0x2000_0000
+        } else {
+            let args = unsafe { slice::from_raw_parts(argv, argc) };
+            str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
+                .unwrap()
+        };
 
-    let dtb = DtbParser::init(dtb_ptr).unwrap();
-    let mut best: Option<Pl011Candidate> = None;
-    let mut second: Option<Pl011Candidate> = None;
-    let _ = dtb
-        .find_nodes_by_compatible_view("arm,pl011", &mut |view,
-                                                          name|
-         -> Result<
-            ControlFlow<()>,
-            WalkError<()>,
-        > {
-            let reg = view.reg_iter().unwrap().next().unwrap().unwrap();
-            let mut irq = None;
-            let _ = view
-                .for_each_interrupt_specifier(
-                    &mut |cells| -> Result<ControlFlow<()>, WalkError<()>> {
+        let dtb = DtbParser::init(dtb_ptr).unwrap();
+        let mut best: Option<Pl011Candidate> = None;
+        let mut second: Option<Pl011Candidate> = None;
+        let _ = dtb
+            .find_nodes_by_compatible_view("arm,pl011", &mut |view,
+                                                              name|
+             -> Result<
+                ControlFlow<()>,
+                WalkError<()>,
+            > {
+                let reg = view.reg_iter().unwrap().next().unwrap().unwrap();
+                let mut irq = None;
+                let _ = view
+                    .for_each_interrupt_specifier(&mut |cells| -> Result<
+                        ControlFlow<()>,
+                        WalkError<()>,
+                    > {
                         irq =
                             Some(irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"));
                         Ok(ControlFlow::Break(()))
+                    })
+                    .unwrap();
+                update_best_two_pl011_candidates(
+                    &mut best,
+                    &mut second,
+                    Pl011Candidate {
+                        uart_node: UartNode {
+                            base: reg.0,
+                            size: reg.1,
+                            irq,
+                        },
+                        name,
+                        parsed_index: parse_uart_index_from_name(name),
                     },
-                )
-                .unwrap();
-            update_best_two_pl011_candidates(
-                &mut best,
-                &mut second,
-                Pl011Candidate {
-                    uart_node: UartNode {
-                        base: reg.0,
-                        size: reg.1,
-                        irq,
-                    },
-                    name,
-                    parsed_index: parse_uart_index_from_name(name),
-                },
-            );
-            Ok(ControlFlow::Continue(()))
-        })
-        .unwrap();
-    let best = best.unwrap_or_else(|| panic!("uart selection: no arm,pl011 nodes found"));
-    let second = second
-        .unwrap_or_else(|| panic!("uart selection: need at least two distinct arm,pl011 nodes"));
-    // SAFETY: early boot UART globals are initialized once on the BSP before secondary cores/interrupts.
-    unsafe {
-        *GUEST_UART.get() = Some(best.uart_node);
-        *GDB_UART.get() = Some(second.uart_node);
-        *DEBUG_UART_ADDR.get() = Some(best.uart_node.base);
-    }
-    let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
-    let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
-    #[cfg(feature = "rpi4")]
-    {
-        assert_eq!(
-            guest_uart.base, PL011_UART_ADDR,
-            "selected guest UART does not match expected PL011 address"
-        );
-        assert_eq!(
-            gdb_uart.base, GDB_UART_ADDR,
-            "selected gdb UART does not match expected PL011 address"
-        );
-    }
-    debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
-    log_selected_uart("guest", best);
-    log_selected_uart("gdb", second);
-    let tls_result = unsafe {
-        tls::init_current_cpu(
-            NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
-            el2_tls_bsp_end.checked_sub(el2_tls_bsp_start).unwrap(),
-        )
-    };
-    if let Err(err) = tls_result {
-        println!("tls init failed: {:?}", err);
-        panic!("tls init failed");
-    }
-
-    // enable gdb_uart gpio
-    #[cfg(feature = "rpi4")]
-    enable_uart2_gpio(&dtb);
-    gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
-
-    debug::init_gdb_stub();
-    println!(
-        "debug uart starting (guest console @ 0x{:X})...\r\n",
-        guest_uart.base
-    );
-    let gic_info = find_gicv2_info(&dtb).unwrap();
-
-    assert_eq!(cpu::get_current_el(), 2);
-
-    let mut systimer = SystemTimer::new();
-    systimer.init();
-    println!(
-        "system counter frequency: {}Hz",
-        systimer.counter_frequency_hz()
-    );
-    println!("setup allocator");
-    GLOBAL_ALLOCATOR.init();
-    let _ = dtb
-        .find_node(Some("memory"), None, &mut |addr,
-                                               size|
-         -> Result<
-            ControlFlow<()>,
-            WalkError<()>,
-        > {
-            GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
-            record_memory_region(addr, size);
-            Ok(ControlFlow::Continue(()))
-        })
-        .unwrap();
-    dtb.find_memory_reservation_block(&mut |addr, size| {
-        GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
-        ControlFlow::Continue(())
-    });
-    let result = dtb.find_reserved_memory_node(
-        &mut |addr, size| {
-            GLOBAL_ALLOCATOR
-                .add_reserved_region(addr, size)
-                .map_err(|_| WalkError::User(()))?;
-            Ok(ControlFlow::Continue(()))
-        },
-        &mut |size, align, alloc_range| {
-            let allocated = GLOBAL_ALLOCATOR
-                .allocate_dynamic_reserved_region(size, align, alloc_range)
-                .map_err(|_| WalkError::User(()))?;
-            if allocated.is_some() {
+                );
                 Ok(ControlFlow::Continue(()))
-            } else {
-                Err(WalkError::User(()))
-            }
-        },
-    );
-    match result {
-        Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
-        Err(WalkError::Dtb(err)) => panic!("{}", err),
-        Err(WalkError::User(())) => panic!("reserved-memory: allocator error"),
-    }
-    GLOBAL_ALLOCATOR
-        .add_reserved_region(program_start, stack_start - program_start)
-        .unwrap();
-    GLOBAL_ALLOCATOR
-        .add_reserved_region(dtb_ptr, dtb.get_size())
-        .unwrap();
-    GLOBAL_ALLOCATOR.finalize().unwrap();
-    println!("allocator setup success!!!");
-    record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, &gdb_uart, &gic_info);
-    dump_guest_mmio_allowlist();
-
-    println!("setup EL2 Stage-1 paging with stack guard...");
-    let stage1_settings = build_stage1_el2_map();
-    EL2Stage1Paging::init_stage1paging(&stage1_settings)
-        .expect("EL2 Stage-1 paging initialization failed");
-    println!("EL2 Stage-1 paging enabled");
-
-    // SAFETY: emergency stack is initialized after Stage-1 is enabled.
-    // The stack is mapped as Normal memory with identity mapping.
-    unsafe {
-        stack_overflow::init_emergency_stack();
-    }
-    println!("Emergency stack initialized");
-
-    // setup paging
-    println!("start paging...");
-    println!(
-        "guest uart addr: 0x{:X}, size: 0x{:X}",
-        guest_uart.base, guest_uart.size
-    );
-    println!(
-        "gdb uart addr: 0x{:X}, size: 0x{:X}",
-        gdb_uart.base, gdb_uart.size
-    );
-    let (paging_data, guest_window) = build_stage2_guest_map();
-    let (guest_ipa_base, guest_ipa_size) = if let Some((ipa_base, ipa_size)) = guest_window {
-        debug::set_guest_ipa_window(ipa_base as u64, ipa_size as u64);
-        (ipa_base, ipa_size)
-    } else {
-        debug::set_guest_ipa_window(0, 0);
-        (0, 0)
-    };
-    if guest_ipa_size != 0 {
-        let mut rom_ranges = [(0u64, 0u64); 1];
-        let mut rom_count = 0usize;
-        if let Some(mem_base) = lowest_memory_base() {
-            if guest_ipa_base > mem_base {
-                rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
-                rom_count = 1;
-            }
+            })
+            .unwrap();
+        let best = best.unwrap_or_else(|| panic!("uart selection: no arm,pl011 nodes found"));
+        let second = second.unwrap_or_else(|| {
+            panic!("uart selection: need at least two distinct arm,pl011 nodes")
+        });
+        // SAFETY: early boot UART globals are initialized once on the BSP before secondary cores/interrupts.
+        unsafe {
+            *GUEST_UART.get() = Some(best.uart_node);
+            *GDB_UART.get() = Some(second.uart_node);
+            *DEBUG_UART_ADDR.get() = Some(best.uart_node.base);
+        }
+        let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
+        let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
+        #[cfg(feature = "rpi4")]
+        {
+            assert_eq!(
+                guest_uart.base, PL011_UART_ADDR,
+                "selected guest UART does not match expected PL011 address"
+            );
+            assert_eq!(
+                gdb_uart.base, GDB_UART_ADDR,
+                "selected gdb UART does not match expected PL011 address"
+            );
+        }
+        debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
+        log_selected_uart("guest", best);
+        log_selected_uart("gdb", second);
+        let tls_result = unsafe {
+            tls::init_current_cpu(
+                NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
+                el2_tls_bsp_end.checked_sub(el2_tls_bsp_start).unwrap(),
+            )
+        };
+        if let Err(err) = tls_result {
+            println!("tls init failed: {:?}", err);
+            panic!("tls init failed");
         }
 
-        let mut io_ranges: Vec<(u64, u64)> = Vec::new();
-        push_debug_io_range(&mut io_ranges, guest_uart.base, guest_uart.size);
-        for range in guest_mmio_allowlist_slice() {
-            if range.size == 0 {
-                continue;
-            }
-            push_debug_io_range(&mut io_ranges, range.base, range.size);
-        }
-        push_debug_io_range(&mut io_ranges, gic_info.dist.base, gic_info.dist.size);
-        push_debug_io_range(&mut io_ranges, gic_info.cpu.base, gic_info.cpu.size);
-        if let Some(gich) = gic_info.gich {
-            push_debug_io_range(&mut io_ranges, gich.base, gich.size);
-        }
-        if let Some(gicv) = gic_info.gicv {
-            push_debug_io_range(&mut io_ranges, gicv.base, gicv.size);
-        }
+        // enable gdb_uart gpio
+        #[cfg(feature = "rpi4")]
+        enable_uart2_gpio(&dtb);
+        gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
 
-        debug::set_memory_map(
-            guest_ipa_base as u64,
-            guest_ipa_size as u64,
-            &rom_ranges[..rom_count],
-            io_ranges.as_slice(),
+        debug::init_gdb_stub();
+        println!(
+            "debug uart starting (guest console @ 0x{:X})...\r\n",
+            guest_uart.base
         );
-    } else {
-        debug::set_memory_map(0, 0, &[], &[]);
-    }
-    if paging_data.is_empty() {
-        panic!("stage2: no guest RAM to map");
-    }
-    println!("init stage2 paging...\npaging_data: {:?}", paging_data);
-    Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
-    Stage2Paging::enable_stage2_translation(true, true);
-    cpu::set_tpidr_el1(guest_uart.base as u64);
-    exceptions::setup_el1_exception();
-    println!("paging success!!!");
-    println!("setup exception");
-    exceptions::setup_exception();
-    handler::setup_handler();
-    vbar_watch::init_vbar_watch();
-    let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
-    gic.configure_ppi(
-        timer::SBSA_EL2_PHYSICAL_TIMER_INTID,
-        IrqGroup::Group1,
-        EL2_TIMER_PPI_PRIORITY,
-        TriggerMode::Level,
-        EnableOp::Enable,
-    )
-    .map_err(|_| "gic: configure el2 timer ppi")
-    .unwrap();
-    irq_monitor::init_physical_timer_poll();
-    vgic::init(&gic, &gic_info, guest_uart, gdb_uart_intid).unwrap();
-    handler::register_gic(gic, Some(gdb_uart_intid));
-    {
-        let mdcr = cpu::get_mdcr_el2();
-        // Trap debug exceptions from lower EL to EL2 (MDCR_EL2.TDE).
-        cpu::set_mdcr_el2(mdcr | (1 << 8));
-    }
-    cpu::enable_irq();
-    cpu::enable_debug_exceptions();
-    let modified = {
-        let mut dtb_bytes = AlignedSliceBox::new_uninit_with_align(dtb.get_size(), 32).unwrap();
-        dtb_bytes.copy_from_slice(unsafe {
-            &*slice_from_raw_parts(dtb_ptr as *const MaybeUninit<u8>, dtb.get_size())
+        let gic_info = find_gicv2_info(&dtb).unwrap();
+
+        assert_eq!(cpu::get_current_el(), 2);
+
+        let mut systimer = SystemTimer::new();
+        systimer.init();
+        println!(
+            "system counter frequency: {}Hz",
+            systimer.counter_frequency_hz()
+        );
+        println!("setup allocator");
+        GLOBAL_ALLOCATOR.init();
+        let _ = dtb
+            .find_node(Some("memory"), None, &mut |addr,
+                                                   size|
+             -> Result<
+                ControlFlow<()>,
+                WalkError<()>,
+            > {
+                GLOBAL_ALLOCATOR.add_available_region(addr, size).unwrap();
+                record_memory_region(addr, size);
+                Ok(ControlFlow::Continue(()))
+            })
+            .unwrap();
+        dtb.find_memory_reservation_block(&mut |addr, size| {
+            GLOBAL_ALLOCATOR.add_reserved_region(addr, size).unwrap();
+            ControlFlow::Continue(())
         });
-        unsafe { dtb_bytes.assume_init() }
+        let result = dtb.find_reserved_memory_node(
+            &mut |addr, size| {
+                GLOBAL_ALLOCATOR
+                    .add_reserved_region(addr, size)
+                    .map_err(|_| WalkError::User(()))?;
+                Ok(ControlFlow::Continue(()))
+            },
+            &mut |size, align, alloc_range| {
+                let allocated = GLOBAL_ALLOCATOR
+                    .allocate_dynamic_reserved_region(size, align, alloc_range)
+                    .map_err(|_| WalkError::User(()))?;
+                if allocated.is_some() {
+                    Ok(ControlFlow::Continue(()))
+                } else {
+                    Err(WalkError::User(()))
+                }
+            },
+        );
+        match result {
+            Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
+            Err(WalkError::Dtb(err)) => panic!("{}", err),
+            Err(WalkError::User(())) => panic!("reserved-memory: allocator error"),
+        }
+        GLOBAL_ALLOCATOR
+            .add_reserved_region(program_start, stack_start - program_start)
+            .unwrap();
+        GLOBAL_ALLOCATOR
+            .add_reserved_region(dtb_ptr, dtb.get_size())
+            .unwrap();
+        GLOBAL_ALLOCATOR.finalize().unwrap();
+        println!("allocator setup success!!!");
+        record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, &gdb_uart, &gic_info);
+        dump_guest_mmio_allowlist();
+
+        println!("setup EL2 Stage-1 paging with stack guard...");
+        let stage1_settings = build_stage1_el2_map();
+        EL2Stage1Paging::init_stage1paging(&stage1_settings)
+            .expect("EL2 Stage-1 paging initialization failed");
+        println!("EL2 Stage-1 paging enabled");
+
+        // SAFETY: emergency stack is initialized after Stage-1 is enabled.
+        // The stack is mapped as Normal memory with identity mapping.
+        unsafe {
+            stack_overflow::init_emergency_stack();
+        }
+        println!("Emergency stack initialized");
+
+        // setup paging
+        println!("start paging...");
+        println!(
+            "guest uart addr: 0x{:X}, size: 0x{:X}",
+            guest_uart.base, guest_uart.size
+        );
+        println!(
+            "gdb uart addr: 0x{:X}, size: 0x{:X}",
+            gdb_uart.base, gdb_uart.size
+        );
+        let (paging_data, guest_window) = build_stage2_guest_map();
+        let (guest_ipa_base, guest_ipa_size) = guest_window.expect("stage2: no guest RAM window");
+        debug::set_guest_ipa_window(guest_ipa_base as u64, guest_ipa_size as u64);
+
+        let guest_ipa_end = guest_ipa_base
+            .checked_add(guest_ipa_size)
+            .expect("stage2: guest_ipa_base + guest_ipa_size overflow");
+        let sp_el1 = align_down(guest_ipa_end, 16);
+        assert!(
+            sp_el1 > guest_ipa_base,
+            "stage2: sp_el1 ({:#X}) must be above guest_ipa_base ({:#X})",
+            sp_el1,
+            guest_ipa_base
+        );
+        assert!(
+            sp_el1 <= guest_ipa_end,
+            "stage2: sp_el1 ({:#X}) must be at or below guest_ipa_end ({:#X})",
+            sp_el1,
+            guest_ipa_end
+        );
+        assert!(
+            sp_el1.checked_sub(0x20).unwrap_or(0) >= guest_ipa_base,
+            "stage2: sp_el1 - 0x20 ({:#X}) underflows guest_ipa_base ({:#X})",
+            sp_el1.wrapping_sub(0x20),
+            guest_ipa_base
+        );
+
+        let el1_stack_base = align_down(
+            sp_el1
+                .checked_sub(EL1_STACK_BYTES)
+                .expect("stage2: sp_el1 - EL1_STACK_BYTES underflow"),
+            PAGE_SIZE,
+        );
+        assert!(
+            el1_stack_base >= guest_ipa_base,
+            "stage2: el1_stack_base ({:#X}) below guest_ipa_base ({:#X})",
+            el1_stack_base,
+            guest_ipa_base
+        );
+        assert!(
+            el1_stack_base
+                .checked_add(EL1_STACK_BYTES)
+                .expect("stage2: el1_stack_base + EL1_STACK_BYTES overflow")
+                <= guest_ipa_end,
+            "stage2: el1 stack region exceeds guest_ipa_end"
+        );
+
+        if guest_ipa_size != 0 {
+            let mut rom_ranges = [(0u64, 0u64); 1];
+            let mut rom_count = 0usize;
+            if let Some(mem_base) = lowest_memory_base() {
+                if guest_ipa_base > mem_base {
+                    rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
+                    rom_count = 1;
+                }
+            }
+
+            let mut io_ranges: Vec<(u64, u64)> = Vec::new();
+            push_debug_io_range(&mut io_ranges, guest_uart.base, guest_uart.size);
+            for range in guest_mmio_allowlist_slice() {
+                if range.size == 0 {
+                    continue;
+                }
+                push_debug_io_range(&mut io_ranges, range.base, range.size);
+            }
+            push_debug_io_range(&mut io_ranges, gic_info.dist.base, gic_info.dist.size);
+            push_debug_io_range(&mut io_ranges, gic_info.cpu.base, gic_info.cpu.size);
+            if let Some(gich) = gic_info.gich {
+                push_debug_io_range(&mut io_ranges, gich.base, gich.size);
+            }
+            if let Some(gicv) = gic_info.gicv {
+                push_debug_io_range(&mut io_ranges, gicv.base, gicv.size);
+            }
+
+            debug::set_memory_map(
+                guest_ipa_base as u64,
+                guest_ipa_size as u64,
+                &rom_ranges[..rom_count],
+                io_ranges.as_slice(),
+            );
+        } else {
+            debug::set_memory_map(0, 0, &[], &[]);
+        }
+        if paging_data.is_empty() {
+            panic!("stage2: no guest RAM to map");
+        }
+        println!("init stage2 paging...\npaging_data: {:?}", paging_data);
+        Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
+        Stage2Paging::enable_stage2_translation(true, true);
+        cpu::set_tpidr_el1(guest_uart.base as u64);
+        exceptions::setup_el1_exception();
+        println!("paging success!!!");
+        println!("setup exception");
+        exceptions::setup_exception();
+        handler::setup_handler();
+        vbar_watch::init_vbar_watch();
+        let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
+        gic.configure_ppi(
+            timer::SBSA_EL2_PHYSICAL_TIMER_INTID,
+            IrqGroup::Group1,
+            EL2_TIMER_PPI_PRIORITY,
+            TriggerMode::Level,
+            EnableOp::Enable,
+        )
+        .map_err(|_| "gic: configure el2 timer ppi")
+        .unwrap();
+        irq_monitor::init_physical_timer_poll();
+        vgic::init(&gic, &gic_info, guest_uart, gdb_uart_intid).unwrap();
+        handler::register_gic(gic, Some(gdb_uart_intid));
+        {
+            let mdcr = cpu::get_mdcr_el2();
+            // Trap debug exceptions from lower EL to EL2 (MDCR_EL2.TDE).
+            cpu::set_mdcr_el2(mdcr | (1 << 8));
+        }
+        cpu::enable_irq();
+        cpu::enable_debug_exceptions();
+        let modified = {
+            let mut dtb_bytes = AlignedSliceBox::new_uninit_with_align(dtb.get_size(), 32).unwrap();
+            dtb_bytes.copy_from_slice(unsafe {
+                &*slice_from_raw_parts(dtb_ptr as *const MaybeUninit<u8>, dtb.get_size())
+            });
+            unsafe { dtb_bytes.assume_init() }
+        };
+        let mut dtb_tree = DeviceTree::from_dtb(&modified).unwrap().to_owned();
+        apply_guest_dt_edits(
+            &mut dtb_tree,
+            unsafe { &*GUEST_UART.get() }.unwrap().base,
+            &gic_info,
+        )
+        .unwrap();
+
+        let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
+        println!("allocator closed");
+        reserved_memory.push((program_start, stack_start));
+        reserved_memory.push((el1_stack_base, EL1_STACK_BYTES));
+
+        for (addr, size) in &reserved_memory {
+            dtb_tree.mem_reserve.push(dtb::MemReserve {
+                address: *addr as u64,
+                size: *size as u64,
+            });
+        }
+        let dtb_box = dtb_tree.into_dtb_box().unwrap();
+        let (dtb_ptr, _dtb_len, _dtb_align) = allocator::AlignedSliceBox::into_raw_parts(dtb_box);
+        // SAFETY: the DTB allocation is intentionally leaked so the guest can access it.
+        unsafe {
+            *DTB_ADDR.get() = dtb_ptr as usize;
+        }
+        println!("jumping linux...");
+
+        unsafe {
+            core::arch::asm!("isb");
+            core::arch::asm!("dsb sy");
+        }
+        sp_el1
     };
-    let mut dtb_tree = DeviceTree::from_dtb(&modified).unwrap().to_owned();
-    apply_guest_dt_edits(
-        &mut dtb_tree,
-        unsafe { &*GUEST_UART.get() }.unwrap().base,
-        &gic_info,
-    )
-    .unwrap();
-
-    let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
-    println!("allocator closed");
-    reserved_memory.push((program_start, stack_start));
-
-    for (addr, size) in &reserved_memory {
-        dtb_tree.mem_reserve.push(dtb::MemReserve {
-            address: *addr as u64,
-            size: *size as u64,
-        });
-    }
-    let dtb_box = dtb_tree.into_dtb_box().unwrap();
-    let (dtb_ptr, _dtb_len, _dtb_align) = allocator::AlignedSliceBox::into_raw_parts(dtb_box);
-    // SAFETY: the DTB allocation is intentionally leaked so the guest can access it.
-    unsafe {
-        *DTB_ADDR.get() = dtb_ptr as usize;
-    }
-    println!("jumping linux...");
-
-    unsafe {
-        core::arch::asm!("isb");
-        core::arch::asm!("dsb sy");
-    }
-
     let el1_main = el1_main as *const fn() as usize as u64;
-    let stack_addr =
-        unsafe { alloc::alloc::alloc(Layout::from_size_align_unchecked(0x1000, 0x1000)) } as usize
-            + 0x1000;
     println!(
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
-        el1_main, stack_addr
+        el1_main, sp_el1
     );
 
     // Print HyprProbe ascii art
@@ -632,7 +675,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     unsafe {
         core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
-        core::arch::asm!("msr sp_el1, {}", in(reg) stack_addr);
+        core::arch::asm!("msr sp_el1, {}", in(reg) sp_el1);
         core::arch::asm!("msr sctlr_el2, {0:x}", in(reg) 0);
         cpu::isb();
         core::arch::asm!("eret", options(noreturn));
@@ -1420,6 +1463,46 @@ fn normalize_stage2_settings(settings: &mut [Stage2PagingSetting], count: usize)
     write
 }
 
+fn push_normal_excluding_guard(
+    settings: &mut Vec<EL2Stage1PagingSetting>,
+    start: usize,
+    end: usize,
+    guard_page_start: usize,
+    guard_page_end: usize,
+) {
+    if end <= start {
+        return;
+    }
+
+    // Exclude the guard page (unmapped) region.
+    if guard_page_end <= start || guard_page_start >= end {
+        settings.push(EL2Stage1PagingSetting {
+            va: start,
+            pa: start,
+            size: end - start,
+            types: EL2Stage1PageTypes::Normal,
+        });
+        return;
+    }
+
+    if start < guard_page_start {
+        settings.push(EL2Stage1PagingSetting {
+            va: start,
+            pa: start,
+            size: guard_page_start - start,
+            types: EL2Stage1PageTypes::Normal,
+        });
+    }
+    if guard_page_end < end {
+        settings.push(EL2Stage1PagingSetting {
+            va: guard_page_end,
+            pa: guard_page_end,
+            size: end - guard_page_end,
+            types: EL2Stage1PageTypes::Normal,
+        });
+    }
+}
+
 fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
     unsafe extern "C" {
         static _STACK_BOTTOM: usize;
@@ -1447,35 +1530,34 @@ fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
             continue;
         }
 
-        if guard_page_end <= start || guard_page_start >= end {
-            settings.push(EL2Stage1PagingSetting {
-                va: start,
-                pa: start,
-                size: end - start,
-                types: EL2Stage1PageTypes::Normal,
-            });
-        } else {
-            if start < guard_page_start {
-                settings.push(EL2Stage1PagingSetting {
-                    va: start,
-                    pa: start,
-                    size: guard_page_start - start,
-                    types: EL2Stage1PageTypes::Normal,
-                });
-            }
-            if guard_page_end < end {
-                settings.push(EL2Stage1PagingSetting {
-                    va: guard_page_end,
-                    pa: guard_page_end,
-                    size: end - guard_page_end,
-                    types: EL2Stage1PageTypes::Normal,
-                });
-            }
-        }
+        push_normal_excluding_guard(&mut settings, start, end, guard_page_start, guard_page_end);
     }
 
     // map other memory regions as mmio
     settings.sort_by(|a, b| a.va.cmp(&b.va));
+
+    if settings.is_empty() {
+        // If nothing is mapped as Normal, map everything as Device (fallback).
+        // This should not happen in normal boot, but avoids indexing panic.
+        let parange = match cpu::get_parange().unwrap() {
+            cpu::registers::PARange::PA32bits4GB => 32,
+            cpu::registers::PARange::PA36bits64GB => 36,
+            cpu::registers::PARange::PA40bits1TB => 40,
+            cpu::registers::PARange::PA42bits4TB => 42,
+            cpu::registers::PARange::PA44bits16TB => 44,
+            cpu::registers::PARange::PA48bits256TB => 48,
+            cpu::registers::PARange::PA52bits4PB => 48,
+            cpu::registers::PARange::PA56bits64PB => 48,
+        };
+        let ipa_space = 1usize << parange;
+        settings.push(EL2Stage1PagingSetting {
+            va: 0,
+            pa: 0,
+            size: ipa_space,
+            types: EL2Stage1PageTypes::Device,
+        });
+        return settings;
+    }
 
     if settings[0].va != 0 {
         settings.insert(
