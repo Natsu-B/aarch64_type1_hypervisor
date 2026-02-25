@@ -12,8 +12,15 @@ pub use pl011::Pl011Uart;
 
 pub static DEBUG_UART: RawSpinLock<DebugUart> = RawSpinLock::new(DebugUart::new());
 
+#[derive(Clone, Copy)]
+pub struct MirrorOps {
+    pub write: fn(&str),
+    pub flush: fn(),
+}
+
 pub struct DebugUart {
     uart: OnceCell<Pl011Uart>,
+    mirror: Option<MirrorOps>,
 }
 
 impl Default for DebugUart {
@@ -23,12 +30,15 @@ impl Default for DebugUart {
 }
 
 impl DebugUart {
+    /// Creates an uninitialized debug UART container.
     pub const fn new() -> DebugUart {
         DebugUart {
             uart: OnceCell::new(),
+            mirror: None,
         }
     }
 
+    /// Initializes the primary PL011 debug UART.
     pub fn init(&mut self, uart_peripherals: usize, uart_clk: u64, baud_rate: u32) {
         let mut uart = Pl011Uart::new(uart_peripherals, uart_clk);
         uart.init(baud_rate);
@@ -39,8 +49,26 @@ impl DebugUart {
         }
     }
 
+    /// Returns mutable access to the initialized UART, if present.
     pub fn get_mut(&mut self) -> Option<&mut Pl011Uart> {
         self.uart.get_mut()
+    }
+}
+
+struct MirrorWriter<'a> {
+    uart: Option<&'a mut Pl011Uart>,
+    mirror: Option<MirrorOps>,
+}
+
+impl<'a> fmt::Write for MirrorWriter<'a> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if let Some(uart) = self.uart.as_mut() {
+            uart.write(s);
+        }
+        if let Some(mirror) = self.mirror {
+            (mirror.write)(s);
+        }
+        Ok(())
     }
 }
 
@@ -81,61 +109,81 @@ macro_rules! pr_trace {
     };
 }
 
+/// Initializes the global debug UART instance.
 pub fn init(uart_peripherals: usize, uart_clk: u64, baud_rate: u32) {
     DEBUG_UART
         .lock()
         .init(uart_peripherals, uart_clk, baud_rate);
 }
 
-pub fn write(args: fmt::Arguments) {
-    DEBUG_UART
-        .lock()
-        .get_mut()
-        .unwrap()
-        .write_fmt(args)
-        .unwrap();
+/// Sets or clears an optional mirror output sink.
+pub fn set_mirror(ops: Option<MirrorOps>) {
+    DEBUG_UART.lock().mirror = ops;
 }
 
+/// Writes formatted output to the primary UART and optional mirror sink.
+pub fn write(args: fmt::Arguments) {
+    let mut guard = DEBUG_UART.lock();
+    let mirror = guard.mirror;
+    let mut writer = MirrorWriter {
+        uart: Some(guard.get_mut().unwrap()),
+        mirror,
+    };
+    writer.write_fmt(args).unwrap();
+}
+
+/// `print!` backend.
 pub fn _print(args: fmt::Arguments) {
     write(args);
 }
 
+/// Lockless print path for contexts where taking the lock may deadlock.
 pub fn _print_force(args: fmt::Arguments) {
     // SAFETY: Caller must ensure this is only used in contexts where taking the lock
     // would deadlock (e.g. panic path), and accept potential interleaving.
-    unsafe { DEBUG_UART.no_lock() }
-        .get_mut()
-        .unwrap()
-        .write_fmt(args)
-        .unwrap();
+    let mut guard = unsafe { DEBUG_UART.no_lock() };
+    let mirror = guard.mirror;
+    let mut writer = MirrorWriter {
+        uart: Some(guard.get_mut().unwrap()),
+        mirror,
+    };
+    writer.write_fmt(args).unwrap();
 }
 
+/// Flushes the primary UART and optional mirror sink.
 pub fn flush() {
-    DEBUG_UART.lock().get_mut().unwrap().flush();
+    let mut guard = DEBUG_UART.lock();
+    if let Some(uart) = guard.get_mut() {
+        uart.flush();
+    }
+    if let Some(mirror) = guard.mirror {
+        (mirror.flush)();
+    }
 }
 
 pub mod debug_uart {
     use super::*;
 
+    /// Initializes the debug UART.
     pub fn init(uart_peripherals: usize, uart_clk: u64, baud_rate: u32) {
         super::init(uart_peripherals, uart_clk, baud_rate);
     }
 
+    /// Writes a string to the debug UART and optional mirror sink.
     pub fn write(s: &str) {
         let mut guard = DEBUG_UART.lock();
+        let mirror = guard.mirror;
         if let Some(uart) = guard.get_mut() {
             uart.write(s);
         }
+        if let Some(mirror) = mirror {
+            (mirror.write)(s);
+        }
     }
 
+    /// Lockless formatted print path for deadlock-sensitive contexts.
     pub fn print_force(args: fmt::Arguments) {
-        // SAFETY: Caller must ensure this is only used in contexts where taking the lock
-        // would deadlock (e.g. panic path), and accept potential interleaving.
-        unsafe { DEBUG_UART.no_lock() }
-            .get_mut()
-            .unwrap()
-            .write_fmt(args)
-            .unwrap();
+        super::_print_force(args);
     }
 
     /// Configure PL011 RX-related interrupts (FIFO trigger + timeout).
