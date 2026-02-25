@@ -17,6 +17,10 @@
 extern crate alloc;
 mod debug;
 mod gdb_stream;
+#[cfg(not(feature = "rpi4_net"))]
+mod gdb_uart;
+#[cfg(feature = "rpi4_net")]
+#[path = "gdb_uart_udp.rs"]
 mod gdb_uart;
 mod build_info {
     include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
@@ -26,6 +30,8 @@ mod handler;
 mod irq_decode;
 mod irq_monitor;
 mod monitor;
+#[cfg(feature = "rpi4_net")]
+mod net;
 mod softirq;
 mod stack_overflow;
 mod vbar;
@@ -61,13 +67,13 @@ use arch_hal::paging::stage1::EL2Stage1Paging;
 use arch_hal::paging::stage1::EL2Stage1PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 use arch_hal::soc::bcm2711::gpio::Bcm2711Gpio;
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 use arch_hal::soc::bcm2711::gpio::Bcm2711GpioError;
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 use arch_hal::soc::bcm2711::gpio::Pull;
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 use arch_hal::soc::bcm2711::gpio::gpio_mmio_from_dtb;
 use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
@@ -82,7 +88,6 @@ use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts;
-use core::ptr::write_volatile;
 use core::slice;
 use core::usize;
 use dtb::DeviceTree;
@@ -126,7 +131,7 @@ static GUEST_MMIO_ALLOWLIST: SyncUnsafeCell<Option<Box<[GuestMmioRange]>>> =
 const PL011_UART_ADDR: usize = 0x900_0000;
 #[cfg(feature = "rpi4")]
 const PL011_UART_ADDR: usize = 0xFE20_1000;
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 const GDB_UART_ADDR: usize = 0xFE20_1400;
 const UART_CLOCK_HZ: u64 = 48 * 1_000_000;
 const UART_BAUD: u32 = 115_200;
@@ -360,19 +365,23 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             })
             .unwrap();
         let best = best.unwrap_or_else(|| panic!("uart selection: no arm,pl011 nodes found"));
-        let second = second.unwrap_or_else(|| {
+        #[cfg(not(feature = "rpi4_net"))]
+        let gdb_candidate = Some(second.unwrap_or_else(|| {
             panic!("uart selection: need at least two distinct arm,pl011 nodes")
-        });
+        }));
+        #[cfg(feature = "rpi4_net")]
+        let gdb_candidate = second;
         // SAFETY: early boot UART globals are initialized once on the BSP before secondary cores/interrupts.
         unsafe {
             *GUEST_UART.get() = Some(best.uart_node);
-            *GDB_UART.get() = Some(second.uart_node);
+            *GDB_UART.get() = gdb_candidate.map(|candidate| candidate.uart_node);
             *DEBUG_UART_ADDR.get() = Some(best.uart_node.base);
         }
-        let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
-        let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
-        #[cfg(feature = "rpi4")]
+        let guest_uart = unsafe { (*GUEST_UART.get()).expect("guest uart is not initialized") };
+        let gdb_uart = unsafe { *GDB_UART.get() };
+        #[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
         {
+            let gdb_uart = gdb_uart.expect("gdb uart is not initialized");
             assert_eq!(
                 guest_uart.base, PL011_UART_ADDR,
                 "selected guest UART does not match expected PL011 address"
@@ -382,9 +391,18 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                 "selected gdb UART does not match expected PL011 address"
             );
         }
+        #[cfg(all(feature = "rpi4", feature = "rpi4_net"))]
+        {
+            assert_eq!(
+                guest_uart.base, PL011_UART_ADDR,
+                "selected guest UART does not match expected PL011 address"
+            );
+        }
         debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
         log_selected_uart("guest", best);
-        log_selected_uart("gdb", second);
+        if let Some(gdb_candidate) = gdb_candidate {
+            log_selected_uart("gdb", gdb_candidate);
+        }
         let tls_result = unsafe {
             tls::init_current_cpu(
                 NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
@@ -396,10 +414,26 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             panic!("tls init failed");
         }
 
-        // enable gdb_uart gpio
-        #[cfg(feature = "rpi4")]
-        enable_uart2_gpio(&dtb);
-        gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+        #[cfg(not(feature = "rpi4_net"))]
+        {
+            let gdb_uart = gdb_uart.expect("gdb uart is not initialized");
+            // enable gdb_uart gpio
+            #[cfg(feature = "rpi4")]
+            enable_uart2_gpio(&dtb);
+            gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+        }
+
+        #[cfg(feature = "rpi4_net")]
+        {
+            // TODO: wire the real RPi4 Ethernet driver that implements `EthernetFrameIo`.
+            let eth = net::rpi4::init_ethernet_from_dtb(&dtb);
+            net::udp_uart::init(eth, net::config::LOCAL_IP);
+            arch_hal::set_mirror(Some(arch_hal::MirrorOps {
+                write: net::udp_uart::debug_write_str,
+                flush: net::udp_uart::debug_flush,
+            }));
+            gdb_uart::init(0, UART_CLOCK_HZ, UART_BAUD);
+        }
 
         debug::init_gdb_stub();
         println!(
@@ -465,7 +499,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             .unwrap();
         GLOBAL_ALLOCATOR.finalize().unwrap();
         println!("allocator setup success!!!");
-        record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, &gdb_uart, &gic_info);
+        record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, gdb_uart.as_ref(), &gic_info);
         dump_guest_mmio_allowlist();
 
         println!("setup EL2 Stage-1 paging with stack guard...");
@@ -487,10 +521,12 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             "guest uart addr: 0x{:X}, size: 0x{:X}",
             guest_uart.base, guest_uart.size
         );
-        println!(
-            "gdb uart addr: 0x{:X}, size: 0x{:X}",
-            gdb_uart.base, gdb_uart.size
-        );
+        if let Some(gdb_uart) = gdb_uart {
+            println!(
+                "gdb uart addr: 0x{:X}, size: 0x{:X}",
+                gdb_uart.base, gdb_uart.size
+            );
+        }
         let (paging_data, guest_window) = build_stage2_guest_map();
         let (guest_ipa_base, guest_ipa_size) = guest_window.expect("stage2: no guest RAM window");
         debug::set_guest_ipa_window(guest_ipa_base as u64, guest_ipa_size as u64);
@@ -587,7 +623,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         exceptions::setup_exception();
         handler::setup_handler();
         vbar_watch::init_vbar_watch();
-        let (gic, gdb_uart_intid) = init_gicv2_for_gdb(&gic_info, gdb_uart).unwrap();
+        let (gic, gdb_uart_intid) = init_gicv2(&gic_info, gdb_uart).unwrap();
         gic.configure_ppi(
             timer::SBSA_EL2_PHYSICAL_TIMER_INTID,
             IrqGroup::Group1,
@@ -599,7 +635,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         .unwrap();
         irq_monitor::init_physical_timer_poll();
         vgic::init(&gic, &gic_info, guest_uart, gdb_uart_intid).unwrap();
-        handler::register_gic(gic, Some(gdb_uart_intid));
+        handler::register_gic(gic, gdb_uart_intid);
         {
             let mdcr = cpu::get_mdcr_el2();
             // Trap debug exceptions from lower EL to EL2 (MDCR_EL2.TDE).
@@ -1029,14 +1065,14 @@ fn push_guest_mmio_range(
 fn record_guest_mmio_allowlist_from_dtb(
     dtb: &DtbParser,
     guest_uart: &UartNode,
-    gdb_uart: &UartNode,
+    gdb_uart: Option<&UartNode>,
     gic_info: &Gicv2Info,
 ) {
     let pa_bits = cpu::get_parange().map(pa_bits_from_parange).unwrap_or(48);
     let pa_limit_excl = pa_limit_exclusive(pa_bits).unwrap_or(usize::MAX);
 
     let guest_range = normalize_guest_mmio_range(guest_uart.base, guest_uart.size);
-    let mut gdb_range = normalize_guest_mmio_range(gdb_uart.base, gdb_uart.size);
+    let mut gdb_range = gdb_uart.and_then(|node| normalize_guest_mmio_range(node.base, node.size));
     if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range) {
         if ranges_overlap(guest_range, current_gdb_range) {
             println!(
@@ -1343,10 +1379,10 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
     found.ok_or("gic: missing GICv2 node")
 }
 
-fn init_gicv2_for_gdb(
+fn init_gicv2(
     info: &Gicv2Info,
-    gdb_uart: UartNode,
-) -> Result<(gic::gicv2::Gicv2, u32), &'static str> {
+    gdb_uart: Option<UartNode>,
+) -> Result<(gic::gicv2::Gicv2, Option<u32>), &'static str> {
     let virt = match (info.gich, info.gicv, info.maintenance_intid) {
         (Some(gich), Some(gicv), Some(maint)) => Some(gic::gicv2::Gicv2VirtualizationRegion {
             gich,
@@ -1369,17 +1405,21 @@ fn init_gicv2_for_gdb(
     };
     gic.configure(&cfg).map_err(|_| "gic: configure")?;
 
-    let gdb_intid = gdb_uart.irq.ok_or("gic: gdb uart missing IRQ")?;
-
-    gic.configure_spi(
-        gdb_intid,
-        IrqGroup::Group1,
-        0x80,
-        TriggerMode::Level,
-        SpiRoute::Specific(cpu::get_current_core_id()),
-        EnableOp::Enable,
-    )
-    .map_err(|_| "gic: configure spi")?;
+    let gdb_intid = if let Some(gdb_uart) = gdb_uart {
+        let gdb_intid = gdb_uart.irq.ok_or("gic: gdb uart missing IRQ")?;
+        gic.configure_spi(
+            gdb_intid,
+            IrqGroup::Group1,
+            0x80,
+            TriggerMode::Level,
+            SpiRoute::Specific(cpu::get_current_core_id()),
+            EnableOp::Enable,
+        )
+        .map_err(|_| "gic: configure spi")?;
+        Some(gdb_intid)
+    } else {
+        None
+    };
 
     Ok((gic, gdb_intid))
 }
@@ -2290,14 +2330,14 @@ fn decode_cstr(bytes: &[u8]) -> Option<&str> {
     core::str::from_utf8(&bytes[..end]).ok()
 }
 
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnableUart2GpioError {
     ResolveMmio(Bcm2711GpioError),
     ConfigurePins(Bcm2711GpioError),
 }
 
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 fn enable_uart2_gpio(dtb: &DtbParser) {
     match try_enable_uart2_gpio(dtb) {
         Ok(()) => {}
@@ -2308,7 +2348,7 @@ fn enable_uart2_gpio(dtb: &DtbParser) {
     }
 }
 
-#[cfg(feature = "rpi4")]
+#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 fn try_enable_uart2_gpio(dtb: &DtbParser) -> Result<(), EnableUart2GpioError> {
     let mmio = gpio_mmio_from_dtb(dtb).map_err(EnableUart2GpioError::ResolveMmio)?;
     // SAFETY: `mmio.base` comes from the DTB GPIO `reg` property for this board,

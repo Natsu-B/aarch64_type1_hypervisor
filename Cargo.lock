@@ -133,6 +133,7 @@ dependencies = [
  "gdb_remote",
  "io-api",
  "mutex",
+ "net",
  "typestate",
 ]
 
@@ -216,6 +217,13 @@ name = "mutex"
 version = "0.1.0"
 dependencies = [
  "typestate",
+]
+
+[[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "io-api",
 ]
 
 [[package]]

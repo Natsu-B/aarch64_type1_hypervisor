@@ -94,7 +94,7 @@ pub(crate) fn init(
     gic: &Gicv2,
     info: &Gicv2Info,
     guest_uart: UartNode,
-    gdb_uart_intid: u32,
+    gdb_uart_intid: Option<u32>,
 ) -> Result<(), &'static str> {
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
     enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
@@ -107,7 +107,7 @@ pub(crate) fn init(
         .map_err(|_| "vgic: switch in")?;
 
     if let Some(pintid) = guest_uart.irq {
-        if pintid != gdb_uart_intid {
+        if Some(pintid) != gdb_uart_intid {
             VGIC.map_pirq_prepared(
                 gic,
                 PIntId(pintid),
@@ -125,7 +125,7 @@ pub(crate) fn init(
     }
 
     for intid in 32..1020 {
-        if intid == gdb_uart_intid || guest_uart.irq == Some(intid) {
+        if Some(intid) == gdb_uart_intid || guest_uart.irq == Some(intid) {
             continue;
         }
         match VGIC.map_pirq_prepared(

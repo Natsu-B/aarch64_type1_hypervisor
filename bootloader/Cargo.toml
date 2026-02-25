@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = []
 rpi4 = []
+rpi4_net = ["rpi4", "dep:net-proto"]
 
 [dependencies]
 dtb = { path = "../dtb" }
@@ -17,6 +18,7 @@ arch_hal = { path = "../arch_hal" }
 gdb_remote = { path = "../gdb_remote" }
 mutex = { path = "../mutex" }
 io-api = { path = "../io_api" }
+net-proto = { path = "../net", package = "net", optional = true }
 
 [dev-dependencies]
 aarch64_unit_test = { path = "../arch_hal/aarch64_hal/aarch64_unit_test" }
