@@ -96,6 +96,12 @@ fn main() {
     let encoded_rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
     let has_test_lds = rustflags.contains("test.lds") || encoded_rustflags.contains("test.lds");
     if !has_test_lds {
-        println!("cargo:rustc-link-arg=-Taarch64.lds");
+        let rpi4_lds = env::var_os("CARGO_FEATURE_RPI4").is_some();
+        let script = if rpi4_lds {
+            "aarch64-rpi4.lds"
+        } else {
+            "aarch64.lds"
+        };
+        println!("cargo:rustc-link-arg=-T{script}");
     }
 }
