@@ -149,7 +149,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - run: nix develop --accept-flake-config --command bash -c 'cargo xbuild && cargo xrun rpi5'
+      - run: nix develop --accept-flake-config --command bash -c 'cargo xbuild && cargo xrun rpi5 && cargo xbuild rpi4'
 
       - name: List build outputs
         run: ls -al bin || (echo "bin/ not found" && exit 1)
@@ -217,4 +217,5 @@ jobs:
             cargo xtest
             cargo xbuild
             cargo xbuild rpi5
-          '
+            cargo xbuild rpi4
+            '
