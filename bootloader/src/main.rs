@@ -126,6 +126,93 @@ pub(crate) struct UartNode {
 }
 
 #[derive(Copy, Clone, Debug)]
+struct Pl011Candidate {
+    uart_node: UartNode,
+    name: &'static str,
+    parsed_index: Option<u32>,
+}
+
+fn parse_decimal_prefix_u32(input: &str) -> Option<u32> {
+    let bytes = input.as_bytes();
+    let mut value: u32 = 0;
+    let mut saw_digit = false;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        saw_digit = true;
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+    }
+    if saw_digit { Some(value) } else { None }
+}
+
+fn parse_uart_index_from_name(name: &str) -> Option<u32> {
+    if let Some(rest) = name.strip_prefix("uart") {
+        return parse_decimal_prefix_u32(rest);
+    }
+    if let Some(rest) = name.strip_prefix("serial") {
+        return parse_decimal_prefix_u32(rest);
+    }
+    None
+}
+
+fn pl011_candidate_key(candidate: &Pl011Candidate) -> (u32, usize) {
+    (
+        candidate.parsed_index.unwrap_or(u32::MAX),
+        candidate.uart_node.base,
+    )
+}
+
+fn pl011_same_region(a: &Pl011Candidate, b: &Pl011Candidate) -> bool {
+    a.uart_node.base == b.uart_node.base && a.uart_node.size == b.uart_node.size
+}
+
+fn update_best_two_pl011_candidates(
+    best: &mut Option<Pl011Candidate>,
+    second: &mut Option<Pl011Candidate>,
+    candidate: Pl011Candidate,
+) {
+    if let Some(current_best) = best {
+        if pl011_same_region(current_best, &candidate) {
+            return;
+        }
+    } else {
+        *best = Some(candidate);
+        return;
+    }
+
+    if pl011_candidate_key(&candidate) < pl011_candidate_key(best.as_ref().unwrap()) {
+        *second = *best;
+        *best = Some(candidate);
+        return;
+    }
+
+    if let Some(current_second) = second {
+        if pl011_same_region(current_second, &candidate) {
+            return;
+        }
+        if pl011_candidate_key(&candidate) < pl011_candidate_key(current_second) {
+            *second = Some(candidate);
+        }
+    } else {
+        *second = Some(candidate);
+    }
+}
+
+fn log_selected_uart(role: &str, candidate: Pl011Candidate) {
+    match candidate.parsed_index {
+        Some(index) => println!(
+            "{} uart selected: {} (idx {}) @ 0x{:X}",
+            role, candidate.name, index, candidate.uart_node.base
+        ),
+        None => println!(
+            "{} uart selected: {} (idx none) @ 0x{:X}",
+            role, candidate.name, candidate.uart_node.base
+        ),
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
 pub(crate) struct MemoryRegion {
     base: usize,
     size: usize,
@@ -189,66 +276,53 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
             .unwrap();
     let dtb = DtbParser::init(dtb_ptr).unwrap();
-    let mut i = 0;
+    let mut best: Option<Pl011Candidate> = None;
+    let mut second: Option<Pl011Candidate> = None;
     let _ = dtb
         .find_nodes_by_compatible_view("arm,pl011", &mut |view,
-                                                          _|
+                                                          name|
          -> Result<
             ControlFlow<()>,
             WalkError<()>,
         > {
-            match i {
-                0 => unsafe {
-                    let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
-                    *GUEST_UART.get() = Some(UartNode {
-                        base: tmp.0,
-                        size: tmp.1,
-                        irq: {
-                            let mut tmp = None;
-                            let _ = view
-                                .for_each_interrupt_specifier(
-                                    &mut |cells| -> Result<ControlFlow<()>, WalkError<()>> {
-                                        tmp = Some(
-                                            irq_decode::dt_irq_to_pintid(cells)
-                                                .expect("uart: bad IRQ spec"),
-                                        );
-                                        Ok(ControlFlow::Break(()))
-                                    },
-                                )
-                                .unwrap();
-                            tmp
-                        },
-                    });
-                    *DEBUG_UART_ADDR.get() = Some(tmp.0);
+            let reg = view.reg_iter().unwrap().next().unwrap().unwrap();
+            let mut irq = None;
+            let _ = view
+                .for_each_interrupt_specifier(
+                    &mut |cells| -> Result<ControlFlow<()>, WalkError<()>> {
+                        irq =
+                            Some(irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"));
+                        Ok(ControlFlow::Break(()))
+                    },
+                )
+                .unwrap();
+            update_best_two_pl011_candidates(
+                &mut best,
+                &mut second,
+                Pl011Candidate {
+                    uart_node: UartNode {
+                        base: reg.0,
+                        size: reg.1,
+                        irq,
+                    },
+                    name,
+                    parsed_index: parse_uart_index_from_name(name),
                 },
-                1 => unsafe {
-                    let tmp = view.reg_iter().unwrap().next().unwrap().unwrap();
-                    *GDB_UART.get() = Some(UartNode {
-                        base: tmp.0,
-                        size: tmp.1,
-                        irq: {
-                            let mut tmp = None;
-                            let _ = view
-                                .for_each_interrupt_specifier(
-                                    &mut |cells| -> Result<ControlFlow<()>, WalkError<()>> {
-                                        tmp = Some(
-                                            irq_decode::dt_irq_to_pintid(cells)
-                                                .expect("uart: bad IRQ spec"),
-                                        );
-                                        Ok(ControlFlow::Break(()))
-                                    },
-                                )
-                                .unwrap();
-                            tmp
-                        },
-                    });
-                },
-                _ => return Ok(ControlFlow::Break(())),
-            }
-            i += 1;
+            );
             Ok(ControlFlow::Continue(()))
         })
         .unwrap();
+    let best = best.unwrap_or_else(|| panic!("uart selection: no arm,pl011 nodes found"));
+    let second = second
+        .unwrap_or_else(|| panic!("uart selection: need at least two distinct arm,pl011 nodes"));
+    // SAFETY: early boot UART globals are initialized once on the BSP before secondary cores/interrupts.
+    unsafe {
+        *GUEST_UART.get() = Some(best.uart_node);
+        *GDB_UART.get() = Some(second.uart_node);
+        *DEBUG_UART_ADDR.get() = Some(best.uart_node.base);
+    }
+    log_selected_uart("guest", best);
+    log_selected_uart("gdb", second);
     let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
     let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
     debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
@@ -327,7 +401,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         .unwrap();
     GLOBAL_ALLOCATOR.finalize().unwrap();
     println!("allocator setup success!!!");
-    record_guest_mmio_allowlist_from_dtb(&dtb, &gdb_uart, &gic_info);
+    record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, &gdb_uart, &gic_info);
     dump_guest_mmio_allowlist();
 
     println!("setup EL2 Stage-1 paging with stack guard...");
@@ -758,11 +832,22 @@ fn push_guest_mmio_range(
 
 fn record_guest_mmio_allowlist_from_dtb(
     dtb: &DtbParser,
+    guest_uart: &UartNode,
     gdb_uart: &UartNode,
     gic_info: &Gicv2Info,
 ) {
+    let guest_range = normalize_guest_mmio_range(guest_uart.base, guest_uart.size);
+    let mut gdb_range = normalize_guest_mmio_range(gdb_uart.base, gdb_uart.size);
+    if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range) {
+        if ranges_overlap(guest_range, current_gdb_range) {
+            println!(
+                "warning: guest/gdb UART ranges overlap within normalized MMIO pages; not denying GDB range"
+            );
+            gdb_range = None;
+        }
+    }
     let mut denylist = GuestMmioDenyList {
-        gdb_range: normalize_guest_mmio_range(gdb_uart.base, gdb_uart.size),
+        gdb_range,
         deny: Vec::new(),
     };
     denylist.push_deny(gic_info.dist.base, gic_info.dist.size);
