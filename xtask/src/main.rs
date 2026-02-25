@@ -50,8 +50,8 @@ fn print_xtask_usage() {
     println!("Usage: cargo xtask <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build [rpi5] [cargo args...]");
-    println!("  run [rpi5] [args...]");
+    println!("  build [rpi4|rpi4_net|rpi5] [cargo args...]");
+    println!("  run [rpi4|rpi5] [args...]");
     println!("  test [xtest args...]");
     println!();
     println!("Options:");
@@ -62,6 +62,7 @@ fn build(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("rpi5") => build_rpi5(&args[1..]),
         Some("rpi4") => build_rpi4(&args[1..]),
+        Some("rpi4_net") => build_rpi4_net(&args[1..]),
         _ => build_bootloader(args),
     }
 }
@@ -108,6 +109,14 @@ fn build_rpi4(args: &[String]) -> Result<String, String> {
     let mut combined_args = Vec::with_capacity(args.len() + 2);
     combined_args.push("--features".to_string());
     combined_args.push("rpi4".to_string());
+    combined_args.extend_from_slice(args);
+    build_bootloader(&combined_args)
+}
+
+fn build_rpi4_net(args: &[String]) -> Result<String, String> {
+    let mut combined_args = Vec::with_capacity(args.len() + 2);
+    combined_args.push("--features".to_string());
+    combined_args.push("rpi4_net".to_string());
     combined_args.extend_from_slice(args);
     build_bootloader(&combined_args)
 }
