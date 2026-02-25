@@ -1,10 +1,10 @@
+use crate::gdb_stream::BootGdbUartStream;
 use crate::gdb_uart;
 use crate::guest_mmio_allowlist_contains_range;
 use crate::monitor;
 use arch_hal::aarch64_gdb;
 use arch_hal::aarch64_gdb::Aarch64GdbStub;
 use arch_hal::aarch64_gdb::DebugEntryCause;
-use arch_hal::aarch64_gdb::DebugIo;
 use arch_hal::aarch64_gdb::MemoryAccess;
 use arch_hal::aarch64_gdb::WatchpointKind;
 use arch_hal::cpu;
@@ -62,6 +62,8 @@ impl MemoryAccess for Stage2Memory {
 type GdbStub = Aarch64GdbStub<Stage2Memory, MAX_GDB_PKT, MAX_GDB_TX_CAP>;
 
 static GDB_STUB: SyncUnsafeCell<MaybeUninit<GdbStub>> = SyncUnsafeCell::new(MaybeUninit::uninit());
+static GDB_STREAM: SyncUnsafeCell<BootGdbUartStream> =
+    SyncUnsafeCell::new(BootGdbUartStream::new());
 static GUEST_IPA_BASE: RawAtomicPod<u64> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 static GUEST_IPA_SIZE: RawAtomicPod<u64> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 static MEMORY_MAP_BUF: SyncUnsafeCell<[u8; 1024]> = SyncUnsafeCell::new([0; 1024]);
@@ -111,11 +113,8 @@ pub(crate) fn init_gdb_stub() {
     // SAFETY: called once during early boot, before debug exceptions are enabled.
     unsafe {
         let stub = &mut *GDB_STUB.get();
-        aarch64_gdb::register_debug_io(DebugIo {
-            try_read: gdb_uart::try_read_byte,
-            try_write: gdb_uart::try_write_byte,
-            flush: gdb_uart::flush,
-        });
+        let stream = &mut *GDB_STREAM.get();
+        aarch64_gdb::register_debug_stream(stream);
         // Avoid constructing large fixed-size buffers on the stack.
         GdbStub::init_in_place(stub, Stage2Memory);
         let stub = stub.assume_init_mut();
@@ -152,7 +151,7 @@ pub(crate) fn enter_debug_from_irq(regs: &mut cpu::Registers, reason: u8) {
     };
 
     let _debug_active = DebugActiveGuard::new();
-    let saved_daif = cpu::read_daif();
+    let saved_daif = cpu::irq_save();
     let _stop_loop = gdb_uart::begin_stop_loop();
 
     let el2_timer = timer::El2PhysicalTimer::new();

@@ -8,6 +8,7 @@ members = [
     "elf",
     "file",
     "gdb_remote",
+    "io_api",
     "intrusive_linked_list",
     "mutex",
     "pci",

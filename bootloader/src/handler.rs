@@ -4,6 +4,7 @@ use crate::gdb_uart;
 use crate::guest_mmio_allowlist_contains_range;
 use crate::irq_monitor;
 use crate::monitor;
+use crate::softirq;
 use crate::vgic;
 use arch_hal::aarch64_gdb;
 use arch_hal::cpu;
@@ -29,7 +30,6 @@ use core::ffi::c_void;
 use core::hint::spin_loop;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
-use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::TI;
@@ -108,6 +108,10 @@ pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_instruction_abort_handler(instruction_abort_handler);
     exceptions::synchronous_handler::set_trapped_wf_handler(trapped_wf_handler);
     exceptions::irq_handler::set_irq_handler(irq_handler);
+    exceptions::post_handler::set_post_handler(softirq::post_exception);
+    softirq::enable(
+        softirq::EV_UART_RX | softirq::EV_GDB_ATTACH_CHECK | softirq::EV_UART_POLL_FALLBACK,
+    );
 
     // deny guest PSCI CPU_ON.
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, deny_cpu_on_handler);
@@ -554,7 +558,7 @@ fn data_abort_handler(
 
     if !decision.should_trap && !in_debug && !in_debug_stop {
         gdb_uart::handle_irq();
-        debug::enter_debug_from_irq(regs, gdb_uart::take_attach_reason());
+        softirq::pend(softirq::EV_GDB_ATTACH_CHECK);
     }
 
     if log_now && !did_trap {
@@ -655,7 +659,7 @@ fn gic_access_size(access_width: SyndromeAccessSize) -> Option<Gicv2AccessSize> 
     }
 }
 
-fn irq_handler(regs: &mut cpu::Registers) {
+fn irq_handler(_regs: &mut cpu::Registers) {
     // SAFETY: IRQ handler runs after GIC is initialized.
     // println!("irq_handler called");
     let Some(gic) = (unsafe { &*GICV2.get() }) else {
@@ -668,11 +672,7 @@ fn irq_handler(regs: &mut cpu::Registers) {
     if ack.intid == timer::SBSA_EL2_PHYSICAL_TIMER_INTID {
         irq_monitor::handle_physical_timer_irq();
         gic.end_of_interrupt(ack).unwrap();
-        gdb_uart::poll_rx();
-        let reason = gdb_uart::take_attach_reason();
-        if reason != 0 {
-            debug::enter_debug_from_irq(regs, reason);
-        }
+        softirq::pend_from_irq(softirq::EV_UART_POLL_FALLBACK | softirq::EV_GDB_ATTACH_CHECK);
         return;
     }
     // SAFETY: GDB UART INTID is written once during boot and then read-only.
@@ -683,16 +683,23 @@ fn irq_handler(regs: &mut cpu::Registers) {
         && Some(ack.intid) != maintenance_intid
         && ack.intid != kick_intid;
     irq_monitor::record_ack(ack.intid, count_for_storm);
+
+    let mut pend_mask = 0u32;
     if gdb_uart::is_debug_active() {
         if Some(ack.intid) == gdb_intid {
             gdb_uart::handle_irq();
+            pend_mask |= softirq::EV_UART_RX | softirq::EV_GDB_ATTACH_CHECK;
         }
         gic.end_of_interrupt(ack).unwrap();
+        if pend_mask != 0 {
+            softirq::pend_from_irq(pend_mask);
+        }
         return;
     }
 
     if Some(ack.intid) == gdb_intid {
         gdb_uart::handle_irq();
+        pend_mask |= softirq::EV_UART_RX | softirq::EV_GDB_ATTACH_CHECK;
     } else if Some(ack.intid) == vgic::maintenance_intid() {
         vgic::handle_maintenance_irq().unwrap();
     } else if ack.intid == vgic::kick_sgi_intid() {
@@ -713,19 +720,14 @@ fn irq_handler(regs: &mut cpu::Registers) {
         }
     }
     gic.end_of_interrupt(ack).unwrap();
-
-    let reason = gdb_uart::take_attach_reason();
-    if reason != 0 {
-        debug::enter_debug_from_irq(regs, reason);
+    if pend_mask != 0 {
+        softirq::pend_from_irq(pend_mask);
     }
 }
 
-fn trapped_wf_handler(regs: &mut cpu::Registers, info: &TrappedWfInfo) {
+fn trapped_wf_handler(_regs: &mut cpu::Registers, info: &TrappedWfInfo) {
     gdb_uart::poll_rx();
-    let reason = gdb_uart::take_attach_reason();
-    if reason != 0 {
-        debug::enter_debug_from_irq(regs, reason);
-    }
+    softirq::pend(softirq::EV_GDB_ATTACH_CHECK);
 
     cpu::set_elr_el2(cpu::get_elr_el2().wrapping_add(4));
 

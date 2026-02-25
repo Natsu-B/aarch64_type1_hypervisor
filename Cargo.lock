@@ -10,6 +10,7 @@ dependencies = [
  "cpu",
  "exceptions",
  "gdb_remote",
+ "io-api",
 ]
 
 [[package]]
@@ -85,6 +86,9 @@ dependencies = [
 [[package]]
 name = "block-device-api"
 version = "0.1.0"
+dependencies = [
+ "io-api",
+]
 
 [[package]]
 name = "common"
@@ -127,6 +131,7 @@ dependencies = [
  "elf",
  "file",
  "gdb_remote",
+ "io-api",
  "mutex",
  "typestate",
 ]
@@ -175,6 +180,7 @@ name = "gdb_remote"
 version = "0.1.0"
 dependencies = [
  "aarch64_test",
+ "io-api",
  "print",
 ]
 
@@ -199,6 +205,10 @@ dependencies = [
 
 [[package]]
 name = "intrusive_linked_list"
+version = "0.1.0"
+
+[[package]]
+name = "io-api"
 version = "0.1.0"
 
 [[package]]
@@ -234,6 +244,7 @@ dependencies = [
 name = "print"
 version = "0.1.0"
 dependencies = [
+ "io-api",
  "mutex",
  "typestate",
  "typestate_macro",

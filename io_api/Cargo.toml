@@ -1,7 +1,6 @@
 [package]
-name = "block-device-api"
+name = "io-api"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-io-api = { path = "../../io_api" }

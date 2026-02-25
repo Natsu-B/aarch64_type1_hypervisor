@@ -12,6 +12,7 @@ elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
 gdb_remote = { path = "../gdb_remote" }
 mutex = { path = "../mutex" }
+io-api = { path = "../io_api" }
 
 [dev-dependencies]
 aarch64_unit_test = { path = "../arch_hal/aarch64_hal/aarch64_unit_test" }

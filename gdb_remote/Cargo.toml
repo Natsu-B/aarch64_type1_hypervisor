@@ -8,6 +8,7 @@ default = []
 gdb_monitor_debug = []
 
 [dependencies]
+io-api = { path = "../io_api" }
 
 [target.'cfg(target_arch = "aarch64")'.dev-dependencies]
 aarch64_test = { path = "../arch_hal/aarch64_hal/aarch64_test" }

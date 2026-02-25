@@ -54,6 +54,13 @@ impl LastStopKind {
 
 use core::convert::Infallible;
 use core::fmt;
+use core::hint::spin_loop;
+use core::task::Context;
+use core::task::Poll;
+use core::task::RawWaker;
+use core::task::RawWakerVTable;
+use core::task::Waker;
+use io_api::stream::PollByteStream;
 
 #[cfg(any(feature = "gdb_monitor_debug", test))]
 use core::fmt::Write;
@@ -112,6 +119,31 @@ pub enum ProcessResult {
 type TargetErr<T> = TargetError<<T as Target>::RecoverableError, <T as Target>::UnrecoverableError>;
 type GdbServerError<T> =
     GdbError<<T as Target>::RecoverableError, <T as Target>::UnrecoverableError>;
+
+// SAFETY: This callback never dereferences the pointer and returns the same
+// static no-op waker representation.
+unsafe fn noop_waker_clone(_ptr: *const ()) -> RawWaker {
+    RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
+}
+
+// SAFETY: No-op wake callback; pointer is intentionally unused.
+unsafe fn noop_waker_wake(_ptr: *const ()) {}
+// SAFETY: No-op wake-by-ref callback; pointer is intentionally unused.
+unsafe fn noop_waker_wake_by_ref(_ptr: *const ()) {}
+// SAFETY: No-op drop callback; pointer is intentionally unused.
+unsafe fn noop_waker_drop(_ptr: *const ()) {}
+
+static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    noop_waker_clone,
+    noop_waker_wake,
+    noop_waker_wake_by_ref,
+    noop_waker_drop,
+);
+
+fn noop_waker() -> Waker {
+    // SAFETY: vtable functions are no-ops and the data pointer is never dereferenced.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
+}
 
 /// IRQ-facing transport-agnostic interface for the RSP engine.
 pub trait RspIrqEndpoint<T: Target> {
@@ -828,6 +860,108 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
 
     pub fn has_tx_pending(&self) -> bool {
         !self.tx.is_empty()
+    }
+
+    pub fn run_until_monitor_exit<S: PollByteStream<Error = Infallible>, T: Target>(
+        &mut self,
+        stream: &mut S,
+        target: &mut T,
+    ) -> Result<(), GdbServerError<T>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut rx_buf = [0u8; 64];
+        let mut tx_buf = [0u8; 128];
+        let mut tx_pos = 0usize;
+        let mut tx_len = 0usize;
+
+        loop {
+            let mut progress = false;
+
+            loop {
+                match stream.poll_read(&mut cx, &mut rx_buf) {
+                    Poll::Ready(Ok(len)) => {
+                        if len == 0 {
+                            break;
+                        }
+                        progress = true;
+                        for &byte in &rx_buf[..len] {
+                            match self.on_rx_byte_irq(target, byte) {
+                                Ok(ProcessResult::MonitorExit) => {
+                                    match stream.poll_flush(&mut cx) {
+                                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                                        Poll::Ready(Err(err)) => match err {},
+                                    }
+                                    return Ok(());
+                                }
+                                Ok(ProcessResult::None)
+                                | Ok(ProcessResult::Resume(_))
+                                | Ok(ProcessResult::FileIoReply { .. }) => {}
+                                Err(GdbError::MalformedPacket | GdbError::PacketTooLong) => {
+                                    self.resync();
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
+                    }
+                    Poll::Pending => break,
+                    Poll::Ready(Err(err)) => match err {},
+                }
+            }
+
+            if tx_pos < tx_len {
+                match stream.poll_write(&mut cx, &tx_buf[tx_pos..tx_len]) {
+                    Poll::Ready(Ok(written)) => {
+                        if written != 0 {
+                            tx_pos = tx_pos.saturating_add(written);
+                            progress = true;
+                            if tx_pos >= tx_len {
+                                tx_pos = 0;
+                                tx_len = 0;
+                            }
+                        }
+                    }
+                    Poll::Pending => {}
+                    Poll::Ready(Err(err)) => match err {},
+                }
+            }
+
+            if tx_pos == tx_len {
+                tx_pos = 0;
+                tx_len = 0;
+                while tx_len < tx_buf.len() {
+                    let Some(byte) = self.pop_tx_byte_irq() else {
+                        break;
+                    };
+                    tx_buf[tx_len] = byte;
+                    tx_len += 1;
+                }
+                if tx_len != 0 {
+                    match stream.poll_write(&mut cx, &tx_buf[..tx_len]) {
+                        Poll::Ready(Ok(written)) => {
+                            if written != 0 {
+                                progress = true;
+                                tx_pos = written;
+                                if tx_pos >= tx_len {
+                                    tx_pos = 0;
+                                    tx_len = 0;
+                                }
+                            }
+                        }
+                        Poll::Pending => {}
+                        Poll::Ready(Err(err)) => match err {},
+                    }
+                }
+            }
+
+            if progress {
+                match stream.poll_flush(&mut cx) {
+                    Poll::Ready(Ok(())) | Poll::Pending => {}
+                    Poll::Ready(Err(err)) => match err {},
+                }
+            } else {
+                spin_loop();
+            }
+        }
     }
 
     fn reply_recoverable<T: Target>(

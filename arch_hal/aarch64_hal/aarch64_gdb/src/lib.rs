@@ -1,10 +1,16 @@
 #![no_std]
 
 use aarch64_mutex::RawSpinLockIrqSave;
+use core::convert::Infallible;
 use core::hint::spin_loop;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
+use core::task::Context;
+use core::task::Poll;
+use core::task::RawWaker;
+use core::task::RawWakerVTable;
+use core::task::Waker;
 use cpu::Registers;
 use cpu::registers::DBGWCR_EL1;
 use cpu::registers::DBGWVR_EL1;
@@ -18,6 +24,7 @@ use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
 pub use gdb_remote::WatchpointKind;
+use io_api::stream::PollByteStream;
 
 mod semihost;
 
@@ -1170,7 +1177,78 @@ struct DebugStubPtr(*mut dyn DebugStub);
 unsafe impl Send for DebugStubPtr {}
 unsafe impl Sync for DebugStubPtr {}
 
+#[derive(Clone, Copy)]
+struct DebugStreamPtr(*mut dyn PollByteStream<Error = Infallible>);
+
+// SAFETY: The debug stream pointer is registered once and consumed only through
+// the serialized debug-stop path.
+unsafe impl Send for DebugStreamPtr {}
+unsafe impl Sync for DebugStreamPtr {}
+
+struct DebugIoAdapter {
+    io: DebugIo,
+}
+
+impl PollByteStream for DebugIoAdapter {
+    type Error = Infallible;
+
+    fn poll_read(
+        &mut self,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Self::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut read = 0usize;
+        while read < buf.len() {
+            let Some(byte) = (self.io.try_read)() else {
+                break;
+            };
+            buf[read] = byte;
+            read += 1;
+        }
+
+        if read == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(read))
+        }
+    }
+
+    fn poll_write(
+        &mut self,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Self::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut written = 0usize;
+        while written < buf.len() {
+            if !(self.io.try_write)(buf[written]) {
+                break;
+            }
+            written += 1;
+        }
+
+        if written == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(written))
+        }
+    }
+
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        (self.io.flush)();
+        Poll::Ready(Ok(()))
+    }
+}
+
 static DEBUG_STUB: RawSpinLockIrqSave<Option<DebugStubPtr>> = RawSpinLockIrqSave::new(None);
+static DEBUG_STREAM: RawSpinLockIrqSave<Option<DebugStreamPtr>> = RawSpinLockIrqSave::new(None);
 static DEBUG_IO: RawSpinLockIrqSave<Option<DebugIo>> = RawSpinLockIrqSave::new(None);
 static IN_DEBUG_STOP: AtomicBool = AtomicBool::new(false);
 static STOP_REPLY_QUEUED: AtomicU64 = AtomicU64::new(0);
@@ -1214,6 +1292,12 @@ pub fn register_debug_stub(stub: &'static mut dyn DebugStub) {
     *guard = Some(DebugStubPtr(ptr));
 }
 
+pub fn register_debug_stream(stream: &'static mut dyn PollByteStream<Error = Infallible>) {
+    let ptr: *mut dyn PollByteStream<Error = Infallible> = stream;
+    let mut guard = DEBUG_STREAM.lock_irqsave();
+    *guard = Some(DebugStreamPtr(ptr));
+}
+
 pub fn register_debug_io(io: DebugIo) {
     let mut guard = DEBUG_IO.lock_irqsave();
     *guard = Some(io);
@@ -1222,6 +1306,44 @@ pub fn register_debug_io(io: DebugIo) {
 fn debug_io() -> Option<DebugIo> {
     let guard = DEBUG_IO.lock_irqsave();
     *guard
+}
+
+fn debug_stream() -> Option<&'static mut dyn PollByteStream<Error = Infallible>> {
+    let ptr = {
+        let guard = DEBUG_STREAM.lock_irqsave();
+        *guard
+    };
+    let Some(ptr) = ptr else {
+        return None;
+    };
+    // SAFETY: pointer originates from register_debug_stream and remains valid for
+    // the debug subsystem lifetime.
+    Some(unsafe { &mut *ptr.0 })
+}
+
+// SAFETY: This callback never dereferences the pointer and returns the same
+// static no-op waker representation.
+unsafe fn noop_waker_clone(_ptr: *const ()) -> RawWaker {
+    RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
+}
+
+// SAFETY: No-op wake callback; pointer is intentionally unused.
+unsafe fn noop_waker_wake(_ptr: *const ()) {}
+// SAFETY: No-op wake-by-ref callback; pointer is intentionally unused.
+unsafe fn noop_waker_wake_by_ref(_ptr: *const ()) {}
+// SAFETY: No-op drop callback; pointer is intentionally unused.
+unsafe fn noop_waker_drop(_ptr: *const ()) {}
+
+static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    noop_waker_clone,
+    noop_waker_wake,
+    noop_waker_wake_by_ref,
+    noop_waker_drop,
+);
+
+fn noop_waker() -> Waker {
+    // SAFETY: vtable functions are no-ops and the data pointer is never dereferenced.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
 }
 
 pub fn in_debug_stop() -> bool {
@@ -1353,9 +1475,17 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         } else {
             self.handle_pending_step(None);
         }
-        let Some(io) = debug_io() else {
-            return;
-        };
+        let mut io_adapter = debug_io().map(|io| DebugIoAdapter { io });
+        let stream: &mut dyn PollByteStream<Error = Infallible> =
+            if let Some(stream) = debug_stream() {
+                stream
+            } else if let Some(adapter) = io_adapter.as_mut() {
+                adapter
+            } else {
+                return;
+            };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
         let _debug_stop = DebugStopGuard::new();
         self.state.suspend_hw_watchpoints();
         let mut semihost_trap = false;
@@ -1433,7 +1563,10 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 None
             }
         };
-        let mut tx_hold = None;
+        let mut tx_buf = [0u8; 128];
+        let mut tx_pos = 0usize;
+        let mut tx_len = 0usize;
+        let mut rx_buf = [0u8; 64];
         let outcome = 'debug: loop {
             let mut target = self.state.target(regs);
             let mut progress = false;
@@ -1461,92 +1594,105 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 }
             }
 
-            if let Some(byte) = tx_hold {
-                if (io.try_write)(byte) {
-                    tx_hold = None;
-                    progress = true;
+            if tx_pos < tx_len {
+                match stream.poll_write(&mut cx, &tx_buf[tx_pos..tx_len]) {
+                    Poll::Ready(Ok(written)) => {
+                        if written != 0 {
+                            tx_pos = tx_pos.saturating_add(written);
+                            progress = true;
+                            if tx_pos >= tx_len {
+                                tx_pos = 0;
+                                tx_len = 0;
+                            }
+                        }
+                    }
+                    Poll::Ready(Err(err)) => match err {},
+                    Poll::Pending => {}
                 }
             }
 
-            while tx_hold.is_none() {
-                let Some(byte) = self.server.pop_tx_byte_irq() else {
-                    break;
-                };
-                if (io.try_write)(byte) {
-                    progress = true;
-                } else {
-                    tx_hold = Some(byte);
-                    break;
+            if tx_pos == tx_len {
+                tx_pos = 0;
+                tx_len = 0;
+                while tx_len < tx_buf.len() {
+                    let Some(byte) = self.server.pop_tx_byte_irq() else {
+                        break;
+                    };
+                    tx_buf[tx_len] = byte;
+                    tx_len += 1;
+                }
+                if tx_len != 0 {
+                    match stream.poll_write(&mut cx, &tx_buf[..tx_len]) {
+                        Poll::Ready(Ok(written)) => {
+                            if written != 0 {
+                                progress = true;
+                                tx_pos = written;
+                                if tx_pos >= tx_len {
+                                    tx_pos = 0;
+                                    tx_len = 0;
+                                }
+                            }
+                        }
+                        Poll::Ready(Err(err)) => match err {},
+                        Poll::Pending => {}
+                    }
                 }
             }
 
             loop {
-                match (io.try_read)() {
-                    Some(byte) => {
+                match stream.poll_read(&mut cx, &mut rx_buf) {
+                    Poll::Ready(Ok(len)) => {
+                        if len == 0 {
+                            break;
+                        }
                         progress = true;
-                        match self.server.on_rx_byte_irq(&mut target, byte) {
-                            Ok(ProcessResult::Resume(action)) => {
-                                if semihost::fileio_pending() {
-                                    if semihost::fileio_enabled() {
-                                        if !semihost::fileio_inflight() {
-                                            let mut buf = [0u8; 128];
-                                            if let Ok(Some(len)) =
-                                                semihost::fileio_try_build_request(
-                                                    &mut target.state.mem,
-                                                    &mut buf,
-                                                )
-                                            {
-                                                let mut queued =
-                                                    self.server.queue_packet_payload(&buf[..len]);
-                                                if matches!(queued, Err(GdbError::TxOverflow)) {
-                                                    self.server.drop_console_output();
-                                                    queued = self
+                        for &byte in &rx_buf[..len] {
+                            match self.server.on_rx_byte_irq(&mut target, byte) {
+                                Ok(ProcessResult::Resume(action)) => {
+                                    if semihost::fileio_pending() {
+                                        if semihost::fileio_enabled() {
+                                            if !semihost::fileio_inflight() {
+                                                let mut buf = [0u8; 128];
+                                                if let Ok(Some(len)) =
+                                                    semihost::fileio_try_build_request(
+                                                        &mut target.state.mem,
+                                                        &mut buf,
+                                                    )
+                                                {
+                                                    let mut queued = self
                                                         .server
                                                         .queue_packet_payload(&buf[..len]);
-                                                }
-                                                match queued {
-                                                    Ok(()) => {
-                                                        self.pending_fileio_resume = Some(action);
-                                                        continue;
+                                                    if matches!(queued, Err(GdbError::TxOverflow)) {
+                                                        self.server.drop_console_output();
+                                                        queued = self
+                                                            .server
+                                                            .queue_packet_payload(&buf[..len]);
                                                     }
-                                                    Err(_) => {
-                                                        let _ = semihost::fileio_on_reply(
-                                                            -1,
-                                                            semihost::EINVAL,
-                                                        );
+                                                    match queued {
+                                                        Ok(()) => {
+                                                            self.pending_fileio_resume =
+                                                                Some(action);
+                                                            continue;
+                                                        }
+                                                        Err(_) => {
+                                                            let _ = semihost::fileio_on_reply(
+                                                                -1,
+                                                                semihost::EINVAL,
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                        if semihost::fileio_inflight() {
+                                            if semihost::fileio_inflight() {
+                                                continue;
+                                            }
+                                        } else {
+                                            if pending_stop_reply.is_none() {
+                                                pending_stop_reply = Some(StopReply::Sigtrap);
+                                            }
                                             continue;
                                         }
-                                    } else {
-                                        if pending_stop_reply.is_none() {
-                                            pending_stop_reply = Some(StopReply::Sigtrap);
-                                        }
-                                        continue;
                                     }
-                                }
-                                match semihost::resume_gate() {
-                                    semihost::ResumeGate::Hold => {
-                                        continue;
-                                    }
-                                    semihost::ResumeGate::Proceed(Some((req, completion))) => {
-                                        regs.x0 = completion.result as u64;
-                                        cpu::set_elr_el2(req.pc_after);
-                                    }
-                                    semihost::ResumeGate::Proceed(None) => {}
-                                }
-                                break 'debug DebugOutcome::Resume(action);
-                            }
-                            Ok(ProcessResult::FileIoReply {
-                                retcode,
-                                errno,
-                                ctrl_c: _,
-                            }) => {
-                                let _ = semihost::fileio_on_reply(retcode, errno);
-                                if let Some(action) = self.pending_fileio_resume.take() {
                                     match semihost::resume_gate() {
                                         semihost::ResumeGate::Hold => {
                                             continue;
@@ -1559,13 +1705,12 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                     }
                                     break 'debug DebugOutcome::Resume(action);
                                 }
-                            }
-                            Ok(ProcessResult::MonitorExit) => break 'debug DebugOutcome::Exit,
-                            Ok(ProcessResult::None) => {
-                                if self.server.take_fileio_parse_error()
-                                    && self.pending_fileio_resume.is_some()
-                                {
-                                    let _ = semihost::fileio_on_reply(-1, semihost::EINVAL);
+                                Ok(ProcessResult::FileIoReply {
+                                    retcode,
+                                    errno,
+                                    ctrl_c: _,
+                                }) => {
+                                    let _ = semihost::fileio_on_reply(retcode, errno);
                                     if let Some(action) = self.pending_fileio_resume.take() {
                                         match semihost::resume_gate() {
                                             semihost::ResumeGate::Hold => {
@@ -1583,19 +1728,47 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                         break 'debug DebugOutcome::Resume(action);
                                     }
                                 }
+                                Ok(ProcessResult::MonitorExit) => break 'debug DebugOutcome::Exit,
+                                Ok(ProcessResult::None) => {
+                                    if self.server.take_fileio_parse_error()
+                                        && self.pending_fileio_resume.is_some()
+                                    {
+                                        let _ = semihost::fileio_on_reply(-1, semihost::EINVAL);
+                                        if let Some(action) = self.pending_fileio_resume.take() {
+                                            match semihost::resume_gate() {
+                                                semihost::ResumeGate::Hold => {
+                                                    continue;
+                                                }
+                                                semihost::ResumeGate::Proceed(Some((
+                                                    req,
+                                                    completion,
+                                                ))) => {
+                                                    regs.x0 = completion.result as u64;
+                                                    cpu::set_elr_el2(req.pc_after);
+                                                }
+                                                semihost::ResumeGate::Proceed(None) => {}
+                                            }
+                                            break 'debug DebugOutcome::Resume(action);
+                                        }
+                                    }
+                                }
+                                Err(GdbError::MalformedPacket | GdbError::PacketTooLong) => {
+                                    self.server.resync();
+                                }
+                                Err(_) => break 'debug DebugOutcome::Exit,
                             }
-                            Err(GdbError::MalformedPacket | GdbError::PacketTooLong) => {
-                                self.server.resync();
-                            }
-                            Err(_) => break 'debug DebugOutcome::Exit,
                         }
                     }
-                    None => break,
+                    Poll::Pending => break,
+                    Poll::Ready(Err(err)) => match err {},
                 }
             }
 
             if progress {
-                (io.flush)();
+                match stream.poll_flush(&mut cx) {
+                    Poll::Ready(Ok(())) | Poll::Pending => {}
+                    Poll::Ready(Err(err)) => match err {},
+                }
             } else {
                 spin_loop();
             }

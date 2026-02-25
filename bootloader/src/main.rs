@@ -16,6 +16,7 @@
 
 extern crate alloc;
 mod debug;
+mod gdb_stream;
 mod gdb_uart;
 mod build_info {
     include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
@@ -25,6 +26,7 @@ mod handler;
 mod irq_decode;
 mod irq_monitor;
 mod monitor;
+mod softirq;
 mod stack_overflow;
 mod vbar;
 mod vbar_watch;

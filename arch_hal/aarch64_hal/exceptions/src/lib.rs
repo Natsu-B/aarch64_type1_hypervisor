@@ -20,6 +20,7 @@ mod el1;
 pub mod emulation;
 pub mod irq_handler;
 pub mod memory_hook;
+pub mod post_handler;
 pub mod registers;
 pub mod synchronous_handler;
 
@@ -190,6 +191,8 @@ synchronous_handler = sym synchronous_handler,
 fn exit_exception() {
     naked_asm!(
         r#"
+    mov  x0, sp
+    bl   {post_handler}
     ldp x30, xzr, [sp, #( 15 * 16)]
     ldp x28, x29, [sp, #( 14 * 16)]
     ldp x26, x27, [sp, #( 13 * 16)]
@@ -208,7 +211,8 @@ fn exit_exception() {
     ldp  x0,  x1, [sp, #(  0 * 16)]
     add  sp,  sp, #(8 * 32)
     eret
-        "#
+        "#,
+        post_handler = sym post_handler::post_handler,
     );
 }
 
