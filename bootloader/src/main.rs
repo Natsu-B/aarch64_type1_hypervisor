@@ -754,6 +754,36 @@ fn normalize_guest_mmio_range(base: usize, size: usize) -> Option<GuestMmioRange
     })
 }
 
+fn pa_bits_from_parange(p: arch_hal::cpu::registers::PARange) -> u32 {
+    match p {
+        arch_hal::cpu::registers::PARange::PA32bits4GB => 32,
+        arch_hal::cpu::registers::PARange::PA36bits64GB => 36,
+        arch_hal::cpu::registers::PARange::PA40bits1TB => 40,
+        arch_hal::cpu::registers::PARange::PA42bits4TB => 42,
+        arch_hal::cpu::registers::PARange::PA44bits16TB => 44,
+        arch_hal::cpu::registers::PARange::PA48bits256TB => 48,
+        arch_hal::cpu::registers::PARange::PA52bits4PB => 52,
+        arch_hal::cpu::registers::PARange::PA56bits64PB => 56,
+    }
+}
+
+fn pa_limit_exclusive(pa_bits: u32) -> Option<usize> {
+    if pa_bits >= usize::BITS {
+        return None;
+    }
+    Some(1usize << pa_bits)
+}
+
+fn range_within_limit(base: usize, size: usize, limit_excl: usize) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    base < limit_excl && end <= limit_excl
+}
+
 fn normalize_guest_mmio_allowlist(ranges: &mut Vec<GuestMmioRange>) {
     ranges.retain(|range| range.size != 0);
     ranges.sort_by(|a, b| a.base.cmp(&b.base));
@@ -786,6 +816,54 @@ fn normalize_guest_mmio_allowlist(ranges: &mut Vec<GuestMmioRange>) {
             .iter()
             .all(|range| (range.base | range.size) & (PAGE_SIZE - 1) == 0)
     );
+}
+
+fn validate_guest_mmio_allowlist(ranges: &[GuestMmioRange], pa_limit_excl: usize) {
+    const LARGE_RANGE_WARN_THRESHOLD: usize = 256 * 1024 * 1024;
+
+    let mut prev: Option<GuestMmioRange> = None;
+    for (idx, &range) in ranges.iter().enumerate() {
+        if !range_within_limit(range.base, range.size, pa_limit_excl) {
+            println!(
+                "error: guest MMIO allowlist entry outside PA limit: idx={} base=0x{:X} size=0x{:X} pa_limit_excl=0x{:X}",
+                idx, range.base, range.size, pa_limit_excl
+            );
+            panic!("invalid guest MMIO allowlist: PA limit violation");
+        }
+
+        if range.size >= LARGE_RANGE_WARN_THRESHOLD {
+            println!(
+                "warning: guest MMIO allowlist large range: idx={} base=0x{:X} size=0x{:X}",
+                idx, range.base, range.size
+            );
+        }
+
+        if let Some(prev_range) = prev {
+            let Some(prev_end) = prev_range.base.checked_add(prev_range.size) else {
+                println!(
+                    "error: guest MMIO allowlist previous entry overflowed: prev_base=0x{:X} prev_size=0x{:X}",
+                    prev_range.base, prev_range.size
+                );
+                panic!("invalid guest MMIO allowlist: previous range overflow");
+            };
+            if prev_range.base > range.base {
+                println!(
+                    "error: guest MMIO allowlist is not sorted: prev_base=0x{:X} prev_size=0x{:X} next_base=0x{:X} next_size=0x{:X}",
+                    prev_range.base, prev_range.size, range.base, range.size
+                );
+                panic!("invalid guest MMIO allowlist: unsorted ranges");
+            }
+            if prev_end > range.base {
+                println!(
+                    "error: guest MMIO allowlist overlap: prev_base=0x{:X} prev_size=0x{:X} next_base=0x{:X} next_size=0x{:X}",
+                    prev_range.base, prev_range.size, range.base, range.size
+                );
+                panic!("invalid guest MMIO allowlist: overlapping ranges");
+            }
+        }
+
+        prev = Some(range);
+    }
 }
 
 fn set_guest_mmio_allowlist(ranges: Vec<GuestMmioRange>) {
@@ -836,6 +914,11 @@ struct GuestMmioScanStats {
     dropped_cpu: usize,
     dropped_deny: usize,
     dropped_gdb: usize,
+    dropped_out_of_pa: usize,
+    dropped_reg_iter_err: usize,
+    dropped_reg_entry_err: usize,
+    dropped_ranges_iter_err: usize,
+    dropped_ranges_entry_err: usize,
 }
 
 fn node_property_eq(node: &DtbNodeView<'_, '_>, key: &str, value: &str) -> bool {
@@ -872,11 +955,23 @@ fn push_guest_mmio_range(
     denylist: &GuestMmioDenyList,
     base: usize,
     size: usize,
+    node_name: &str,
+    source: &str,
+    pa_bits: u32,
+    pa_limit_excl: usize,
     stats: &mut GuestMmioScanStats,
 ) {
     let Some(range) = normalize_guest_mmio_range(base, size) else {
         return;
     };
+    if !range_within_limit(range.base, range.size, pa_limit_excl) {
+        stats.dropped_out_of_pa += 1;
+        println!(
+            "warning: dropped MMIO candidate outside PA range from node '{}' source={} base=0x{:X} size=0x{:X} pa_bits={}",
+            node_name, source, range.base, range.size, pa_bits
+        );
+        return;
+    }
     if let Some(gdb_range) = denylist.gdb_range {
         if ranges_overlap(range, gdb_range) {
             stats.dropped_gdb += 1;
@@ -896,6 +991,9 @@ fn record_guest_mmio_allowlist_from_dtb(
     gdb_uart: &UartNode,
     gic_info: &Gicv2Info,
 ) {
+    let pa_bits = cpu::get_parange().map(pa_bits_from_parange).unwrap_or(48);
+    let pa_limit_excl = pa_limit_exclusive(pa_bits).unwrap_or(usize::MAX);
+
     let guest_range = normalize_guest_mmio_range(guest_uart.base, guest_uart.size);
     let mut gdb_range = normalize_guest_mmio_range(gdb_uart.base, gdb_uart.size);
     if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range) {
@@ -944,6 +1042,8 @@ fn record_guest_mmio_allowlist_from_dtb(
         in_cpus: bool,
         denylist: &GuestMmioDenyList,
         ranges: &mut Vec<GuestMmioRange>,
+        pa_bits: u32,
+        pa_limit_excl: usize,
         stats: &mut GuestMmioScanStats,
     ) -> Result<ControlFlow<()>, WalkError<&'static str>> {
         let name = node.name();
@@ -965,17 +1065,40 @@ fn record_guest_mmio_allowlist_from_dtb(
         let skip_collect =
             node_is_memory(&node) || node_is_disabled(&node) || node_has_no_map(&node);
         if !skip_collect {
-            if let Ok(mut regs) = node.reg_iter() {
-                while let Some(entry) = regs.next() {
-                    let (base, size) = match entry {
-                        Ok(entry) => entry,
-                        Err(_) => break,
-                    };
-                    if size == 0 {
-                        continue;
+            match node.reg_iter() {
+                Ok(mut regs) => {
+                    while let Some(entry) = regs.next() {
+                        let (base, size) = match entry {
+                            Ok(entry) => entry,
+                            Err(err) => {
+                                stats.dropped_reg_entry_err += 1;
+                                println!(
+                                    "warning: reg entry parse failed at node '{}': {}",
+                                    name, err
+                                );
+                                break;
+                            }
+                        };
+                        if size == 0 {
+                            continue;
+                        }
+                        stats.candidates += 1;
+                        push_guest_mmio_range(
+                            ranges,
+                            denylist,
+                            base,
+                            size,
+                            name,
+                            "reg",
+                            pa_bits,
+                            pa_limit_excl,
+                            stats,
+                        );
                     }
-                    stats.candidates += 1;
-                    push_guest_mmio_range(ranges, denylist, base, size, stats);
+                }
+                Err(err) => {
+                    stats.dropped_reg_iter_err += 1;
+                    println!("warning: reg_iter failed at node '{}': {}", name, err);
                 }
             }
 
@@ -984,7 +1107,14 @@ fn record_guest_mmio_allowlist_from_dtb(
                     while let Some(entry) = iter.next() {
                         let entry = match entry {
                             Ok(entry) => entry,
-                            Err(_) => break,
+                            Err(err) => {
+                                stats.dropped_ranges_entry_err += 1;
+                                println!(
+                                    "warning: ranges entry parse failed at node '{}': {}",
+                                    name, err
+                                );
+                                break;
+                            }
                         };
                         if entry.len == 0 {
                             continue;
@@ -995,23 +1125,49 @@ fn record_guest_mmio_allowlist_from_dtb(
                             denylist,
                             entry.parent_base,
                             entry.len,
+                            name,
+                            "ranges",
+                            pa_bits,
+                            pa_limit_excl,
                             stats,
                         );
                     }
                 }
-                Ok(None) | Err(_) => {}
+                Ok(None) => {}
+                Err(err) => {
+                    stats.dropped_ranges_iter_err += 1;
+                    println!("warning: ranges_iter failed at node '{}': {}", name, err);
+                }
             }
         }
 
         node.for_each_child_view(&mut |child| {
-            walk(child, in_reserved, in_cpus, denylist, ranges, stats)
+            walk(
+                child,
+                in_reserved,
+                in_cpus,
+                denylist,
+                ranges,
+                pa_bits,
+                pa_limit_excl,
+                stats,
+            )
         })
     }
 
     let result = (|| -> Result<(), &'static str> {
         let root = dtb.root_node_view()?;
         let result = root.for_each_child_view(&mut |child| {
-            walk(child, false, false, &denylist, &mut ranges, &mut stats)
+            walk(
+                child,
+                false,
+                false,
+                &denylist,
+                &mut ranges,
+                pa_bits,
+                pa_limit_excl,
+                &mut stats,
+            )
         });
         match result {
             Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => Ok(()),
@@ -1024,15 +1180,21 @@ fn record_guest_mmio_allowlist_from_dtb(
         println!("warning: guest MMIO allowlist scan failed: {}", err);
     }
     println!(
-        "mmio scan: candidates={} dropped reserved-subtree={} dropped cpu-subtree={} dropped deny-overlap={} dropped gdb-overlap={}",
+        "mmio scan: candidates={} dropped reserved-subtree={} dropped cpu-subtree={} dropped deny-overlap={} dropped gdb-overlap={} dropped out-of-pa={} dropped reg-iter-err={} dropped reg-entry-err={} dropped ranges-iter-err={} dropped ranges-entry-err={}",
         stats.candidates,
         stats.dropped_reserved,
         stats.dropped_cpu,
         stats.dropped_deny,
-        stats.dropped_gdb
+        stats.dropped_gdb,
+        stats.dropped_out_of_pa,
+        stats.dropped_reg_iter_err,
+        stats.dropped_reg_entry_err,
+        stats.dropped_ranges_iter_err,
+        stats.dropped_ranges_entry_err
     );
 
     normalize_guest_mmio_allowlist(&mut ranges);
+    validate_guest_mmio_allowlist(&ranges, pa_limit_excl);
     set_guest_mmio_allowlist(ranges);
 }
 
