@@ -11,7 +11,7 @@ use typestate::Readable;
 use typestate::Writable;
 use typestate::WriteOnly;
 
-pub const DT_COMPAT_BCM2835_GPIO: &str = "brcm,bcm2835-gpio";
+pub const DT_COMPAT_BCM2711_GPIO: &str = "brcm,bcm2711-gpio";
 pub const GPIO_PIN_MAX: u8 = 57;
 pub const GPIO_MMIO_MIN_SIZE: usize = 0x1000;
 
@@ -237,7 +237,7 @@ impl Bcm2711Gpio {
 }
 
 pub fn gpio_mmio_from_dtb(dtb: &DtbParser) -> Result<common::MmioRegion, Bcm2711GpioError> {
-    let result = dtb.find_nodes_by_compatible_view(DT_COMPAT_BCM2835_GPIO, &mut |view, _name| {
+    let result = dtb.find_nodes_by_compatible_view(DT_COMPAT_BCM2711_GPIO, &mut |view, _name| {
         let reg = view
             .reg_iter()
             .map_err(WalkError::Dtb)?
