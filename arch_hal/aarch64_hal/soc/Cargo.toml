@@ -12,3 +12,4 @@ print = { path = "../print" }
 cpu = { path = "../cpu" }
 mutex = { path = "../../../mutex" }
 common = { path = "../common" }
+io-api = { path = "../../../io_api" }

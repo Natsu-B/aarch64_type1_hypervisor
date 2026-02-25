@@ -305,6 +305,7 @@ dependencies = [
  "common",
  "cpu",
  "dtb",
+ "io-api",
  "mutex",
  "pci",
  "print",
