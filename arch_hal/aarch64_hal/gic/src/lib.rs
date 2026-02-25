@@ -1092,6 +1092,17 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         group: IrqGroup,
         priority: u8,
     ) -> Result<VgicUpdate, GicError>;
+    /// Map host pIRQ to guest vIRQ without enabling the virtual interrupt;
+    /// guest will enable via GICD/SGI registers later.
+    fn map_pirq_prepared(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        sense: IrqSense,
+        group: IrqGroup,
+        priority: u8,
+    ) -> Result<VgicUpdate, GicError>;
     #[cfg(test)]
     fn unmap_pirq(&self, pintid: PIntId) -> Result<VgicUpdate, GicError>;
     fn on_physical_irq(&self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError>;

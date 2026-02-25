@@ -134,6 +134,31 @@ where
         group: IrqGroup,
         priority: u8,
     ) -> Result<VgicUpdate, GicError> {
+        self.map_pirq_inner_with_enable(pintid, target, vintid, sense, group, priority, true)
+    }
+
+    pub(crate) fn map_pirq_inner_prepared(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        sense: IrqSense,
+        group: IrqGroup,
+        priority: u8,
+    ) -> Result<VgicUpdate, GicError> {
+        self.map_pirq_inner_with_enable(pintid, target, vintid, sense, group, priority, false)
+    }
+
+    fn map_pirq_inner_with_enable(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        sense: IrqSense,
+        group: IrqGroup,
+        priority: u8,
+        enable: bool,
+    ) -> Result<VgicUpdate, GicError> {
         self.common.vcpu_index(target)?; // validate target
 
         let entry = PirqEntry {
@@ -188,12 +213,16 @@ where
             update.combine(&self.set_group(scope, vintid, group)?);
             update.combine(&self.set_priority(scope, vintid, priority)?);
             update.combine(&self.set_trigger(scope, vintid, trigger)?);
-            update.combine(&self.set_enable(scope, vintid, true)?);
+            if enable {
+                update.combine(&self.set_enable(scope, vintid, true)?);
+            }
             Ok(())
         })();
         if let Err(err) = apply_result {
             if inserted {
-                let _ = self.set_enable(scope, vintid, false);
+                if enable {
+                    let _ = self.set_enable(scope, vintid, false);
+                }
                 let mut routing = self.common.routing_lock.lock_irqsave();
                 let _ = routing.pirqs.take(pintid);
             }

@@ -197,6 +197,21 @@ where
         self.apply_update(hw, update)
     }
 
+    pub fn map_pirq_prepared<H: VgicHw>(
+        &self,
+        hw: &H,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        sense: IrqSense,
+        group: IrqGroup,
+        priority: u8,
+    ) -> Result<(), GicError> {
+        let vm = self.model()?;
+        let update = vm.map_pirq_prepared(pintid, target, vintid, sense, group, priority)?;
+        self.apply_update(hw, update)
+    }
+
     pub fn set_pirq_hook(&self, hook: Option<PirqHookFn>) -> Result<(), GicError> {
         let vm = self.model()?;
         vm.set_pirq_hook(hook);

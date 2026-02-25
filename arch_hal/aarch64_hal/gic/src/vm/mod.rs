@@ -740,6 +740,18 @@ where
         self.map_pirq_inner(pintid, target, vintid, sense, group, priority)
     }
 
+    fn map_pirq_prepared(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        sense: IrqSense,
+        group: IrqGroup,
+        priority: u8,
+    ) -> Result<VgicUpdate, GicError> {
+        self.map_pirq_inner_prepared(pintid, target, vintid, sense, group, priority)
+    }
+
     #[cfg(test)]
     fn unmap_pirq(&self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
         self.unmap_pirq_inner(pintid)
@@ -962,6 +974,34 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn prepared_map_defers_injection_until_guest_enables() {
+        let vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+        vm.set_dist_enable(true, true).unwrap();
+        vm.map_pirq_prepared(
+            pintid,
+            VcpuId(0),
+            vintid,
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+
+        vm.on_physical_irq(pintid, true).unwrap();
+        {
+            let vcpu = vm.vcpu(VcpuId(0)).unwrap();
+            assert_eq!(vcpu.enqueued.borrow().count, 0);
+        }
+
+        vm.set_enable(VgicIrqScope::Global, vintid, true).unwrap();
+        let vcpu = vm.vcpu(VcpuId(0)).unwrap();
+        let enqueued = vcpu.enqueued.borrow();
+        assert_eq!(enqueued.count, 1);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn map_pirq_does_not_touch_spi_route() {
         let vm = recording_vm(2);
         let vintid = VIntId(40);
@@ -1162,6 +1202,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(ENABLE_COUNTER.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn map_pirq_prepared_does_not_call_enable_hook_on_initial_map() {
+        let vm = recording_vm(1);
+        static ENABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        fn enable_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+            if int_id == 48 && matches!(op, PirqHookOp::Enable { .. }) {
+                ENABLE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        vm.set_pirq_hook(Some(enable_hook));
+        ENABLE_COUNTER.store(0, Ordering::SeqCst);
+
+        vm.map_pirq_prepared(
+            PIntId(48),
+            VcpuId(0),
+            VIntId(40),
+            IrqSense::Level,
+            IrqGroup::Group1,
+            0x20,
+        )
+        .unwrap();
+
+        assert_eq!(ENABLE_COUNTER.load(Ordering::SeqCst), 0);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]

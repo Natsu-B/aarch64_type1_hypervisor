@@ -17,6 +17,7 @@ use arch_hal::gic::vm::PirqHookError;
 use arch_hal::gic::vm::PirqHookOp;
 use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
+use arch_hal::println;
 use core::cell::SyncUnsafeCell;
 
 use crate::Gicv2Info;
@@ -26,8 +27,6 @@ use crate::irq_monitor;
 
 struct BootVgicDelegate;
 
-const MIP_SPI_OFFSET: u32 = 128;
-const PASSTHROUGH_SPI_COUNT: u32 = 32;
 const DEFAULT_SPI_PRIORITY: u8 = 0x80;
 const KICK_SGI_ID: u8 = 15;
 const KICK_INTID: u32 = KICK_SGI_ID as u32;
@@ -95,6 +94,7 @@ pub(crate) fn init(
     gic: &Gicv2,
     info: &Gicv2Info,
     guest_uart: UartNode,
+    gdb_uart_intid: u32,
 ) -> Result<(), &'static str> {
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
     enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
@@ -107,23 +107,28 @@ pub(crate) fn init(
         .map_err(|_| "vgic: switch in")?;
 
     if let Some(pintid) = guest_uart.irq {
-        VGIC.map_pirq(
-            gic,
-            PIntId(pintid),
-            VcpuId(0),
-            VIntId(pintid),
-            IrqSense::Level,
-            IrqGroup::Group1,
-            DEFAULT_SPI_PRIORITY,
-        )
-        .map_err(|_| "vgic: map pirq")?;
+        if pintid != gdb_uart_intid {
+            VGIC.map_pirq_prepared(
+                gic,
+                PIntId(pintid),
+                VcpuId(0),
+                VIntId(pintid),
+                IrqSense::Level,
+                IrqGroup::Group1,
+                DEFAULT_SPI_PRIORITY,
+            )
+            .map_err(|e| {
+                println!("Failed to map guest UART PIRQ {}: {:?}", pintid, e);
+                "vgic: map pirq"
+            })?;
+        }
     }
 
     for intid in 32..1020 {
-        if intid >= MIP_SPI_OFFSET + PASSTHROUGH_SPI_COUNT {
+        if intid == gdb_uart_intid || guest_uart.irq == Some(intid) {
             continue;
         }
-        match VGIC.map_pirq(
+        match VGIC.map_pirq_prepared(
             gic,
             PIntId(intid),
             VcpuId(0),

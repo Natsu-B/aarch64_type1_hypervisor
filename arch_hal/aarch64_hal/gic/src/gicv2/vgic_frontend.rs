@@ -1135,6 +1135,18 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
+        fn map_pirq_prepared(
+            &self,
+            _pintid: PIntId,
+            _target: VcpuId,
+            _vintid: VIntId,
+            _sense: IrqSense,
+            _group: IrqGroup,
+            _priority: u8,
+        ) -> Result<VgicUpdate, GicError> {
+            Ok(VgicUpdate::None)
+        }
+
         fn unmap_pirq(&self, _pintid: PIntId) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }
