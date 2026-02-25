@@ -11,6 +11,7 @@ members = [
     "io_api",
     "intrusive_linked_list",
     "mutex",
+    "net",
     "pci",
     "rpi_boot",
     "typestate",

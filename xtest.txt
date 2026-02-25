@@ -13,6 +13,7 @@ std common
 std dtb
 std intrusive_linked_list
 std mutex
+std net
 std pci
 std typestate
 std xtask
