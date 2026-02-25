@@ -113,7 +113,12 @@ static MEM_REGIONS: SyncUnsafeCell<[MemoryRegion; MAX_MEM_REGIONS]> =
 static GUEST_MMIO_ALLOWLIST: SyncUnsafeCell<Option<Box<[GuestMmioRange]>>> =
     SyncUnsafeCell::new(None);
 
+#[cfg(not(feature = "rpi4"))]
 const PL011_UART_ADDR: usize = 0x900_0000;
+#[cfg(feature = "rpi4")]
+const PL011_UART_ADDR: usize = 0xFE20_1000;
+#[cfg(feature = "rpi4")]
+const GDB_UART_ADDR: usize = 0xFE20_1400;
 const UART_CLOCK_HZ: u64 = 48 * 1_000_000;
 const UART_BAUD: u32 = 115_200;
 const EL2_TIMER_PPI_PRIORITY: u8 = 0x80; // Priority for the timeout monitor tick.
@@ -251,7 +256,7 @@ static GLOBAL_ALLOCATOR: allocator::MemoryAllocator<4096, { allocator::levels!(4
     allocator::MemoryAllocator::new();
 
 #[unsafe(naked)]
-#[cfg(not(all(test, target_arch = "aarch64")))]
+#[cfg(all(not(all(test, target_arch = "aarch64")), not(feature = "rpi4")))]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
     naked_asm!(
@@ -263,6 +268,33 @@ extern "C" fn _start() {
     )
 }
 
+#[unsafe(naked)]
+#[cfg(all(not(all(test, target_arch = "aarch64")), feature = "rpi4"))]
+#[unsafe(no_mangle)]
+extern "C" fn _start() {
+    naked_asm!(
+        r#"
+        msr spsel, #1
+        isb
+        ldr x0, =_STACK_TOP
+        mov sp, x0
+    clear_bss:
+        ldr x0, =_BSS_START
+        ldr x1, =_BSS_END
+    clear_bss_loop:
+        cmp x0, x1
+        beq clear_bss_end
+        str xzr, [x0], #8
+        b clear_bss_loop
+    clear_bss_end:
+        bl main
+    loop:
+        wfe
+        b loop
+        "#
+    )
+}
+
 #[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
@@ -271,10 +303,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let el2_tls_bsp_start = &raw mut __el2_tls_bsp_start as *const _ as usize;
     let el2_tls_bsp_end = &raw mut __el2_tls_bsp_end as *const _ as usize;
 
-    let args = unsafe { slice::from_raw_parts(argv, argc) };
-    let dtb_ptr =
-        str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
-            .unwrap();
+    let dtb_ptr = if cfg!(feature = "rpi4") {
+        0x2000_0000
+    } else {
+        let args = unsafe { slice::from_raw_parts(argv, argc) };
+        str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() }).unwrap()
+    };
+
     let dtb = DtbParser::init(dtb_ptr).unwrap();
     let mut best: Option<Pl011Candidate> = None;
     let mut second: Option<Pl011Candidate> = None;
@@ -321,12 +356,23 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         *GDB_UART.get() = Some(second.uart_node);
         *DEBUG_UART_ADDR.get() = Some(best.uart_node.base);
     }
-    log_selected_uart("guest", best);
-    log_selected_uart("gdb", second);
     let guest_uart = unsafe { &*GUEST_UART.get() }.unwrap();
     let gdb_uart = unsafe { &*GDB_UART.get() }.unwrap();
+    #[cfg(feature = "rpi4")]
+    {
+        assert_eq!(
+            guest_uart.base, PL011_UART_ADDR,
+            "selected guest UART does not match expected PL011 address"
+        );
+        assert_eq!(
+            gdb_uart.base, GDB_UART_ADDR,
+            "selected gdb UART does not match expected PL011 address"
+        );
+    }
     debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
     gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+    log_selected_uart("guest", best);
+    log_selected_uart("gdb", second);
     let tls_result = unsafe {
         tls::init_current_cpu(
             NonNull::new(el2_tls_bsp_start as *mut u8).unwrap(),
@@ -474,6 +520,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     if paging_data.is_empty() {
         panic!("stage2: no guest RAM to map");
     }
+    println!("init stage2 paging...\npaging_data: {:?}", paging_data);
     Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
     Stage2Paging::enable_stage2_translation(true, true);
     cpu::set_tpidr_el1(guest_uart.base as u64);
