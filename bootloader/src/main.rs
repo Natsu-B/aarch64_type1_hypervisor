@@ -578,9 +578,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     )
     .unwrap();
 
-    let mut reserved_memory = GLOBAL_ALLOCATOR
-        .trim_for_boot(0x1000 * 0x1000 * 128)
-        .unwrap();
+    let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, stack_start));
 
@@ -1761,10 +1759,9 @@ fn apply_guest_uart_dt_edit(
         if !node_compatible_contains(tree, id, "arm,pl011")? {
             continue;
         }
-        let Some(base) = node_reg_base(tree, id)? else {
-            continue;
-        };
-        if base == guest_uart_base {
+        let raw_base = node_reg_base(tree, id)?;
+        let translated_base = node_reg_base_translated(tree, id)?;
+        if raw_base == Some(guest_uart_base) || translated_base == Some(guest_uart_base) {
             guest_node = Some(id);
         } else {
             disable_nodes.push(id);
@@ -1933,6 +1930,33 @@ fn node_reg_base(
     tree: &DeviceTree<'static>,
     node_id: usize,
 ) -> Result<Option<usize>, &'static str> {
+    let Some((addr, _)) = node_reg_first(tree, node_id)? else {
+        return Ok(None);
+    };
+    let base = usize::try_from(addr).map_err(|_| "reg: address overflow usize")?;
+    Ok(Some(base))
+}
+
+fn node_reg_base_translated(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+) -> Result<Option<usize>, &'static str> {
+    let Some(addr_len) = node_reg_first(tree, node_id)? else {
+        return Ok(None);
+    };
+    let mapped = match translate_address_via_ancestors(tree, node_id, addr_len) {
+        Ok(mapped) => mapped,
+        Err("ranges: address not covered") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let addr = usize::try_from(mapped.0).map_err(|_| "ranges: mapped address overflow usize")?;
+    Ok(Some(addr))
+}
+
+fn node_reg_first(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+) -> Result<Option<(u128, u128)>, &'static str> {
     let Some(node) = tree.node(node_id) else {
         return Ok(None);
     };
@@ -1940,18 +1964,176 @@ fn node_reg_base(
         return Ok(None);
     };
     let parent = node.parent.unwrap_or(tree.root);
-    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2);
-    let addr_cells = usize::try_from(addr_cells).map_err(|_| "reg: address-cells overflow")?;
+    let addr_cells = inherited_u32(tree, parent, "#address-cells")?.unwrap_or(2);
+    let size_cells = inherited_u32(tree, parent, "#size-cells")?.unwrap_or(1);
+
+    let addr_cells_usize =
+        usize::try_from(addr_cells).map_err(|_| "reg: address/size cells overflow usize")?;
+    let size_cells_usize =
+        usize::try_from(size_cells).map_err(|_| "reg: address/size cells overflow usize")?;
+    if addr_cells_usize > 4 || size_cells_usize > 4 {
+        return Err("reg: address/size cells overflow u128");
+    }
+
+    let entry_cells = addr_cells_usize
+        .checked_add(size_cells_usize)
+        .ok_or("reg: cell count overflow")?;
+    let entry_bytes = entry_cells
+        .checked_mul(4)
+        .ok_or("reg: byte count overflow")?;
     let bytes = prop.value.as_slice();
-    if bytes.len() < addr_cells * 4 {
+    if bytes.len() < entry_bytes {
         return Ok(None);
     }
-    let mut value: u64 = 0;
-    for i in 0..addr_cells {
-        let cell = read_be_u32(bytes, i * 4)?;
-        value = (value << 32) | cell as u64;
+
+    let (addr, consumed) = read_be_cells_u128(bytes, 0, addr_cells)?;
+    let (len, _) = read_be_cells_u128(bytes, consumed, size_cells)?;
+    Ok(Some((addr, len)))
+}
+
+fn translate_address_via_ancestors(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+    mut addr_len: (u128, u128),
+) -> Result<(u128, u128), &'static str> {
+    let mut current = node_id;
+    loop {
+        let Some(node) = tree.node(current) else {
+            return Err("ranges: invalid node");
+        };
+        let Some(parent) = node.parent else {
+            break;
+        };
+        addr_len = translate_one_level_ranges(tree, parent, addr_len)?;
+        current = parent;
     }
-    Ok(Some(value as usize))
+    Ok(addr_len)
+}
+
+fn translate_one_level_ranges(
+    tree: &DeviceTree<'static>,
+    bus_node_id: usize,
+    child: (u128, u128),
+) -> Result<(u128, u128), &'static str> {
+    let Some(bus) = tree.node(bus_node_id) else {
+        return Err("ranges: invalid bus node");
+    };
+    let Some(prop) = bus.property("ranges") else {
+        return Ok(child);
+    };
+    let ranges = prop.value.as_slice();
+    if ranges.is_empty() {
+        return Ok(child);
+    }
+
+    let child_address_cells = inherited_u32(tree, bus_node_id, "#address-cells")?.unwrap_or(2);
+    let child_size_cells = inherited_u32(tree, bus_node_id, "#size-cells")?.unwrap_or(1);
+    let parent = bus.parent.ok_or("ranges: missing parent")?;
+    let parent_address_cells = inherited_u32(tree, parent, "#address-cells")?.unwrap_or(2);
+
+    let child_address_cells_usize = usize::try_from(child_address_cells)
+        .map_err(|_| "ranges: address/size cells overflow usize")?;
+    let child_size_cells_usize = usize::try_from(child_size_cells)
+        .map_err(|_| "ranges: address/size cells overflow usize")?;
+    let parent_address_cells_usize = usize::try_from(parent_address_cells)
+        .map_err(|_| "ranges: address/size cells overflow usize")?;
+    if child_address_cells_usize > 4 || child_size_cells_usize > 4 || parent_address_cells_usize > 4
+    {
+        return Err("ranges: address/size cells overflow u128");
+    }
+
+    let cell_count = child_address_cells
+        .checked_add(parent_address_cells)
+        .and_then(|v| v.checked_add(child_size_cells))
+        .ok_or("ranges: stride overflow")?;
+    let entry_stride = cell_count.checked_mul(4).ok_or("ranges: stride overflow")?;
+    let entry_stride = usize::try_from(entry_stride).map_err(|_| "ranges: stride overflow")?;
+    if entry_stride == 0 {
+        return Err("ranges: zero stride");
+    }
+    if ranges.len() % entry_stride != 0 {
+        return Err("ranges: length not multiple of stride");
+    }
+
+    let child_end = child
+        .0
+        .checked_add(child.1)
+        .ok_or("ranges: child overflow")?;
+    let mut consumed = 0usize;
+    while consumed < ranges.len() {
+        let base = consumed;
+        let (child_base, c0) = read_be_cells_u128(ranges, base, child_address_cells)?;
+        let off1 = base.checked_add(c0).ok_or("ranges: overrun")?;
+        let (parent_base, c1) = read_be_cells_u128(ranges, off1, parent_address_cells)?;
+        let off2 = off1.checked_add(c1).ok_or("ranges: overrun")?;
+        let (len, c2) = read_be_cells_u128(ranges, off2, child_size_cells)?;
+        let entry_consumed = c0
+            .checked_add(c1)
+            .and_then(|v| v.checked_add(c2))
+            .ok_or("ranges: overrun")?;
+        if entry_consumed != entry_stride {
+            return Err("ranges: unexpected entry size");
+        }
+        consumed = consumed
+            .checked_add(entry_consumed)
+            .ok_or("ranges: overrun")?;
+
+        let entry_end = child_base
+            .checked_add(len)
+            .ok_or("ranges: entry overflow")?;
+        if child.0 >= child_base && child_end <= entry_end {
+            let off = child.0.checked_sub(child_base).ok_or("ranges: underflow")?;
+            let parent_mapped = parent_base.checked_add(off).ok_or("ranges: overflow")?;
+            return Ok((parent_mapped, child.1));
+        }
+    }
+
+    Err("ranges: address not covered")
+}
+
+fn inherited_u32(
+    tree: &DeviceTree<'static>,
+    node_id: usize,
+    key: &str,
+) -> Result<Option<u32>, &'static str> {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        if let Some(value) = property_u32(tree, id, key)? {
+            return Ok(Some(value));
+        }
+        current = tree.node(id).and_then(|node| node.parent);
+    }
+    Ok(None)
+}
+
+fn read_be_cells_u128(
+    bytes: &[u8],
+    offset: usize,
+    cells: u32,
+) -> Result<(u128, usize), &'static str> {
+    let cells = usize::try_from(cells).map_err(|_| "dtb: read_be_cells_u128 cell overflow")?;
+    if cells > 4 {
+        return Err("dtb: read_be_cells_u128 overflow u128");
+    }
+    let consumed = cells
+        .checked_mul(4)
+        .ok_or("dtb: read_be_cells_u128 byte overflow")?;
+    let end = offset
+        .checked_add(consumed)
+        .ok_or("dtb: read_be_cells_u128 overflow")?;
+    if bytes.get(offset..end).is_none() {
+        return Err("dtb: read_be_cells_u128 oob");
+    }
+
+    let mut value = 0u128;
+    for i in 0..cells {
+        let cell_offset = offset
+            .checked_add(i.checked_mul(4).ok_or("dtb: read_be_cells_u128 overflow")?)
+            .ok_or("dtb: read_be_cells_u128 overflow")?;
+        let cell = read_be_u32(bytes, cell_offset)?;
+        value = (value << 32) | cell as u128;
+    }
+    Ok((value, consumed))
 }
 
 fn property_u32(
