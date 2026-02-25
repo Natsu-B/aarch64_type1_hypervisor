@@ -61,6 +61,14 @@ use arch_hal::paging::stage1::EL2Stage1Paging;
 use arch_hal::paging::stage1::EL2Stage1PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+#[cfg(feature = "rpi4")]
+use arch_hal::soc::bcm2711::gpio::Bcm2711Gpio;
+#[cfg(feature = "rpi4")]
+use arch_hal::soc::bcm2711::gpio::Bcm2711GpioError;
+#[cfg(feature = "rpi4")]
+use arch_hal::soc::bcm2711::gpio::Pull;
+#[cfg(feature = "rpi4")]
+use arch_hal::soc::bcm2711::gpio::gpio_mmio_from_dtb;
 use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
 use arch_hal::tls;
@@ -370,7 +378,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         );
     }
     debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
-    gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
     log_selected_uart("guest", best);
     log_selected_uart("gdb", second);
     let tls_result = unsafe {
@@ -383,6 +390,12 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         println!("tls init failed: {:?}", err);
         panic!("tls init failed");
     }
+
+    // enable gdb_uart gpio
+    #[cfg(feature = "rpi4")]
+    enable_uart2_gpio(&dtb);
+    gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
+
     debug::init_gdb_stub();
     println!(
         "debug uart starting (guest console @ 0x{:X})...\r\n",
@@ -1849,6 +1862,36 @@ fn node_path(tree: &DeviceTree<'static>, node_id: usize) -> Option<String> {
 fn decode_cstr(bytes: &[u8]) -> Option<&str> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     core::str::from_utf8(&bytes[..end]).ok()
+}
+
+#[cfg(feature = "rpi4")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnableUart2GpioError {
+    ResolveMmio(Bcm2711GpioError),
+    ConfigurePins(Bcm2711GpioError),
+}
+
+#[cfg(feature = "rpi4")]
+fn enable_uart2_gpio(dtb: &DtbParser) {
+    match try_enable_uart2_gpio(dtb) {
+        Ok(()) => {}
+        Err(err) => {
+            println!("uart2 gpio setup failed: {:?}", err);
+            panic!("uart2 gpio setup failed");
+        }
+    }
+}
+
+#[cfg(feature = "rpi4")]
+fn try_enable_uart2_gpio(dtb: &DtbParser) -> Result<(), EnableUart2GpioError> {
+    let mmio = gpio_mmio_from_dtb(dtb).map_err(EnableUart2GpioError::ResolveMmio)?;
+    // SAFETY: `mmio.base` comes from the DTB GPIO `reg` property for this board,
+    // this code runs during single-core early init, and the mapped region is used
+    // as the sole GPIO controller view in this initialization path.
+    let gpio = unsafe { Bcm2711Gpio::new(mmio.base) };
+    gpio.configure_uart2_pins(false, Pull::None)
+        .map_err(EnableUart2GpioError::ConfigurePins)?;
+    Ok(())
 }
 
 #[cfg(not(all(test, target_arch = "aarch64")))]
