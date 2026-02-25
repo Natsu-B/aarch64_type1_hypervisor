@@ -61,6 +61,7 @@ fn print_xtask_usage() {
 fn build(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("rpi5") => build_rpi5(&args[1..]),
+        Some("rpi4") => build_rpi4(&args[1..]),
         _ => build_bootloader(args),
     }
 }
@@ -101,6 +102,14 @@ fn build_bootloader(args: &[String]) -> Result<String, String> {
     eprintln!("\n--- Bootloader built successfully ---");
     let profile = resolve_profile(args);
     copy_artifact_to_bin("elf-hypervisor", "elf-hypervisor.elf", &profile)
+}
+
+fn build_rpi4(args: &[String]) -> Result<String, String> {
+    let mut combined_args = Vec::with_capacity(args.len() + 2);
+    combined_args.push("--features".to_string());
+    combined_args.push("rpi4".to_string());
+    combined_args.extend_from_slice(args);
+    build_bootloader(&combined_args)
 }
 
 fn build_rpi5(args: &[String]) -> Result<String, String> {
@@ -144,6 +153,7 @@ fn build_rpi5(args: &[String]) -> Result<String, String> {
 fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("rpi5") => run_rpi5(&args[1..]),
+        Some("rpi4") => run_rpi4(&args[1..]),
         _ => {
             run_default(args);
         }
@@ -159,6 +169,20 @@ fn run_default(args: &[String]) -> ! {
     use std::os::unix::process::CommandExt;
     let err = Command::new("./run.sh").arg(&binary_path).args(args).exec();
     panic!("Failed to exec ./run.sh: {}", err);
+}
+
+fn run_rpi4(args: &[String]) -> ! {
+    let binary_path = build_rpi4(args).unwrap_or_else(|err| {
+        panic!("Failed to build rpi4 bootloader: {}", err);
+    });
+
+    eprintln!("\n--- Running ./run_rpi4.sh ---");
+    use std::os::unix::process::CommandExt;
+    let err = Command::new("./run_rpi4.sh")
+        .arg(&binary_path)
+        .args(args)
+        .exec();
+    panic!("Failed to exec ./run_rpi4.sh: {}", err);
 }
 
 fn run_rpi5(args: &[String]) -> Result<(), String> {
