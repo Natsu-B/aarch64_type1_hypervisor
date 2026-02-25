@@ -53,10 +53,6 @@ SECTIONS {
     KEEP(*(.el2_tls .el2_tls.*))
     __el2_tls_end = .;
     __el2_tls_size = __el2_tls_end - __el2_tls_start;
-    . = ALIGN(64);
-    __el2_tls_bsp_start = .;
-    . = . + __el2_tls_size;
-    __el2_tls_bsp_end = .;
     *(.rodata .rodata.*)
     __rodata_end = .;
   }
@@ -65,6 +61,11 @@ SECTIONS {
     __bss_start = .;
     _BSS_START = .;
     *(.bss .bss.*)
+    . = ALIGN(64);
+    __el2_tls_bsp_start = .;
+    . = . + __el2_tls_size;
+    __el2_tls_bsp_end = .;
+    . = ALIGN(8);
     _BSS_END = .;
     __bss_end = .;
   }
