@@ -75,6 +75,7 @@ impl<const N: usize> RxRing<N> {
 struct GdbUartState<const N: usize> {
     uart: Pl011Uart,
     rx: RxRing<N>,
+    rsp: RspFrameAssembler,
     prefetch_buf: [u8; PREFETCH_CAP],
     prefetch_len: usize,
     prefetch_pos: usize,
@@ -105,6 +106,7 @@ pub fn init(base: usize, clock_hz: u64, baud: u32) {
         let p = slot.as_mut_ptr();
         ptr::write_bytes(p, 0u8, 1);
         ptr::addr_of_mut!((*p).uart).write(uart);
+        ptr::addr_of_mut!((*p).rsp).write(RspFrameAssembler::new());
         // rx/prefetch fields are already zeroed by write_bytes.
     }
     GDB_UART_READY.store(true, Ordering::Release);
@@ -173,6 +175,7 @@ impl Drop for StopLoopGuard {
             // SAFETY: READY is published after full initialization with Release ordering.
             let state = unsafe { (&mut *guard).assume_init_mut() };
             state.rx.clear();
+            state.rsp.reset();
             state.prefetch_len = 0;
             state.prefetch_pos = 0;
             state.uart.enable_rx_interrupts(FifoLevel::OneQuarter, true);
@@ -207,23 +210,27 @@ fn drain_uart_locked(state: &mut GdbUartState<RX_RING_SIZE>) {
             break;
         };
         let _ = state.rx.push_drop_oldest(byte);
-        record_attach_byte(byte);
+        record_attach_byte(&mut state.rsp, byte);
     }
 }
 
-fn record_attach_byte(byte: u8) {
-    // Breakpoint: attach byte detection (should be inactive after session init).
-    if !DEBUG_SESSION_ACTIVE.load(Ordering::Acquire) {
-        let reason = ATTACH_REASON.load(Ordering::Acquire);
-        if byte == 0x03 {
-            // Release publishes the attach request after RX buffering.
-            if reason != 2 {
-                ATTACH_REASON.store(2, Ordering::Release);
-            }
-        } else if byte == b'$' && reason == 0 {
-            // Release publishes the attach request after RX buffering.
-            ATTACH_REASON.store(1, Ordering::Release);
+fn record_attach_byte(assembler: &mut RspFrameAssembler, byte: u8) {
+    let event = assembler.push(byte);
+    if matches!(event, RspFrameEvent::CtrlC) {
+        // Release publishes the attach request after RX buffering.
+        if ATTACH_REASON.load(Ordering::Acquire) != 2 {
+            ATTACH_REASON.store(2, Ordering::Release);
         }
+        return;
+    }
+
+    // Breakpoint: attach byte detection (should be inactive after session init).
+    if !DEBUG_SESSION_ACTIVE.load(Ordering::Acquire)
+        && byte == b'$'
+        && ATTACH_REASON.load(Ordering::Acquire) == 0
+    {
+        // Release publishes the attach request after RX buffering.
+        ATTACH_REASON.store(1, Ordering::Release);
     }
 }
 
@@ -415,6 +422,7 @@ fn flush_rx_input() {
             break;
         }
     }
+    state.rsp.reset();
     state.uart.drain_rx();
     let icr = UARTICR::new()
         .set(UARTICR::rxic, 1)
@@ -490,7 +498,8 @@ mod tests {
         reset_attach_state();
         set_debug_active(true);
         set_debug_session_active(false);
-        record_attach_byte(b'$');
+        let mut asm = RspFrameAssembler::new();
+        record_attach_byte(&mut asm, b'$');
         assert_eq!(ATTACH_REASON.load(Ordering::Acquire), 1);
         reset_attach_state();
     }
@@ -499,7 +508,29 @@ mod tests {
     fn attach_reason_ignored_when_session_active() {
         reset_attach_state();
         set_debug_session_active(true);
-        record_attach_byte(b'$');
+        let mut asm = RspFrameAssembler::new();
+        record_attach_byte(&mut asm, b'$');
+        assert_eq!(ATTACH_REASON.load(Ordering::Acquire), 0);
+        reset_attach_state();
+    }
+
+    #[test_case]
+    fn ctrl_c_sets_attach_reason_when_session_active() {
+        reset_attach_state();
+        set_debug_session_active(true);
+        let mut asm = RspFrameAssembler::new();
+        record_attach_byte(&mut asm, 0x03);
+        assert_eq!(ATTACH_REASON.load(Ordering::Acquire), 2);
+        reset_attach_state();
+    }
+
+    #[test_case]
+    fn ctrl_c_inside_frame_is_ignored() {
+        reset_attach_state();
+        set_debug_session_active(true);
+        let mut asm = RspFrameAssembler::new();
+        record_attach_byte(&mut asm, b'$');
+        record_attach_byte(&mut asm, 0x03);
         assert_eq!(ATTACH_REASON.load(Ordering::Acquire), 0);
         reset_attach_state();
     }
