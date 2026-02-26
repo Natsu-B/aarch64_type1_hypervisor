@@ -1580,6 +1580,59 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         let mut tx_pos = 0usize;
         let mut tx_len = 0usize;
         let mut rx_buf = [0u8; 64];
+        let drain_server_tx_and_flush =
+            |stream: &mut dyn PollByteStream<Error = Infallible>,
+             cx: &mut Context<'_>,
+             server: &mut GdbServer<MAX_PKT, TX_CAP>,
+             tx_buf: &mut [u8; 128],
+             tx_pos: &mut usize,
+             tx_len: &mut usize| {
+                loop {
+                    if *tx_pos < *tx_len {
+                        match stream.poll_write(cx, &tx_buf[*tx_pos..*tx_len]) {
+                            Poll::Ready(Ok(written)) => {
+                                if written != 0 {
+                                    *tx_pos = (*tx_pos).saturating_add(written);
+                                    if *tx_pos >= *tx_len {
+                                        *tx_pos = 0;
+                                        *tx_len = 0;
+                                    }
+                                } else {
+                                    spin_loop();
+                                }
+                            }
+                            Poll::Ready(Err(err)) => match err {},
+                            Poll::Pending => spin_loop(),
+                        }
+                        continue;
+                    }
+
+                    *tx_pos = 0;
+                    *tx_len = 0;
+                    while *tx_len < tx_buf.len() {
+                        let Some(byte) = server.pop_tx_byte_irq() else {
+                            break;
+                        };
+                        tx_buf[*tx_len] = byte;
+                        *tx_len += 1;
+                    }
+
+                    if *tx_pos == *tx_len && !server.has_tx_pending() {
+                        break;
+                    }
+                    if *tx_len == 0 {
+                        spin_loop();
+                    }
+                }
+
+                loop {
+                    match stream.poll_flush(cx) {
+                        Poll::Ready(Ok(())) => break,
+                        Poll::Ready(Err(err)) => match err {},
+                        Poll::Pending => spin_loop(),
+                    }
+                }
+            };
         let outcome = 'debug: loop {
             let mut target = self.state.target(regs);
             let mut progress = false;
@@ -1716,6 +1769,14 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                         }
                                         semihost::ResumeGate::Proceed(None) => {}
                                     }
+                                    drain_server_tx_and_flush(
+                                        stream,
+                                        &mut cx,
+                                        &mut self.server,
+                                        &mut tx_buf,
+                                        &mut tx_pos,
+                                        &mut tx_len,
+                                    );
                                     break 'debug DebugOutcome::Resume(action);
                                 }
                                 Ok(ProcessResult::FileIoReply {
@@ -1738,6 +1799,14 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                             }
                                             semihost::ResumeGate::Proceed(None) => {}
                                         }
+                                        drain_server_tx_and_flush(
+                                            stream,
+                                            &mut cx,
+                                            &mut self.server,
+                                            &mut tx_buf,
+                                            &mut tx_pos,
+                                            &mut tx_len,
+                                        );
                                         break 'debug DebugOutcome::Resume(action);
                                     }
                                 }
@@ -1761,6 +1830,14 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                                 }
                                                 semihost::ResumeGate::Proceed(None) => {}
                                             }
+                                            drain_server_tx_and_flush(
+                                                stream,
+                                                &mut cx,
+                                                &mut self.server,
+                                                &mut tx_buf,
+                                                &mut tx_pos,
+                                                &mut tx_len,
+                                            );
                                             break 'debug DebugOutcome::Resume(action);
                                         }
                                     }
