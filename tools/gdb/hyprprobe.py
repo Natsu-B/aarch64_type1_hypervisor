@@ -635,7 +635,7 @@ gdb.events.stop.connect(_on_stop)
 def _on_exit(event) -> None:
     _semihost_close_all()
 
-def _on_before_prompt(event) -> None:
+def _on_before_prompt(event=None) -> None:
     try:
         inf = gdb.selected_inferior()
     except Exception:
