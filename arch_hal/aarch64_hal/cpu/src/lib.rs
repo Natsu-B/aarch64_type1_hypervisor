@@ -1,6 +1,7 @@
 #![no_std]
 
 use core::arch::asm;
+use core::slice;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
 
@@ -1108,26 +1109,118 @@ pub fn clean_data_cache_all() {
 ///
 /// Stage-2 must already be configured and enabled. The returned physical address is expected to be
 /// directly accessible from EL2 in the current boot flow (identity mapping).
+/// This performs a software walk of the configured Stage-2 page tables.
 pub fn ipa_to_pa_el2(ipa: u64) -> Option<u64> {
-    let par_after: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {tmp}, par_el1",
-            "at S12E1R, {ipa}",
-            "isb",
-            "mrs {par_after}, par_el1",
-            "msr par_el1, {tmp}",
-            tmp        = lateout(reg) _,
-            par_after  = out(reg) par_after,
-            ipa        = in(reg) ipa,
-            options(nostack)
-        );
-    }
+    const PAGE_SHIFT: u64 = 12;
+    const PAGE_MASK: u64 = 0xFFF;
+    const LEVEL_STRIDE_BITS: u64 = 9;
+    const ENTRIES_PER_TABLE: usize = 512;
+    const STAGE2_DESC_TYPE_INVALID: u64 = 0b00;
+    const STAGE2_DESC_TYPE_BLOCK: u64 = 0b01;
+    const STAGE2_DESC_TYPE_TABLE_OR_PAGE: u64 = 0b11;
 
-    if (par_after & 1) != 0 {
+    let vtcr_el2 = get_vtcr_el2();
+    let t0sz = vtcr_el2 & 0x3F;
+    let sl0 = (vtcr_el2 >> 6) & 0x3;
+    let tg0 = (vtcr_el2 >> 14) & 0x3;
+    let ds = (vtcr_el2 >> 32) & 0x1;
+
+    if ds != 0 {
+        return None;
+    }
+    if tg0 != 0b00 {
+        return None;
+    }
+    if t0sz >= 64 {
         return None;
     }
 
-    let pa = par_after & 0x0000_FFFF_FFFF_F000;
-    Some(pa | (ipa & 0xFFF))
+    let start_level = match sl0 {
+        0b10 => 0u8,
+        0b01 => 1u8,
+        // Level-2 start is valid architecturally for 4KB granule, but unsupported here.
+        0b00 => return None,
+        _ => return None,
+    };
+
+    let ipa_bits = 64 - t0sz;
+    let baseline_ipa_bits = PAGE_SHIFT + LEVEL_STRIDE_BITS * (4 - u64::from(start_level));
+    let num_tables = if ipa_bits <= baseline_ipa_bits {
+        1usize
+    } else {
+        let extra = ipa_bits - baseline_ipa_bits;
+        if extra > 4 {
+            return None;
+        }
+        1usize << extra
+    };
+
+    let vttbr_el2 = get_vttbr_el2();
+    let top_table_base = (vttbr_el2 & !PAGE_MASK) as usize;
+    if top_table_base == 0 {
+        return None;
+    }
+
+    let top_table_entries = num_tables.checked_mul(ENTRIES_PER_TABLE)?;
+    let top_table_mask = top_table_entries.checked_sub(1)?;
+
+    // SAFETY:
+    // - Stage-2 page tables are allocated in RAM and are accessible from EL2 in this boot flow.
+    // - `top_table_base` is 4KiB-aligned (masked from VTTBR_EL2).
+    // - The top-level region is expected to span at least `top_table_entries * 8` bytes.
+    let mut table =
+        unsafe { slice::from_raw_parts(top_table_base as *const u64, top_table_entries) };
+    let mut level = start_level;
+
+    loop {
+        if level > 3 {
+            return None;
+        }
+
+        let shift = PAGE_SHIFT + LEVEL_STRIDE_BITS * (3 - u64::from(level));
+        let idx = if level == start_level {
+            ((ipa >> shift) as usize) & top_table_mask
+        } else {
+            ((ipa >> shift) & 0x1FF) as usize
+        };
+        if idx >= table.len() {
+            return None;
+        }
+
+        let desc = table[idx];
+        match desc & 0b11 {
+            STAGE2_DESC_TYPE_INVALID => return None,
+            STAGE2_DESC_TYPE_BLOCK => {
+                if level != 1 && level != 2 {
+                    return None;
+                }
+                let block_size_shift = PAGE_SHIFT + LEVEL_STRIDE_BITS * (3 - u64::from(level));
+                let block_size = 1u64 << block_size_shift;
+                let base_pa = desc & !(block_size - 1);
+                let offset = ipa & (block_size - 1);
+                return Some(base_pa | offset);
+            }
+            STAGE2_DESC_TYPE_TABLE_OR_PAGE => {
+                if level == 3 {
+                    let base_pa = desc & !PAGE_MASK;
+                    let offset = ipa & PAGE_MASK;
+                    return Some(base_pa | offset);
+                }
+
+                let next_table_addr = (desc & !PAGE_MASK) as usize;
+                if next_table_addr == 0 {
+                    return None;
+                }
+                // SAFETY:
+                // - `next_table_addr` is obtained from a valid Stage-2 table descriptor.
+                // - Next-level tables are 4KiB-aligned and contain exactly 512 u64 entries.
+                // - The pointed memory is expected to span at least `512 * 8` bytes.
+                table = unsafe {
+                    slice::from_raw_parts(next_table_addr as *const u64, ENTRIES_PER_TABLE)
+                };
+                level += 1;
+            }
+            _ => return None,
+        }
+    }
 }
