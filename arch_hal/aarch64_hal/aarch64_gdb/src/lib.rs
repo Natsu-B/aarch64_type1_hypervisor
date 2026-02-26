@@ -131,6 +131,20 @@ const DBGBCR_PMC_EL0_EL1: u64 = 0b11 << DBGBCR_PMC_SHIFT;
 const DBGBCR_BAS_ALL: u64 = 0b1111 << DBGBCR_BAS_SHIFT;
 const DBGBCR_INSN: u64 = DBGBCR_E | DBGBCR_PMC_EL0_EL1 | DBGBCR_BAS_ALL;
 
+#[inline(always)]
+fn set_elr_el2_and_sync_frame(regs: &mut Registers, pc: u64) {
+    // `exit_exception` restores ELR_EL2/SPSR_EL2 from the saved frame after
+    // `post_handler`, so the frame copy must stay authoritative.
+    cpu::set_elr_el2(pc);
+    regs.elr_el2 = pc;
+}
+
+#[inline(always)]
+fn set_spsr_el2_and_sync_frame(regs: &mut Registers, spsr: u64) {
+    cpu::set_spsr_el2(spsr);
+    regs.spsr_el2 = spsr;
+}
+
 pub trait MemoryAccess {
     type Error;
 
@@ -961,11 +975,11 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         offset += 8;
 
         let pc = read_u64(&src[offset..offset + 8])?;
-        cpu::set_elr_el2(pc);
+        set_elr_el2_and_sync_frame(self.regs, pc);
         offset += 8;
 
         let cpsr = read_u32(&src[offset..offset + 4])?;
-        cpu::set_spsr_el2(cpsr as u64);
+        set_spsr_el2_and_sync_frame(self.regs, cpsr as u64);
         offset += 4;
 
         if self.state.features_active {
@@ -1021,11 +1035,11 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
             }
             REG_PC => {
                 let pc = read_u64(src)?;
-                cpu::set_elr_el2(pc);
+                set_elr_el2_and_sync_frame(self.regs, pc);
             }
             REG_CPSR => {
                 let cpsr = read_u32(src)?;
-                cpu::set_spsr_el2(cpsr as u64);
+                set_spsr_el2_and_sync_frame(self.regs, cpsr as u64);
             }
             REG_TPIDR_EL0 => cpu::set_tpidr_el0(read_u64(src)?),
             REG_TPIDRRO_EL0 => {}
@@ -1468,11 +1482,11 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
     pub fn enter_debug(&mut self, regs: &mut Registers, cause: DebugEntryCause) {
         if let DebugEntryCause::DebugException(ec) = cause {
-            if self.handle_pending_step(Some(ec)) {
+            if self.handle_pending_step(regs, Some(ec)) {
                 return;
             }
         } else {
-            self.handle_pending_step(None);
+            self.handle_pending_step(regs, None);
         }
         let mut io_adapter = debug_io().map(|io| DebugIoAdapter { io });
         let stream: &mut dyn PollByteStream<Error = Infallible> =
@@ -1525,7 +1539,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                     if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
                         breakpoint_slot = Some(slot);
                         breakpoint_addr = pc_prev;
-                        cpu::set_elr_el2(pc_prev);
+                        set_elr_el2_and_sync_frame(regs, pc_prev);
                     }
                 }
             }
@@ -1698,7 +1712,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                         }
                                         semihost::ResumeGate::Proceed(Some((req, completion))) => {
                                             regs.x0 = completion.result as u64;
-                                            cpu::set_elr_el2(req.pc_after);
+                                            set_elr_el2_and_sync_frame(regs, req.pc_after);
                                         }
                                         semihost::ResumeGate::Proceed(None) => {}
                                     }
@@ -1720,7 +1734,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                                 completion,
                                             ))) => {
                                                 regs.x0 = completion.result as u64;
-                                                cpu::set_elr_el2(req.pc_after);
+                                                set_elr_el2_and_sync_frame(regs, req.pc_after);
                                             }
                                             semihost::ResumeGate::Proceed(None) => {}
                                         }
@@ -1743,7 +1757,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                                                     completion,
                                                 ))) => {
                                                     regs.x0 = completion.result as u64;
-                                                    cpu::set_elr_el2(req.pc_after);
+                                                    set_elr_el2_and_sync_frame(regs, req.pc_after);
                                                 }
                                                 semihost::ResumeGate::Proceed(None) => {}
                                             }
@@ -1785,7 +1799,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         };
 
         if let Some(pc) = new_pc {
-            cpu::set_elr_el2(pc);
+            set_elr_el2_and_sync_frame(regs, pc);
         }
 
         if let Some(slot) = breakpoint_slot {
@@ -1794,7 +1808,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
                 self.pending_step = Some(PendingStep {
                     slot: Some(slot),
                     action: resume_action,
-                    restore: enable_single_step(),
+                    restore: enable_single_step(regs),
                 });
                 self.state.resume_hw_watchpoints();
                 return;
@@ -1803,7 +1817,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         }
 
         if matches!(resume_action, PendingStepAction::Step) {
-            if let Some(restore) = enable_single_step() {
+            if let Some(restore) = enable_single_step(regs) {
                 self.pending_step = Some(PendingStep {
                     slot: None,
                     action: resume_action,
@@ -1818,10 +1832,10 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
         self.enter_debug(regs, DebugEntryCause::DebugException(ec));
     }
 
-    fn handle_pending_step(&mut self, ec: Option<ExceptionClass>) -> bool {
+    fn handle_pending_step(&mut self, regs: &mut Registers, ec: Option<ExceptionClass>) -> bool {
         if let Some(pending) = self.pending_step.take() {
             if let Some(restore) = pending.restore {
-                disable_single_step(restore);
+                disable_single_step(regs, restore);
             }
             if let Some(slot) = pending.slot {
                 let _ = self.state.reinstall_sw_breakpoint_slot(slot);
@@ -1847,7 +1861,7 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 const SPSR_DAIF_D: u64 = 1 << 9;
 const SPSR_SS: u64 = 1 << 21;
 
-fn enable_single_step() -> Option<StepRestore> {
+fn enable_single_step(regs: &mut Registers) -> Option<StepRestore> {
     let spsr = cpu::get_spsr_el2();
     let mdscr = cpu::get_mdscr_el1();
     let restore = StepRestore {
@@ -1864,7 +1878,7 @@ fn enable_single_step() -> Option<StepRestore> {
         .set(MDSCR_EL1::kde, 1)
         .set(MDSCR_EL1::mde, 1);
 
-    cpu::set_spsr_el2(new_spsr);
+    set_spsr_el2_and_sync_frame(regs, new_spsr);
     cpu::set_mdscr_el1(new_mdscr);
 
     let verify_spsr = cpu::get_spsr_el2();
@@ -1874,13 +1888,13 @@ fn enable_single_step() -> Option<StepRestore> {
         && verify_mdscr.get(MDSCR_EL1::kde) != 0
         && verify_mdscr.get(MDSCR_EL1::mde) != 0;
     if !(spsr_ok && mdscr_ok) {
-        disable_single_step(restore);
+        disable_single_step(regs, restore);
         return None;
     }
     Some(restore)
 }
 
-fn disable_single_step(restore: StepRestore) {
+fn disable_single_step(regs: &mut Registers, restore: StepRestore) {
     let mut spsr = cpu::get_spsr_el2();
     if restore.spsr_d {
         spsr |= SPSR_DAIF_D;
@@ -1892,7 +1906,7 @@ fn disable_single_step(restore: StepRestore) {
     } else {
         spsr &= !SPSR_SS;
     }
-    cpu::set_spsr_el2(spsr);
+    set_spsr_el2_and_sync_frame(regs, spsr);
 
     let mdscr = cpu::get_mdscr_el1()
         .set(MDSCR_EL1::ss, restore.mdscr_ss as u64)
