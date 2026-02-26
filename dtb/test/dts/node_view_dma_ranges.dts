@@ -1,0 +1,19 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+
+    bus@0 {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges = <0x0 0x0 0x1000>;
+        dma-ranges = <0xC0000000 0x00000000 0x40000000>;
+
+        ethernet@10 {
+            compatible = "test,dma-child";
+            reg = <0x10 0x20>;
+        };
+    };
+};

@@ -338,6 +338,67 @@ mod tests {
     }
 
     #[test]
+    fn node_view_dma_ranges_parent_walk() {
+        let out_dir = env!("OUT_DIR");
+        let mut path = PathBuf::from(out_dir);
+        path.push("node_view_dma_ranges.dtb");
+        assert!(
+            path.exists(),
+            "{} not found. dtc is required to build DTS fixtures.",
+            path.display()
+        );
+
+        let test_data = std::fs::read(&path).expect("failed to load generated dtb file");
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
+        let parser = DtbParser::init(test_data_addr).unwrap();
+
+        let mut found_child = false;
+        let mut found_dma_ranges = false;
+
+        let result = parser.for_each_node_view(&mut |node| {
+            if !node
+                .compatible_contains("test,dma-child")
+                .map_err(WalkError::Dtb)?
+            {
+                return Ok(ControlFlow::Continue(()));
+            }
+
+            found_child = true;
+
+            let mut current = node.parent_view().map_err(WalkError::Dtb)?;
+            while let Some(parent) = current {
+                if let Some(mut iter) = parent.dma_ranges_iter().map_err(WalkError::Dtb)? {
+                    let first = iter
+                        .next()
+                        .ok_or(WalkError::Dtb("dma-ranges: expected an entry"))?
+                        .map_err(WalkError::Dtb)?;
+                    assert_eq!(first.child_base, 0xC0000000);
+                    assert_eq!(first.parent_base, 0x00000000);
+                    assert_eq!(first.len, 0x40000000);
+
+                    match iter.next() {
+                        None => {}
+                        Some(Ok(_)) => {
+                            return Err(WalkError::Dtb("dma-ranges: expected single entry"));
+                        }
+                        Some(Err(err)) => return Err(WalkError::Dtb(err)),
+                    }
+
+                    found_dma_ranges = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                current = parent.parent_view().map_err(WalkError::Dtb)?;
+            }
+
+            Err(WalkError::Dtb("dma-ranges: parent bus not found"))
+        });
+        assert_walk_ok(result);
+        assert!(found_child);
+        assert!(found_dma_ranges);
+    }
+
+    #[test]
     fn ranges_pci_3cells_translation_works() {
         let out_dir = env::var_os("OUT_DIR").unwrap();
         let mut path = PathBuf::from(out_dir);

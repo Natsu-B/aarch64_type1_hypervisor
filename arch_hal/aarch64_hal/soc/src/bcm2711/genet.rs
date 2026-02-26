@@ -37,6 +37,7 @@ const RX_TOTAL_BUFSIZE: usize = RX_BUF_LENGTH * RX_DESCS;
 const RX_BUF_OFFSET: usize = 2;
 const ETH_FCS_LEN: usize = 4;
 const TX_BUF_LENGTH: usize = 2048;
+const MAX_DMA_WINDOWS: usize = 4;
 
 const DMA_EN: u32 = 1 << 0;
 const DMA_RING_BUF_EN_SHIFT: u32 = 1;
@@ -102,6 +103,7 @@ pub enum Bcm2711GenetError {
     MdioReadFail,
     PhyTimeout,
     TxTimeout,
+    DmaAddressNotCovered,
     LoopbackSelfTestFailed,
     LoopbackSelfTestTxFailed,
     LoopbackSelfTestRxTimeout,
@@ -314,6 +316,23 @@ struct AlignedTxBuffer([u8; TX_BUF_LENGTH]);
 #[repr(align(256))]
 struct AlignedRxStorage([u8; RX_TOTAL_BUFSIZE]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DmaWindow {
+    dma_base: usize,
+    cpu_base: usize,
+    len: usize,
+}
+
+impl DmaWindow {
+    const fn empty() -> Self {
+        Self {
+            dma_base: 0,
+            cpu_base: 0,
+            len: 0,
+        }
+    }
+}
+
 struct DtbGenetConfig {
     mmio_base: usize,
     mmio_size: usize,
@@ -322,6 +341,8 @@ struct DtbGenetConfig {
     phy_addr: u8,
     interrupts: [u32; 4],
     interrupt_count: usize,
+    dma_windows: [DmaWindow; MAX_DMA_WINDOWS],
+    dma_window_count: usize,
 }
 
 /// BCM2711 GENETv5 backend implementing frame-level Ethernet I/O.
@@ -350,6 +371,8 @@ pub struct Bcm2711GenetV5 {
     local_loopback: bool,
     interrupts: [u32; 4],
     interrupt_count: usize,
+    dma_windows: [DmaWindow; MAX_DMA_WINDOWS],
+    dma_window_count: usize,
     tx_index: u16,
     rx_index: u16,
     c_index: u16,
@@ -425,6 +448,8 @@ impl Bcm2711GenetV5 {
             local_loopback,
             interrupts: parsed.interrupts,
             interrupt_count: parsed.interrupt_count,
+            dma_windows: parsed.dma_windows,
+            dma_window_count: parsed.dma_window_count,
             tx_index: 0,
             rx_index: 0,
             c_index: 0,
@@ -515,6 +540,9 @@ impl Bcm2711GenetV5 {
                 )));
             }
 
+            let (dma_windows, dma_window_count) =
+                Self::parse_dma_windows(&node).map_err(WalkError::User)?;
+
             Ok(ControlFlow::Break(DtbGenetConfig {
                 mmio_base: reg.0,
                 mmio_size: reg.1,
@@ -523,6 +551,8 @@ impl Bcm2711GenetV5 {
                 phy_addr,
                 interrupts,
                 interrupt_count: stored,
+                dma_windows,
+                dma_window_count,
             }))
         });
 
@@ -576,6 +606,42 @@ impl Bcm2711GenetV5 {
         }
     }
 
+    fn parse_dma_windows(
+        node: &dtb::DtbNodeView<'_, '_>,
+    ) -> Result<([DmaWindow; MAX_DMA_WINDOWS], usize), Bcm2711GenetError> {
+        let mut windows = [DmaWindow::empty(); MAX_DMA_WINDOWS];
+        let mut count = 0usize;
+
+        let mut current = node
+            .parent_view()
+            .map_err(Bcm2711GenetError::DtbParseError)?;
+        while let Some(parent) = current {
+            if let Some(mut iter) = parent
+                .dma_ranges_iter()
+                .map_err(Bcm2711GenetError::DtbParseError)?
+            {
+                for entry in &mut iter {
+                    let entry = entry.map_err(Bcm2711GenetError::DtbParseError)?;
+                    if count < MAX_DMA_WINDOWS {
+                        windows[count] = DmaWindow {
+                            dma_base: entry.child_base,
+                            cpu_base: entry.parent_base,
+                            len: entry.len,
+                        };
+                        count += 1;
+                    }
+                }
+                break;
+            }
+
+            current = parent
+                .parent_view()
+                .map_err(Bcm2711GenetError::DtbParseError)?;
+        }
+
+        Ok((windows, count))
+    }
+
     fn parse_nul_terminated_string(bytes: &[u8]) -> Option<&str> {
         let nul = bytes.iter().position(|&b| b == 0)?;
         core::str::from_utf8(&bytes[..nul]).ok()
@@ -592,6 +658,39 @@ impl Bcm2711GenetV5 {
             };
         }
         spec.first().copied().unwrap_or(0)
+    }
+
+    fn rx_base_cpu() -> usize {
+        // SAFETY: `RXBUF` is dedicated static storage for this singleton NIC backend.
+        unsafe { core::ptr::addr_of!(RXBUF.0) as *const u8 as usize }
+    }
+
+    fn rx_slot_cpu_addr(&self, slot: u16) -> usize {
+        Self::rx_base_cpu() + (slot as usize) * RX_BUF_LENGTH
+    }
+
+    fn cpu_to_dma(&self, cpu: usize, len: usize) -> Result<usize, Bcm2711GenetError> {
+        if self.dma_window_count == 0 {
+            return Ok(cpu);
+        }
+        let cpu_end = cpu
+            .checked_add(len)
+            .ok_or(Bcm2711GenetError::DmaAddressNotCovered)?;
+
+        for window in self.dma_windows.iter().take(self.dma_window_count) {
+            let Some(window_end) = window.cpu_base.checked_add(window.len) else {
+                continue;
+            };
+            if cpu >= window.cpu_base && cpu_end <= window_end {
+                let offset = cpu - window.cpu_base;
+                return window
+                    .dma_base
+                    .checked_add(offset)
+                    .ok_or(Bcm2711GenetError::DmaAddressNotCovered);
+            }
+        }
+
+        Err(Bcm2711GenetError::DmaAddressNotCovered)
     }
 
     fn init_hw(&mut self) -> Result<(), Bcm2711GenetError> {
@@ -626,7 +725,7 @@ impl Bcm2711GenetV5 {
 
         self.disable_dma_and_flush_tx();
         self.rx_ring_init();
-        self.rx_descs_init();
+        self.rx_descs_init()?;
         self.tx_ring_init();
         self.enable_dma();
 
@@ -730,7 +829,7 @@ impl Bcm2711GenetV5 {
     fn enable_dma(&self) {
         let dma_ctrl = (1u32 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT)) | DMA_EN;
         self.regs.tdma_common.dma_ctrl.write(dma_ctrl);
-        self.regs.rdma_common.dma_ctrl.set_bits(dma_ctrl);
+        self.regs.rdma_common.dma_ctrl.write(dma_ctrl);
     }
 
     fn rdma_ring(&self) -> &DmaRingRegs {
@@ -766,24 +865,23 @@ impl Bcm2711GenetV5 {
         self.regs.rdma_common.ring_cfg.write(1u32 << DEFAULT_Q);
     }
 
-    fn rx_descs_init(&self) {
+    fn rx_descs_init(&self) -> Result<(), Bcm2711GenetError> {
         let len_stat = ((RX_BUF_LENGTH as u32) << DMA_BUFLENGTH_SHIFT) | DMA_OWN;
-
-        // SAFETY: `RXBUF` is a dedicated static storage region for this singleton NIC driver.
-        // We only create a raw pointer (no reference), then hand addresses to descriptors.
-        let rxbase = unsafe { core::ptr::addr_of!(RXBUF.0) as *const u8 as usize };
+        let rxbase_cpu = Self::rx_base_cpu();
 
         // The entire RX storage is owned by DMA after descriptor programming. We clean once to
         // push potential dirty CPU lines before NIC writes into these buffers.
-        cpu::clean_dcache_range(rxbase as *const u8, RX_TOTAL_BUFSIZE);
+        cpu::clean_dcache_range(rxbase_cpu as *const u8, RX_TOTAL_BUFSIZE);
 
         for i in 0..RX_DESCS {
             let desc = &self.regs.rx_desc[i];
-            let addr = rxbase + i * RX_BUF_LENGTH;
-            desc.addr_lo.write(addr as u32);
-            desc.addr_hi.write((addr >> 32) as u32);
+            let addr_cpu = rxbase_cpu + i * RX_BUF_LENGTH;
+            let addr_dma = self.cpu_to_dma(addr_cpu, RX_BUF_LENGTH)?;
+            desc.addr_lo.write(addr_dma as u32);
+            desc.addr_hi.write((addr_dma >> 32) as u32);
             desc.length_status.write(len_stat);
         }
+        Ok(())
     }
 
     fn tx_ring_init(&mut self) {
@@ -1088,7 +1186,7 @@ impl Bcm2711GenetV5 {
         // Mask on every increment so we never publish 0x1_0000 at wrap boundaries.
         let prod_index = (cur.wrapping_add(1)) & 0xffff;
         let desc = &self.regs.tx_desc[self.tx_index as usize];
-        let addr = tx_ptr as usize;
+        let addr_dma = self.cpu_to_dma(tx_ptr as usize, frame.len())?;
 
         // Queue tag 0x3f and APPEND_CRC mirror U-Boot. The hardware appends Ethernet FCS when
         // APPEND_CRC is set; frame buffers therefore carry header+payload without trailing FCS.
@@ -1098,8 +1196,8 @@ impl Bcm2711GenetV5 {
             | DMA_SOP
             | DMA_EOP;
 
-        desc.addr_lo.write(addr as u32);
-        desc.addr_hi.write((addr >> 32) as u32);
+        desc.addr_lo.write(addr_dma as u32);
+        desc.addr_hi.write((addr_dma >> 32) as u32);
         desc.length_status.write(len_stat);
 
         // SAFETY: `dmb oshst` orders the descriptor MMIO stores above before the TDMA producer
@@ -1127,29 +1225,29 @@ impl Bcm2711GenetV5 {
             spin_loop();
         }
 
-        self.recover_after_tx_timeout();
+        self.recover_after_tx_timeout()?;
         Err(Bcm2711GenetError::TxTimeout)
     }
 
-    fn recover_after_tx_timeout(&mut self) {
+    fn recover_after_tx_timeout(&mut self) -> Result<(), Bcm2711GenetError> {
         // Best-effort bounded recovery for a wedged TX path. Keep this path free of long MDIO
         // waits so callers do not block for PHY autonegotiation durations on every timeout.
         self.disable_dma_and_flush_tx();
         self.umac_reset_sequence();
         self.program_mac_address();
         self.rx_ring_init();
-        self.rx_descs_init();
+        self.rx_descs_init()?;
         self.tx_ring_init();
         self.enable_dma();
         self.adjust_link_and_enable_umac();
+        Ok(())
     }
 
     fn rearm_one_rx_buffer(&mut self) {
-        let desc = &self.regs.rx_desc[self.rx_index as usize];
-        let addr = ((desc.addr_hi.read() as usize) << 32) | (desc.addr_lo.read() as usize);
+        let addr_cpu = self.rx_slot_cpu_addr(self.rx_index);
 
         // After CPU consumed an RX buffer, clean it before giving ownership back to DMA.
-        cpu::clean_dcache_range(addr as *const u8, RX_BUF_LENGTH);
+        cpu::clean_dcache_range(addr_cpu as *const u8, RX_BUF_LENGTH);
 
         self.c_index = self.c_index.wrapping_add(1) & 0xffff;
         self.rdma_ring().index_b.write(self.c_index as u32);
@@ -1169,12 +1267,11 @@ impl Bcm2711GenetV5 {
         if length > RX_BUF_LENGTH {
             length = RX_BUF_LENGTH;
         }
-
-        let addr = ((desc.addr_hi.read() as usize) << 32) | (desc.addr_lo.read() as usize);
+        let addr_cpu = self.rx_slot_cpu_addr(self.rx_index);
 
         // RX buffers are fixed-size, dedicated slots inside `RXBUF`. Invalidate the entire slot
         // before reading so stale cache lines from previous, longer packets cannot leak in.
-        cpu::invalidate_dcache_range(addr as *const u8, RX_BUF_LENGTH);
+        cpu::invalidate_dcache_range(addr_cpu as *const u8, RX_BUF_LENGTH);
 
         // RBUF_ALIGN_2B causes hardware to place payload with a 2-byte offset for IP alignment.
         let payload_len = length.saturating_sub(RX_BUF_OFFSET + ETH_FCS_LEN);
@@ -1193,9 +1290,9 @@ impl Bcm2711GenetV5 {
             return Some(0);
         }
 
-        // SAFETY: Descriptor points into our dedicated RX storage programmed at init.
+        // SAFETY: RX slot addresses are computed from dedicated `RXBUF` storage bounds.
         let src = unsafe {
-            core::slice::from_raw_parts((addr + RX_BUF_OFFSET) as *const u8, payload_len)
+            core::slice::from_raw_parts((addr_cpu + RX_BUF_OFFSET) as *const u8, payload_len)
         };
         out[..payload_len].copy_from_slice(src);
 

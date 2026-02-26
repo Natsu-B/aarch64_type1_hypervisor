@@ -27,6 +27,7 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
     const PROP_ADDRESS_CELLS: &'static str = "#address-cells";
     const PROP_SIZE_CELLS: &'static str = "#size-cells";
     const PROP_RANGES: &'static str = "ranges";
+    const PROP_DMA_RANGES: &'static str = "dma-ranges";
     const PROP_COMPATIBLE: &'static str = "compatible";
     const PROP_INTERRUPTS: &'static str = "interrupts";
     const PROP_INTERRUPT_CELLS: &'static str = "#interrupt-cells";
@@ -238,6 +239,16 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
             .unwrap_or(false)
     }
 
+    pub fn parent_view(&self) -> Result<Option<DtbNodeView<'dtb, 's>>, &'static str> {
+        let Some((parent_scope, parent_ancestors)) = self.ancestors.split_last() else {
+            return Ok(None);
+        };
+        let parent = self
+            .parser
+            .node_view_from_scope(*parent_scope, parent_ancestors)?;
+        Ok(Some(parent))
+    }
+
     pub fn ranges_iter(&self) -> Result<Option<RangesIter<'_>>, &'static str> {
         let Some(prop) = self.property_bytes(Self::PROP_RANGES)? else {
             return Ok(None);
@@ -247,6 +258,27 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         }
         let parent_address_cells =
             self.parent_cells(Self::PROP_ADDRESS_CELLS, 2, "ranges: missing parent")?;
+        let child_address_cells = self.address_cells_result()?;
+        let child_size_cells = self.size_cells_result()?;
+
+        RangesIter::new(
+            child_address_cells,
+            parent_address_cells,
+            child_size_cells,
+            prop,
+        )
+        .map(Some)
+    }
+
+    pub fn dma_ranges_iter(&self) -> Result<Option<RangesIter<'_>>, &'static str> {
+        let Some(prop) = self.property_bytes(Self::PROP_DMA_RANGES)? else {
+            return Ok(None);
+        };
+        if prop.is_empty() {
+            return Ok(None); // empty dma-ranges => identity; iterator not needed
+        }
+        let parent_address_cells =
+            self.parent_cells(Self::PROP_ADDRESS_CELLS, 2, "dma-ranges: missing parent")?;
         let child_address_cells = self.address_cells_result()?;
         let child_size_cells = self.size_cells_result()?;
 
