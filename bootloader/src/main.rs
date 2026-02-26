@@ -634,8 +634,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         .map_err(|_| "gic: configure el2 timer ppi")
         .unwrap();
         irq_monitor::init_physical_timer_poll();
-        vgic::init(&gic, &gic_info, guest_uart, gdb_uart_intid).unwrap();
         handler::register_gic(gic, gdb_uart_intid);
+        let gic = handler::gic().unwrap();
+        vgic::init(gic, &gic_info, guest_uart, gdb_uart_intid).unwrap();
         {
             let mdcr = cpu::get_mdcr_el2();
             // Trap debug exceptions from lower EL to EL2 (MDCR_EL2.TDE).

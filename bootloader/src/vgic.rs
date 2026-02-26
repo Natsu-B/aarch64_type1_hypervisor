@@ -139,7 +139,10 @@ pub(crate) fn init(
         ) {
             Ok(()) => {}
             Err(GicError::InvalidState) => continue,
-            Err(_) => return Err("vgic: map pirq"),
+            Err(e) => {
+                println!("Failed to map PIRQ {}: {:?}", intid, e);
+                return Err("vgic: map pirq");
+            }
         }
     }
 
