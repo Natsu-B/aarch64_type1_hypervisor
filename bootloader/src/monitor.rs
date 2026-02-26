@@ -3,6 +3,7 @@ use crate::vbar_watch;
 use arch_hal::aarch64_gdb;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::cpu;
+use arch_hal::psci;
 use core::fmt;
 use core::fmt::Write;
 use gdb_remote::WatchpointKind;
@@ -449,6 +450,7 @@ fn write_hp_help(out: &mut OutBuf<'_>) {
         "  monitor hp semihost reply <result> <errno>\n",
         "  monitor hp semihost alloc_handle\n",
         "  monitor hp semihost reset\n",
+        "  monitor hp reset\n",
         "  monitor hp gdb stop-counters\n",
         "  monitor hp vbar <status|last|clear|check|bt?|bt>\n",
     ];
@@ -607,6 +609,16 @@ fn parse_u64_token(token: &str) -> Option<u64> {
     } else {
         u64::from_str_radix(token, 10).ok()
     }
+}
+
+fn try_system_reset_via_psci() -> Result<core::convert::Infallible, i64> {
+    let saved = cpu::irq_save();
+    // SAFETY: cpu::Registers is a plain-old-data struct of u64 fields; all-zero is a valid initial value for staging an SMC call.
+    let mut regs: cpu::Registers = unsafe { core::mem::zeroed() };
+    regs.x0 = psci::PsciFunctionId::SystemReset as u64;
+    psci::secure_monitor_call(&mut regs);
+    cpu::irq_restore(saved);
+    Err(regs.x0 as i64)
 }
 
 pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
@@ -865,6 +877,19 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         }
                         _ => {
                             write_error(&mut out, "bad_args");
+                            Some(out.len())
+                        }
+                    }
+                }
+                "reset" => {
+                    if parts.next().is_some() {
+                        write_error(&mut out, "extra_args");
+                        return Some(out.len());
+                    }
+                    match try_system_reset_via_psci() {
+                        Ok(never) => match never {},
+                        Err(rc) => {
+                            let _ = write!(out, "error=psci_failed rc={}", rc);
                             Some(out.len())
                         }
                     }
