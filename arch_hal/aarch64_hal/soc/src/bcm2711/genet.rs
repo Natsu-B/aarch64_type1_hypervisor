@@ -60,6 +60,10 @@ const PHY_LINK_TIMEOUT_US: u64 = 5_000_000;
 const TX_DONE_TIMEOUT_US: u64 = 2_000;
 const PHY_STATUS_POLL_INTERVAL_US: u64 = 10_000;
 const PHY_STATUS_LOG_INTERVAL_US: u64 = 250_000;
+const LOOPBACK_SELFTEST_TIMEOUT_US: u64 = 200_000;
+const LOOPBACK_SELFTEST_FRAME_LEN: usize = 128;
+const LOOPBACK_SELFTEST_LOG_BYTES: usize = 32;
+const LOOPBACK_SELFTEST_ETHERTYPE: u16 = 0x88B5;
 
 const PHY_BMCR: u8 = 0;
 const PHY_BMSR: u8 = 1;
@@ -98,6 +102,10 @@ pub enum Bcm2711GenetError {
     MdioReadFail,
     PhyTimeout,
     TxTimeout,
+    LoopbackSelfTestFailed,
+    LoopbackSelfTestTxFailed,
+    LoopbackSelfTestRxTimeout,
+    LoopbackSelfTestMismatch,
     AlreadyTaken,
 }
 
@@ -339,6 +347,7 @@ pub struct Bcm2711GenetV5 {
     mac_addr: MacAddr,
     phy_mode: PhyMode,
     phy_addr: u8,
+    local_loopback: bool,
     interrupts: [u32; 4],
     interrupt_count: usize,
     tx_index: u16,
@@ -367,6 +376,19 @@ static mut RXBUF: AlignedRxStorage = AlignedRxStorage([0; RX_TOTAL_BUFSIZE]);
 
 impl Bcm2711GenetV5 {
     pub fn init_from_dtb(dtb: &DtbParser) -> Result<&'static mut Self, Bcm2711GenetError> {
+        Self::init_from_dtb_with_mode(dtb, false)
+    }
+
+    pub fn init_from_dtb_loopback_no_phy(
+        dtb: &DtbParser,
+    ) -> Result<&'static mut Self, Bcm2711GenetError> {
+        Self::init_from_dtb_with_mode(dtb, true)
+    }
+
+    fn init_from_dtb_with_mode(
+        dtb: &DtbParser,
+        local_loopback: bool,
+    ) -> Result<&'static mut Self, Bcm2711GenetError> {
         if TAKEN
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -374,7 +396,7 @@ impl Bcm2711GenetV5 {
             return Err(Bcm2711GenetError::AlreadyTaken);
         }
 
-        let result = Self::init_from_dtb_inner(dtb);
+        let result = Self::init_from_dtb_inner(dtb, local_loopback);
         if result.is_err() {
             READY.store(false, Ordering::Release);
             TAKEN.store(false, Ordering::Release);
@@ -382,7 +404,10 @@ impl Bcm2711GenetV5 {
         result
     }
 
-    fn init_from_dtb_inner(dtb: &DtbParser) -> Result<&'static mut Self, Bcm2711GenetError> {
+    fn init_from_dtb_inner(
+        dtb: &DtbParser,
+        local_loopback: bool,
+    ) -> Result<&'static mut Self, Bcm2711GenetError> {
         let parsed = Self::parse_dtb(dtb)?;
         if parsed.mmio_size < GENET_MMIO_MIN_SIZE || parsed.mmio_base == 0 {
             return Err(Bcm2711GenetError::InvalidMmioRegion);
@@ -397,6 +422,7 @@ impl Bcm2711GenetV5 {
             mac_addr: parsed.mac_addr,
             phy_mode: parsed.phy_mode,
             phy_addr: parsed.phy_addr,
+            local_loopback,
             interrupts: parsed.interrupts,
             interrupt_count: parsed.interrupt_count,
             tx_index: 0,
@@ -604,13 +630,19 @@ impl Bcm2711GenetV5 {
         self.tx_ring_init();
         self.enable_dma();
 
-        debug_uart_log(format_args!(
-            "genet: phy bringup begin timeout={}ms phy_addr={}\n",
-            PHY_LINK_TIMEOUT_US / 1_000,
-            self.phy_addr
-        ));
-        self.phy_bringup()?;
-        debug_uart_log(format_args!("genet: phy bringup complete\n"));
+        if self.local_loopback {
+            debug_uart_log(format_args!(
+                "[selftest] genet: skip PHY bringup (local loopback mode)\n"
+            ));
+        } else {
+            debug_uart_log(format_args!(
+                "genet: phy bringup begin timeout={}ms phy_addr={}\n",
+                PHY_LINK_TIMEOUT_US / 1_000,
+                self.phy_addr
+            ));
+            self.phy_bringup()?;
+            debug_uart_log(format_args!("genet: phy bringup complete\n"));
+        }
         self.adjust_link_and_enable_umac();
         debug_uart_log(format_args!("genet: umac enable complete\n"));
 
@@ -978,6 +1010,11 @@ impl Bcm2711GenetV5 {
         let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
             .set(UmacCmd::speed, speed)
             .set(UmacCmd::crc_fwd, 0)
+            .set(UmacCmd::sw_reset, 0)
+            .set(
+                UmacCmd::lcl_loop_en,
+                if self.local_loopback { 1 } else { 0 },
+            )
             .set(UmacCmd::tx_en, 1)
             .set(UmacCmd::rx_en, 1)
             .bits();
@@ -1164,6 +1201,99 @@ impl Bcm2711GenetV5 {
 
         self.rearm_one_rx_buffer();
         Some(payload_len)
+    }
+
+    pub fn local_loopback_selftest(&mut self) -> Result<(), Bcm2711GenetError> {
+        if !self.local_loopback {
+            debug_uart_log(format_args!(
+                "[selftest] genet: local_loopback_selftest requires loopback init mode\n"
+            ));
+            return Err(Bcm2711GenetError::LoopbackSelfTestFailed);
+        }
+
+        let mut tx = [0u8; LOOPBACK_SELFTEST_FRAME_LEN];
+        tx[..6].copy_from_slice(&self.mac_addr.0);
+        tx[6..12].copy_from_slice(&self.mac_addr.0);
+        tx[12..14].copy_from_slice(&LOOPBACK_SELFTEST_ETHERTYPE.to_be_bytes());
+        for (i, byte) in tx[14..].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(17).wrapping_add(0x5a);
+        }
+
+        debug_uart_log(format_args!(
+            "[selftest] genet: send local-loopback frame len={}\n",
+            tx.len()
+        ));
+        if let Err(err) = self.try_send_frame_result(&tx) {
+            debug_uart_log(format_args!(
+                "[selftest] genet: tx failed during loopback selftest: {:?}\n",
+                err
+            ));
+            return Err(Bcm2711GenetError::LoopbackSelfTestTxFailed);
+        }
+
+        let deadline = deadline_ticks_from_now(LOOPBACK_SELFTEST_TIMEOUT_US);
+        let mut rx = [0u8; 256];
+        loop {
+            match self.try_recv_frame_impl(&mut rx) {
+                None | Some(0) => {}
+                Some(n) => {
+                    let expected = tx.len();
+                    let expected_with_fcs = expected + ETH_FCS_LEN;
+                    if n != expected && n != expected_with_fcs {
+                        debug_uart_log(format_args!(
+                            "[selftest] genet: unexpected rx length={}, expected {} or {}\n",
+                            n, expected, expected_with_fcs
+                        ));
+                        return Err(Bcm2711GenetError::LoopbackSelfTestMismatch);
+                    }
+                    if rx[..expected] != tx[..] {
+                        debug_uart_log(format_args!(
+                            "[selftest] genet: frame mismatch len={} expected={}\n",
+                            n, expected
+                        ));
+                        let inspect = expected.min(LOOPBACK_SELFTEST_LOG_BYTES);
+                        for i in 0..inspect {
+                            if rx[i] != tx[i] {
+                                debug_uart_log(format_args!(
+                                    "[selftest] genet: first mismatch byte={} tx={:02x} rx={:02x}\n",
+                                    i, tx[i], rx[i]
+                                ));
+                                break;
+                            }
+                        }
+                        debug_uart_log(format_args!("[selftest] genet: tx[0..{}]=", inspect));
+                        for byte in tx.iter().take(inspect) {
+                            debug_uart_log(format_args!("{:02x}", byte));
+                        }
+                        debug_uart_log(format_args!("\n"));
+                        debug_uart_log(format_args!("[selftest] genet: rx[0..{}]=", inspect));
+                        for byte in rx.iter().take(inspect) {
+                            debug_uart_log(format_args!("{:02x}", byte));
+                        }
+                        debug_uart_log(format_args!("\n"));
+                        return Err(Bcm2711GenetError::LoopbackSelfTestMismatch);
+                    }
+                    if n == expected_with_fcs {
+                        debug_uart_log(format_args!(
+                            "[selftest] genet: received frame includes trailing 4-byte FCS\n"
+                        ));
+                    }
+                    debug_uart_log(format_args!(
+                        "[selftest] genet: local-loopback PASS len={}\n",
+                        n
+                    ));
+                    return Ok(());
+                }
+            }
+
+            if timed_out(deadline) {
+                debug_uart_log(format_args!(
+                    "[selftest] genet: timeout waiting for loopback RX frame\n"
+                ));
+                return Err(Bcm2711GenetError::LoopbackSelfTestRxTimeout);
+            }
+            spin_loop();
+        }
     }
 }
 

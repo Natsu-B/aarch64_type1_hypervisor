@@ -26,6 +26,8 @@ mod build_info {
     include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 }
 
+#[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
+mod genet_selftest;
 mod handler;
 mod irq_decode;
 mod irq_monitor;
@@ -37,6 +39,9 @@ mod stack_overflow;
 mod vbar;
 mod vbar_watch;
 mod vgic;
+
+#[cfg(all(feature = "rpi4_genet_loopback_selftest", feature = "rpi4_net"))]
+compile_error!("feature \"rpi4_genet_loopback_selftest\" cannot be enabled with \"rpi4_net\"");
 
 #[cfg(all(test, target_arch = "aarch64"))]
 aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);
@@ -402,6 +407,10 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         log_selected_uart("guest", best);
         if let Some(gdb_candidate) = gdb_candidate {
             log_selected_uart("gdb", gdb_candidate);
+        }
+        #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
+        {
+            genet_selftest::run(&dtb);
         }
         let tls_result = unsafe {
             tls::init_current_cpu(
