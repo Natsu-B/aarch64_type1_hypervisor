@@ -1,5 +1,7 @@
 use core::arch::asm;
 use core::cell::SyncUnsafeCell;
+use core::fmt;
+use core::fmt::Write as _;
 use core::hint::spin_loop;
 use core::mem::MaybeUninit;
 use core::mem::offset_of;
@@ -55,6 +57,8 @@ const DMA_FC_THRESH_VALUE: u32 = (DMA_FC_THRESH_LO << 16) | DMA_FC_THRESH_HI;
 const MDIO_BUSY_TIMEOUT_US: u64 = 20_000;
 const PHY_LINK_TIMEOUT_US: u64 = 5_000_000;
 const TX_DONE_TIMEOUT_US: u64 = 2_000;
+const PHY_STATUS_POLL_INTERVAL_US: u64 = 10_000;
+const PHY_STATUS_LOG_INTERVAL_US: u64 = 250_000;
 
 const PHY_BMCR: u8 = 0;
 const PHY_BMSR: u8 = 1;
@@ -568,6 +572,13 @@ impl Bcm2711GenetV5 {
         if major != 6 {
             return Err(Bcm2711GenetError::UnsupportedGenetVersion { major, minor });
         }
+        debug_uart_log(format_args!(
+            "genet: init rev={}.{} phy_addr={} phy_mode={}\n",
+            major,
+            minor,
+            self.phy_addr,
+            phy_mode_name(self.phy_mode)
+        ));
 
         self.program_phy_interface();
 
@@ -590,8 +601,15 @@ impl Bcm2711GenetV5 {
         self.tx_ring_init();
         self.enable_dma();
 
+        debug_uart_log(format_args!(
+            "genet: phy bringup begin timeout={}ms phy_addr={}\n",
+            PHY_LINK_TIMEOUT_US / 1_000,
+            self.phy_addr
+        ));
         self.phy_bringup()?;
+        debug_uart_log(format_args!("genet: phy bringup complete\n"));
         self.adjust_link_and_enable_umac();
+        debug_uart_log(format_args!("genet: umac enable complete\n"));
 
         Ok(())
     }
@@ -765,21 +783,111 @@ impl Bcm2711GenetV5 {
         let bmcr = self.mdio_read(self.phy_addr, PHY_BMCR)?;
         let restart = bmcr | PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART;
         self.mdio_write(self.phy_addr, PHY_BMCR, restart)?;
+        debug_uart_log(format_args!(
+            "genet: phy bringup start phy={} bmcr=0x{:04x} restart=0x{:04x}\n",
+            self.phy_addr, bmcr, restart
+        ));
 
         // Loop-count timeouts vary with core speed. Use a CNTPCT-based deadline so this wait
         // remains a real 5-second timeout independent of frequency/optimization changes.
         let deadline = deadline_ticks_from_now(PHY_LINK_TIMEOUT_US);
+        let poll_ticks = ticks_from_us(PHY_STATUS_POLL_INTERVAL_US);
+        let log_ticks = ticks_from_us(PHY_STATUS_LOG_INTERVAL_US);
+        let mut next_poll = read_cntpct_el0();
+        let mut next_log = next_poll.wrapping_add(log_ticks);
+
+        let mut last_bmcr = bmcr;
+        let mut last_bmsr = 0u16;
+        let mut last_adv = 0u16;
+        let mut last_lpa = 0u16;
+        let mut last_ctrl1000 = 0u16;
+        let mut last_stat1000 = 0u16;
+
         loop {
-            let bmsr = self.mdio_read(self.phy_addr, PHY_BMSR)?;
-            if (bmsr & PHY_BMSR_LSTATUS) != 0 && (bmsr & PHY_BMSR_ANEGCOMPLETE) != 0 {
-                return Ok(());
+            let now = read_cntpct_el0();
+            if tick_reached(now, next_poll) {
+                last_bmsr = self.mdio_read(self.phy_addr, PHY_BMSR)?;
+                if (last_bmsr & PHY_BMSR_LSTATUS) != 0 && (last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0 {
+                    if let Ok(value) = self.mdio_read(self.phy_addr, PHY_BMCR) {
+                        last_bmcr = value;
+                    }
+                    if let Ok(value) = self.mdio_read(self.phy_addr, PHY_ADVERTISE) {
+                        last_adv = value;
+                    }
+                    if let Ok(value) = self.mdio_read(self.phy_addr, PHY_LPA) {
+                        last_lpa = value;
+                    }
+                    if let Ok(value) = self.mdio_read(self.phy_addr, PHY_CTRL1000) {
+                        last_ctrl1000 = value;
+                    }
+                    if let Ok(value) = self.mdio_read(self.phy_addr, PHY_STAT1000) {
+                        last_stat1000 = value;
+                    }
+                    debug_uart_log(format_args!(
+                        "genet: phy link up phy={} link=1 aneg=1 bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
+                        self.phy_addr,
+                        last_bmcr,
+                        last_bmsr,
+                        last_adv,
+                        last_lpa,
+                        last_ctrl1000,
+                        last_stat1000
+                    ));
+                    return Ok(());
+                }
+                next_poll = now.wrapping_add(poll_ticks);
             }
-            if timed_out(deadline) {
+
+            if tick_reached(now, next_log) {
+                if let Ok(value) = self.mdio_read(self.phy_addr, PHY_BMCR) {
+                    last_bmcr = value;
+                }
+                if let Ok(value) = self.mdio_read(self.phy_addr, PHY_ADVERTISE) {
+                    last_adv = value;
+                }
+                if let Ok(value) = self.mdio_read(self.phy_addr, PHY_LPA) {
+                    last_lpa = value;
+                }
+                if let Ok(value) = self.mdio_read(self.phy_addr, PHY_CTRL1000) {
+                    last_ctrl1000 = value;
+                }
+                if let Ok(value) = self.mdio_read(self.phy_addr, PHY_STAT1000) {
+                    last_stat1000 = value;
+                }
+
+                debug_uart_log(format_args!(
+                    "genet: phy wait phy={} link={} aneg={} bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
+                    self.phy_addr,
+                    ((last_bmsr & PHY_BMSR_LSTATUS) != 0) as u8,
+                    ((last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0) as u8,
+                    last_bmcr,
+                    last_bmsr,
+                    last_adv,
+                    last_lpa,
+                    last_ctrl1000,
+                    last_stat1000
+                ));
+                next_log = now.wrapping_add(log_ticks);
+            }
+
+            if tick_reached(now, deadline) {
                 break;
             }
             spin_loop();
         }
 
+        debug_uart_log(format_args!(
+            "genet: phy timeout phy={} link={} aneg={} bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
+            self.phy_addr,
+            ((last_bmsr & PHY_BMSR_LSTATUS) != 0) as u8,
+            ((last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0) as u8,
+            last_bmcr,
+            last_bmsr,
+            last_adv,
+            last_lpa,
+            last_ctrl1000,
+            last_stat1000
+        ));
         Err(Bcm2711GenetError::PhyTimeout)
     }
 
@@ -851,9 +959,17 @@ impl Bcm2711GenetV5 {
 
         // PHY and MAC speed must match or traffic can fail silently. Resolve speed from Clause-22
         // registers when possible, and fall back to 1000 Mbps to preserve previous behavior.
-        let speed = self
-            .resolve_umac_speed_from_phy()
-            .unwrap_or(UMAC_SPEED_1000);
+        let resolved_speed = self.resolve_umac_speed_from_phy();
+        let (speed, source) = match resolved_speed {
+            Some(value) => (value, "clause22"),
+            None => (UMAC_SPEED_1000, "fallback_1000"),
+        };
+        debug_uart_log(format_args!(
+            "genet: umac speed source={} raw={} mbps={}\n",
+            source,
+            speed,
+            umac_speed_mbps(speed)
+        ));
         let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
             .set(UmacCmd::speed, speed)
             .set(UmacCmd::tx_en, 1)
@@ -1048,6 +1164,68 @@ fn ring_index_reached(cons: u16, expect: u16) -> bool {
     delta < 0x8000
 }
 
+struct UartLogBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> UartLogBuf<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(&self.buf[..self.len]).ok()
+    }
+}
+
+impl<const N: usize> fmt::Write for UartLogBuf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let avail = self.buf.len().saturating_sub(self.len);
+        if avail == 0 {
+            return Ok(());
+        }
+        let bytes = s.as_bytes();
+        let copy_len = bytes.len().min(avail);
+        self.buf[self.len..self.len + copy_len].copy_from_slice(&bytes[..copy_len]);
+        self.len += copy_len;
+        Ok(())
+    }
+}
+
+fn debug_uart_log(args: fmt::Arguments<'_>) {
+    let mut line = UartLogBuf::<288>::new();
+    let _ = line.write_fmt(args);
+    if let Some(s) = line.as_str() {
+        print::debug_uart::write(s);
+    }
+}
+
+fn phy_mode_name(mode: PhyMode) -> &'static str {
+    match mode {
+        PhyMode::Rgmii => "rgmii",
+        PhyMode::RgmiiRxid => "rgmii-rxid",
+        PhyMode::RgmiiIdBestEffort => "rgmii-id(best-effort)",
+        PhyMode::RgmiiTxidBestEffort => "rgmii-txid(best-effort)",
+    }
+}
+
+fn umac_speed_mbps(speed: u32) -> u32 {
+    match speed {
+        UMAC_SPEED_10 => 10,
+        UMAC_SPEED_100 => 100,
+        UMAC_SPEED_1000 => 1000,
+        _ => 0,
+    }
+}
+
+fn tick_reached(now: u64, target: u64) -> bool {
+    now.wrapping_sub(target) < (1u64 << 63)
+}
+
 fn read_cntfrq_el0() -> u64 {
     let current_frequency;
     // SAFETY: Accessing CNTFRQ_EL0 requires EL2 in this project, is read-only, and has no side
@@ -1085,7 +1263,7 @@ fn deadline_ticks_from_now(us: u64) -> u64 {
 fn timed_out(deadline: u64) -> bool {
     // Wrap-safe deadline test: once `now` reaches/passes `deadline` in modular u64 space,
     // `(now - deadline)` falls in the forward half-space [0, 2^63).
-    read_cntpct_el0().wrapping_sub(deadline) < (1u64 << 63)
+    tick_reached(read_cntpct_el0(), deadline)
 }
 
 impl EthernetFrameIo for Bcm2711GenetV5 {
