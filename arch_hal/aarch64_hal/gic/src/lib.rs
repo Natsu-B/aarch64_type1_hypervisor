@@ -358,6 +358,9 @@ pub trait GicDistributor {
     /// - re-enabling forwarding for the intended interrupt group(s).
     fn init_distributor(&self) -> Result<(), GicError>;
 
+    /// Return the maximum supported INTID (exclusive upper bound for valid distributor INTIDs).
+    fn max_intid(&self) -> u32;
+
     /// Toggle forwarding of a single SPI only (no attribute changes).
     fn set_spi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError>;
 

@@ -136,10 +136,15 @@ impl Gicv2 {
     }
 
     #[inline]
-    fn max_intid(&self) -> u32 {
+    fn max_intid_inner(&self) -> u32 {
         let typer = self.gicd.typer.read();
         // Maximum interrupts = 32 * (ITLinesNumber + 1), but INTIDs >= 1020 are spurious/reserved.
         (32 * (typer.get(GICD_TYPER::it_lines_number) + 1)).min(1020)
+    }
+
+    #[inline]
+    pub fn max_intid(&self) -> u32 {
+        self.max_intid_inner()
     }
 
     #[inline]

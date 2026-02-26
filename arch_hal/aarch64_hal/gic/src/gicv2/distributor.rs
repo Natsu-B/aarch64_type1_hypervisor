@@ -287,6 +287,10 @@ impl GicDistributor for Gicv2 {
         Ok(())
     }
 
+    fn max_intid(&self) -> u32 {
+        Gicv2::max_intid(self)
+    }
+
     fn set_spi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError> {
         if intid < 32 || intid >= self.max_intid() {
             return Err(GicError::UnsupportedIntId);

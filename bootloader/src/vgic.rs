@@ -124,7 +124,8 @@ pub(crate) fn init(
         }
     }
 
-    for intid in 32..1020 {
+    let max_intid = gic.max_intid();
+    for intid in 32..max_intid {
         if Some(intid) == gdb_uart_intid || guest_uart.irq == Some(intid) {
             continue;
         }
