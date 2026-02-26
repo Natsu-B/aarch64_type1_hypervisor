@@ -3,8 +3,6 @@
 use aarch64_mutex::RawSpinLockIrqSave;
 use core::convert::Infallible;
 use core::hint::spin_loop;
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use core::task::Context;
 use core::task::Poll;
@@ -25,6 +23,7 @@ use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
 pub use gdb_remote::WatchpointKind;
 use io_api::stream::PollByteStream;
+use mutex::pod::RawBytePod;
 
 mod semihost;
 
@@ -1250,10 +1249,10 @@ impl PollByteStream for DebugIoAdapter {
 static DEBUG_STUB: RawSpinLockIrqSave<Option<DebugStubPtr>> = RawSpinLockIrqSave::new(None);
 static DEBUG_STREAM: RawSpinLockIrqSave<Option<DebugStreamPtr>> = RawSpinLockIrqSave::new(None);
 static DEBUG_IO: RawSpinLockIrqSave<Option<DebugIo>> = RawSpinLockIrqSave::new(None);
-static IN_DEBUG_STOP: AtomicBool = AtomicBool::new(false);
-static STOP_REPLY_QUEUED: AtomicU64 = AtomicU64::new(0);
-static STOP_REPLY_OVERFLOW: AtomicU64 = AtomicU64::new(0);
-static STOP_REPLY_SENT: AtomicU64 = AtomicU64::new(0);
+static IN_DEBUG_STOP: RawBytePod<bool> = unsafe { RawBytePod::new_raw_unchecked(false) };
+static STOP_REPLY_QUEUED: RawBytePod<u64> = unsafe { RawBytePod::new_raw_unchecked(0) };
+static STOP_REPLY_OVERFLOW: RawBytePod<u64> = unsafe { RawBytePod::new_raw_unchecked(0) };
+static STOP_REPLY_SENT: RawBytePod<u64> = unsafe { RawBytePod::new_raw_unchecked(0) };
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StopReplyCounters {

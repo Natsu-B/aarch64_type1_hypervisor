@@ -9,3 +9,4 @@ aarch64_mutex = { path = "../aarch64_mutex" }
 cpu = { path = "../cpu" }
 exceptions = { path = "../exceptions" }
 io-api = { path = "../../../io_api" }
+mutex = { path = "../../../mutex" }

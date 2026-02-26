@@ -7,13 +7,13 @@ use core::mem::MaybeUninit;
 use core::mem::offset_of;
 use core::mem::size_of;
 use core::ops::ControlFlow;
-use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
 use dtb::DtbParser;
 use dtb::WalkError;
 use io_api::ethernet::EthernetFrameIo;
 use io_api::ethernet::MacAddr;
+use mutex::pod::RawBytePod;
 use typestate::ReadPure;
 use typestate::ReadWrite;
 use typestate::Readable;
@@ -352,9 +352,9 @@ unsafe impl Send for Bcm2711GenetV5 {}
 unsafe impl Sync for Bcm2711GenetV5 {}
 
 // SAFETY: One NIC instance is expected in the bootloader, so singleton ownership is sufficient.
-static TAKEN: AtomicBool = AtomicBool::new(false);
+static TAKEN: RawBytePod<bool> = unsafe { RawBytePod::new_raw_unchecked(false) };
 // SAFETY: Publishes completion of one-time initialization for `STATE`.
-static READY: AtomicBool = AtomicBool::new(false);
+static READY: RawBytePod<bool> = unsafe { RawBytePod::new_raw_unchecked(false) };
 // SAFETY: The crate enables `sync_unsafe_cell`; this cell stores the singleton driver instance.
 // Access is serialized by the `TAKEN/READY` one-time initialization protocol.
 static STATE: SyncUnsafeCell<MaybeUninit<Bcm2711GenetV5>> =

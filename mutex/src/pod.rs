@@ -38,6 +38,9 @@ where
     _phantom: PhantomData<T>,
 }
 
+/// Alias used by crates that refer to raw atomics as byte-pod backed cells.
+pub type RawBytePod<T> = RawAtomicPod<T>;
+
 unsafe impl<T: AtomicPod> Sync for RawAtomicPod<T> where T::Raw: AtomicRaw + Send {}
 unsafe impl<T: AtomicPod> Send for RawAtomicPod<T> where T::Raw: AtomicRaw + Send {}
 
