@@ -1,3 +1,4 @@
+use core::arch::asm;
 use core::cell::SyncUnsafeCell;
 use core::hint::spin_loop;
 use core::mem::MaybeUninit;
@@ -50,18 +51,34 @@ const DMA_FC_THRESH_HI: u32 = (RX_DESCS as u32) >> 4;
 const DMA_FC_THRESH_LO: u32 = 5;
 const DMA_FC_THRESH_VALUE: u32 = (DMA_FC_THRESH_LO << 16) | DMA_FC_THRESH_HI;
 
-const MDIO_BUSY_TIMEOUT_ITERS: usize = 200_000;
-const PHY_LINK_TIMEOUT_ITERS: usize = 50_000_000;
-const TX_DONE_TIMEOUT_ITERS: usize = 200_000;
+// Real-time deadlines derived from CNTPCT/CNTFRQ keep behavior stable across CPU frequencies.
+const MDIO_BUSY_TIMEOUT_US: u64 = 20_000;
+const PHY_LINK_TIMEOUT_US: u64 = 5_000_000;
+const TX_DONE_TIMEOUT_US: u64 = 2_000;
 
 const PHY_BMCR: u8 = 0;
 const PHY_BMSR: u8 = 1;
+const PHY_ADVERTISE: u8 = 4;
+const PHY_LPA: u8 = 5;
+const PHY_CTRL1000: u8 = 9;
+const PHY_STAT1000: u8 = 10;
 const PHY_BMCR_ANENABLE: u16 = 1 << 12;
 const PHY_BMCR_ANRESTART: u16 = 1 << 9;
+const PHY_BMCR_FULLDPLX: u16 = 1 << 8;
+const PHY_BMCR_SPEED100: u16 = 1 << 13;
+const PHY_BMCR_SPEED1000: u16 = 1 << 6;
 const PHY_BMSR_LSTATUS: u16 = 1 << 2;
 const PHY_BMSR_ANEGCOMPLETE: u16 = 1 << 5;
+const PHY_ADV_10HALF: u16 = 1 << 5;
+const PHY_ADV_10FULL: u16 = 1 << 6;
+const PHY_ADV_100HALF: u16 = 1 << 7;
+const PHY_ADV_100FULL: u16 = 1 << 8;
+const PHY_1000_HALF: u16 = 1 << 8;
+const PHY_1000_FULL: u16 = 1 << 9;
 
 const PORT_MODE_EXT_GPHY: u32 = 3;
+const UMAC_SPEED_10: u32 = 0;
+const UMAC_SPEED_100: u32 = 1;
 const UMAC_SPEED_1000: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,10 +290,13 @@ bitregs! {
     }
 }
 
-#[repr(align(64))]
+// Cache maintenance rounds ranges to the runtime D-cache line size derived from CTR_EL0.
+// Keep DMA backing storage conservatively aligned so clean/invalidate operations do not spill
+// into unrelated memory even on larger cache line configurations.
+#[repr(align(256))]
 struct AlignedTxBuffer([u8; TX_BUF_LENGTH]);
 
-#[repr(align(64))]
+#[repr(align(256))]
 struct AlignedRxStorage([u8; RX_TOTAL_BUFSIZE]);
 
 struct DtbGenetConfig {
@@ -746,15 +766,75 @@ impl Bcm2711GenetV5 {
         let restart = bmcr | PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART;
         self.mdio_write(self.phy_addr, PHY_BMCR, restart)?;
 
-        for _ in 0..PHY_LINK_TIMEOUT_ITERS {
+        // Loop-count timeouts vary with core speed. Use a CNTPCT-based deadline so this wait
+        // remains a real 5-second timeout independent of frequency/optimization changes.
+        let deadline = deadline_ticks_from_now(PHY_LINK_TIMEOUT_US);
+        loop {
             let bmsr = self.mdio_read(self.phy_addr, PHY_BMSR)?;
             if (bmsr & PHY_BMSR_LSTATUS) != 0 && (bmsr & PHY_BMSR_ANEGCOMPLETE) != 0 {
                 return Ok(());
+            }
+            if timed_out(deadline) {
+                break;
             }
             spin_loop();
         }
 
         Err(Bcm2711GenetError::PhyTimeout)
+    }
+
+    fn resolve_umac_speed_from_phy(&self) -> Option<u32> {
+        // Clause-22 provides a mostly-standard way to infer speed. Not all PHYs expose every
+        // detail via these registers, so this is intentionally best-effort.
+        let bmsr = self.mdio_read(self.phy_addr, PHY_BMSR).ok()?;
+        if (bmsr & PHY_BMSR_LSTATUS) == 0 {
+            return None;
+        }
+
+        let bmcr = self.mdio_read(self.phy_addr, PHY_BMCR).ok()?;
+        if (bmcr & PHY_BMCR_ANENABLE) != 0 {
+            if (bmsr & PHY_BMSR_ANEGCOMPLETE) == 0 {
+                return None;
+            }
+
+            // For 1000BASE-T, local advertisement (reg 9) and partner status (reg 10) expose
+            // the common capabilities directly; prefer the highest common mode.
+            let adv1000 = self.mdio_read(self.phy_addr, PHY_CTRL1000).ok()?;
+            let stat1000 = self.mdio_read(self.phy_addr, PHY_STAT1000).ok()?;
+            let common1000 = adv1000 & stat1000;
+            if (common1000 & PHY_1000_FULL) != 0 {
+                return Some(UMAC_SPEED_1000);
+            }
+            if (common1000 & PHY_1000_HALF) != 0 {
+                return Some(UMAC_SPEED_1000);
+            }
+
+            // For 10/100, intersect local advertise and partner ability (regs 4/5).
+            let advertise = self.mdio_read(self.phy_addr, PHY_ADVERTISE).ok()?;
+            let lpa = self.mdio_read(self.phy_addr, PHY_LPA).ok()?;
+            let common = advertise & lpa;
+            if (common & (PHY_ADV_100FULL | PHY_ADV_100HALF)) != 0 {
+                return Some(UMAC_SPEED_100);
+            }
+            if (common & (PHY_ADV_10FULL | PHY_ADV_10HALF)) != 0 {
+                return Some(UMAC_SPEED_10);
+            }
+            return None;
+        }
+
+        // Forced mode path: decode BMCR speed bits. Some PHYs may use vendor extensions for
+        // corner cases; returning None keeps caller fallback behavior intact.
+        let _is_full_duplex = (bmcr & PHY_BMCR_FULLDPLX) != 0;
+        let speed = match (
+            (bmcr & PHY_BMCR_SPEED100) != 0,
+            (bmcr & PHY_BMCR_SPEED1000) != 0,
+        ) {
+            (false, false) => UMAC_SPEED_10,
+            (true, false) => UMAC_SPEED_100,
+            (false, true) => UMAC_SPEED_1000,
+            (true, true) => return None,
+        };
+        Some(speed)
     }
 
     fn adjust_link_and_enable_umac(&self) {
@@ -769,9 +849,11 @@ impl Bcm2711GenetV5 {
         }
         self.regs.ext_rgmii_oob_ctrl.write(oob.bits());
 
-        // Clause-22 speed resolution is PHY-specific; defaulting to 1000 Mbps after successful
-        // autoneg/link to match the RPi4 typical path and keep bring-up deterministic.
-        let speed = UMAC_SPEED_1000;
+        // PHY and MAC speed must match or traffic can fail silently. Resolve speed from Clause-22
+        // registers when possible, and fall back to 1000 Mbps to preserve previous behavior.
+        let speed = self
+            .resolve_umac_speed_from_phy()
+            .unwrap_or(UMAC_SPEED_1000);
         let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
             .set(UmacCmd::speed, speed)
             .set(UmacCmd::tx_en, 1)
@@ -815,9 +897,15 @@ impl Bcm2711GenetV5 {
     }
 
     fn wait_mdio_done(&self) -> Result<(), Bcm2711GenetError> {
-        for _ in 0..MDIO_BUSY_TIMEOUT_ITERS {
+        // Loop-count timeouts are brittle because compiler settings and core frequency change how
+        // long one iteration takes. Deadline-based polling keeps timeout behavior predictable.
+        let deadline = deadline_ticks_from_now(MDIO_BUSY_TIMEOUT_US);
+        loop {
             if MdioCmd::from_bits(self.regs.mdio_cmd.read()).get(MdioCmd::start_busy) == 0 {
                 return Ok(());
+            }
+            if timed_out(deadline) {
+                break;
             }
             spin_loop();
         }
@@ -831,15 +919,15 @@ impl Bcm2711GenetV5 {
 
         self.txbuf.0[..frame.len()].copy_from_slice(frame);
 
-        // We copy user payload into an internal 64-byte aligned TX scratch buffer so cache clean
+        // We copy user payload into an internal cacheline-aligned TX scratch buffer so cache clean
         // operations cannot spill into unrelated caller memory.
         let tx_ptr = self.txbuf.0.as_ptr();
         cpu::clean_dcache_range(tx_ptr, frame.len());
 
-        let prod_index = self.regs.tdma_rings[DEFAULT_Q]
-            .index_b
-            .read()
-            .wrapping_add(1);
+        let cur = self.regs.tdma_rings[DEFAULT_Q].index_b.read();
+        // TDMA producer/consumer indices are effectively 16-bit counters in hardware.
+        // Mask on every increment so we never publish 0x1_0000 at wrap boundaries.
+        let prod_index = (cur.wrapping_add(1)) & 0xffff;
         let desc = &self.regs.tx_desc[self.tx_index as usize];
         let addr = tx_ptr as usize;
 
@@ -858,15 +946,36 @@ impl Bcm2711GenetV5 {
         self.tx_index = (self.tx_index + 1) & 0xff;
         self.regs.tdma_rings[DEFAULT_Q].index_b.write(prod_index);
 
-        let expect = prod_index & 0xffff;
-        for _ in 0..TX_DONE_TIMEOUT_ITERS {
-            if (self.regs.tdma_rings[DEFAULT_Q].index_a.read() & 0xffff) == expect {
+        let expect = (prod_index & 0xffff) as u16;
+        let deadline = deadline_ticks_from_now(TX_DONE_TIMEOUT_US);
+        // Poll completion using a wrap-safe predicate. Equality only works if no wrap/overshoot
+        // happens while we poll; "reached" works both across wrap and when CONS advances further.
+        loop {
+            let cons = (self.regs.tdma_rings[DEFAULT_Q].index_a.read() & 0xffff) as u16;
+            if ring_index_reached(cons, expect) {
                 return Ok(());
+            }
+            if timed_out(deadline) {
+                break;
             }
             spin_loop();
         }
 
+        self.recover_after_tx_timeout();
         Err(Bcm2711GenetError::TxTimeout)
+    }
+
+    fn recover_after_tx_timeout(&mut self) {
+        // Best-effort bounded recovery for a wedged TX path. Keep this path free of long MDIO
+        // waits so callers do not block for PHY autonegotiation durations on every timeout.
+        self.disable_dma_and_flush_tx();
+        self.umac_reset_sequence();
+        self.program_mac_address();
+        self.rx_ring_init();
+        self.rx_descs_init();
+        self.tx_ring_init();
+        self.enable_dma();
+        self.adjust_link_and_enable_umac();
     }
 
     fn rearm_one_rx_buffer(&mut self) {
@@ -902,19 +1011,81 @@ impl Bcm2711GenetV5 {
         cpu::invalidate_dcache_range(addr as *const u8, length);
 
         // RBUF_ALIGN_2B causes hardware to place payload with a 2-byte offset for IP alignment.
-        let payload = length.saturating_sub(RX_BUF_OFFSET);
-        let copy_len = payload.min(out.len());
-        if copy_len > 0 {
-            // SAFETY: Descriptor points into our dedicated RX storage programmed at init.
-            let src = unsafe {
-                core::slice::from_raw_parts((addr + RX_BUF_OFFSET) as *const u8, copy_len)
-            };
-            out[..copy_len].copy_from_slice(src);
+        let payload_len = length.saturating_sub(RX_BUF_OFFSET);
+        if payload_len == 0 {
+            // Empty/malformed descriptor payload: consume and recycle the descriptor so RX keeps
+            // flowing. Returning Some(0) is safe because current callers already drop frame_len=0.
+            self.rearm_one_rx_buffer();
+            return Some(0);
+        }
+        if payload_len > out.len() {
+            // Never return truncated frames. Callers treat Some(n>0) as a complete Ethernet frame,
+            // and partial payloads break higher-layer parsing (e.g. UDP decode). Returning Some(0)
+            // explicitly signals "drop this frame" while still consuming the descriptor, so the RX
+            // ring does not stall behind an oversized packet.
+            self.rearm_one_rx_buffer();
+            return Some(0);
         }
 
+        // SAFETY: Descriptor points into our dedicated RX storage programmed at init.
+        let src = unsafe {
+            core::slice::from_raw_parts((addr + RX_BUF_OFFSET) as *const u8, payload_len)
+        };
+        out[..payload_len].copy_from_slice(src);
+
         self.rearm_one_rx_buffer();
-        Some(copy_len)
+        Some(payload_len)
     }
+}
+
+fn ring_index_reached(cons: u16, expect: u16) -> bool {
+    // Naive `cons >= expect` fails when the 16-bit index wraps:
+    //   expect=0x0000 after wrap, cons=0xffff (still before wrap) would look "greater".
+    // In modular arithmetic, `cons` has reached/passed `expect` when `(cons - expect)` is in the
+    // forward half-space [0, 0x7fff]. This is equivalent to interpreting the delta as signed i16
+    // and checking `>= 0`, but keeps everything in integer arithmetic without casts.
+    let delta = cons.wrapping_sub(expect);
+    delta < 0x8000
+}
+
+fn read_cntfrq_el0() -> u64 {
+    let current_frequency;
+    // SAFETY: Accessing CNTFRQ_EL0 requires EL2 in this project, is read-only, and has no side
+    // effects. No additional ordering is needed for this static frequency value.
+    unsafe {
+        asm!(
+            "mrs {current_frequency}, CNTFRQ_EL0",
+            current_frequency = out(reg) current_frequency
+        );
+    }
+    current_frequency
+}
+
+fn read_cntpct_el0() -> u64 {
+    cpu::isb();
+    let counter;
+    // SAFETY: Reading CNTPCT_EL0 requires EL2 in this project and is side-effect free. The ISB
+    // above provides ordering so the sampled counter value is not speculatively stale.
+    unsafe {
+        asm!("mrs {counter}, CNTPCT_EL0", counter = out(reg) counter);
+    }
+    counter
+}
+
+fn ticks_from_us(us: u64) -> u64 {
+    let freq = read_cntfrq_el0();
+    let ticks = u128::from(us).saturating_mul(u128::from(freq)) / 1_000_000u128;
+    ticks.min(u128::from(u64::MAX)) as u64
+}
+
+fn deadline_ticks_from_now(us: u64) -> u64 {
+    read_cntpct_el0().wrapping_add(ticks_from_us(us))
+}
+
+fn timed_out(deadline: u64) -> bool {
+    // Wrap-safe deadline test: once `now` reaches/passes `deadline` in modular u64 space,
+    // `(now - deadline)` falls in the forward half-space [0, 2^63).
+    read_cntpct_el0().wrapping_sub(deadline) < (1u64 << 63)
 }
 
 impl EthernetFrameIo for Bcm2711GenetV5 {

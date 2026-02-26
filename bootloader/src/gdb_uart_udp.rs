@@ -109,14 +109,18 @@ pub struct StopLoopGuard {
 
 /// Begins a debug stop-loop section for attach/prefetch logic.
 pub fn begin_stop_loop() -> StopLoopGuard {
-    // Best-effort nesting avoidance using only load/store (RawAtomicPod portability).
-    if STOP_LOOP_ACTIVE.load(Ordering::Acquire) {
+    // Enforce nesting avoidance with one CAS RMW so only one core can mark stop-loop active.
+    // RawAtomicPod becomes truly atomic only after `mutex::enable_raw_atomics()` during
+    // single-core bring-up; SMP correctness requires that sequencing before secondaries start.
+    if STOP_LOOP_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return StopLoopGuard {
             restore: false,
             pause_start_ticks: 0,
         };
     }
-    STOP_LOOP_ACTIVE.store(true, Ordering::Release);
     let pause_start_ticks = timer::El2PhysicalTimer::new().now();
 
     if !GDB_UART_READY.load(Ordering::Acquire) {

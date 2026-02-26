@@ -2,6 +2,8 @@ use io_api::ethernet::MacAddr;
 use net::EncodeError;
 use net::ParseError;
 use net::arp::ARP_PAYLOAD_LEN;
+use net::checksum::fold_ones_complement_sum;
+use net::checksum::ones_complement_sum;
 use net::encode_arp_reply;
 use net::encode_udp_ipv4_frame;
 use net::parse_arp_request;
@@ -42,6 +44,28 @@ fn ipv4_checksum_local(header: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+fn udp_ipv4_checksum_local(src_ip: [u8; 4], dst_ip: [u8; 4], udp_datagram: &[u8]) -> u16 {
+    assert!(udp_datagram.len() >= UDP_LEN);
+    let udp_len = usize::from(read_be_u16(udp_datagram, 4));
+    assert!(udp_len >= UDP_LEN);
+    assert!(udp_len <= udp_datagram.len());
+
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&src_ip);
+    pseudo[4..8].copy_from_slice(&dst_ip);
+    pseudo[8] = 0;
+    pseudo[9] = 17;
+    write_be_u16(&mut pseudo, 10, udp_len as u16);
+
+    let mut sum = ones_complement_sum(&pseudo);
+    sum = sum.wrapping_add(ones_complement_sum(&udp_datagram[..6]));
+    sum = sum.wrapping_add(ones_complement_sum(&[0, 0]));
+    sum = sum.wrapping_add(ones_complement_sum(&udp_datagram[8..udp_len]));
+
+    let checksum = !fold_ones_complement_sum(sum);
+    if checksum == 0 { 0xFFFF } else { checksum }
 }
 
 fn ihl_bytes(frame: &[u8]) -> usize {
@@ -304,6 +328,14 @@ fn encode_parse_round_trip_and_checksum() {
     let expected = ipv4_checksum_local(&ip_header);
     let actual = read_be_u16(&frame, ETH_LEN + 10);
     assert_eq!(actual, expected);
+
+    let udp_start = ETH_LEN + IPV4_MIN_LEN;
+    let udp_len = usize::from(read_be_u16(&frame, udp_start + 4));
+    let udp_expected =
+        udp_ipv4_checksum_local(SRC_IP, DST_IP, &frame[udp_start..udp_start + udp_len]);
+    let udp_actual = read_be_u16(&frame, udp_start + 6);
+    assert_eq!(udp_actual, udp_expected);
+    assert_ne!(udp_actual, 0);
 }
 
 #[test]

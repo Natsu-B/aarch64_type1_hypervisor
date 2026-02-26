@@ -108,12 +108,18 @@ pub fn encode_udp_ipv4_frame(
     let _ = eth::encode_ethernet_ii(buf, remote_mac, local_mac, eth::ETHERTYPE_IPV4)?;
 
     let udp_offset = eth::HEADER_LEN + ipv4::HEADER_LEN_NO_OPTIONS;
-    let _ = udp::encode_udp_datagram(
+    let udp_len = udp::encode_udp_datagram(
         &mut buf[udp_offset..frame_len],
         local_port,
         remote_port,
         payload,
     )?;
+    let udp_checksum = udp::compute_ipv4_udp_checksum(
+        local_ip,
+        remote_ip,
+        &buf[udp_offset..udp_offset + udp_len],
+    )?;
+    write_be_u16(buf, udp_offset + 6, udp_checksum);
 
     let _ = ipv4::encode_ipv4_header(
         &mut buf[eth::HEADER_LEN..udp_offset],
