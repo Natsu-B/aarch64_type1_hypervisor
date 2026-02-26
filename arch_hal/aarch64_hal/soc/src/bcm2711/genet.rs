@@ -35,6 +35,7 @@ const ENET_MAX_MTU_SIZE: usize = 1536;
 const RX_BUF_LENGTH: usize = 2048;
 const RX_TOTAL_BUFSIZE: usize = RX_BUF_LENGTH * RX_DESCS;
 const RX_BUF_OFFSET: usize = 2;
+const ETH_FCS_LEN: usize = 4;
 const TX_BUF_LENGTH: usize = 2048;
 
 const DMA_EN: u32 = 1 << 0;
@@ -271,7 +272,9 @@ bitregs! {
         pub tx_en@[0:0],
         pub rx_en@[1:1],
         pub speed@[3:2],
-        reserved@[12:4] [ignore],
+        reserved@[5:4] [ignore],
+        pub crc_fwd@[6:6],
+        reserved@[12:7] [ignore],
         pub sw_reset@[13:13],
         reserved@[14:14] [ignore],
         pub lcl_loop_en@[15:15],
@@ -954,6 +957,8 @@ impl Bcm2711GenetV5 {
 
         if matches!(self.phy_mode, PhyMode::Rgmii | PhyMode::RgmiiRxid) {
             oob = oob.set(ExtRgmiiOobCtrl::id_mode_dis, 1);
+        } else {
+            oob = oob.set(ExtRgmiiOobCtrl::id_mode_dis, 0);
         }
         self.regs.ext_rgmii_oob_ctrl.write(oob.bits());
 
@@ -972,6 +977,7 @@ impl Bcm2711GenetV5 {
         ));
         let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
             .set(UmacCmd::speed, speed)
+            .set(UmacCmd::crc_fwd, 0)
             .set(UmacCmd::tx_en, 1)
             .set(UmacCmd::rx_en, 1)
             .bits();
@@ -1059,6 +1065,13 @@ impl Bcm2711GenetV5 {
         desc.addr_hi.write((addr >> 32) as u32);
         desc.length_status.write(len_stat);
 
+        // SAFETY: `dmb oshst` orders the descriptor MMIO stores above before the TDMA producer
+        // index doorbell store below, so the device cannot observe a new producer value before
+        // descriptor contents are visible on the interconnect.
+        unsafe {
+            asm!("dmb oshst", options(nostack, preserves_flags));
+        }
+
         self.tx_index = (self.tx_index + 1) & 0xff;
         self.regs.tdma_rings[DEFAULT_Q].index_b.write(prod_index);
 
@@ -1122,12 +1135,12 @@ impl Bcm2711GenetV5 {
 
         let addr = ((desc.addr_hi.read() as usize) << 32) | (desc.addr_lo.read() as usize);
 
-        // RX buffers are fixed-size, dedicated, and aligned chunks inside `RXBUF`. We invalidate
-        // only lines covered by this DMA buffer so we do not discard unrelated dirty cache state.
-        cpu::invalidate_dcache_range(addr as *const u8, length);
+        // RX buffers are fixed-size, dedicated slots inside `RXBUF`. Invalidate the entire slot
+        // before reading so stale cache lines from previous, longer packets cannot leak in.
+        cpu::invalidate_dcache_range(addr as *const u8, RX_BUF_LENGTH);
 
         // RBUF_ALIGN_2B causes hardware to place payload with a 2-byte offset for IP alignment.
-        let payload_len = length.saturating_sub(RX_BUF_OFFSET);
+        let payload_len = length.saturating_sub(RX_BUF_OFFSET + ETH_FCS_LEN);
         if payload_len == 0 {
             // Empty/malformed descriptor payload: consume and recycle the descriptor so RX keeps
             // flowing. Returning Some(0) is safe because current callers already drop frame_len=0.
