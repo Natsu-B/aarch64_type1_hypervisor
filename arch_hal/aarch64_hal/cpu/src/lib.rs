@@ -89,6 +89,8 @@ pub struct Registers {
     pub x29: u64,
     pub x30: u64,
     pub x31: u64,
+    pub elr_el2: u64,
+    pub spsr_el2: u64,
 }
 
 impl Registers {
@@ -114,8 +116,8 @@ impl Registers {
     /// Returns a mutable view of the 32 general-purpose registers (x0..x31).
     #[inline]
     pub fn gprs_mut(&mut self) -> &mut [u64; 32] {
-        // SAFETY: Registers is #[repr(C)] with 32 consecutive u64 fields,
-        // so it is layout-compatible with [u64; 32].
+        // SAFETY: Registers is #[repr(C)] and its first 32 u64 fields are
+        // x0..x31. Additional fields may follow after those 32 entries.
         unsafe { &mut *(self as *mut _ as *mut [u64; 32]) }
     }
 

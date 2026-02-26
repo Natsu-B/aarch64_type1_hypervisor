@@ -41,7 +41,7 @@ pub use memory_hook::SplitPolicy;
 global_asm!(
 r#"
     .macro SAVE_CALL_RESTORE
-    sub sp,   sp, #(8 * 32)
+    sub sp,   sp, #(17 * 16)
     stp x30, xzr, [sp, #( 15 * 16)]
     stp x28, x29, [sp, #( 14 * 16)]
     stp x26, x27, [sp, #( 13 * 16)]
@@ -191,8 +191,18 @@ synchronous_handler = sym synchronous_handler,
 fn exit_exception() {
     naked_asm!(
         r#"
-    mov  x0, sp
+    mov  x19, sp
+    bl   {has_post_handler}
+    cbz  x0, 1f
+    mrs  x10, elr_el2
+    mrs  x11, spsr_el2
+    stp  x10, x11, [x19, #(16 * 16)]
+    mov  x0, x19
     bl   {post_handler}
+    ldp  x10, x11, [x19, #(16 * 16)]
+    msr  elr_el2, x10
+    msr  spsr_el2, x11
+1:
     ldp x30, xzr, [sp, #( 15 * 16)]
     ldp x28, x29, [sp, #( 14 * 16)]
     ldp x26, x27, [sp, #( 13 * 16)]
@@ -209,9 +219,10 @@ fn exit_exception() {
     ldp  x4,  x5, [sp, #(  2 * 16)]
     ldp  x2,  x3, [sp, #(  1 * 16)]
     ldp  x0,  x1, [sp, #(  0 * 16)]
-    add  sp,  sp, #(8 * 32)
+    add  sp,  sp, #(17 * 16)
     eret
         "#,
+        has_post_handler = sym post_handler::has_post_handler,
         post_handler = sym post_handler::post_handler,
     );
 }

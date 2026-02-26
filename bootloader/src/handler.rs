@@ -294,7 +294,7 @@ fn data_abort_handler(
         InstructionRegisterSize::Instruction64bit => 64,
     };
     let esr = cpu::get_esr_el2();
-    let elr = cpu::get_elr_el2();
+    let elr = regs.elr_el2;
     let log_now = should_log_unmapped_abort();
     if !addr_is_ipa && log_now {
         println!(
@@ -328,7 +328,7 @@ fn data_abort_handler(
                     .expect("vbar write emulation failed");
             }
         }
-        cpu::set_elr_el2(elr + 4);
+        regs.elr_el2 = elr.wrapping_add(4);
         return;
     }
 
@@ -362,7 +362,7 @@ fn data_abort_handler(
                 }
             }
         }
-        cpu::set_elr_el2(elr + 4);
+        regs.elr_el2 = elr.wrapping_add(4);
         return;
     }
 
@@ -453,7 +453,7 @@ fn data_abort_handler(
                 }
             }
         }
-        cpu::set_elr_el2(elr + 4);
+        regs.elr_el2 = elr.wrapping_add(4);
         return;
     }
 
@@ -605,7 +605,7 @@ fn data_abort_handler(
             };
             *register = 0;
         }
-        cpu::set_elr_el2(next_elr);
+        regs.elr_el2 = next_elr;
     }
 }
 
@@ -725,11 +725,11 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     }
 }
 
-fn trapped_wf_handler(_regs: &mut cpu::Registers, info: &TrappedWfInfo) {
+fn trapped_wf_handler(regs: &mut cpu::Registers, info: &TrappedWfInfo) {
     gdb_uart::poll_rx();
     softirq::pend(softirq::EV_GDB_ATTACH_CHECK);
 
-    cpu::set_elr_el2(cpu::get_elr_el2().wrapping_add(4));
+    regs.elr_el2 = regs.elr_el2.wrapping_add(4);
 
     match info.ti {
         TI::WFE | TI::WFET => {
