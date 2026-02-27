@@ -15,11 +15,14 @@
 #![recursion_limit = "256"]
 
 extern crate alloc;
+
+#[cfg(all(feature = "rpi4_net", feature = "virtio_net"))]
+compile_error!("rpi4_net and virtio_net cannot be enabled together");
 mod debug;
 mod gdb_stream;
-#[cfg(not(feature = "rpi4_net"))]
+#[cfg(not(any(feature = "rpi4_net", feature = "virtio_net")))]
 mod gdb_uart;
-#[cfg(feature = "rpi4_net")]
+#[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
 #[path = "gdb_uart_udp.rs"]
 mod gdb_uart;
 mod build_info {
@@ -32,7 +35,7 @@ mod handler;
 mod irq_decode;
 mod irq_monitor;
 mod monitor;
-#[cfg(feature = "rpi4_net")]
+#[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
 mod net;
 mod softirq;
 mod stack_overflow;
@@ -71,13 +74,25 @@ use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
 #[cfg(feature = "rpi4_net")]
 use arch_hal::soc::bcm2711::genet::Bcm2711GenetV5;
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 use arch_hal::soc::bcm2711::gpio::Bcm2711Gpio;
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 use arch_hal::soc::bcm2711::gpio::Bcm2711GpioError;
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 use arch_hal::soc::bcm2711::gpio::Pull;
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 use arch_hal::soc::bcm2711::gpio::gpio_mmio_from_dtb;
 use arch_hal::timer;
 use arch_hal::timer::SystemTimer;
@@ -137,7 +152,10 @@ static GUEST_MMIO_ALLOWLIST: SyncUnsafeCell<Option<Box<[GuestMmioRange]>>> =
 const PL011_UART_ADDR: usize = 0x900_0000;
 #[cfg(feature = "rpi4")]
 const PL011_UART_ADDR: usize = 0xFE20_1000;
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 const GDB_UART_ADDR: usize = 0xFE20_1400;
 const UART_CLOCK_HZ: u64 = 48 * 1_000_000;
 const UART_BAUD: u32 = 115_200;
@@ -237,7 +255,7 @@ fn log_selected_uart(role: &str, candidate: Pl011Candidate) {
     }
 }
 
-#[cfg(feature = "rpi4_net")]
+#[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
 fn sync_pending_async_serror() {
     cpu::dsb_sy();
     cpu::isb();
@@ -369,13 +387,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             })
             .unwrap();
         let best = best.unwrap_or_else(|| panic!("uart selection: no arm,pl011 nodes found"));
-        #[cfg(feature = "rpi4_net")]
+        #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
         let _ = second;
-        #[cfg(not(feature = "rpi4_net"))]
+        #[cfg(not(any(feature = "rpi4_net", feature = "virtio_net")))]
         let gdb_candidate = Some(second.unwrap_or_else(|| {
             panic!("uart selection: need at least two distinct arm,pl011 nodes")
         }));
-        #[cfg(feature = "rpi4_net")]
+        #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
         let gdb_candidate: Option<Pl011Candidate> = None;
         // SAFETY: early boot UART globals are initialized once on the BSP before secondary cores/interrupts.
         unsafe {
@@ -385,7 +403,10 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         }
         let guest_uart = unsafe { (*GUEST_UART.get()).expect("guest uart is not initialized") };
         let gdb_uart = unsafe { *GDB_UART.get() };
-        #[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+        #[cfg(all(
+            feature = "rpi4",
+            not(any(feature = "rpi4_net", feature = "virtio_net"))
+        ))]
         {
             let gdb_uart = gdb_uart.expect("gdb uart is not initialized");
             assert_eq!(
@@ -397,7 +418,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                 "selected gdb UART does not match expected PL011 address"
             );
         }
-        #[cfg(all(feature = "rpi4", feature = "rpi4_net"))]
+        #[cfg(all(feature = "rpi4", any(feature = "rpi4_net", feature = "virtio_net")))]
         {
             assert_eq!(
                 guest_uart.base, PL011_UART_ADDR,
@@ -420,7 +441,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         #[cfg(all(
             feature = "rpi4",
             feature = "rpi4_genet_loopback_selftest",
-            not(feature = "rpi4_net")
+            not(any(feature = "rpi4_net", feature = "virtio_net"))
         ))]
         {
             genet_selftest::run_from_dtb(&dtb);
@@ -436,7 +457,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             panic!("tls init failed");
         }
 
-        #[cfg(not(feature = "rpi4_net"))]
+        #[cfg(not(any(feature = "rpi4_net", feature = "virtio_net")))]
         {
             let gdb_uart = gdb_uart.expect("gdb uart is not initialized");
             // enable gdb_uart gpio
@@ -529,20 +550,35 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, gdb_uart.as_ref(), &gic_info);
         dump_guest_mmio_allowlist();
 
-        #[cfg(feature = "rpi4_net")]
+        #[cfg(feature = "virtio_net")]
+        {
+            let vnet = net::virtio::init_from_dtb(&dtb);
+            let eth = vnet as &'static mut dyn io_api::ethernet::EthernetFrameIo;
+            net::udp_uart::init(eth, net::config::LOCAL_IP);
+            arch_hal::set_mirror(Some(arch_hal::MirrorOps {
+                write: net::udp_uart::debug_write_str,
+                flush: net::udp_uart::debug_flush,
+            }));
+            gdb_uart::init(0, UART_CLOCK_HZ, UART_BAUD);
+        }
+
+        #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
         {
             net::udp_uart::pause();
             arch_hal::set_mirror(None);
-            assert!(
-                !genet_ptr.is_null(),
-                "rpi4_net: genet pointer must be initialized before quiesce"
-            );
-            // SAFETY: IRQs are still disabled at this point in boot flow, and UDP UART traffic
-            // has been paused immediately above, so there is no concurrent access to `genet_ptr`.
-            unsafe {
-                (&mut *genet_ptr)
-                    .quiesce_for_paging()
-                    .expect("genet quiesce failed");
+            #[cfg(feature = "rpi4_net")]
+            {
+                assert!(
+                    !genet_ptr.is_null(),
+                    "rpi4_net: genet pointer must be initialized before quiesce"
+                );
+                // SAFETY: IRQs are still disabled at this point in boot flow, and UDP UART traffic
+                // has been paused immediately above, so there is no concurrent access to `genet_ptr`.
+                unsafe {
+                    (&mut *genet_ptr)
+                        .quiesce_for_paging()
+                        .expect("genet quiesce failed");
+                }
             }
             sync_pending_async_serror();
         }
@@ -551,7 +587,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         let stage1_settings = build_stage1_el2_map();
         EL2Stage1Paging::init_stage1paging(&stage1_settings)
             .expect("EL2 Stage-1 paging initialization failed");
-        #[cfg(feature = "rpi4_net")]
+        #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
         {
             sync_pending_async_serror();
         }
@@ -665,16 +701,19 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         println!("init stage2 paging...\npaging_data: {:?}", paging_data);
         Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
         Stage2Paging::enable_stage2_translation(true, true);
-        #[cfg(feature = "rpi4_net")]
+        #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
         {
-            assert!(
-                !genet_ptr.is_null(),
-                "rpi4_net: genet pointer must be initialized before resume"
-            );
-            // SAFETY: IRQs are enabled later in boot flow; UDP UART stays paused until the
-            // hardware resume below completes, so dereferencing `genet_ptr` is not concurrent.
-            unsafe {
-                (&mut *genet_ptr).resume_after_paging();
+            #[cfg(feature = "rpi4_net")]
+            {
+                assert!(
+                    !genet_ptr.is_null(),
+                    "rpi4_net: genet pointer must be initialized before resume"
+                );
+                // SAFETY: IRQs are enabled later in boot flow; UDP UART stays paused until the
+                // hardware resume below completes, so dereferencing `genet_ptr` is not concurrent.
+                unsafe {
+                    (&mut *genet_ptr).resume_after_paging();
+                }
             }
             net::udp_uart::resume();
             arch_hal::set_mirror(Some(arch_hal::MirrorOps {
@@ -2393,14 +2432,20 @@ fn decode_cstr(bytes: &[u8]) -> Option<&str> {
     core::str::from_utf8(&bytes[..end]).ok()
 }
 
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnableUart2GpioError {
     ResolveMmio(Bcm2711GpioError),
     ConfigurePins(Bcm2711GpioError),
 }
 
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 fn enable_uart2_gpio(dtb: &DtbParser) {
     match try_enable_uart2_gpio(dtb) {
         Ok(()) => {}
@@ -2411,7 +2456,10 @@ fn enable_uart2_gpio(dtb: &DtbParser) {
     }
 }
 
-#[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
+#[cfg(all(
+    feature = "rpi4",
+    not(any(feature = "rpi4_net", feature = "virtio_net"))
+))]
 fn try_enable_uart2_gpio(dtb: &DtbParser) -> Result<(), EnableUart2GpioError> {
     let mmio = gpio_mmio_from_dtb(dtb).map_err(EnableUart2GpioError::ResolveMmio)?;
     // SAFETY: `mmio.base` comes from the DTB GPIO `reg` property for this board,

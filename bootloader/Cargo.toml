@@ -7,6 +7,7 @@ edition = "2024"
 default = []
 rpi4 = []
 rpi4_net = ["rpi4", "dep:net-proto", "rpi4_genet_loopback_selftest"]
+virtio_net = ["dep:virtio", "dep:net-proto"]
 rpi4_genet_loopback_selftest = ["rpi4"]
 
 [dependencies]
@@ -20,6 +21,7 @@ gdb_remote = { path = "../gdb_remote" }
 mutex = { path = "../mutex" }
 io-api = { path = "../io_api" }
 net-proto = { path = "../net", package = "net", optional = true }
+virtio = { path = "../virtio", optional = true }
 
 [dev-dependencies]
 aarch64_unit_test = { path = "../arch_hal/aarch64_hal/aarch64_unit_test" }

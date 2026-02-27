@@ -12,6 +12,7 @@ ROOTFS_IMG="$BIN/DISK0"
 
 SIZE_MB=2048
 GDB_PORT=${GDB_PORT:-3333}
+RUN_NET=${RUN_NET:-0}
 
 mkdir -p "$BIN" "$MNT1" "$MNT2"
 
@@ -46,14 +47,28 @@ sudo dd if="$ROOTFS_IMG" of="${LOOP}p2" bs=4M conv=fsync
 sudo umount "$MNT1"
 sudo losetup -d "$LOOP"
 
-qemu-system-aarch64 \
-  -M virt,gic-version=2,secure=off,virtualization=on \
-  -global virtio-mmio.force-legacy=off \
-  -bios "$BIN/u-boot.bin" -cpu max -m 4G \
-  -nographic \
-  -serial mon:stdio \
-  -chardev socket,id=gdbserial,port=${GDB_PORT},host=127.0.0.1,server=on,wait=off \
-  -serial chardev:gdbserial \
-  -device virtio-blk-device,drive=disk \
-  -drive file="$DISK_IMG",format=raw,if=none,media=disk,id=disk \
-  -gdb tcp::1234 #-S
+if [ "$RUN_NET" = "1" ]; then
+  qemu-system-aarch64 \
+    -M virt,gic-version=2,secure=off,virtualization=on \
+    -global virtio-mmio.force-legacy=off \
+    -bios "$BIN/u-boot.bin" -cpu max -m 4G \
+    -nographic \
+    -serial mon:stdio \
+    -netdev user,id=net0,hostfwd=udp::40000-:10000,hostfwd=udp::40010-:10001 \
+    -device virtio-net-device,netdev=net0 \
+    -device virtio-blk-device,drive=disk \
+    -drive file="$DISK_IMG",format=raw,if=none,media=disk,id=disk \
+    -gdb tcp::1234 #-S
+else
+  qemu-system-aarch64 \
+    -M virt,gic-version=2,secure=off,virtualization=on \
+    -global virtio-mmio.force-legacy=off \
+    -bios "$BIN/u-boot.bin" -cpu max -m 4G \
+    -nographic \
+    -serial mon:stdio \
+    -chardev socket,id=gdbserial,port=${GDB_PORT},host=127.0.0.1,server=on,wait=off \
+    -serial chardev:gdbserial \
+    -device virtio-blk-device,drive=disk \
+    -drive file="$DISK_IMG",format=raw,if=none,media=disk,id=disk \
+    -gdb tcp::1234 #-S
+fi

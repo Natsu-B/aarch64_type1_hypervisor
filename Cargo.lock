@@ -136,6 +136,7 @@ dependencies = [
  "mutex",
  "net",
  "typestate",
+ "virtio",
 ]
 
 [[package]]

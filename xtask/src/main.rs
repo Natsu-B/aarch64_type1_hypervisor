@@ -6,11 +6,18 @@ use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::io::{self};
+use std::net::Shutdown;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::net::UdpSocket;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -51,8 +58,8 @@ fn print_xtask_usage() {
     println!("Usage: cargo xtask <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build [rpi5|rpi4|example] [args...]");
-    println!("  run [rpi4|rpi5] [args...]");
+    println!("  build [rpi5|rpi4|rpi4_net|example] [args...]");
+    println!("  run [rpi4|rpi5|net] [args...]");
     println!("  test [xtest args...]");
     println!();
     println!("Options:");
@@ -356,6 +363,14 @@ fn build_rpi4_net(args: &[String]) -> Result<String, String> {
     build_bootloader(&combined_args)
 }
 
+fn build_virtio_net(args: &[String]) -> Result<String, String> {
+    let mut combined_args = Vec::with_capacity(args.len() + 2);
+    combined_args.push("--features".to_string());
+    combined_args.push("virtio_net".to_string());
+    combined_args.extend_from_slice(args);
+    build_bootloader(&combined_args)
+}
+
 fn build_rpi5(args: &[String]) -> Result<String, String> {
     let pkg = "rpi_boot";
     eprintln!("\n--- Building rpi5 package: {} ---", pkg);
@@ -398,6 +413,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("rpi5") => run_rpi5(&args[1..]),
         Some("rpi4") => run_rpi4(&args[1..]),
+        Some("net") => run_net(&args[1..]),
         _ => {
             run_default(args);
         }
@@ -427,6 +443,235 @@ fn run_rpi4(args: &[String]) -> ! {
         .args(args)
         .exec();
     panic!("Failed to exec ./run_rpi4.sh: {}", err);
+}
+
+const TCP_LISTEN: &str = "127.0.0.1:3333";
+const QEMU_FWD_GDB_UDP_DST: &str = "127.0.0.1:40000";
+const QEMU_FWD_DBG_UDP_DST: &str = "127.0.0.1:40010";
+const PROXY_GDB_UDP_SRC_BIND: &str = "127.0.0.1:40001";
+const PROXY_DBG_UDP_SRC_BIND: &str = "127.0.0.1:40011";
+
+fn run_single_gdb_bridge(
+    tcp_stream: TcpStream,
+    udp_gdb: UdpSocket,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    tcp_stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| format!("Failed to set TCP read timeout: {}", e))?;
+    udp_gdb
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| format!("Failed to set UDP read timeout: {}", e))?;
+
+    let mut tcp_reader = tcp_stream
+        .try_clone()
+        .map_err(|e| format!("Failed to clone TCP stream: {}", e))?;
+    let mut tcp_writer = tcp_stream;
+    let udp_tx = udp_gdb
+        .try_clone()
+        .map_err(|e| format!("Failed to clone UDP socket: {}", e))?;
+    let udp_rx = udp_gdb;
+
+    let stop_tx = stop.clone();
+    let tcp_to_udp = thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            if stop_tx.load(Ordering::Acquire) {
+                break;
+            }
+            match tcp_reader.read(&mut buf) {
+                Ok(0) => {
+                    stop_tx.store(true, Ordering::Release);
+                    break;
+                }
+                Ok(n) => {
+                    if udp_tx.send(&buf[..n]).is_err() {
+                        stop_tx.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => {
+                    stop_tx.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    });
+
+    let stop_rx = stop.clone();
+    let udp_to_tcp = thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        loop {
+            if stop_rx.load(Ordering::Acquire) {
+                break;
+            }
+            match udp_rx.recv(&mut buf) {
+                Ok(0) => continue,
+                Ok(n) => {
+                    if tcp_writer.write_all(&buf[..n]).is_err() {
+                        stop_rx.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => {
+                    stop_rx.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+        let _ = tcp_writer.shutdown(Shutdown::Both);
+    });
+
+    if tcp_to_udp.join().is_err() {
+        stop.store(true, Ordering::Release);
+        return Err("GDB proxy TCP->UDP thread panicked".to_string());
+    }
+    if udp_to_tcp.join().is_err() {
+        stop.store(true, Ordering::Release);
+        return Err("GDB proxy UDP->TCP thread panicked".to_string());
+    }
+    Ok(())
+}
+
+fn run_net(args: &[String]) -> Result<(), String> {
+    let binary_path = build_virtio_net(args)?;
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let udp_gdb = UdpSocket::bind(PROXY_GDB_UDP_SRC_BIND).map_err(|e| {
+        format!(
+            "Failed to bind GDB UDP proxy socket {}: {}",
+            PROXY_GDB_UDP_SRC_BIND, e
+        )
+    })?;
+    udp_gdb
+        .connect(QEMU_FWD_GDB_UDP_DST)
+        .map_err(|e| format!("Failed to connect GDB UDP proxy socket: {}", e))?;
+
+    let udp_dbg = UdpSocket::bind(PROXY_DBG_UDP_SRC_BIND).map_err(|e| {
+        format!(
+            "Failed to bind debug UDP proxy socket {}: {}",
+            PROXY_DBG_UDP_SRC_BIND, e
+        )
+    })?;
+    udp_dbg
+        .connect(QEMU_FWD_DBG_UDP_DST)
+        .map_err(|e| format!("Failed to connect debug UDP proxy socket: {}", e))?;
+    udp_dbg
+        .send(b"prime")
+        .map_err(|e| format!("Failed to send debug priming datagram: {}", e))?;
+
+    let debug_socket = udp_dbg
+        .try_clone()
+        .map_err(|e| format!("Failed to clone debug UDP socket: {}", e))?;
+    debug_socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| format!("Failed to set debug UDP read timeout: {}", e))?;
+    let debug_stop = stop.clone();
+    let debug_handle = thread::spawn(move || {
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        let mut buf = [0u8; 2048];
+        while !debug_stop.load(Ordering::Acquire) {
+            match debug_socket.recv(&mut buf) {
+                Ok(0) => continue,
+                Ok(n) => {
+                    let _ = stderr.write_all(&buf[..n]);
+                    let _ = stderr.flush();
+                }
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let listener = TcpListener::bind(TCP_LISTEN)
+        .map_err(|e| format!("Failed to bind GDB TCP listener {}: {}", TCP_LISTEN, e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to configure GDB TCP listener: {}", e))?;
+    eprintln!("xrun net: GDB proxy listening on {}", TCP_LISTEN);
+
+    let accept_stop = stop.clone();
+    let accept_handle = thread::spawn(move || -> Result<(), String> {
+        while !accept_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    return run_single_gdb_bridge(stream, udp_gdb, accept_stop.clone());
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => return Err(format!("Failed to accept GDB TCP client: {}", err)),
+            }
+        }
+        Ok(())
+    });
+
+    let mut qemu = match Command::new("./run.sh")
+        .arg(&binary_path)
+        .args(args)
+        .env("RUN_NET", "1")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect(TCP_LISTEN);
+            let _ = accept_handle.join();
+            let _ = debug_handle.join();
+            return Err(format!("Failed to spawn ./run.sh: {}", err));
+        }
+    };
+
+    let status = match qemu.wait() {
+        Ok(status) => status,
+        Err(err) => {
+            stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect(TCP_LISTEN);
+            let _ = accept_handle.join();
+            let _ = debug_handle.join();
+            return Err(format!("Failed to wait for ./run.sh: {}", err));
+        }
+    };
+
+    stop.store(true, Ordering::Release);
+    let _ = TcpStream::connect(TCP_LISTEN);
+
+    let accept_result = match accept_handle.join() {
+        Ok(result) => result,
+        Err(_) => Err("GDB proxy accept thread panicked".to_string()),
+    };
+    let debug_result = debug_handle.join();
+
+    if debug_result.is_err() {
+        return Err("Debug UDP mirror thread panicked".to_string());
+    }
+    accept_result?;
+
+    if !status.success() {
+        return Err(format!("./run.sh exited with status {}", status));
+    }
+    Ok(())
 }
 
 fn run_rpi5(args: &[String]) -> Result<(), String> {
