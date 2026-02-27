@@ -2,6 +2,7 @@ use core::alloc::Layout;
 use core::slice;
 
 use cpu::get_sctlr_el2;
+use cpu::isb;
 
 use crate::PAGE_TABLE_SIZE;
 use crate::PagingErr;
@@ -125,7 +126,7 @@ impl EL2Stage1Paging {
         cpu::set_ttbr0_el2(table as u64);
 
         cpu::isb();
-        cpu::dsb_ish();
+        cpu::dsb_sy();
 
         let sctlr_el2 = SCTLR_EL2::from_bits(get_sctlr_el2())
             .set(SCTLR_EL2::m, 0b1)
@@ -135,6 +136,7 @@ impl EL2Stage1Paging {
 
         cpu::set_sctlr_el2(sctlr_el2);
         cpu::flush_tlb_el2();
+        cpu::isb();
         Ok(())
     }
 

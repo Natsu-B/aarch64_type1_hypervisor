@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use cpu::isb;
 use core::alloc::Layout;
 use core::cell::SyncUnsafeCell;
 use core::mem;
@@ -390,6 +391,7 @@ impl Stage2Paging {
             hcr = hcr.set(HCR_EL2::twi, 0b1).set(HCR_EL2::twe, 0b1);
         }
         cpu::set_hcr_el2(hcr.bits());
+        cpu::isb();
     }
 
     /// Translate a guest IPA to a physical address using the installed Stage-2 tables.
