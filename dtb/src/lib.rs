@@ -399,6 +399,81 @@ mod tests {
     }
 
     #[test]
+    fn node_view_dma_ranges_bcm2711_genet_context_walk() {
+        let out_dir = env!("OUT_DIR");
+        let mut path = PathBuf::from(out_dir);
+        path.push("node_view_dma_ranges_bcm2711_soc.dtb");
+        assert!(
+            path.exists(),
+            "{} not found. dtc is required to build DTS fixtures.",
+            path.display()
+        );
+
+        let test_data = std::fs::read(&path).expect("failed to load generated dtb file");
+        let aligned = align_dtb(&test_data);
+        let test_data_addr = aligned.as_ptr() as usize;
+        let parser = DtbParser::init(test_data_addr).unwrap();
+
+        let mut found_genet = false;
+        let mut found_dma_ranges = false;
+
+        let result = parser.for_each_node_view(&mut |node| {
+            if !node
+                .compatible_contains("brcm,bcm2711-genet-v5")
+                .map_err(WalkError::Dtb)?
+            {
+                return Ok(ControlFlow::Continue(()));
+            }
+
+            found_genet = true;
+
+            let mut current = Some(node);
+            while let Some(scan_node) = current {
+                let dma_ranges = scan_node
+                    .property_bytes("dma-ranges")
+                    .map_err(WalkError::Dtb)?;
+                let Some(raw_dma_ranges) = dma_ranges else {
+                    current = scan_node.parent_view().map_err(WalkError::Dtb)?;
+                    continue;
+                };
+
+                assert!(
+                    !raw_dma_ranges.is_empty(),
+                    "bcm2711 fixture expects non-empty dma-ranges"
+                );
+
+                let mut iter = scan_node
+                    .dma_ranges_iter()
+                    .map_err(WalkError::Dtb)?
+                    .ok_or(WalkError::Dtb("dma-ranges: iterator missing"))?;
+                let first = iter
+                    .next()
+                    .ok_or(WalkError::Dtb("dma-ranges: expected an entry"))?
+                    .map_err(WalkError::Dtb)?;
+                assert_eq!(first.child_base, 0xC0000000);
+                assert_eq!(first.parent_base, 0x00000000);
+                assert_eq!(first.len, 0x40000000);
+
+                match iter.next() {
+                    None => {}
+                    Some(Ok(_)) => return Err(WalkError::Dtb("dma-ranges: expected single entry")),
+                    Some(Err(err)) => return Err(WalkError::Dtb(err)),
+                }
+
+                found_dma_ranges = true;
+                return Ok(ControlFlow::Break(()));
+            }
+
+            Err(WalkError::Dtb(
+                "dma-ranges: missing from genet node ancestry",
+            ))
+        });
+        assert_walk_ok(result);
+        assert!(found_genet);
+        assert!(found_dma_ranges);
+    }
+
+    #[test]
     fn ranges_pci_3cells_translation_works() {
         let out_dir = env::var_os("OUT_DIR").unwrap();
         let mut path = PathBuf::from(out_dir);

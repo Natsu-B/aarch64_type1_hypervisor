@@ -90,6 +90,9 @@ const PORT_MODE_EXT_GPHY: u32 = 3;
 const UMAC_SPEED_10: u32 = 0;
 const UMAC_SPEED_100: u32 = 1;
 const UMAC_SPEED_1000: u32 = 2;
+const BCM2711_DMA_FALLBACK_CPU_BASE: usize = 0x0000_0000;
+const BCM2711_DMA_FALLBACK_DMA_BASE: usize = 0xC000_0000;
+const BCM2711_DMA_FALLBACK_LEN: usize = 0x4000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bcm2711GenetError {
@@ -333,6 +336,22 @@ impl DmaWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmaMappingSource {
+    DtbRanges { node_name: &'static str },
+    DtbRangesEmptyIdentity { node_name: &'static str },
+    FallbackBcm2711,
+}
+
+enum DmaRangesScanResult {
+    NotFound,
+    Found {
+        windows: [DmaWindow; MAX_DMA_WINDOWS],
+        count: usize,
+        source: DmaMappingSource,
+    },
+}
+
 struct DtbGenetConfig {
     mmio_base: usize,
     mmio_size: usize,
@@ -343,6 +362,7 @@ struct DtbGenetConfig {
     interrupt_count: usize,
     dma_windows: [DmaWindow; MAX_DMA_WINDOWS],
     dma_window_count: usize,
+    dma_mapping_source: DmaMappingSource,
 }
 
 /// BCM2711 GENETv5 backend implementing frame-level Ethernet I/O.
@@ -365,6 +385,7 @@ struct DtbGenetConfig {
 /// - RX payload storage itself is in normal RAM (`RXBUF`) and must be cache-maintained.
 pub struct Bcm2711GenetV5 {
     regs: &'static Registers,
+    mmio_base: usize,
     mac_addr: MacAddr,
     phy_mode: PhyMode,
     phy_addr: u8,
@@ -373,6 +394,7 @@ pub struct Bcm2711GenetV5 {
     interrupt_count: usize,
     dma_windows: [DmaWindow; MAX_DMA_WINDOWS],
     dma_window_count: usize,
+    dma_mapping_source: DmaMappingSource,
     tx_index: u16,
     rx_index: u16,
     c_index: u16,
@@ -442,6 +464,7 @@ impl Bcm2711GenetV5 {
 
         let mut instance = Bcm2711GenetV5 {
             regs,
+            mmio_base: parsed.mmio_base,
             mac_addr: parsed.mac_addr,
             phy_mode: parsed.phy_mode,
             phy_addr: parsed.phy_addr,
@@ -450,6 +473,7 @@ impl Bcm2711GenetV5 {
             interrupt_count: parsed.interrupt_count,
             dma_windows: parsed.dma_windows,
             dma_window_count: parsed.dma_window_count,
+            dma_mapping_source: parsed.dma_mapping_source,
             tx_index: 0,
             rx_index: 0,
             c_index: 0,
@@ -540,8 +564,29 @@ impl Bcm2711GenetV5 {
                 )));
             }
 
-            let (dma_windows, dma_window_count) =
-                Self::parse_dma_windows(&node).map_err(WalkError::User)?;
+            let (dma_windows, dma_window_count, dma_mapping_source) =
+                match Self::parse_dma_windows(&node).map_err(WalkError::User)? {
+                    DmaRangesScanResult::Found {
+                        windows,
+                        count,
+                        source,
+                    } => (windows, count, source),
+                    DmaRangesScanResult::NotFound => {
+                        let mut windows = [DmaWindow::empty(); MAX_DMA_WINDOWS];
+                        windows[0] = DmaWindow {
+                            cpu_base: BCM2711_DMA_FALLBACK_CPU_BASE,
+                            dma_base: BCM2711_DMA_FALLBACK_DMA_BASE,
+                            len: BCM2711_DMA_FALLBACK_LEN,
+                        };
+                        debug_uart_log(format_args!(
+                            "genet: dma-ranges missing in DTB; using fallback cpu_base=0x{:016x} dma_base=0x{:016x} len=0x{:016x}\n",
+                            windows[0].cpu_base,
+                            windows[0].dma_base,
+                            windows[0].len
+                        ));
+                        (windows, 1, DmaMappingSource::FallbackBcm2711)
+                    }
+                };
 
             Ok(ControlFlow::Break(DtbGenetConfig {
                 mmio_base: reg.0,
@@ -553,6 +598,7 @@ impl Bcm2711GenetV5 {
                 interrupt_count: stored,
                 dma_windows,
                 dma_window_count,
+                dma_mapping_source,
             }))
         });
 
@@ -608,38 +654,58 @@ impl Bcm2711GenetV5 {
 
     fn parse_dma_windows(
         node: &dtb::DtbNodeView<'_, '_>,
-    ) -> Result<([DmaWindow; MAX_DMA_WINDOWS], usize), Bcm2711GenetError> {
-        let mut windows = [DmaWindow::empty(); MAX_DMA_WINDOWS];
-        let mut count = 0usize;
+    ) -> Result<DmaRangesScanResult, Bcm2711GenetError> {
+        let mut current = Some(*node);
+        while let Some(scan_node) = current {
+            let dma_ranges = scan_node
+                .property_bytes("dma-ranges")
+                .map_err(Bcm2711GenetError::DtbParseError)?;
+            let Some(raw_dma_ranges) = dma_ranges else {
+                current = scan_node
+                    .parent_view()
+                    .map_err(Bcm2711GenetError::DtbParseError)?;
+                continue;
+            };
 
-        let mut current = node
-            .parent_view()
-            .map_err(Bcm2711GenetError::DtbParseError)?;
-        while let Some(parent) = current {
-            if let Some(mut iter) = parent
-                .dma_ranges_iter()
-                .map_err(Bcm2711GenetError::DtbParseError)?
-            {
-                for entry in &mut iter {
-                    let entry = entry.map_err(Bcm2711GenetError::DtbParseError)?;
-                    if count < MAX_DMA_WINDOWS {
-                        windows[count] = DmaWindow {
-                            dma_base: entry.child_base,
-                            cpu_base: entry.parent_base,
-                            len: entry.len,
-                        };
-                        count += 1;
-                    }
-                }
-                break;
+            if raw_dma_ranges.is_empty() {
+                return Ok(DmaRangesScanResult::Found {
+                    windows: [DmaWindow::empty(); MAX_DMA_WINDOWS],
+                    count: 0,
+                    source: DmaMappingSource::DtbRangesEmptyIdentity {
+                        node_name: scan_node.name(),
+                    },
+                });
             }
 
-            current = parent
-                .parent_view()
-                .map_err(Bcm2711GenetError::DtbParseError)?;
+            let mut windows = [DmaWindow::empty(); MAX_DMA_WINDOWS];
+            let mut count = 0usize;
+            let mut iter = scan_node
+                .dma_ranges_iter()
+                .map_err(Bcm2711GenetError::DtbParseError)?
+                .ok_or(Bcm2711GenetError::DtbParseError(
+                    "genet: dma-ranges present but not iterable",
+                ))?;
+            for entry in &mut iter {
+                let entry = entry.map_err(Bcm2711GenetError::DtbParseError)?;
+                if count < MAX_DMA_WINDOWS {
+                    windows[count] = DmaWindow {
+                        dma_base: entry.child_base,
+                        cpu_base: entry.parent_base,
+                        len: entry.len,
+                    };
+                    count += 1;
+                }
+            }
+            return Ok(DmaRangesScanResult::Found {
+                windows,
+                count,
+                source: DmaMappingSource::DtbRanges {
+                    node_name: scan_node.name(),
+                },
+            });
         }
 
-        Ok((windows, count))
+        Ok(DmaRangesScanResult::NotFound)
     }
 
     fn parse_nul_terminated_string(bytes: &[u8]) -> Option<&str> {
@@ -658,6 +724,45 @@ impl Bcm2711GenetV5 {
             };
         }
         spec.first().copied().unwrap_or(0)
+    }
+
+    fn log_dma_mapping_setup(&self) {
+        debug_uart_log(format_args!(
+            "genet: dma setup mmio_base=0x{:016x} rxbase_cpu=0x{:016x} dma_window_count={}\n",
+            self.mmio_base,
+            Self::rx_base_cpu(),
+            self.dma_window_count
+        ));
+        match self.dma_mapping_source {
+            DmaMappingSource::DtbRanges { node_name } => {
+                debug_uart_log(format_args!(
+                    "genet: dma mapping source=DTB dma-ranges @ {}\n",
+                    node_name
+                ));
+            }
+            DmaMappingSource::DtbRangesEmptyIdentity { node_name } => {
+                debug_uart_log(format_args!(
+                    "genet: dma mapping source=DTB dma-ranges empty -> identity @ {}\n",
+                    node_name
+                ));
+            }
+            DmaMappingSource::FallbackBcm2711 => {
+                debug_uart_log(format_args!(
+                    "genet: dma mapping source=fallback bcm2711 dma-ranges\n"
+                ));
+            }
+        }
+        for (index, window) in self
+            .dma_windows
+            .iter()
+            .take(self.dma_window_count)
+            .enumerate()
+        {
+            debug_uart_log(format_args!(
+                "genet: dma_window[{}] cpu_base=0x{:016x} dma_base=0x{:016x} len=0x{:016x}\n",
+                index, window.cpu_base, window.dma_base, window.len
+            ));
+        }
     }
 
     fn rx_base_cpu() -> usize {
@@ -707,6 +812,7 @@ impl Bcm2711GenetV5 {
             self.phy_addr,
             phy_mode_name(self.phy_mode)
         ));
+        self.log_dma_mapping_setup();
 
         self.program_phy_interface();
 
@@ -727,6 +833,11 @@ impl Bcm2711GenetV5 {
         self.rx_ring_init();
         self.rx_descs_init()?;
         self.tx_ring_init();
+        // SAFETY: `dsb sy` guarantees descriptor stores and cache maintenance complete before
+        // setting `DMA_EN`, so RDMA/TDMA cannot fetch stale descriptor data.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
         self.enable_dma();
 
         if self.local_loopback {
@@ -877,9 +988,30 @@ impl Bcm2711GenetV5 {
             let desc = &self.regs.rx_desc[i];
             let addr_cpu = rxbase_cpu + i * RX_BUF_LENGTH;
             let addr_dma = self.cpu_to_dma(addr_cpu, RX_BUF_LENGTH)?;
+            if i == 0 {
+                debug_uart_log(format_args!(
+                    "genet: rx_desc[0] addr_dma=0x{:016x} addr_cpu=0x{:016x} len=0x{:x}\n",
+                    addr_dma, addr_cpu, RX_BUF_LENGTH
+                ));
+            }
+            if (addr_dma >> 32) != 0 {
+                debug_uart_log(format_args!(
+                    "genet: rx_desc[{}] addr_dma exceeds 32-bit addr_cpu=0x{:016x} addr_dma=0x{:016x}\n",
+                    i, addr_cpu, addr_dma
+                ));
+                return Err(Bcm2711GenetError::DmaAddressNotCovered);
+            }
             desc.addr_lo.write(addr_dma as u32);
             desc.addr_hi.write((addr_dma >> 32) as u32);
             desc.length_status.write(len_stat);
+            if i < 4 {
+                let addr_lo = desc.addr_lo.read();
+                let addr_hi = desc.addr_hi.read();
+                debug_uart_log(format_args!(
+                    "genet: rx_desc[{}] programmed addr_lo=0x{:08x} addr_hi=0x{:08x}\n",
+                    i, addr_lo, addr_hi
+                ));
+            }
         }
         Ok(())
     }
@@ -1187,6 +1319,15 @@ impl Bcm2711GenetV5 {
         let prod_index = (cur.wrapping_add(1)) & 0xffff;
         let desc = &self.regs.tx_desc[self.tx_index as usize];
         let addr_dma = self.cpu_to_dma(tx_ptr as usize, frame.len())?;
+        if (addr_dma >> 32) != 0 {
+            debug_uart_log(format_args!(
+                "genet: tx scratch addr_dma exceeds 32-bit addr_cpu=0x{:016x} addr_dma=0x{:016x} len={}\n",
+                tx_ptr as usize,
+                addr_dma,
+                frame.len()
+            ));
+            return Err(Bcm2711GenetError::DmaAddressNotCovered);
+        }
 
         // Queue tag 0x3f and APPEND_CRC mirror U-Boot. The hardware appends Ethernet FCS when
         // APPEND_CRC is set; frame buffers therefore carry header+payload without trailing FCS.
@@ -1238,6 +1379,10 @@ impl Bcm2711GenetV5 {
         self.rx_ring_init();
         self.rx_descs_init()?;
         self.tx_ring_init();
+        // SAFETY: Keep the same descriptor/MMIO ordering guarantee as initial bring-up.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
         self.enable_dma();
         self.adjust_link_and_enable_umac();
         Ok(())
