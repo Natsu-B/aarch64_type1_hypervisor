@@ -8,12 +8,14 @@ use core::mem::offset_of;
 use core::mem::size_of;
 use core::ops::ControlFlow;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use dtb::DtbParser;
 use dtb::WalkError;
 use io_api::ethernet::EthernetFrameIo;
 use io_api::ethernet::MacAddr;
 use mutex::pod::RawBytePod;
+use timer::SystemTimer;
 use typestate::ReadPure;
 use typestate::ReadWrite;
 use typestate::Readable;
@@ -824,7 +826,7 @@ impl Bcm2711GenetV5 {
                 .set(UmacCmd::lcl_loop_en, 1)
                 .bits(),
         );
-        Self::short_delay();
+        Self::delay_us(2);
 
         self.umac_reset_sequence();
         self.program_mac_address();
@@ -860,10 +862,10 @@ impl Bcm2711GenetV5 {
         Ok(())
     }
 
-    fn short_delay() {
-        for _ in 0..1024 {
-            spin_loop();
-        }
+    fn delay_us(us: u64) {
+        let mut timer = SystemTimer::new();
+        timer.init();
+        timer.wait(Duration::from_micros(us));
     }
 
     fn program_phy_interface(&self) {
@@ -874,19 +876,19 @@ impl Bcm2711GenetV5 {
     }
 
     fn umac_reset_sequence(&self) {
-        // U-Boot toggles bit1 in SYS_RBUF_FLUSH_CTRL with short delays around transitions.
+        // U-Boot toggles bit1 in SYS_RBUF_FLUSH_CTRL with 10us delays around transitions.
         let flush_bit = 1u32 << 1;
         let mut reg = self.regs.sys_rbuf_flush_ctrl.read();
         reg |= flush_bit;
         self.regs.sys_rbuf_flush_ctrl.write(reg);
-        Self::short_delay();
+        Self::delay_us(10);
 
         reg &= !flush_bit;
         self.regs.sys_rbuf_flush_ctrl.write(reg);
-        Self::short_delay();
+        Self::delay_us(10);
 
         self.regs.sys_rbuf_flush_ctrl.write(0);
-        Self::short_delay();
+        Self::delay_us(10);
 
         self.regs.umac_cmd.write(0);
         self.regs.umac_cmd.write(
@@ -895,7 +897,7 @@ impl Bcm2711GenetV5 {
                 .set(UmacCmd::lcl_loop_en, 1)
                 .bits(),
         );
-        Self::short_delay();
+        Self::delay_us(2);
         self.regs.umac_cmd.write(0);
 
         // Reset MIB counters.
@@ -934,7 +936,7 @@ impl Bcm2711GenetV5 {
         self.regs.rdma_common.dma_ctrl.clear_bits(DMA_EN);
 
         self.regs.umac_tx_flush.write(1);
-        Self::short_delay();
+        Self::delay_us(10);
         self.regs.umac_tx_flush.write(0);
     }
 

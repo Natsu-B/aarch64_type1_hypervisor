@@ -310,6 +310,7 @@ dependencies = [
  "mutex",
  "pci",
  "print",
+ "timer",
  "typestate",
  "typestate_macro",
 ]
