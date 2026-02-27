@@ -42,6 +42,7 @@ const TX_BUF_LENGTH: usize = 2048;
 const MAX_DMA_WINDOWS: usize = 4;
 
 const DMA_EN: u32 = 1 << 0;
+const DMA_DISABLED: u32 = 1 << 0;
 const DMA_RING_BUF_EN_SHIFT: u32 = 1;
 const DMA_BUFLENGTH_SHIFT: u32 = 16;
 const DMA_BUFLENGTH_MASK: u32 = 0x0fff;
@@ -59,6 +60,7 @@ const DMA_FC_THRESH_VALUE: u32 = (DMA_FC_THRESH_LO << 16) | DMA_FC_THRESH_HI;
 
 // Real-time deadlines derived from CNTPCT/CNTFRQ keep behavior stable across CPU frequencies.
 const MDIO_BUSY_TIMEOUT_US: u64 = 20_000;
+const DMA_TIMEOUT_US: u64 = 5_000;
 const TX_DONE_TIMEOUT_US: u64 = 2_000;
 const PHY_STATUS_POLL_INTERVAL_US: u64 = 10_000;
 const PHY_STATUS_LOG_INTERVAL_US: u64 = 250_000;
@@ -107,6 +109,7 @@ pub enum Bcm2711GenetError {
     MdioReadFail,
     PhyTimeout,
     TxTimeout,
+    DmaTeardownTimeout { is_tx: bool },
     DmaAddressNotCovered,
     El2VaToPaFailed,
     LoopbackSelfTestFailed,
@@ -157,7 +160,7 @@ struct DmaRingRegs {
 struct DmaCommonRegs {
     ring_cfg: ReadWrite<u32>,
     dma_ctrl: ReadWrite<u32>,
-    _reserved_0x08: ReadWrite<u32>,
+    dma_status: ReadPure<u32>,
     scb_burst_size: ReadWrite<u32>,
 }
 
@@ -1010,6 +1013,78 @@ impl Bcm2711GenetV5 {
         self.regs.rdma_common.dma_ctrl.set_bits(dma_ctrl);
     }
 
+    fn disable_dma_en_and_wait(&self, is_tx: bool) -> Result<(), Bcm2711GenetError> {
+        let (common, dir) = if is_tx {
+            (&self.regs.tdma_common, "tx")
+        } else {
+            (&self.regs.rdma_common, "rx")
+        };
+        common.dma_ctrl.clear_bits(DMA_EN);
+
+        let deadline = deadline_ticks_from_now(DMA_TIMEOUT_US);
+        loop {
+            let last_status = common.dma_status.read();
+            if (last_status & DMA_DISABLED) != 0 {
+                return Ok(());
+            }
+            if timed_out(deadline) {
+                debug_uart_log(format_args!(
+                    "genet: dma teardown timeout dir={} dma_status=0x{:08x}\n",
+                    dir, last_status
+                ));
+                return Err(Bcm2711GenetError::DmaTeardownTimeout { is_tx });
+            }
+            spin_loop();
+        }
+    }
+
+    fn strict_dma_teardown(&self) -> Result<(), Bcm2711GenetError> {
+        self.disable_dma_en_and_wait(true)?;
+        Self::delay_us(10_000);
+        self.disable_dma_en_and_wait(false)?;
+
+        let ring_enable = 1u32 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT);
+        let ring_cfg = 1u32 << DEFAULT_Q;
+        self.regs.tdma_common.dma_ctrl.clear_bits(ring_enable);
+        self.regs.rdma_common.dma_ctrl.clear_bits(ring_enable);
+        self.regs.tdma_common.ring_cfg.clear_bits(ring_cfg);
+        self.regs.rdma_common.ring_cfg.clear_bits(ring_cfg);
+        cpu::dsb_sy();
+
+        self.regs.umac_tx_flush.write(1);
+        Self::delay_us(10);
+        self.regs.umac_tx_flush.write(0);
+        Ok(())
+    }
+
+    pub fn quiesce_for_paging(&mut self) -> Result<(), Bcm2711GenetError> {
+        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
+            .set(UmacCmd::tx_en, 0)
+            .set(UmacCmd::rx_en, 0)
+            .bits();
+        self.regs.umac_cmd.write(cmd);
+        self.strict_dma_teardown()?;
+        cpu::dsb_sy();
+        Self::error_sync_barrier();
+        Ok(())
+    }
+
+    pub fn resume_after_paging(&mut self) {
+        self.enable_dma();
+        cpu::dsb_sy();
+        Self::error_sync_barrier();
+        self.adjust_link_and_enable_umac();
+    }
+
+    pub fn set_rx_enabled(&mut self, enable: bool) {
+        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
+            .set(UmacCmd::rx_en, if enable { 1 } else { 0 })
+            .bits();
+        self.regs.umac_cmd.write(cmd);
+        cpu::dsb_sy();
+        Self::error_sync_barrier();
+    }
+
     fn stop_hw_quiesce(&self) {
         let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
             .set(UmacCmd::tx_en, 0)
@@ -1017,16 +1092,24 @@ impl Bcm2711GenetV5 {
             .bits();
         self.regs.umac_cmd.write(cmd);
 
-        let mask = Self::dma_ctrl_enable_mask();
-        self.regs.tdma_common.dma_ctrl.clear_bits(mask);
-        self.regs.rdma_common.dma_ctrl.clear_bits(mask);
-        self.regs.rdma_common.ring_cfg.write(0);
-        self.regs.tdma_common.ring_cfg.write(0);
-        cpu::dsb_sy();
+        if let Err(err) = self.strict_dma_teardown() {
+            debug_uart_log(format_args!(
+                "genet: stop_hw_quiesce strict teardown failed: {:?}\n",
+                err
+            ));
+            let mask = Self::dma_ctrl_enable_mask();
+            self.regs.tdma_common.dma_ctrl.clear_bits(mask);
+            self.regs.rdma_common.dma_ctrl.clear_bits(mask);
+            self.regs.rdma_common.ring_cfg.write(0);
+            self.regs.tdma_common.ring_cfg.write(0);
+            cpu::dsb_sy();
 
-        self.regs.umac_tx_flush.write(1);
-        Self::delay_us(10);
-        self.regs.umac_tx_flush.write(0);
+            self.regs.umac_tx_flush.write(1);
+            Self::delay_us(10);
+            self.regs.umac_tx_flush.write(0);
+        }
+        cpu::dsb_sy();
+        Self::error_sync_barrier();
     }
 
     fn rdma_ring(&self) -> &DmaRingRegs {

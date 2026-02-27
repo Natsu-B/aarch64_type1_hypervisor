@@ -42,6 +42,8 @@ unsafe impl Send for UdpUartState {}
 
 // SAFETY: published with Release in `init` after full state initialization.
 static UDP_UART_READY: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
+// SAFETY: updated with Release ordering from quiesce/resume control paths.
+static UDP_UART_PAUSED: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 // SAFETY: initialized once in `init`; all accesses are serialized by IRQ-save lock.
 static UDP_UART_STATE: RawSpinLockIrqSave<MaybeUninit<UdpUartState>> =
     RawSpinLockIrqSave::new(MaybeUninit::uninit());
@@ -76,8 +78,19 @@ pub fn init(eth: &'static mut dyn EthernetFrameIo, local_ip: Ipv4Addr) {
     UDP_UART_READY.store(true, Ordering::Release);
 }
 
+pub fn pause() {
+    UDP_UART_PAUSED.store(true, Ordering::Release);
+}
+
+pub fn resume() {
+    UDP_UART_PAUSED.store(false, Ordering::Release);
+}
+
 /// Polls Ethernet RX, handles ARP, demultiplexes UDP streams, and invokes byte callbacks.
 pub fn poll(mut on_gdb_byte: impl FnMut(u8), mut on_dbg_byte: impl FnMut(u8)) {
+    if UDP_UART_PAUSED.load(Ordering::Acquire) {
+        return;
+    }
     let _ = with_state(|state| {
         loop {
             let recv_cap = max_rx_frame_len(state);
@@ -144,6 +157,9 @@ pub fn poll(mut on_gdb_byte: impl FnMut(u8), mut on_dbg_byte: impl FnMut(u8)) {
 ///
 /// Returns `false` when no peer is learned or TX cannot proceed.
 pub fn gdb_try_write_byte(byte: u8) -> bool {
+    if UDP_UART_PAUSED.load(Ordering::Acquire) {
+        return false;
+    }
     with_state(|state| {
         if state.gdb_peer.is_none() {
             return false;
@@ -172,11 +188,17 @@ pub fn gdb_try_write_byte(byte: u8) -> bool {
 
 /// Flushes pending GDB UDP TX payload.
 pub fn gdb_flush() {
+    if UDP_UART_PAUSED.load(Ordering::Acquire) {
+        return;
+    }
     let _ = with_state(flush_gdb_locked);
 }
 
 /// Best-effort debug/log mirror output over UDP.
 pub fn debug_write_str(s: &str) {
+    if UDP_UART_PAUSED.load(Ordering::Acquire) {
+        return;
+    }
     let _ = with_state(|state| {
         if state.debug_peer.is_none() {
             return;
@@ -202,6 +224,9 @@ pub fn debug_write_str(s: &str) {
 
 /// Flushes pending debug/log UDP payload.
 pub fn debug_flush() {
+    if UDP_UART_PAUSED.load(Ordering::Acquire) {
+        return;
+    }
     let _ = with_state(flush_debug_locked);
 }
 

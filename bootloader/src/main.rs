@@ -69,6 +69,8 @@ use arch_hal::paging::stage1::EL2Stage1Paging;
 use arch_hal::paging::stage1::EL2Stage1PagingSetting;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
+#[cfg(feature = "rpi4_net")]
+use arch_hal::soc::bcm2711::genet::Bcm2711GenetV5;
 #[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
 use arch_hal::soc::bcm2711::gpio::Bcm2711Gpio;
 #[cfg(all(feature = "rpi4", not(feature = "rpi4_net")))]
@@ -235,6 +237,17 @@ fn log_selected_uart(role: &str, candidate: Pl011Candidate) {
     }
 }
 
+#[cfg(feature = "rpi4_net")]
+fn sync_pending_async_serror() {
+    cpu::dsb_sy();
+    cpu::isb();
+    // SAFETY: `hint #16` is the architectural ESB encoding and is used here to synchronize
+    // pending asynchronous SError to this exact boot transition point.
+    unsafe {
+        core::arch::asm!("hint #16", options(nostack, preserves_flags));
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct MemoryRegion {
     base: usize,
@@ -356,12 +369,14 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             })
             .unwrap();
         let best = best.unwrap_or_else(|| panic!("uart selection: no arm,pl011 nodes found"));
+        #[cfg(feature = "rpi4_net")]
+        let _ = second;
         #[cfg(not(feature = "rpi4_net"))]
         let gdb_candidate = Some(second.unwrap_or_else(|| {
             panic!("uart selection: need at least two distinct arm,pl011 nodes")
         }));
         #[cfg(feature = "rpi4_net")]
-        let gdb_candidate = second;
+        let gdb_candidate: Option<Pl011Candidate> = None;
         // SAFETY: early boot UART globals are initialized once on the BSP before secondary cores/interrupts.
         unsafe {
             *GUEST_UART.get() = Some(best.uart_node);
@@ -431,11 +446,12 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         }
 
         #[cfg(feature = "rpi4_net")]
-        {
+        let genet_ptr: *mut Bcm2711GenetV5 = {
             let genet =
                 net::rpi4::init_genet_from_dtb_with_link_wait(&dtb, Some(Duration::from_secs(30)));
             #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
             genet_selftest::run_with_driver(genet);
+            let genet_ptr: *mut Bcm2711GenetV5 = genet;
             let eth = genet as &'static mut dyn io_api::ethernet::EthernetFrameIo;
             net::udp_uart::init(eth, net::config::LOCAL_IP);
             arch_hal::set_mirror(Some(arch_hal::MirrorOps {
@@ -443,7 +459,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                 flush: net::udp_uart::debug_flush,
             }));
             gdb_uart::init(0, UART_CLOCK_HZ, UART_BAUD);
-        }
+            genet_ptr
+        };
 
         debug::init_gdb_stub();
         println!(
@@ -512,10 +529,32 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         record_guest_mmio_allowlist_from_dtb(&dtb, &guest_uart, gdb_uart.as_ref(), &gic_info);
         dump_guest_mmio_allowlist();
 
+        #[cfg(feature = "rpi4_net")]
+        {
+            net::udp_uart::pause();
+            arch_hal::set_mirror(None);
+            assert!(
+                !genet_ptr.is_null(),
+                "rpi4_net: genet pointer must be initialized before quiesce"
+            );
+            // SAFETY: IRQs are still disabled at this point in boot flow, and UDP UART traffic
+            // has been paused immediately above, so there is no concurrent access to `genet_ptr`.
+            unsafe {
+                (&mut *genet_ptr)
+                    .quiesce_for_paging()
+                    .expect("genet quiesce failed");
+            }
+            sync_pending_async_serror();
+        }
+
         println!("setup EL2 Stage-1 paging with stack guard...");
         let stage1_settings = build_stage1_el2_map();
         EL2Stage1Paging::init_stage1paging(&stage1_settings)
             .expect("EL2 Stage-1 paging initialization failed");
+        #[cfg(feature = "rpi4_net")]
+        {
+            sync_pending_async_serror();
+        }
         println!("EL2 Stage-1 paging enabled");
 
         // SAFETY: emergency stack is initialized after Stage-1 is enabled.
@@ -626,6 +665,23 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         println!("init stage2 paging...\npaging_data: {:?}", paging_data);
         Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
         Stage2Paging::enable_stage2_translation(true, true);
+        #[cfg(feature = "rpi4_net")]
+        {
+            assert!(
+                !genet_ptr.is_null(),
+                "rpi4_net: genet pointer must be initialized before resume"
+            );
+            // SAFETY: IRQs are enabled later in boot flow; UDP UART stays paused until the
+            // hardware resume below completes, so dereferencing `genet_ptr` is not concurrent.
+            unsafe {
+                (&mut *genet_ptr).resume_after_paging();
+            }
+            net::udp_uart::resume();
+            arch_hal::set_mirror(Some(arch_hal::MirrorOps {
+                write: net::udp_uart::debug_write_str,
+                flush: net::udp_uart::debug_flush,
+            }));
+        }
         cpu::set_tpidr_el1(guest_uart.base as u64);
         handler::setup_handler();
         vbar_watch::init_vbar_watch();
