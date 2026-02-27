@@ -40,9 +40,6 @@ mod vbar;
 mod vbar_watch;
 mod vgic;
 
-#[cfg(all(feature = "rpi4_genet_loopback_selftest", feature = "rpi4_net"))]
-compile_error!("feature \"rpi4_genet_loopback_selftest\" cannot be enabled with \"rpi4_net\"");
-
 #[cfg(all(test, target_arch = "aarch64"))]
 aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);
 use alloc::boxed::Box;
@@ -275,35 +272,22 @@ static GLOBAL_ALLOCATOR: allocator::MemoryAllocator<4096, { allocator::levels!(4
     allocator::MemoryAllocator::new();
 
 #[unsafe(naked)]
-#[cfg(all(not(all(test, target_arch = "aarch64")), not(feature = "rpi4")))]
-#[unsafe(no_mangle)]
-extern "C" fn _start() {
-    naked_asm!(
-        "msr spsel, #1\n",
-        "isb\n",
-        "ldr x9, =_STACK_TOP\n",
-        "mov sp, x9\n",
-        "b main\n",
-    )
-}
-
-#[unsafe(naked)]
-#[cfg(all(not(all(test, target_arch = "aarch64")), feature = "rpi4"))]
+#[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
     naked_asm!(
         r#"
         msr spsel, #1
         isb
-        ldr x0, =_STACK_TOP
-        mov sp, x0
+        ldr x9, =_STACK_TOP
+        mov sp, x9
     clear_bss:
-        ldr x0, =_BSS_START
-        ldr x1, =_BSS_END
+        ldr x9, =_BSS_START
+        ldr x10, =_BSS_END
     clear_bss_loop:
-        cmp x0, x1
+        cmp x9, x10
         beq clear_bss_end
-        str xzr, [x0], #8
+        str xzr, [x9], #8
         b clear_bss_loop
     clear_bss_end:
         bl main
@@ -405,12 +389,24 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         }
         debug_uart::init(guest_uart.base, UART_CLOCK_HZ, UART_BAUD);
         log_selected_uart("guest", best);
+        exceptions::setup_el1_exception();
+        println!("paging success!!!");
+        println!("setup exception");
+        exceptions::setup_exception();
+        unsafe {
+            cpu::write_daif(cpu::read_daif() & !(0b1 << 8) /* SError */)
+        };
+
         if let Some(gdb_candidate) = gdb_candidate {
             log_selected_uart("gdb", gdb_candidate);
         }
-        #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
+        #[cfg(all(
+            feature = "rpi4",
+            feature = "rpi4_genet_loopback_selftest",
+            not(feature = "rpi4_net")
+        ))]
         {
-            genet_selftest::run(&dtb);
+            genet_selftest::run_from_dtb(&dtb);
         }
         let tls_result = unsafe {
             tls::init_current_cpu(
@@ -434,8 +430,10 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 
         #[cfg(feature = "rpi4_net")]
         {
-            // TODO: wire the real RPi4 Ethernet driver that implements `EthernetFrameIo`.
-            let eth = net::rpi4::init_ethernet_from_dtb(&dtb);
+            let genet = net::rpi4::init_genet_from_dtb(&dtb);
+            #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
+            genet_selftest::run_with_driver(genet);
+            let eth = genet as &'static mut dyn io_api::ethernet::EthernetFrameIo;
             net::udp_uart::init(eth, net::config::LOCAL_IP);
             arch_hal::set_mirror(Some(arch_hal::MirrorOps {
                 write: net::udp_uart::debug_write_str,
@@ -626,10 +624,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         Stage2Paging::init_stage2paging(&paging_data, &GLOBAL_ALLOCATOR).unwrap();
         Stage2Paging::enable_stage2_translation(true, true);
         cpu::set_tpidr_el1(guest_uart.base as u64);
-        exceptions::setup_el1_exception();
-        println!("paging success!!!");
-        println!("setup exception");
-        exceptions::setup_exception();
         handler::setup_handler();
         vbar_watch::init_vbar_watch();
         let (gic, gdb_uart_intid) = init_gicv2(&gic_info, gdb_uart).unwrap();

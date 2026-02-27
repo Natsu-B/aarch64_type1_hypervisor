@@ -1462,14 +1462,7 @@ impl Bcm2711GenetV5 {
         Some(payload_len)
     }
 
-    pub fn local_loopback_selftest(&mut self) -> Result<(), Bcm2711GenetError> {
-        if !self.local_loopback {
-            debug_uart_log(format_args!(
-                "[selftest] genet: local_loopback_selftest requires loopback init mode\n"
-            ));
-            return Err(Bcm2711GenetError::LoopbackSelfTestFailed);
-        }
-
+    fn loopback_selftest_impl(&mut self) -> Result<(), Bcm2711GenetError> {
         let mut tx = [0u8; LOOPBACK_SELFTEST_FRAME_LEN];
         tx[..6].copy_from_slice(&self.mac_addr.0);
         tx[6..12].copy_from_slice(&self.mac_addr.0);
@@ -1553,6 +1546,37 @@ impl Bcm2711GenetV5 {
             }
             spin_loop();
         }
+    }
+
+    pub fn local_loopback_selftest(&mut self) -> Result<(), Bcm2711GenetError> {
+        if !self.local_loopback {
+            debug_uart_log(format_args!(
+                "[selftest] genet: local_loopback_selftest requires loopback init mode\n"
+            ));
+            return Err(Bcm2711GenetError::LoopbackSelfTestFailed);
+        }
+
+        self.loopback_selftest_impl()
+    }
+
+    pub fn local_loopback_selftest_live(&mut self) -> Result<(), Bcm2711GenetError> {
+        let prev_local = self.local_loopback;
+        let prev_cmd_bits = self.regs.umac_cmd.read();
+
+        let test_cmd_bits = UmacCmd::from_bits(prev_cmd_bits)
+            .set(UmacCmd::sw_reset, 0)
+            .set(UmacCmd::lcl_loop_en, 1)
+            .set(UmacCmd::tx_en, 1)
+            .set(UmacCmd::rx_en, 1)
+            .bits();
+        self.local_loopback = true;
+        self.regs.umac_cmd.write(test_cmd_bits);
+
+        let result = self.loopback_selftest_impl();
+
+        self.regs.umac_cmd.write(prev_cmd_bits);
+        self.local_loopback = prev_local;
+        result
     }
 }
 

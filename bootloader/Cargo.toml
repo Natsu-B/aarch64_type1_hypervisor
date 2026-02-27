@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = []
 rpi4 = []
-rpi4_net = ["rpi4", "dep:net-proto"]
+rpi4_net = ["rpi4", "dep:net-proto", "rpi4_genet_loopback_selftest"]
 rpi4_genet_loopback_selftest = ["rpi4"]
 
 [dependencies]

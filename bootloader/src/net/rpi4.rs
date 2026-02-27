@@ -55,7 +55,7 @@ fn debug_uart_log(args: fmt::Arguments<'_>) {
 /// This is used by UDP UART networking setup in `bootloader/src/main.rs` when
 /// `feature = \"rpi4_net\"` is enabled. PHY link timeouts are retried; other
 /// boot-time initialization errors remain fatal.
-pub fn init_ethernet_from_dtb(dtb: &DtbParser) -> &'static mut dyn EthernetFrameIo {
+pub fn init_genet_from_dtb(dtb: &DtbParser) -> &'static mut Bcm2711GenetV5 {
     let mut retry_timer = SystemTimer::new();
     retry_timer.init();
     let mut attempt = 1u32;
@@ -70,7 +70,7 @@ pub fn init_ethernet_from_dtb(dtb: &DtbParser) -> &'static mut dyn EthernetFrame
                     "rpi4_net: ethernet ready after attempt={}\n",
                     attempt
                 ));
-                return driver as &'static mut dyn EthernetFrameIo;
+                return driver;
             }
             Err(Bcm2711GenetError::PhyTimeout) => {
                 debug_uart_log(format_args!(
@@ -83,4 +83,8 @@ pub fn init_ethernet_from_dtb(dtb: &DtbParser) -> &'static mut dyn EthernetFrame
             Err(err) => panic!("rpi4_net: failed to init BCM2711 GENETv5: {:?}", err),
         }
     }
+}
+
+pub fn init_ethernet_from_dtb(dtb: &DtbParser) -> &'static mut dyn EthernetFrameIo {
+    init_genet_from_dtb(dtb) as &'static mut dyn EthernetFrameIo
 }
