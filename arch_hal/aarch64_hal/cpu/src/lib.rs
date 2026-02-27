@@ -1038,50 +1038,48 @@ fn va_to_pa_el2_common(va: u64, is_write: bool) -> Option<u64> {
         return Some(va);
     }
 
+    let saved_par: u64;
     let par_after: u64;
 
     if is_write {
         // SAFETY:
-        // - Uses `AT S1E2W` to perform an EL2 stage-1 translation probe for `va`.
-        // - Saves and restores PAR_EL1 so callers do not observe clobbered PAR state.
-        // - `isb` orders PAR_EL1 observation after the AT operation.
+        // - Uses `AT S1E2W` to probe EL2 stage-1 translation for `va`.
+        // - Saves/restores PAR_EL1 so callers do not observe clobbered PAR state.
+        // - `saved_par` is `out(reg)` (not `lateout`) because it is written before `va` is consumed.
         unsafe {
             core::arch::asm!(
-                "mrs {tmp}, par_el1",
+                "mrs {saved_par}, par_el1",
                 "at S1E2W, {va}",
                 "isb",
                 "mrs {par_after}, par_el1",
-                "msr par_el1, {tmp}",
-                tmp        = lateout(reg) _,
-                par_after  = out(reg) par_after,
-                va         = in(reg) va,
+                "msr par_el1, {saved_par}",
+                saved_par = out(reg) saved_par,
+                par_after = lateout(reg) par_after,
+                va        = in(reg) va,
                 options(nostack)
             );
         }
     } else {
-        // SAFETY:
-        // - Uses `AT S1E2R` to perform an EL2 stage-1 translation probe for `va`.
-        // - Saves and restores PAR_EL1 so callers do not observe clobbered PAR state.
-        // - `isb` orders PAR_EL1 observation after the AT operation.
+        // SAFETY: same as the write path, but uses `AT S1E2R`.
         unsafe {
             core::arch::asm!(
-                "mrs {tmp}, par_el1",
+                "mrs {saved_par}, par_el1",
                 "at S1E2R, {va}",
                 "isb",
                 "mrs {par_after}, par_el1",
-                "msr par_el1, {tmp}",
-                tmp        = lateout(reg) _,
-                par_after  = out(reg) par_after,
-                va         = in(reg) va,
+                "msr par_el1, {saved_par}",
+                saved_par = out(reg) saved_par,
+                par_after = lateout(reg) par_after,
+                va        = in(reg) va,
                 options(nostack)
             );
         }
     }
+    let _ = saved_par;
 
     if (par_after & 1) != 0 {
         return None;
     }
-
     let pa = par_after & 0x0000_FFFF_FFFF_F000;
     Some(pa | (va & 0xFFF))
 }
