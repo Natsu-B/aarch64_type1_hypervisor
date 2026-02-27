@@ -1452,10 +1452,10 @@ impl Bcm2711GenetV5 {
             .set(MdioCmd::phy, phy as u32)
             .set(MdioCmd::reg, reg as u32)
             .set(MdioCmd::data, value as u32)
-            .set(MdioCmd::start_busy, 0)
+            .set(MdioCmd::start_busy, 1)
             .bits();
         self.regs.mdio_cmd.write(cmd);
-        self.mdio_start();
+        self.mdio_posted_write_sync();
         self.wait_mdio_busy_clear("transaction", MDIO_OP_WRITE_BITS, phy, reg)
     }
 
@@ -1466,10 +1466,10 @@ impl Bcm2711GenetV5 {
             .set_enum(MdioCmd::op, MdioOp::Read)
             .set(MdioCmd::phy, phy as u32)
             .set(MdioCmd::reg, reg as u32)
-            .set(MdioCmd::start_busy, 0)
+            .set(MdioCmd::start_busy, 1)
             .bits();
         self.regs.mdio_cmd.write(cmd);
-        self.mdio_start();
+        self.mdio_posted_write_sync();
         self.wait_mdio_busy_clear("transaction", MDIO_OP_READ_BITS, phy, reg)?;
 
         let done = MdioCmd::from_bits(self.regs.mdio_cmd.read());
@@ -1486,18 +1486,17 @@ impl Bcm2711GenetV5 {
         Ok(bmsr_first | bmsr_second)
     }
 
-    fn mdio_start(&self) {
-        self.regs
-            .mdio_cmd
-            .set_bits(MdioCmd::new().set(MdioCmd::start_busy, 1).bits());
+    fn mdio_ensure_idle(&self, op: u32, phy: u8, reg: u8) -> Result<(), Bcm2711GenetError> {
+        self.wait_mdio_busy_clear("ensure_idle", op, phy, reg)
     }
 
-    fn mdio_ensure_idle(&self, op: u32, phy: u8, reg: u8) -> Result<(), Bcm2711GenetError> {
-        let mdio = MdioCmd::from_bits(self.regs.mdio_cmd.read());
-        if mdio.get(MdioCmd::start_busy) != 0 {
-            self.wait_mdio_busy_clear("ensure_idle", op, phy, reg)?;
+    fn mdio_posted_write_sync(&self) {
+        // Read back MDIO_CMD so the command write is observed before busy polling starts.
+        let _posted_mdio_cmd = self.regs.mdio_cmd.read();
+        // SAFETY: `dsb sy` enforces completion of prior device accesses before the polling loop.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
         }
-        Ok(())
     }
 
     fn wait_mdio_busy_clear(
