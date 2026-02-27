@@ -861,31 +861,7 @@ impl Bcm2711GenetV5 {
             self.log_dma_mapping_setup()?;
 
             self.program_phy_interface();
-
-            // Disable MAC, then issue soft reset with local loopback first.
-            self.regs.umac_cmd.write(0);
-            self.regs.umac_cmd.write(
-                UmacCmd::new()
-                    .set(UmacCmd::sw_reset, 1)
-                    .set(UmacCmd::lcl_loop_en, 1)
-                    .bits(),
-            );
-            Self::delay_us(2);
-
-            self.umac_reset_sequence();
-            self.program_mac_address();
-
-            self.disable_dma_and_flush_tx();
-            self.rx_ring_init();
-            self.rx_descs_init()?;
-            self.tx_ring_init();
-            // SAFETY: `dsb sy` guarantees descriptor stores and cache maintenance complete before
-            // setting `DMA_EN`, so RDMA/TDMA cannot fetch stale descriptor data.
-            unsafe {
-                asm!("dsb sy", options(nostack, preserves_flags));
-            }
-            self.enable_dma();
-            Self::error_sync_barrier();
+            self.prepare_umac_for_mdio_probe();
 
             if self.local_loopback {
                 debug_uart_log(format_args!(
@@ -910,6 +886,22 @@ impl Bcm2711GenetV5 {
                 self.phy_bringup(link_wait)?;
                 debug_uart_log(format_args!("genet: phy bringup complete\n"));
             }
+
+            self.umac_reset_sequence();
+            self.program_mac_address();
+
+            self.disable_dma_and_flush_tx();
+            self.rx_ring_init();
+            self.rx_descs_init()?;
+            self.tx_ring_init();
+            // SAFETY: `dsb sy` guarantees descriptor stores and cache maintenance complete before
+            // setting `DMA_EN`, so RDMA/TDMA cannot fetch stale descriptor data.
+            unsafe {
+                asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            self.enable_dma();
+            Self::error_sync_barrier();
+
             self.adjust_link_and_enable_umac();
             debug_uart_log(format_args!("genet: umac enable complete\n"));
             Ok(())
@@ -938,6 +930,21 @@ impl Bcm2711GenetV5 {
             .set(SysPortCtrl::port_mode, PORT_MODE_EXT_GPHY)
             .bits();
         self.regs.sys_port_ctrl.write(value);
+    }
+
+    fn prepare_umac_for_mdio_probe(&self) {
+        // Mirror U-Boot probe state before first MDIO/PHY transactions.
+        self.regs.sys_rbuf_flush_ctrl.write(0);
+        Self::delay_us(10);
+
+        self.regs.umac_cmd.write(0);
+        self.regs.umac_cmd.write(
+            UmacCmd::new()
+                .set(UmacCmd::sw_reset, 1)
+                .set(UmacCmd::lcl_loop_en, 1)
+                .bits(),
+        );
+        Self::delay_us(2);
     }
 
     fn umac_reset_sequence(&self) {
@@ -1452,10 +1459,8 @@ impl Bcm2711GenetV5 {
             .set(MdioCmd::phy, phy as u32)
             .set(MdioCmd::reg, reg as u32)
             .set(MdioCmd::data, value as u32)
-            .set(MdioCmd::start_busy, 1)
             .bits();
-        self.regs.mdio_cmd.write(cmd);
-        self.mdio_posted_write_sync();
+        self.mdio_start(cmd);
         self.wait_mdio_busy_clear("transaction", MDIO_OP_WRITE_BITS, phy, reg)
     }
 
@@ -1466,10 +1471,8 @@ impl Bcm2711GenetV5 {
             .set_enum(MdioCmd::op, MdioOp::Read)
             .set(MdioCmd::phy, phy as u32)
             .set(MdioCmd::reg, reg as u32)
-            .set(MdioCmd::start_busy, 1)
             .bits();
-        self.regs.mdio_cmd.write(cmd);
-        self.mdio_posted_write_sync();
+        self.mdio_start(cmd);
         self.wait_mdio_busy_clear("transaction", MDIO_OP_READ_BITS, phy, reg)?;
 
         let done = MdioCmd::from_bits(self.regs.mdio_cmd.read());
@@ -1488,6 +1491,17 @@ impl Bcm2711GenetV5 {
 
     fn mdio_ensure_idle(&self, op: u32, phy: u8, reg: u8) -> Result<(), Bcm2711GenetError> {
         self.wait_mdio_busy_clear("ensure_idle", op, phy, reg)
+    }
+
+    fn mdio_start(&self, cmd_without_start: u32) {
+        self.regs.mdio_cmd.write(cmd_without_start);
+        self.mdio_posted_write_sync();
+        self.regs.mdio_cmd.write(
+            MdioCmd::from_bits(cmd_without_start)
+                .set(MdioCmd::start_busy, 1)
+                .bits(),
+        );
+        self.mdio_posted_write_sync();
     }
 
     fn mdio_posted_write_sync(&self) {
@@ -1540,9 +1554,10 @@ impl Bcm2711GenetV5 {
             mdio_cmd.get(MdioCmd::data)
         ));
         debug_uart_log(format_args!(
-            "genet: mdio timeout regs umac_cmd=0x{:08x} sys_port_ctrl=0x{:08x} ext_rgmii_oob_ctrl=0x{:08x}\n",
+            "genet: mdio timeout regs umac_cmd=0x{:08x} sys_port_ctrl=0x{:08x} sys_rbuf_flush_ctrl=0x{:08x} ext_rgmii_oob_ctrl=0x{:08x}\n",
             self.regs.umac_cmd.read(),
             self.regs.sys_port_ctrl.read(),
+            self.regs.sys_rbuf_flush_ctrl.read(),
             self.regs.ext_rgmii_oob_ctrl.read()
         ));
     }
