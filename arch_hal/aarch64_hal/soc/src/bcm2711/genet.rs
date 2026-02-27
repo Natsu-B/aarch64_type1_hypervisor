@@ -839,6 +839,7 @@ impl Bcm2711GenetV5 {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
         self.enable_dma();
+        Self::error_sync_barrier();
 
         if self.local_loopback {
             debug_uart_log(format_args!(
@@ -1384,6 +1385,7 @@ impl Bcm2711GenetV5 {
             asm!("dsb sy", options(nostack, preserves_flags));
         }
         self.enable_dma();
+        Self::error_sync_barrier();
         self.adjust_link_and_enable_umac();
         Ok(())
     }
@@ -1397,6 +1399,14 @@ impl Bcm2711GenetV5 {
         self.c_index = self.c_index.wrapping_add(1) & 0xffff;
         self.rdma_ring().index_b.write(self.c_index as u32);
         self.rx_index = (self.rx_index + 1) & 0xff;
+    }
+
+    fn error_sync_barrier() {
+        // SAFETY: `hint #16` is the architectural ESB encoding. On CPUs that implement ESB it
+        // synchronizes pending asynchronous SError to this point; on others it behaves as a hint.
+        unsafe {
+            asm!("hint #16", options(nostack, preserves_flags));
+        }
     }
 
     fn try_recv_frame_impl(&mut self, out: &mut [u8]) -> Option<usize> {
