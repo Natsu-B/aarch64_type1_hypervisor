@@ -57,6 +57,8 @@ const DMA_MAX_BURST_LENGTH: u32 = 0x8;
 const DMA_FC_THRESH_HI: u32 = (RX_DESCS as u32) >> 4;
 const DMA_FC_THRESH_LO: u32 = 5;
 const DMA_FC_THRESH_VALUE: u32 = (DMA_FC_THRESH_LO << 16) | DMA_FC_THRESH_HI;
+const MDIO_OP_WRITE_BITS: u32 = 0b01;
+const MDIO_OP_READ_BITS: u32 = 0b10;
 
 // Real-time deadlines derived from CNTPCT/CNTFRQ keep behavior stable across CPU frequencies.
 const MDIO_BUSY_TIMEOUT_US: u64 = 20_000;
@@ -1443,30 +1445,32 @@ impl Bcm2711GenetV5 {
     }
 
     fn mdio_write(&self, phy: u8, reg: u8, value: u16) -> Result<(), Bcm2711GenetError> {
+        self.mdio_ensure_idle(MDIO_OP_WRITE_BITS, phy, reg)?;
+
         let cmd = MdioCmd::new()
             .set_enum(MdioCmd::op, MdioOp::Write)
             .set(MdioCmd::phy, phy as u32)
             .set(MdioCmd::reg, reg as u32)
             .set(MdioCmd::data, value as u32)
+            .set(MdioCmd::start_busy, 0)
             .bits();
         self.regs.mdio_cmd.write(cmd);
-        self.regs
-            .mdio_cmd
-            .set_bits(MdioCmd::new().set(MdioCmd::start_busy, 1).bits());
-        self.wait_mdio_done()
+        self.mdio_start();
+        self.wait_mdio_busy_clear("transaction", MDIO_OP_WRITE_BITS, phy, reg)
     }
 
     fn mdio_read(&self, phy: u8, reg: u8) -> Result<u16, Bcm2711GenetError> {
+        self.mdio_ensure_idle(MDIO_OP_READ_BITS, phy, reg)?;
+
         let cmd = MdioCmd::new()
             .set_enum(MdioCmd::op, MdioOp::Read)
             .set(MdioCmd::phy, phy as u32)
             .set(MdioCmd::reg, reg as u32)
+            .set(MdioCmd::start_busy, 0)
             .bits();
         self.regs.mdio_cmd.write(cmd);
-        self.regs
-            .mdio_cmd
-            .set_bits(MdioCmd::new().set(MdioCmd::start_busy, 1).bits());
-        self.wait_mdio_done()?;
+        self.mdio_start();
+        self.wait_mdio_busy_clear("transaction", MDIO_OP_READ_BITS, phy, reg)?;
 
         let done = MdioCmd::from_bits(self.regs.mdio_cmd.read());
         if done.get(MdioCmd::read_fail) != 0 {
@@ -1482,7 +1486,27 @@ impl Bcm2711GenetV5 {
         Ok(bmsr_first | bmsr_second)
     }
 
-    fn wait_mdio_done(&self) -> Result<(), Bcm2711GenetError> {
+    fn mdio_start(&self) {
+        self.regs
+            .mdio_cmd
+            .set_bits(MdioCmd::new().set(MdioCmd::start_busy, 1).bits());
+    }
+
+    fn mdio_ensure_idle(&self, op: u32, phy: u8, reg: u8) -> Result<(), Bcm2711GenetError> {
+        let mdio = MdioCmd::from_bits(self.regs.mdio_cmd.read());
+        if mdio.get(MdioCmd::start_busy) != 0 {
+            self.wait_mdio_busy_clear("ensure_idle", op, phy, reg)?;
+        }
+        Ok(())
+    }
+
+    fn wait_mdio_busy_clear(
+        &self,
+        phase: &'static str,
+        op: u32,
+        phy: u8,
+        reg: u8,
+    ) -> Result<(), Bcm2711GenetError> {
         // Loop-count timeouts are brittle because compiler settings and core frequency change how
         // long one iteration takes. Deadline-based polling keeps timeout behavior predictable.
         let deadline = deadline_ticks_from_now(MDIO_BUSY_TIMEOUT_US);
@@ -1495,7 +1519,33 @@ impl Bcm2711GenetV5 {
             }
             spin_loop();
         }
+        self.log_mdio_timeout(phase, op, phy, reg);
         Err(Bcm2711GenetError::MdioTimeout)
+    }
+
+    fn log_mdio_timeout(&self, phase: &'static str, op: u32, phy: u8, reg: u8) {
+        let mdio_raw = self.regs.mdio_cmd.read();
+        let mdio_cmd = MdioCmd::from_bits(mdio_raw);
+        debug_uart_log(format_args!(
+            "genet: mdio timeout phase={} req_op=0x{:x} req_phy=0x{:02x} req_reg=0x{:02x} mdio_cmd=0x{:08x} op=0x{:x} phy=0x{:02x} reg=0x{:02x} read_fail={} start_busy={} data=0x{:04x}\n",
+            phase,
+            op,
+            phy,
+            reg,
+            mdio_raw,
+            mdio_cmd.get(MdioCmd::op),
+            mdio_cmd.get(MdioCmd::phy),
+            mdio_cmd.get(MdioCmd::reg),
+            mdio_cmd.get(MdioCmd::read_fail),
+            mdio_cmd.get(MdioCmd::start_busy),
+            mdio_cmd.get(MdioCmd::data)
+        ));
+        debug_uart_log(format_args!(
+            "genet: mdio timeout regs umac_cmd=0x{:08x} sys_port_ctrl=0x{:08x} ext_rgmii_oob_ctrl=0x{:08x}\n",
+            self.regs.umac_cmd.read(),
+            self.regs.sys_port_ctrl.read(),
+            self.regs.ext_rgmii_oob_ctrl.read()
+        ));
     }
 
     fn try_send_frame_result(&mut self, frame: &[u8]) -> Result<(), Bcm2711GenetError> {
