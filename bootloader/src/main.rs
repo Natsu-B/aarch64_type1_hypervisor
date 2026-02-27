@@ -466,23 +466,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             gdb_uart::init(gdb_uart.base, UART_CLOCK_HZ, UART_BAUD);
         }
 
-        #[cfg(feature = "rpi4_net")]
-        let genet_ptr: *mut Bcm2711GenetV5 = {
-            let genet =
-                net::rpi4::init_genet_from_dtb_with_link_wait(&dtb, Some(Duration::from_secs(30)));
-            #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
-            genet_selftest::run_with_driver(genet);
-            let genet_ptr: *mut Bcm2711GenetV5 = genet;
-            let eth = genet as &'static mut dyn io_api::ethernet::EthernetFrameIo;
-            net::udp_uart::init(eth, net::config::LOCAL_IP);
-            arch_hal::set_mirror(Some(arch_hal::MirrorOps {
-                write: net::udp_uart::debug_write_str,
-                flush: net::udp_uart::debug_flush,
-            }));
-            gdb_uart::init(0, UART_CLOCK_HZ, UART_BAUD);
-            genet_ptr
-        };
-
         debug::init_gdb_stub();
         println!(
             "debug uart starting (guest console @ 0x{:X})...\r\n",
@@ -562,24 +545,10 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             gdb_uart::init(0, UART_CLOCK_HZ, UART_BAUD);
         }
 
-        #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
+        #[cfg(feature = "virtio_net")]
         {
             net::udp_uart::pause();
             arch_hal::set_mirror(None);
-            #[cfg(feature = "rpi4_net")]
-            {
-                assert!(
-                    !genet_ptr.is_null(),
-                    "rpi4_net: genet pointer must be initialized before quiesce"
-                );
-                // SAFETY: IRQs are still disabled at this point in boot flow, and UDP UART traffic
-                // has been paused immediately above, so there is no concurrent access to `genet_ptr`.
-                unsafe {
-                    (&mut *genet_ptr)
-                        .quiesce_for_paging()
-                        .expect("genet quiesce failed");
-                }
-            }
             sync_pending_async_serror();
         }
 
@@ -599,6 +568,41 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             stack_overflow::init_emergency_stack();
         }
         println!("Emergency stack initialized");
+
+        #[cfg(feature = "rpi4_net")]
+        let genet_ptr: *mut Bcm2711GenetV5 = {
+            let genet =
+                net::rpi4::init_genet_from_dtb_with_link_wait(&dtb, Some(Duration::from_secs(30)));
+            #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
+            genet_selftest::run_with_driver(genet);
+            let genet_ptr: *mut Bcm2711GenetV5 = genet;
+            let eth = genet as &'static mut dyn io_api::ethernet::EthernetFrameIo;
+            net::udp_uart::init(eth, net::config::LOCAL_IP);
+            arch_hal::set_mirror(Some(arch_hal::MirrorOps {
+                write: net::udp_uart::debug_write_str,
+                flush: net::udp_uart::debug_flush,
+            }));
+            gdb_uart::init(0, UART_CLOCK_HZ, UART_BAUD);
+            genet_ptr
+        };
+
+        #[cfg(feature = "rpi4_net")]
+        {
+            net::udp_uart::pause();
+            arch_hal::set_mirror(None);
+            assert!(
+                !genet_ptr.is_null(),
+                "rpi4_net: genet pointer must be initialized before quiesce"
+            );
+            // SAFETY: IRQs are still disabled at this point in boot flow, and UDP UART traffic
+            // has been paused immediately above, so there is no concurrent access to `genet_ptr`.
+            unsafe {
+                (&mut *genet_ptr)
+                    .quiesce_for_paging()
+                    .expect("genet quiesce failed");
+            }
+            sync_pending_async_serror();
+        }
 
         // setup paging
         println!("start paging...");
