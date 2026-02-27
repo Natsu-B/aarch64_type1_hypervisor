@@ -1,0 +1,18 @@
+[package]
+name = "soc-ethernet-loopback"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["."]
+
+[dependencies]
+arch_hal = { path = "../../../../../arch_hal" }
+dtb = { path = "../../../../../dtb" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = true

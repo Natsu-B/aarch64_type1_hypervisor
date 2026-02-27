@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::io::{self};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
@@ -50,7 +51,7 @@ fn print_xtask_usage() {
     println!("Usage: cargo xtask <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build [rpi4|rpi4_net|rpi5] [cargo args...]");
+    println!("  build [rpi5|rpi4|example] [args...]");
     println!("  run [rpi4|rpi5] [args...]");
     println!("  test [xtest args...]");
     println!();
@@ -63,8 +64,242 @@ fn build(args: &[String]) -> Result<String, String> {
         Some("rpi5") => build_rpi5(&args[1..]),
         Some("rpi4") => build_rpi4(&args[1..]),
         Some("rpi4_net") => build_rpi4_net(&args[1..]),
+        Some("example") => build_examples(&args[1..]),
         _ => build_bootloader(args),
     }
+}
+
+fn build_examples(args: &[String]) -> Result<String, String> {
+    let (filters, mut forward_args) = parse_build_example_args(args)?;
+
+    if !has_target_arg(&forward_args) {
+        insert_default_target_arg(&mut forward_args);
+    }
+
+    let workspace = workspace_root()?;
+    let mut manifests = discover_example_manifests(&workspace, 8)?;
+
+    if !filters.is_empty() {
+        manifests.retain(|manifest| {
+            filters
+                .iter()
+                .any(|filter| manifest_matches_filter(manifest, filter))
+        });
+    }
+
+    if manifests.is_empty() {
+        if filters.is_empty() {
+            return Err(
+                "Error: no example manifests found under */example/*/Cargo.toml".to_string(),
+            );
+        }
+        return Err(format!(
+            "Error: no example manifests matched filters: {}",
+            filters.join(", ")
+        ));
+    }
+
+    for manifest in manifests {
+        eprintln!("\n--- Building example: {} ---", manifest.display());
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
+            .arg("-Z")
+            .arg("build-std=core,alloc,compiler_builtins")
+            .arg("-Z")
+            .arg("build-std-features=compiler-builtins-mem")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .args(&forward_args)
+            .env("XTASK_BUILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        eprintln!("Running: {:?}", cmd);
+        let status = cmd
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to spawn cargo build for example manifest {}: {}",
+                    manifest.display(),
+                    e
+                )
+            })
+            .wait()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to wait for cargo build for example manifest {}: {}",
+                    manifest.display(),
+                    e
+                )
+            });
+        if !status.success() {
+            eprintln!(
+                "Error: cargo build failed for example manifest '{}' with status: {:?}",
+                manifest.display(),
+                status
+            );
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    eprintln!("\n--- Examples built successfully ---");
+    Ok(String::new())
+}
+
+fn parse_build_example_args(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut filters = Vec::new();
+    let mut forward_args = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        if arg == "--" {
+            forward_args.extend(args[i..].iter().cloned());
+            break;
+        }
+
+        if let Some(pkg) = arg.strip_prefix("--package=") {
+            filters.push(pkg.to_string());
+            i += 1;
+            continue;
+        }
+
+        if arg == "-p" || arg == "--package" {
+            match args.get(i + 1) {
+                Some(pkg) if pkg != "--" => {
+                    filters.push(pkg.clone());
+                    i += 2;
+                    continue;
+                }
+                _ => return Err("Error: -p/--package requires a value".to_string()),
+            }
+        }
+
+        if arg.starts_with("-p") && arg.len() > 2 {
+            filters.push(arg[2..].to_string());
+            i += 1;
+            continue;
+        }
+
+        forward_args.push(arg.clone());
+        i += 1;
+    }
+
+    Ok((filters, forward_args))
+}
+
+fn has_target_arg(args: &[String]) -> bool {
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--target" || arg.starts_with("--target=") {
+            return true;
+        }
+    }
+    false
+}
+
+fn insert_default_target_arg(args: &mut Vec<String>) {
+    if let Some(separator_pos) = args.iter().position(|arg| arg == "--") {
+        args.insert(separator_pos, "--target".to_string());
+        args.insert(
+            separator_pos + 1,
+            "aarch64-unknown-none-softfloat".to_string(),
+        );
+    } else {
+        args.push("--target".to_string());
+        args.push("aarch64-unknown-none-softfloat".to_string());
+    }
+}
+
+fn discover_example_manifests(root: &Path, max_depth: usize) -> Result<Vec<PathBuf>, String> {
+    let mut manifests = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth {
+            continue;
+        }
+
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!("Failed to read directory entry in {}: {}", dir.display(), e)
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("Failed to inspect {}: {}", entry.path().display(), e))?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                if depth < max_depth {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            };
+
+            if matches!(name, "target" | ".git" | "bin") {
+                continue;
+            }
+
+            if name == "example" {
+                let children = fs::read_dir(&path).map_err(|e| {
+                    format!("Failed to read example directory {}: {}", path.display(), e)
+                })?;
+                for child in children {
+                    let child = child.map_err(|e| {
+                        format!(
+                            "Failed to read directory entry in {}: {}",
+                            path.display(),
+                            e
+                        )
+                    })?;
+                    let child_type = child.file_type().map_err(|e| {
+                        format!("Failed to inspect {}: {}", child.path().display(), e)
+                    })?;
+                    if !child_type.is_dir() {
+                        continue;
+                    }
+
+                    let manifest = child.path().join("Cargo.toml");
+                    if manifest.is_file() {
+                        manifests.push(manifest);
+                    }
+                }
+            }
+
+            if depth < max_depth {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+
+    manifests.sort();
+    manifests.dedup();
+    Ok(manifests)
+}
+
+fn manifest_matches_filter(manifest: &Path, filter: &str) -> bool {
+    let mut previous: Option<&str> = None;
+    for component in manifest.components() {
+        let Some(component) = component.as_os_str().to_str() else {
+            previous = None;
+            continue;
+        };
+        if previous == Some(filter) && component == "example" {
+            return true;
+        }
+        previous = Some(component);
+    }
+    false
 }
 
 fn build_bootloader(args: &[String]) -> Result<String, String> {
