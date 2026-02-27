@@ -414,6 +414,12 @@ unsafe impl Sync for Bcm2711GenetV5 {}
 static TAKEN: RawBytePod<bool> = unsafe { RawBytePod::new_raw_unchecked(false) };
 // SAFETY: Publishes completion of one-time initialization for `STATE`.
 static READY: RawBytePod<bool> = unsafe { RawBytePod::new_raw_unchecked(false) };
+// SAFETY: One-time debug flag updated atomically to avoid repeated ring index reset logs.
+static RX_RING_INDEX_ZERO_LOGGED: RawBytePod<bool> =
+    unsafe { RawBytePod::new_raw_unchecked(false) };
+// SAFETY: One-time debug flag updated atomically to avoid repeated ring index reset logs.
+static TX_RING_INDEX_ZERO_LOGGED: RawBytePod<bool> =
+    unsafe { RawBytePod::new_raw_unchecked(false) };
 // SAFETY: The crate enables `sync_unsafe_cell`; this cell stores the singleton driver instance.
 // Access is serialized by the `TAKEN/READY` one-time initialization protocol.
 static STATE: SyncUnsafeCell<MaybeUninit<Bcm2711GenetV5>> =
@@ -989,6 +995,8 @@ impl Bcm2711GenetV5 {
         let mask = Self::dma_ctrl_enable_mask();
         self.regs.tdma_common.dma_ctrl.clear_bits(mask);
         self.regs.rdma_common.dma_ctrl.clear_bits(mask);
+        self.regs.rdma_common.ring_cfg.write(0);
+        self.regs.tdma_common.ring_cfg.write(0);
         cpu::dsb_sy();
 
         self.regs.umac_tx_flush.write(1);
@@ -1012,6 +1020,8 @@ impl Bcm2711GenetV5 {
         let mask = Self::dma_ctrl_enable_mask();
         self.regs.tdma_common.dma_ctrl.clear_bits(mask);
         self.regs.rdma_common.dma_ctrl.clear_bits(mask);
+        self.regs.rdma_common.ring_cfg.write(0);
+        self.regs.tdma_common.ring_cfg.write(0);
         cpu::dsb_sy();
 
         self.regs.umac_tx_flush.write(1);
@@ -1036,12 +1046,20 @@ impl Bcm2711GenetV5 {
             .end_addr
             .write(((RX_DESCS * size_of::<DmaDesc>()) / 4 - 1) as u32);
 
-        // Hardware cannot initialize RDMA_PROD_INDEX to 0 reliably; align CONS to current PROD.
-        self.c_index = (self.regs.rdma_rings[DEFAULT_Q].index_a.read() & 0xffff) as u16;
-        self.regs.rdma_rings[DEFAULT_Q]
-            .index_b
-            .write(self.c_index as u32);
-        self.rx_index = self.c_index & 0xff;
+        self.c_index = 0;
+        self.rx_index = 0;
+        self.regs.rdma_rings[DEFAULT_Q].index_a.write(0);
+        self.regs.rdma_rings[DEFAULT_Q].index_b.write(0);
+        if RX_RING_INDEX_ZERO_LOGGED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            debug_uart_log(format_args!(
+                "genet: rdma ring index reset index_a=0x{:08x} index_b=0x{:08x}\n",
+                self.regs.rdma_rings[DEFAULT_Q].index_a.read(),
+                self.regs.rdma_rings[DEFAULT_Q].index_b.read()
+            ));
+        }
 
         self.regs.rdma_rings[DEFAULT_Q]
             .ring_buf_size
@@ -1107,12 +1125,19 @@ impl Bcm2711GenetV5 {
             .end_addr
             .write(((TX_DESCS * size_of::<DmaDesc>()) / 4 - 1) as u32);
 
-        // Hardware cannot initialize TDMA_CONS_INDEX to 0 reliably; align PROD to current CONS.
-        self.tx_index = (self.regs.tdma_rings[DEFAULT_Q].index_a.read() & 0xffff) as u16;
-        self.regs.tdma_rings[DEFAULT_Q]
-            .index_b
-            .write(self.tx_index as u32);
-        self.tx_index &= 0xff;
+        self.tx_index = 0;
+        self.regs.tdma_rings[DEFAULT_Q].index_a.write(0);
+        self.regs.tdma_rings[DEFAULT_Q].index_b.write(0);
+        if TX_RING_INDEX_ZERO_LOGGED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            debug_uart_log(format_args!(
+                "genet: tdma ring index reset index_a=0x{:08x} index_b=0x{:08x}\n",
+                self.regs.tdma_rings[DEFAULT_Q].index_a.read(),
+                self.regs.tdma_rings[DEFAULT_Q].index_b.read()
+            ));
+        }
 
         self.regs.tdma_rings[DEFAULT_Q].done_or_thresh.write(1);
         self.regs.tdma_rings[DEFAULT_Q].flow_or_xoff.write(0);
