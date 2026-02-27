@@ -1014,6 +1014,78 @@ pub fn va_to_ipa_el2_write(va: u64) -> Option<u64> {
     va_to_ipa_el2_common(va, true)
 }
 
+/// Translate an EL2 VA to a physical address for a potential read.
+///
+/// This uses the current EL2 stage-1 translation regime via `AT S1E2R`.
+/// If EL2 stage-1 MMU is disabled (`SCTLR_EL2.M == 0`), the input VA is
+/// returned unchanged as an identity mapping.
+pub fn va_to_pa_el2_read(va: u64) -> Option<u64> {
+    va_to_pa_el2_common(va, false)
+}
+
+/// Translate an EL2 VA to a physical address for a potential write.
+///
+/// This uses the current EL2 stage-1 translation regime via `AT S1E2W`.
+/// If EL2 stage-1 MMU is disabled (`SCTLR_EL2.M == 0`), the input VA is
+/// returned unchanged as an identity mapping.
+pub fn va_to_pa_el2_write(va: u64) -> Option<u64> {
+    va_to_pa_el2_common(va, true)
+}
+
+fn va_to_pa_el2_common(va: u64, is_write: bool) -> Option<u64> {
+    let sctlr_el2 = get_sctlr_el2();
+    if (sctlr_el2 & 1) == 0 {
+        return Some(va);
+    }
+
+    let par_after: u64;
+
+    if is_write {
+        // SAFETY:
+        // - Uses `AT S1E2W` to perform an EL2 stage-1 translation probe for `va`.
+        // - Saves and restores PAR_EL1 so callers do not observe clobbered PAR state.
+        // - `isb` orders PAR_EL1 observation after the AT operation.
+        unsafe {
+            core::arch::asm!(
+                "mrs {tmp}, par_el1",
+                "at S1E2W, {va}",
+                "isb",
+                "mrs {par_after}, par_el1",
+                "msr par_el1, {tmp}",
+                tmp        = lateout(reg) _,
+                par_after  = out(reg) par_after,
+                va         = in(reg) va,
+                options(nostack)
+            );
+        }
+    } else {
+        // SAFETY:
+        // - Uses `AT S1E2R` to perform an EL2 stage-1 translation probe for `va`.
+        // - Saves and restores PAR_EL1 so callers do not observe clobbered PAR state.
+        // - `isb` orders PAR_EL1 observation after the AT operation.
+        unsafe {
+            core::arch::asm!(
+                "mrs {tmp}, par_el1",
+                "at S1E2R, {va}",
+                "isb",
+                "mrs {par_after}, par_el1",
+                "msr par_el1, {tmp}",
+                tmp        = lateout(reg) _,
+                par_after  = out(reg) par_after,
+                va         = in(reg) va,
+                options(nostack)
+            );
+        }
+    }
+
+    if (par_after & 1) != 0 {
+        return None;
+    }
+
+    let pa = par_after & 0x0000_FFFF_FFFF_F000;
+    Some(pa | (va & 0xFFF))
+}
+
 pub fn clean_data_cache_all() {
     // SAFETY:
     // - Uses privileged system registers (CLIDR_EL1, CSSELR_EL1, CCSIDR_EL1).

@@ -59,7 +59,6 @@ const DMA_FC_THRESH_VALUE: u32 = (DMA_FC_THRESH_LO << 16) | DMA_FC_THRESH_HI;
 
 // Real-time deadlines derived from CNTPCT/CNTFRQ keep behavior stable across CPU frequencies.
 const MDIO_BUSY_TIMEOUT_US: u64 = 20_000;
-const PHY_LINK_TIMEOUT_US: u64 = 5_000_000;
 const TX_DONE_TIMEOUT_US: u64 = 2_000;
 const PHY_STATUS_POLL_INTERVAL_US: u64 = 10_000;
 const PHY_STATUS_LOG_INTERVAL_US: u64 = 250_000;
@@ -109,6 +108,7 @@ pub enum Bcm2711GenetError {
     PhyTimeout,
     TxTimeout,
     DmaAddressNotCovered,
+    El2VaToPaFailed,
     LoopbackSelfTestFailed,
     LoopbackSelfTestTxFailed,
     LoopbackSelfTestRxTimeout,
@@ -422,19 +422,23 @@ static STATE: SyncUnsafeCell<MaybeUninit<Bcm2711GenetV5>> =
 static mut RXBUF: AlignedRxStorage = AlignedRxStorage([0; RX_TOTAL_BUFSIZE]);
 
 impl Bcm2711GenetV5 {
-    pub fn init_from_dtb(dtb: &DtbParser) -> Result<&'static mut Self, Bcm2711GenetError> {
-        Self::init_from_dtb_with_mode(dtb, false)
+    pub fn init_from_dtb(
+        dtb: &DtbParser,
+        link_wait: Option<Duration>,
+    ) -> Result<&'static mut Self, Bcm2711GenetError> {
+        Self::init_from_dtb_with_mode(dtb, false, link_wait)
     }
 
     pub fn init_from_dtb_loopback_no_phy(
         dtb: &DtbParser,
     ) -> Result<&'static mut Self, Bcm2711GenetError> {
-        Self::init_from_dtb_with_mode(dtb, true)
+        Self::init_from_dtb_with_mode(dtb, true, None)
     }
 
     fn init_from_dtb_with_mode(
         dtb: &DtbParser,
         local_loopback: bool,
+        link_wait: Option<Duration>,
     ) -> Result<&'static mut Self, Bcm2711GenetError> {
         if TAKEN
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -443,7 +447,7 @@ impl Bcm2711GenetV5 {
             return Err(Bcm2711GenetError::AlreadyTaken);
         }
 
-        let result = Self::init_from_dtb_inner(dtb, local_loopback);
+        let result = Self::init_from_dtb_inner(dtb, local_loopback, link_wait);
         if result.is_err() {
             READY.store(false, Ordering::Release);
             TAKEN.store(false, Ordering::Release);
@@ -454,6 +458,7 @@ impl Bcm2711GenetV5 {
     fn init_from_dtb_inner(
         dtb: &DtbParser,
         local_loopback: bool,
+        link_wait: Option<Duration>,
     ) -> Result<&'static mut Self, Bcm2711GenetError> {
         let parsed = Self::parse_dtb(dtb)?;
         if parsed.mmio_size < GENET_MMIO_MIN_SIZE || parsed.mmio_base == 0 {
@@ -482,7 +487,7 @@ impl Bcm2711GenetV5 {
             txbuf: AlignedTxBuffer([0; TX_BUF_LENGTH]),
         };
 
-        instance.init_hw()?;
+        instance.init_hw(link_wait)?;
 
         // SAFETY: Protected by one-time `TAKEN` acquisition; no other writer can race here.
         unsafe { (*STATE.get()).write(instance) };
@@ -728,11 +733,24 @@ impl Bcm2711GenetV5 {
         spec.first().copied().unwrap_or(0)
     }
 
-    fn log_dma_mapping_setup(&self) {
+    fn log_dma_mapping_setup(&self) -> Result<(), Bcm2711GenetError> {
+        let rx_base_va = Self::rx_base_va();
+        let rx_base_pa = Self::rx_base_pa()?;
+        let rx_base_dma = self.cpu_to_dma(rx_base_pa, RX_BUF_LENGTH)?;
+
+        let txbuf_va = self.txbuf.0.as_ptr() as usize;
+        let txbuf_pa = Self::va_to_pa_el2_read_usize(txbuf_va)?;
+        let txbuf_dma = self.cpu_to_dma(txbuf_pa, TX_BUF_LENGTH)?;
+
         debug_uart_log(format_args!(
-            "genet: dma setup mmio_base=0x{:016x} rxbase_cpu=0x{:016x} dma_window_count={}\n",
+            "genet: dma setup mmio_base=0x{:016x} rxbase_va=0x{:016x} rxbase_pa=0x{:016x} rxbase_dma=0x{:016x} txbuf_va=0x{:016x} txbuf_pa=0x{:016x} txbuf_dma=0x{:016x} dma_window_count={}\n",
             self.mmio_base,
-            Self::rx_base_cpu(),
+            rx_base_va,
+            rx_base_pa,
+            rx_base_dma,
+            txbuf_va,
+            txbuf_pa,
+            txbuf_dma,
             self.dma_window_count
         ));
         match self.dma_mapping_source {
@@ -765,15 +783,29 @@ impl Bcm2711GenetV5 {
                 index, window.cpu_base, window.dma_base, window.len
             ));
         }
+        Ok(())
     }
 
-    fn rx_base_cpu() -> usize {
+    fn rx_base_va() -> usize {
         // SAFETY: `RXBUF` is dedicated static storage for this singleton NIC backend.
         unsafe { core::ptr::addr_of!(RXBUF.0) as *const u8 as usize }
     }
 
-    fn rx_slot_cpu_addr(&self, slot: u16) -> usize {
-        Self::rx_base_cpu() + (slot as usize) * RX_BUF_LENGTH
+    fn rx_base_pa() -> Result<usize, Bcm2711GenetError> {
+        Self::va_to_pa_el2_read_usize(Self::rx_base_va())
+    }
+
+    fn va_to_pa_el2_read_usize(va: usize) -> Result<usize, Bcm2711GenetError> {
+        let pa = cpu::va_to_pa_el2_read(va as u64).ok_or(Bcm2711GenetError::El2VaToPaFailed)?;
+        usize::try_from(pa).map_err(|_| Bcm2711GenetError::El2VaToPaFailed)
+    }
+
+    fn rx_slot_va_addr(&self, slot: u16) -> usize {
+        Self::rx_base_va() + (slot as usize) * RX_BUF_LENGTH
+    }
+
+    fn dma_ctrl_enable_mask() -> u32 {
+        (1u32 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT)) | DMA_EN
     }
 
     fn cpu_to_dma(&self, cpu: usize, len: usize) -> Result<usize, Bcm2711GenetError> {
@@ -800,64 +832,86 @@ impl Bcm2711GenetV5 {
         Err(Bcm2711GenetError::DmaAddressNotCovered)
     }
 
-    fn init_hw(&mut self) -> Result<(), Bcm2711GenetError> {
-        let rev = SysRevCtrl::from_bits(self.regs.sys_rev_ctrl.read());
-        let major = rev.get(SysRevCtrl::major) as u8;
-        let minor = rev.get(SysRevCtrl::minor) as u8;
-        if major != 6 {
-            return Err(Bcm2711GenetError::UnsupportedGenetVersion { major, minor });
-        }
-        debug_uart_log(format_args!(
-            "genet: init rev={}.{} phy_addr={} phy_mode={}\n",
-            major,
-            minor,
-            self.phy_addr,
-            phy_mode_name(self.phy_mode)
-        ));
-        self.log_dma_mapping_setup();
-
-        self.program_phy_interface();
-
-        // Disable MAC, then issue soft reset with local loopback first.
-        self.regs.umac_cmd.write(0);
-        self.regs.umac_cmd.write(
-            UmacCmd::new()
-                .set(UmacCmd::sw_reset, 1)
-                .set(UmacCmd::lcl_loop_en, 1)
-                .bits(),
-        );
-        Self::delay_us(2);
-
-        self.umac_reset_sequence();
-        self.program_mac_address();
-
-        self.disable_dma_and_flush_tx();
-        self.rx_ring_init();
-        self.rx_descs_init()?;
-        self.tx_ring_init();
-        // SAFETY: `dsb sy` guarantees descriptor stores and cache maintenance complete before
-        // setting `DMA_EN`, so RDMA/TDMA cannot fetch stale descriptor data.
-        unsafe {
-            asm!("dsb sy", options(nostack, preserves_flags));
-        }
-        self.enable_dma();
-        Self::error_sync_barrier();
-
-        if self.local_loopback {
+    fn init_hw(&mut self, link_wait: Option<Duration>) -> Result<(), Bcm2711GenetError> {
+        let result = (|| -> Result<(), Bcm2711GenetError> {
+            let rev = SysRevCtrl::from_bits(self.regs.sys_rev_ctrl.read());
+            let major = rev.get(SysRevCtrl::major) as u8;
+            let minor = rev.get(SysRevCtrl::minor) as u8;
+            if major != 6 {
+                return Err(Bcm2711GenetError::UnsupportedGenetVersion { major, minor });
+            }
             debug_uart_log(format_args!(
-                "[selftest] genet: skip PHY bringup (local loopback mode)\n"
+                "genet: init rev={}.{} phy_addr={} phy_mode={}\n",
+                major,
+                minor,
+                self.phy_addr,
+                phy_mode_name(self.phy_mode)
             ));
-        } else {
+            self.log_dma_mapping_setup()?;
+
+            self.program_phy_interface();
+
+            // Disable MAC, then issue soft reset with local loopback first.
+            self.regs.umac_cmd.write(0);
+            self.regs.umac_cmd.write(
+                UmacCmd::new()
+                    .set(UmacCmd::sw_reset, 1)
+                    .set(UmacCmd::lcl_loop_en, 1)
+                    .bits(),
+            );
+            Self::delay_us(2);
+
+            self.umac_reset_sequence();
+            self.program_mac_address();
+
+            self.disable_dma_and_flush_tx();
+            self.rx_ring_init();
+            self.rx_descs_init()?;
+            self.tx_ring_init();
+            // SAFETY: `dsb sy` guarantees descriptor stores and cache maintenance complete before
+            // setting `DMA_EN`, so RDMA/TDMA cannot fetch stale descriptor data.
+            unsafe {
+                asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            self.enable_dma();
+            Self::error_sync_barrier();
+
+            if self.local_loopback {
+                debug_uart_log(format_args!(
+                    "[selftest] genet: skip PHY bringup (local loopback mode)\n"
+                ));
+            } else {
+                match link_wait {
+                    Some(timeout) => {
+                        debug_uart_log(format_args!(
+                            "genet: phy bringup begin timeout={}ms phy_addr={}\n",
+                            timeout.as_millis(),
+                            self.phy_addr
+                        ));
+                    }
+                    None => {
+                        debug_uart_log(format_args!(
+                            "genet: phy bringup begin timeout=forever phy_addr={}\n",
+                            self.phy_addr
+                        ));
+                    }
+                }
+                self.phy_bringup(link_wait)?;
+                debug_uart_log(format_args!("genet: phy bringup complete\n"));
+            }
+            self.adjust_link_and_enable_umac();
+            debug_uart_log(format_args!("genet: umac enable complete\n"));
+            Ok(())
+        })();
+
+        if let Err(err) = result {
             debug_uart_log(format_args!(
-                "genet: phy bringup begin timeout={}ms phy_addr={}\n",
-                PHY_LINK_TIMEOUT_US / 1_000,
-                self.phy_addr
+                "genet: init failed; quiescing MAC/DMA err={:?}\n",
+                err
             ));
-            self.phy_bringup()?;
-            debug_uart_log(format_args!("genet: phy bringup complete\n"));
+            self.stop_hw_quiesce();
+            return Err(err);
         }
-        self.adjust_link_and_enable_umac();
-        debug_uart_log(format_args!("genet: umac enable complete\n"));
 
         Ok(())
     }
@@ -932,8 +986,10 @@ impl Bcm2711GenetV5 {
     }
 
     fn disable_dma_and_flush_tx(&self) {
-        self.regs.tdma_common.dma_ctrl.clear_bits(DMA_EN);
-        self.regs.rdma_common.dma_ctrl.clear_bits(DMA_EN);
+        let mask = Self::dma_ctrl_enable_mask();
+        self.regs.tdma_common.dma_ctrl.clear_bits(mask);
+        self.regs.rdma_common.dma_ctrl.clear_bits(mask);
+        cpu::dsb_sy();
 
         self.regs.umac_tx_flush.write(1);
         Self::delay_us(10);
@@ -941,9 +997,26 @@ impl Bcm2711GenetV5 {
     }
 
     fn enable_dma(&self) {
-        let dma_ctrl = (1u32 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT)) | DMA_EN;
+        let dma_ctrl = Self::dma_ctrl_enable_mask();
         self.regs.tdma_common.dma_ctrl.write(dma_ctrl);
-        self.regs.rdma_common.dma_ctrl.write(dma_ctrl);
+        self.regs.rdma_common.dma_ctrl.set_bits(dma_ctrl);
+    }
+
+    fn stop_hw_quiesce(&self) {
+        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
+            .set(UmacCmd::tx_en, 0)
+            .set(UmacCmd::rx_en, 0)
+            .bits();
+        self.regs.umac_cmd.write(cmd);
+
+        let mask = Self::dma_ctrl_enable_mask();
+        self.regs.tdma_common.dma_ctrl.clear_bits(mask);
+        self.regs.rdma_common.dma_ctrl.clear_bits(mask);
+        cpu::dsb_sy();
+
+        self.regs.umac_tx_flush.write(1);
+        Self::delay_us(10);
+        self.regs.umac_tx_flush.write(0);
     }
 
     fn rdma_ring(&self) -> &DmaRingRegs {
@@ -981,26 +1054,28 @@ impl Bcm2711GenetV5 {
 
     fn rx_descs_init(&self) -> Result<(), Bcm2711GenetError> {
         let len_stat = ((RX_BUF_LENGTH as u32) << DMA_BUFLENGTH_SHIFT) | DMA_OWN;
-        let rxbase_cpu = Self::rx_base_cpu();
+        let rxbase_va = Self::rx_base_va();
+        let rxbase_pa = Self::rx_base_pa()?;
 
         // The entire RX storage is owned by DMA after descriptor programming. We clean once to
         // push potential dirty CPU lines before NIC writes into these buffers.
-        cpu::clean_dcache_range(rxbase_cpu as *const u8, RX_TOTAL_BUFSIZE);
+        cpu::clean_dcache_range(rxbase_va as *const u8, RX_TOTAL_BUFSIZE);
 
         for i in 0..RX_DESCS {
             let desc = &self.regs.rx_desc[i];
-            let addr_cpu = rxbase_cpu + i * RX_BUF_LENGTH;
-            let addr_dma = self.cpu_to_dma(addr_cpu, RX_BUF_LENGTH)?;
+            let addr_va = rxbase_va + i * RX_BUF_LENGTH;
+            let addr_pa = rxbase_pa + i * RX_BUF_LENGTH;
+            let addr_dma = self.cpu_to_dma(addr_pa, RX_BUF_LENGTH)?;
             if i == 0 {
                 debug_uart_log(format_args!(
-                    "genet: rx_desc[0] addr_dma=0x{:016x} addr_cpu=0x{:016x} len=0x{:x}\n",
-                    addr_dma, addr_cpu, RX_BUF_LENGTH
+                    "genet: rx_desc[0] addr_dma=0x{:016x} addr_pa=0x{:016x} addr_va=0x{:016x} len=0x{:x}\n",
+                    addr_dma, addr_pa, addr_va, RX_BUF_LENGTH
                 ));
             }
             if (addr_dma >> 32) != 0 {
                 debug_uart_log(format_args!(
-                    "genet: rx_desc[{}] addr_dma exceeds 32-bit addr_cpu=0x{:016x} addr_dma=0x{:016x}\n",
-                    i, addr_cpu, addr_dma
+                    "genet: rx_desc[{}] addr_dma exceeds 32-bit addr_pa=0x{:016x} addr_va=0x{:016x} addr_dma=0x{:016x}\n",
+                    i, addr_pa, addr_va, addr_dma
                 ));
                 return Err(Bcm2711GenetError::DmaAddressNotCovered);
             }
@@ -1047,7 +1122,7 @@ impl Bcm2711GenetV5 {
         self.regs.tdma_common.ring_cfg.write(1u32 << DEFAULT_Q);
     }
 
-    fn phy_bringup(&self) -> Result<(), Bcm2711GenetError> {
+    fn phy_bringup(&self, link_wait: Option<Duration>) -> Result<(), Bcm2711GenetError> {
         let bmcr = self.mdio_read(self.phy_addr, PHY_BMCR)?;
         let restart = bmcr | PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART;
         self.mdio_write(self.phy_addr, PHY_BMCR, restart)?;
@@ -1057,8 +1132,9 @@ impl Bcm2711GenetV5 {
         ));
 
         // Loop-count timeouts vary with core speed. Use a CNTPCT-based deadline so this wait
-        // remains a real 5-second timeout independent of frequency/optimization changes.
-        let deadline = deadline_ticks_from_now(PHY_LINK_TIMEOUT_US);
+        // remains a real-time wait independent of frequency/optimization changes.
+        let deadline =
+            link_wait.map(|timeout| read_cntpct_el0().wrapping_add(ticks_from_duration(timeout)));
         let poll_ticks = ticks_from_us(PHY_STATUS_POLL_INTERVAL_US);
         let log_ticks = ticks_from_us(PHY_STATUS_LOG_INTERVAL_US);
         let mut next_poll = read_cntpct_el0();
@@ -1074,7 +1150,7 @@ impl Bcm2711GenetV5 {
         loop {
             let now = read_cntpct_el0();
             if tick_reached(now, next_poll) {
-                last_bmsr = self.mdio_read(self.phy_addr, PHY_BMSR)?;
+                last_bmsr = self.mdio_read_bmsr_latched()?;
                 if (last_bmsr & PHY_BMSR_LSTATUS) != 0 && (last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0 {
                     if let Ok(value) = self.mdio_read(self.phy_addr, PHY_BMCR) {
                         last_bmcr = value;
@@ -1107,6 +1183,9 @@ impl Bcm2711GenetV5 {
             }
 
             if tick_reached(now, next_log) {
+                if let Ok(value) = self.mdio_read_bmsr_latched() {
+                    last_bmsr = value;
+                }
                 if let Ok(value) = self.mdio_read(self.phy_addr, PHY_BMCR) {
                     last_bmcr = value;
                 }
@@ -1138,31 +1217,31 @@ impl Bcm2711GenetV5 {
                 next_log = now.wrapping_add(log_ticks);
             }
 
-            if tick_reached(now, deadline) {
-                break;
+            if let Some(deadline_ticks) = deadline {
+                if tick_reached(now, deadline_ticks) {
+                    debug_uart_log(format_args!(
+                        "genet: phy timeout phy={} link={} aneg={} bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
+                        self.phy_addr,
+                        ((last_bmsr & PHY_BMSR_LSTATUS) != 0) as u8,
+                        ((last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0) as u8,
+                        last_bmcr,
+                        last_bmsr,
+                        last_adv,
+                        last_lpa,
+                        last_ctrl1000,
+                        last_stat1000
+                    ));
+                    return Err(Bcm2711GenetError::PhyTimeout);
+                }
             }
             spin_loop();
         }
-
-        debug_uart_log(format_args!(
-            "genet: phy timeout phy={} link={} aneg={} bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
-            self.phy_addr,
-            ((last_bmsr & PHY_BMSR_LSTATUS) != 0) as u8,
-            ((last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0) as u8,
-            last_bmcr,
-            last_bmsr,
-            last_adv,
-            last_lpa,
-            last_ctrl1000,
-            last_stat1000
-        ));
-        Err(Bcm2711GenetError::PhyTimeout)
     }
 
     fn resolve_umac_speed_from_phy(&self) -> Option<u32> {
         // Clause-22 provides a mostly-standard way to infer speed. Not all PHYs expose every
         // detail via these registers, so this is intentionally best-effort.
-        let bmsr = self.mdio_read(self.phy_addr, PHY_BMSR).ok()?;
+        let bmsr = self.mdio_read_bmsr_latched().ok()?;
         if (bmsr & PHY_BMSR_LSTATUS) == 0 {
             return None;
         }
@@ -1288,6 +1367,12 @@ impl Bcm2711GenetV5 {
         Ok(done.get(MdioCmd::data) as u16)
     }
 
+    fn mdio_read_bmsr_latched(&self) -> Result<u16, Bcm2711GenetError> {
+        let bmsr_first = self.mdio_read(self.phy_addr, PHY_BMSR)?;
+        let bmsr_second = self.mdio_read(self.phy_addr, PHY_BMSR)?;
+        Ok(bmsr_first | bmsr_second)
+    }
+
     fn wait_mdio_done(&self) -> Result<(), Bcm2711GenetError> {
         // Loop-count timeouts are brittle because compiler settings and core frequency change how
         // long one iteration takes. Deadline-based polling keeps timeout behavior predictable.
@@ -1314,6 +1399,8 @@ impl Bcm2711GenetV5 {
         // We copy user payload into an internal cacheline-aligned TX scratch buffer so cache clean
         // operations cannot spill into unrelated caller memory.
         let tx_ptr = self.txbuf.0.as_ptr();
+        let txbuf_va = tx_ptr as usize;
+        let txbuf_pa = Self::va_to_pa_el2_read_usize(txbuf_va)?;
         cpu::clean_dcache_range(tx_ptr, frame.len());
 
         let cur = self.regs.tdma_rings[DEFAULT_Q].index_b.read();
@@ -1321,11 +1408,12 @@ impl Bcm2711GenetV5 {
         // Mask on every increment so we never publish 0x1_0000 at wrap boundaries.
         let prod_index = (cur.wrapping_add(1)) & 0xffff;
         let desc = &self.regs.tx_desc[self.tx_index as usize];
-        let addr_dma = self.cpu_to_dma(tx_ptr as usize, frame.len())?;
+        let addr_dma = self.cpu_to_dma(txbuf_pa, frame.len())?;
         if (addr_dma >> 32) != 0 {
             debug_uart_log(format_args!(
-                "genet: tx scratch addr_dma exceeds 32-bit addr_cpu=0x{:016x} addr_dma=0x{:016x} len={}\n",
-                tx_ptr as usize,
+                "genet: tx scratch addr_dma exceeds 32-bit addr_pa=0x{:016x} addr_va=0x{:016x} addr_dma=0x{:016x} len={}\n",
+                txbuf_pa,
+                txbuf_va,
                 addr_dma,
                 frame.len()
             ));
@@ -1393,10 +1481,10 @@ impl Bcm2711GenetV5 {
     }
 
     fn rearm_one_rx_buffer(&mut self) {
-        let addr_cpu = self.rx_slot_cpu_addr(self.rx_index);
+        let addr_va = self.rx_slot_va_addr(self.rx_index);
 
         // After CPU consumed an RX buffer, clean it before giving ownership back to DMA.
-        cpu::clean_dcache_range(addr_cpu as *const u8, RX_BUF_LENGTH);
+        cpu::clean_dcache_range(addr_va as *const u8, RX_BUF_LENGTH);
 
         self.c_index = self.c_index.wrapping_add(1) & 0xffff;
         self.rdma_ring().index_b.write(self.c_index as u32);
@@ -1424,11 +1512,11 @@ impl Bcm2711GenetV5 {
         if length > RX_BUF_LENGTH {
             length = RX_BUF_LENGTH;
         }
-        let addr_cpu = self.rx_slot_cpu_addr(self.rx_index);
+        let addr_va = self.rx_slot_va_addr(self.rx_index);
 
         // RX buffers are fixed-size, dedicated slots inside `RXBUF`. Invalidate the entire slot
         // before reading so stale cache lines from previous, longer packets cannot leak in.
-        cpu::invalidate_dcache_range(addr_cpu as *const u8, RX_BUF_LENGTH);
+        cpu::invalidate_dcache_range(addr_va as *const u8, RX_BUF_LENGTH);
 
         // RBUF_ALIGN_2B causes hardware to place payload with a 2-byte offset for IP alignment.
         let mut payload_len = length.saturating_sub(RX_BUF_OFFSET);
@@ -1456,7 +1544,7 @@ impl Bcm2711GenetV5 {
 
         // SAFETY: RX slot addresses are computed from dedicated `RXBUF` storage bounds.
         let src = unsafe {
-            core::slice::from_raw_parts((addr_cpu + RX_BUF_OFFSET) as *const u8, payload_len)
+            core::slice::from_raw_parts((addr_va + RX_BUF_OFFSET) as *const u8, payload_len)
         };
         out[..payload_len].copy_from_slice(src);
 
@@ -1681,6 +1769,12 @@ fn read_cntpct_el0() -> u64 {
 fn ticks_from_us(us: u64) -> u64 {
     let freq = read_cntfrq_el0();
     let ticks = u128::from(us).saturating_mul(u128::from(freq)) / 1_000_000u128;
+    ticks.min(u128::from(u64::MAX)) as u64
+}
+
+fn ticks_from_duration(duration: Duration) -> u64 {
+    let freq = read_cntfrq_el0();
+    let ticks = duration.as_nanos().saturating_mul(u128::from(freq)) / 1_000_000_000u128;
     ticks.min(u128::from(u64::MAX)) as u64
 }
 

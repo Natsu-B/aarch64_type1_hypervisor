@@ -91,6 +91,8 @@ use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts;
 use core::slice;
+#[cfg(feature = "rpi4_net")]
+use core::time::Duration;
 use core::usize;
 use dtb::DeviceTree;
 use dtb::DeviceTreeEditExt;
@@ -430,7 +432,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 
         #[cfg(feature = "rpi4_net")]
         {
-            let genet = net::rpi4::init_genet_from_dtb(&dtb);
+            let genet =
+                net::rpi4::init_genet_from_dtb_with_link_wait(&dtb, Some(Duration::from_secs(30)));
             #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
             genet_selftest::run_with_driver(genet);
             let eth = genet as &'static mut dyn io_api::ethernet::EthernetFrameIo;
