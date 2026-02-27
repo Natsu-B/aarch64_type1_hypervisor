@@ -1058,12 +1058,12 @@ impl Bcm2711GenetV5 {
     }
 
     pub fn quiesce_for_paging(&mut self) -> Result<(), Bcm2711GenetError> {
-        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
-            .set(UmacCmd::tx_en, 0)
-            .set(UmacCmd::rx_en, 0)
-            .bits();
-        self.regs.umac_cmd.write(cmd);
+        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read()).set(UmacCmd::rx_en, 0);
+        self.regs.umac_cmd.write(cmd.bits());
         self.strict_dma_teardown()?;
+        let cmd = cmd.set(UmacCmd::tx_en, 0);
+        self.regs.umac_cmd.write(cmd.bits());
+
         cpu::dsb_sy();
         Self::error_sync_barrier();
         Ok(())
@@ -1086,11 +1086,8 @@ impl Bcm2711GenetV5 {
     }
 
     fn stop_hw_quiesce(&self) {
-        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read())
-            .set(UmacCmd::tx_en, 0)
-            .set(UmacCmd::rx_en, 0)
-            .bits();
-        self.regs.umac_cmd.write(cmd);
+        let cmd = UmacCmd::from_bits(self.regs.umac_cmd.read()).set(UmacCmd::rx_en, 0);
+        self.regs.umac_cmd.write(cmd.bits());
 
         if let Err(err) = self.strict_dma_teardown() {
             debug_uart_log(format_args!(
@@ -1108,6 +1105,10 @@ impl Bcm2711GenetV5 {
             Self::delay_us(10);
             self.regs.umac_tx_flush.write(0);
         }
+
+        let cmd = cmd.set(UmacCmd::tx_en, 0);
+        self.regs.umac_cmd.write(cmd.bits());
+
         cpu::dsb_sy();
         Self::error_sync_barrier();
     }

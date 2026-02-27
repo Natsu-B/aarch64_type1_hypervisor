@@ -1,9 +1,9 @@
 use alloc::boxed::Box;
-use cpu::isb;
 use core::alloc::Layout;
 use core::cell::SyncUnsafeCell;
 use core::mem;
 use core::slice;
+use cpu::isb;
 
 use cpu::registers::PARange;
 
