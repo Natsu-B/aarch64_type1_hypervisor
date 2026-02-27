@@ -1429,7 +1429,14 @@ impl Bcm2711GenetV5 {
         cpu::invalidate_dcache_range(addr_cpu as *const u8, RX_BUF_LENGTH);
 
         // RBUF_ALIGN_2B causes hardware to place payload with a 2-byte offset for IP alignment.
-        let payload_len = length.saturating_sub(RX_BUF_OFFSET + ETH_FCS_LEN);
+        let mut payload_len = length.saturating_sub(RX_BUF_OFFSET);
+
+        // If CRC forwarding is enabled, the trailing 4-byte FCS is present in the RX buffer.
+        // Otherwise, hardware strips FCS and we must not subtract it here.
+        let crc_fwd = UmacCmd::from_bits(self.regs.umac_cmd.read()).get(UmacCmd::crc_fwd) != 0;
+        if crc_fwd {
+            payload_len = payload_len.saturating_sub(ETH_FCS_LEN);
+        }
         if payload_len == 0 {
             // Empty/malformed descriptor payload: consume and recycle the descriptor so RX keeps
             // flowing. Returning Some(0) is safe because current callers already drop frame_len=0.
