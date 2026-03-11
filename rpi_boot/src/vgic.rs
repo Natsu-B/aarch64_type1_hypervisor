@@ -114,7 +114,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         .map_err(|_| "vgic: switch in")?;
 
     if let Some(uart_irq) = uart_irq {
-        VGIC.map_pirq(
+        VGIC.map_pirq_prepared(
             gic,
             PIntId(uart_irq.pintid),
             boot_vcpu_id,
@@ -131,7 +131,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             continue;
         }
         let pintid = PIntId(intid);
-        match VGIC.map_pirq(
+        match VGIC.map_pirq_prepared(
             gic,
             pintid,
             boot_vcpu_id,
