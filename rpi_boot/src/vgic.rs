@@ -16,6 +16,7 @@ use arch_hal::gic::gicv2::Gicv2DistIdRegs;
 use arch_hal::gic::vm::PirqHookFn;
 use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
+use arch_hal::println;
 use core::cell::SyncUnsafeCell;
 
 use crate::Gicv2Info;
@@ -123,10 +124,14 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             IrqGroup::Group1,
             DEFAULT_SPI_PRIORITY,
         )
-        .map_err(|_| "vgic: map pirq")?;
+        .map_err(|x| {
+            println!("vgic: map uart pirq failed: {:?}", x);
+            "vgic: map uart pirq failed"
+        })?;
     }
 
-    for intid in 32..1020 {
+    let max_intid = gic.max_intid();
+    for intid in 32..max_intid {
         if intid >= MIP_SPI_OFFSET + 32 {
             continue;
         }
@@ -142,7 +147,10 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         ) {
             Ok(()) => {}
             Err(GicError::InvalidState) => continue,
-            Err(_) => return Err("vgic: map pirq"),
+            Err(x) => {
+                println!("vgic: map pirq failed: {:?}", x);
+                return Err("vgic: map pirq");
+            }
         }
     }
 

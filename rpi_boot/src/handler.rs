@@ -49,6 +49,16 @@ pub(crate) fn setup_handler() {
     psci::set_unknown_psci_handler(unknown_psci_handler);
 }
 
+pub(crate) fn register_gic(gic: Gicv2) {
+    // SAFETY: Called once during early boot before IRQs are enabled.
+    // This write happens during single-core initialization with no concurrent access.
+    unsafe {
+        let slot = &mut *GICV2_DRIVER.get();
+        assert!(slot.is_none(), "gic: already registered");
+        *slot = Some(gic);
+    }
+}
+
 pub(crate) fn gic() -> Option<&'static Gicv2> {
     // SAFETY: GICV2_DRIVER is initialized once during boot and then treated as read-only.
     unsafe { &*GICV2_DRIVER.get() }.as_ref()

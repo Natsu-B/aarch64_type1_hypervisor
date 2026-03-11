@@ -476,13 +476,14 @@ extern "C" fn main() -> ! {
         )
         .unwrap();
 
+    handler::register_gic(gicv2);
+    let gicv2 = handler::gic().unwrap();
+
     println!("setup vgic...");
 
-    vgic::init(&gicv2, &gic_info, Some(uart_irq)).unwrap();
+    vgic::init(gicv2, &gic_info, Some(uart_irq)).unwrap();
 
     println!("vgic setup success!!!");
-
-    unsafe { GICV2_DRIVER.get().replace(Some(gicv2)) };
 
     debug_uart::enable_rx_interrupts(arch_hal::pl011::FifoLevel::OneEighth, true);
 
