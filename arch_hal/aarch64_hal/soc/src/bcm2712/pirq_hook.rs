@@ -10,7 +10,8 @@ const MIP_SPI_OFFSET: u32 = 128;
 const RP1_MSIX_SPI_START: u32 = MIP_SPI_OFFSET + 32;
 const RP1_PCIE_CFG_OFFSET: usize = 0x10_8000 + 0x08;
 const RP1_PCIE_CFG_LEN: usize = 64;
-const RP1_MSIX_SPI_END: u32 = RP1_MSIX_SPI_START + RP1_PCIE_CFG_LEN as u32 - 1;
+pub const RP1_UART0_MSIX_INDEX: usize = 25;
+pub const RP1_UART0_SPI: u32 = RP1_MSIX_SPI_START + RP1_UART0_MSIX_INDEX as u32;
 
 static RP1_PERIPHERAL_BASE: SyncUnsafeCell<Option<usize>> = SyncUnsafeCell::new(None);
 
@@ -65,7 +66,7 @@ fn rp1_msix_iack(int_id: u32) -> Result<(), PirqHookError> {
 }
 
 pub fn pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
-    if !(RP1_MSIX_SPI_START..=RP1_MSIX_SPI_END).contains(&int_id) {
+    if int_id != RP1_UART0_SPI {
         return Ok(());
     }
 

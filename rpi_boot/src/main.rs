@@ -170,7 +170,7 @@ extern "C" fn main() -> ! {
     assert_eq!(cpu::get_current_el(), 2);
     let gic_info = find_gicv2_info(&dtb).unwrap();
     let uart_irq = vgic::UartIrq {
-        pintid: 128 + 25 + 32,
+        pintid: bcm2712::pirq_hook::RP1_UART0_SPI,
         sense: arch_hal::gic::IrqSense::Edge,
     };
     let uart_irq_pintid = uart_irq.pintid;
@@ -546,7 +546,7 @@ extern "C" fn main() -> ! {
             64,
         )
     };
-    pcie_config[25].set_bits(0b1001);
+    pcie_config[bcm2712::pirq_hook::RP1_UART0_MSIX_INDEX].set_bits(0b1001);
 
     multicore::setup_multicore(stack_top);
 

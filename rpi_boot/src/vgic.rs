@@ -18,6 +18,8 @@ use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
 use arch_hal::println;
 use core::cell::SyncUnsafeCell;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 
 use crate::Gicv2Info;
 use crate::handler;
@@ -40,6 +42,7 @@ static VGIC: VgicManager<VCPU_COUNT> = VgicManager::new(&DELEGATE, 0);
 static GICD_RANGE: SyncUnsafeCell<Option<(usize, usize)>> = SyncUnsafeCell::new(None);
 static MAINT_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
 static GICD_ID: SyncUnsafeCell<Option<Gicv2DistIdRegs>> = SyncUnsafeCell::new(None);
+static VCPU_ONLINE_BITMAP: AtomicUsize = AtomicUsize::new(0);
 
 impl VgicDelegate for RpiVgicDelegate {
     fn distributor(&self) -> Result<&'static dyn GicDistributor, GicError> {
@@ -53,7 +56,12 @@ impl VgicDelegate for RpiVgicDelegate {
         _vm_id: usize,
         vcpu_id: u16,
     ) -> Result<Option<cpu::CoreAffinity>, GicError> {
-        Ok(Some(vcpu_id_to_affinity(VcpuId(vcpu_id))?))
+        let vcpu = VcpuId(vcpu_id);
+        vcpu_index(vcpu)?;
+        if !is_vcpu_online(vcpu) {
+            return Ok(None);
+        }
+        Ok(Some(vcpu_id_to_affinity(vcpu)?))
     }
 
     fn get_home_affinity(
@@ -88,18 +96,46 @@ fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
 fn current_vcpu_id() -> Result<VcpuId, GicError> {
     let core_id = cpu::get_current_core_id();
     let vcpu_id = VcpuId(core_id.aff0 as u16);
-    if (vcpu_id.0 as usize) >= VCPU_COUNT {
-        return Err(GicError::InvalidVcpuId);
-    }
+    vcpu_index(vcpu_id)?;
     Ok(vcpu_id)
 }
 
+fn vcpu_index(vcpu_id: VcpuId) -> Result<usize, GicError> {
+    let index = usize::from(vcpu_id.0);
+    if index >= VCPU_COUNT || index >= usize::BITS as usize {
+        return Err(GicError::InvalidVcpuId);
+    }
+    Ok(index)
+}
+
+fn vcpu_bit(vcpu_id: VcpuId) -> Result<usize, GicError> {
+    Ok(1usize << vcpu_index(vcpu_id)?)
+}
+
+fn reset_online_state_for_init() {
+    VCPU_ONLINE_BITMAP.store(0, Ordering::Release);
+}
+
+fn mark_vcpu_online(vcpu_id: VcpuId) -> Result<(), GicError> {
+    let bit = vcpu_bit(vcpu_id)?;
+    VCPU_ONLINE_BITMAP.fetch_or(bit, Ordering::AcqRel);
+    Ok(())
+}
+
+fn is_vcpu_online(vcpu_id: VcpuId) -> bool {
+    let Ok(bit) = vcpu_bit(vcpu_id) else {
+        return false;
+    };
+    (VCPU_ONLINE_BITMAP.load(Ordering::Acquire) & bit) != 0
+}
+
 fn vcpu_id_to_affinity(vcpu_id: VcpuId) -> Result<cpu::CoreAffinity, GicError> {
-    let aff0 = u8::try_from(vcpu_id.0).map_err(|_| GicError::InvalidVcpuId)?;
+    let aff0 = u8::try_from(vcpu_index(vcpu_id)?).map_err(|_| GicError::InvalidVcpuId)?;
     Ok(cpu::CoreAffinity::new(aff0, 0, 0, 0))
 }
 
 pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<(), &'static str> {
+    reset_online_state_for_init();
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
     enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
 
@@ -113,6 +149,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     let boot_vcpu_id = current_vcpu_id().map_err(|_| "vgic: invalid vcpu id")?;
     VGIC.switch_in(gic, boot_vcpu_id, cpu::get_current_core_id())
         .map_err(|_| "vgic: switch in")?;
+    mark_vcpu_online(boot_vcpu_id).map_err(|_| "vgic: mark online")?;
 
     if let Some(uart_irq) = uart_irq {
         VGIC.map_pirq_prepared(
@@ -170,7 +207,9 @@ pub fn set_pirq_hook(hook: Option<PirqHookFn>) -> Result<(), GicError> {
 pub fn on_cpu_online(gic: &Gicv2) -> Result<(), GicError> {
     enable_guest_ppis(gic)?;
     gic.hw_init()?;
-    VGIC.switch_in(gic, current_vcpu_id()?, cpu::get_current_core_id())
+    let vcpu = current_vcpu_id()?;
+    VGIC.switch_in(gic, vcpu, cpu::get_current_core_id())?;
+    mark_vcpu_online(vcpu)
 }
 
 pub fn maintenance_intid() -> Option<u32> {
