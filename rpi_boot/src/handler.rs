@@ -282,6 +282,7 @@ const LOG_PASSTHROUGH_ERR: u32 = 1 << 2;
 const LOG_EOI_ERR: u32 = 1 << 3;
 const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
+const LOG_DROP_DENIED_LOCAL: u32 = 1 << 6;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
 fn irq_handler(_regs: &mut cpu::Registers) {
@@ -312,13 +313,23 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             Ok(()) => {}
             Err(GicError::UnsupportedIntId) => {
                 is_hypervisor_owned = true;
-                if let Err(err) = vgic::passthrough_physical_irq(irq.intid, level) {
-                    if IRQ_LOG_ONCE.fetch_or(LOG_PASSTHROUGH_ERR, Ordering::Relaxed)
-                        & LOG_PASSTHROUGH_ERR
-                        == 0
-                    {
-                        println!("vgic: passthrough pIRQ {} failed: {:?}", irq.intid, err);
+                if irq.intid >= 32 || vgic::guest_local_intid_allowed(irq.intid) {
+                    if let Err(err) = vgic::passthrough_physical_irq(irq.intid, level) {
+                        if IRQ_LOG_ONCE.fetch_or(LOG_PASSTHROUGH_ERR, Ordering::Relaxed)
+                            & LOG_PASSTHROUGH_ERR
+                            == 0
+                        {
+                            println!("vgic: passthrough pIRQ {} failed: {:?}", irq.intid, err);
+                        }
                     }
+                } else if IRQ_LOG_ONCE.fetch_or(LOG_DROP_DENIED_LOCAL, Ordering::Relaxed)
+                    & LOG_DROP_DENIED_LOCAL
+                    == 0
+                {
+                    println!(
+                        "vgic: drop unsupported local IRQ {} (not allowlisted)",
+                        irq.intid
+                    );
                 }
             }
             Err(err) => {

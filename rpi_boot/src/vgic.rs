@@ -86,12 +86,15 @@ impl VgicDelegate for RpiVgicDelegate {
     }
 }
 
+pub(crate) fn guest_local_intid_allowed(intid: u32) -> bool {
+    // Allow only PMU overflow (23) and EL1 virtual timer (27).
+    // This keeps EL2/EL1 physical timer PPIs (26/30) and all other local IRQs denied by default.
+    matches!(intid, 23 | 27)
+}
+
 fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
-    for ppi in 16..32 {
-        if matches!(ppi, 25 | 26 | 29) {
-            continue;
-        }
-        gic.set_ppi_enable(ppi, true)?;
+    for intid in 16u32..32u32 {
+        gic.set_ppi_enable(intid, guest_local_intid_allowed(intid))?;
     }
     Ok(())
 }
@@ -284,6 +287,12 @@ pub fn handle_gicd_write(
 }
 
 pub fn on_physical_irq(pintid: PIntId, level: bool) -> Result<(), GicError> {
+    println!(
+        "vgic CpuId {}: physical IRQ received: pintid={}, level={}",
+        tls::cpu_if().unwrap(),
+        pintid.0,
+        level
+    );
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     VGIC.handle_physical_irq(gic, pintid, level)
 }

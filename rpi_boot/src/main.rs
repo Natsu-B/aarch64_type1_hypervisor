@@ -485,6 +485,8 @@ extern "C" fn main() -> ! {
 
     println!("vgic setup success!!!");
 
+    apply_guest_timer_policy_for_current_cpu();
+
     debug_uart::enable_rx_interrupts(arch_hal::pl011::FifoLevel::OneEighth, true);
 
     println!("gicv2 setup success!!!");
@@ -613,7 +615,6 @@ extern "C" fn main() -> ! {
     cpu::clean_dcache_poc(DTB_ADDR.get() as usize, size_of::<usize>());
 
     cpu::invalidate_icache_all();
-    setup_guest_sysreg_passthrough_policy();
 
     let el1_main = el1_main as *const fn() as usize as u64;
     let stack_addr =
@@ -659,20 +660,25 @@ fn be_bytes_to_u64(bytes: &[u8]) -> Option<u64> {
     }
 }
 
-fn setup_guest_sysreg_passthrough_policy() {
+pub(crate) fn apply_guest_timer_policy_for_current_cpu() {
     const CNTHCTL_EL2_EL1PCTEN: u64 = 1 << 0;
     const CNTHCTL_EL2_EL1PCEN: u64 = 1 << 1;
+    const LOWER_EL_TIMER_CTL_IMASK: u64 = 1 << 1;
     const MDCR_EL2_TPMCR: u64 = 1 << 5;
     const MDCR_EL2_TPM: u64 = 1 << 6;
 
-    // Allow EL1 access to the physical counter/timer interface when passing through PPI 30.
+    // Hide EL1 physical counter/timer access from the guest.
     // This assumes non-VHE (E2H=0); with E2H=1, the CNTHCTL_EL2 field positions shift by 10.
     let mut cnthctl_el2 = cpu::get_cnthctl_el2();
-    cnthctl_el2 |= CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1PCEN;
+    cnthctl_el2 &= !(CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1PCEN);
     cpu::set_cnthctl_el2(cnthctl_el2);
 
     // Keep timer offset policy explicit and consistent across BSP/APs.
     cpu::set_cntvoff_el2(0);
+
+    // Sanitize stale lower-EL timer control state before guest IRQs are unmasked.
+    cpu::set_cntv_ctl_el0(LOWER_EL_TIMER_CTL_IMASK);
+    cpu::set_cntp_ctl_el0(LOWER_EL_TIMER_CTL_IMASK);
 
     // Leave PMU counters control (HPMN, etc.) unchanged, but let EL1/EL0 PMU sysregs run
     // without trapping if PMU overflow PPI 23 is enabled/passed through.

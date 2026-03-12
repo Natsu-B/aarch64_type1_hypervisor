@@ -705,6 +705,18 @@ pub fn get_cntvoff_el2() -> u64 {
     val
 }
 
+pub fn get_cntv_ctl_el0() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, cntv_ctl_el0", val = out(reg) val) };
+    val
+}
+
+pub fn get_cntp_ctl_el0() -> u64 {
+    let val: u64;
+    unsafe { asm!("mrs {val}, cntp_ctl_el0", val = out(reg) val) };
+    val
+}
+
 pub fn get_cptr_el2() -> u64 {
     let val: u64;
     unsafe { asm!("mrs {val}, cptr_el2", val = out(reg) val) };
@@ -763,6 +775,14 @@ pub fn set_cnthctl_el2(cnthctl_el2: u64) {
 
 pub fn set_cntvoff_el2(cntvoff_el2: u64) {
     unsafe { asm!("msr cntvoff_el2, {}", in(reg) cntvoff_el2) };
+}
+
+pub fn set_cntv_ctl_el0(cntv_ctl_el0: u64) {
+    unsafe { asm!("msr cntv_ctl_el0, {}", in(reg) cntv_ctl_el0) };
+}
+
+pub fn set_cntp_ctl_el0(cntp_ctl_el0: u64) {
+    unsafe { asm!("msr cntp_ctl_el0, {}", in(reg) cntp_ctl_el0) };
 }
 
 pub fn set_cptr_el2(cptr_el2: u64) {

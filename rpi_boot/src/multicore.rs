@@ -1,6 +1,7 @@
 use crate::GICV2_DRIVER;
 use crate::GLOBAL_ALLOCATOR;
 use crate::SPSR_EL2_M_EL1H;
+use crate::apply_guest_timer_policy_for_current_cpu;
 use crate::vgic;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -156,6 +157,7 @@ extern "C" fn ap_main(register_context: *const HypervisorRegisters, tls_space: *
     cpu::set_cntvoff_el2(register_context.cntvoff_el2);
     cpu::set_cptr_el2(register_context.cptr_el2);
     cpu::set_mdcr_el2(register_context.mdcr_el2);
+    apply_guest_timer_policy_for_current_cpu();
 
     // Exception vectors
     cpu::set_vbar_el2(register_context.vbar_el2);
