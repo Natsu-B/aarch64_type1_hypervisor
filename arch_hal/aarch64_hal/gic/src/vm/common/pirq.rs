@@ -19,18 +19,64 @@ use crate::vm::GicVmModelGeneric;
 use crate::vm::common::LOCAL_INTID_COUNT;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) enum PassthroughPhysicalConfig {
+    Unresolved,
+    Resolved { sense: IrqSense },
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) enum PirqDelivery {
+    Local {
+        target: VcpuId,
+        physical: PassthroughPhysicalConfig,
+    },
+    Spi {
+        physical: PassthroughPhysicalConfig,
+    },
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) struct PirqEntry {
-    pub(crate) target: VcpuId,
     pub(crate) vintid: VIntId,
-    pub(crate) sense: IrqSense,
+    pub(crate) delivery: PirqDelivery,
+}
+
+impl PirqEntry {
+    pub(crate) fn scope(&self) -> VgicIrqScope {
+        match self.delivery {
+            PirqDelivery::Local { target, .. } => VgicIrqScope::Local(target),
+            PirqDelivery::Spi { .. } => VgicIrqScope::Global,
+        }
+    }
+
+    pub(crate) fn sense(&self) -> Result<IrqSense, GicError> {
+        match self.delivery {
+            PirqDelivery::Local {
+                physical: PassthroughPhysicalConfig::Resolved { sense },
+                ..
+            } => Ok(sense),
+            PirqDelivery::Spi {
+                physical: PassthroughPhysicalConfig::Resolved { sense },
+            } => Ok(sense),
+            PirqDelivery::Local {
+                physical: PassthroughPhysicalConfig::Unresolved,
+                ..
+            }
+            | PirqDelivery::Spi {
+                physical: PassthroughPhysicalConfig::Unresolved,
+            } => Err(GicError::InvalidState),
+        }
+    }
 }
 
 pub(crate) struct PirqTable<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
 {
-    entries: [Option<PirqEntry>; crate::max_intids_for_vcpus(VCPUS)],
-    v2p: [Option<PIntId>; crate::max_intids_for_vcpus(VCPUS)],
+    global_entries: [Option<PirqEntry>; crate::max_intids_for_vcpus(VCPUS)],
+    global_v2p: [Option<PIntId>; crate::max_intids_for_vcpus(VCPUS)],
+    local_entries: [[Option<PirqEntry>; LOCAL_INTID_COUNT]; VCPUS],
+    local_v2p: [[Option<PIntId>; LOCAL_INTID_COUNT]; VCPUS],
 }
 
 impl<const VCPUS: usize> PirqTable<VCPUS>
@@ -39,14 +85,16 @@ where
 {
     pub(crate) fn new() -> Self {
         Self {
-            entries: [None; { crate::max_intids_for_vcpus(VCPUS) }],
-            v2p: [None; { crate::max_intids_for_vcpus(VCPUS) }],
+            global_entries: [None; { crate::max_intids_for_vcpus(VCPUS) }],
+            global_v2p: [None; { crate::max_intids_for_vcpus(VCPUS) }],
+            local_entries: [[None; LOCAL_INTID_COUNT]; VCPUS],
+            local_v2p: [[None; LOCAL_INTID_COUNT]; VCPUS],
         }
     }
 
     fn index(&self, pintid: PIntId) -> Result<usize, GicError> {
         let idx = pintid.0 as usize;
-        if idx >= self.entries.len() {
+        if idx >= self.global_entries.len() {
             return Err(GicError::UnsupportedIntId);
         }
         Ok(idx)
@@ -54,24 +102,75 @@ where
 
     fn vindex(&self, vintid: VIntId) -> Result<usize, GicError> {
         let idx = vintid.0 as usize;
-        if idx >= self.v2p.len() {
+        if idx >= self.global_v2p.len() {
             return Err(GicError::UnsupportedIntId);
+        }
+        Ok(idx)
+    }
+
+    fn local_pindex(&self, pintid: PIntId) -> Result<usize, GicError> {
+        let idx = pintid.0 as usize;
+        if idx >= LOCAL_INTID_COUNT {
+            return Err(GicError::UnsupportedIntId);
+        }
+        Ok(idx)
+    }
+
+    fn local_vindex(&self, vintid: VIntId) -> Result<usize, GicError> {
+        let idx = vintid.0 as usize;
+        if idx >= LOCAL_INTID_COUNT {
+            return Err(GicError::UnsupportedIntId);
+        }
+        Ok(idx)
+    }
+
+    fn tindex(&self, target: VcpuId) -> Result<usize, GicError> {
+        let idx = target.0 as usize;
+        if idx >= VCPUS {
+            return Err(GicError::InvalidVcpuId);
         }
         Ok(idx)
     }
 
     pub(crate) fn get(&self, pintid: PIntId) -> Result<Option<PirqEntry>, GicError> {
         let idx = self.index(pintid)?;
-        Ok(self.entries[idx])
+        Ok(self.global_entries[idx])
+    }
+
+    pub(crate) fn get_local(
+        &self,
+        target: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PirqEntry>, GicError> {
+        let t_idx = self.tindex(target)?;
+        let p_idx = self.local_pindex(pintid)?;
+        Ok(self.local_entries[t_idx][p_idx])
     }
 
     pub(crate) fn take(&mut self, pintid: PIntId) -> Result<Option<PirqEntry>, GicError> {
         let idx = self.index(pintid)?;
-        let entry = self.entries[idx].take();
+        let entry = self.global_entries[idx].take();
         if let Some(entry) = entry {
             let v_idx = self.vindex(entry.vintid)?;
-            if matches!(self.v2p[v_idx], Some(existing) if existing == pintid) {
-                self.v2p[v_idx] = None;
+            if matches!(self.global_v2p[v_idx], Some(existing) if existing == pintid) {
+                self.global_v2p[v_idx] = None;
+            }
+        }
+        Ok(entry)
+    }
+
+    pub(crate) fn take_local(
+        &mut self,
+        target: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PirqEntry>, GicError> {
+        let t_idx = self.tindex(target)?;
+        let p_idx = self.local_pindex(pintid)?;
+        let entry = self.local_entries[t_idx][p_idx].take();
+        if let Some(entry) = entry {
+            let v_idx = self.local_vindex(entry.vintid)?;
+            if matches!(self.local_v2p[t_idx][v_idx], Some(existing) if existing == pintid) {
+                self.local_v2p[t_idx][v_idx] = None;
             }
         }
         Ok(entry)
@@ -85,35 +184,128 @@ where
         let idx = self.index(pintid)?;
         let v_idx = self.vindex(entry.vintid)?;
 
-        if let Some(existing_pintid) = self.v2p[v_idx] {
+        if let Some(existing_pintid) = self.global_v2p[v_idx] {
             if existing_pintid != pintid {
                 return Err(GicError::InvalidState);
             }
         }
 
-        match self.entries[idx] {
+        match self.global_entries[idx] {
             Some(existing) if existing == entry => {
-                self.v2p[v_idx] = Some(pintid);
+                self.global_v2p[v_idx] = Some(pintid);
                 Ok(false)
             }
             Some(_) => Err(GicError::InvalidState),
             None => {
-                self.entries[idx] = Some(entry);
-                self.v2p[v_idx] = Some(pintid);
+                self.global_entries[idx] = Some(entry);
+                self.global_v2p[v_idx] = Some(pintid);
                 Ok(true)
             }
+        }
+    }
+
+    pub(crate) fn ensure_local_entry(
+        &mut self,
+        target: VcpuId,
+        pintid: PIntId,
+        entry: PirqEntry,
+    ) -> Result<bool, GicError> {
+        let t_idx = self.tindex(target)?;
+        let p_idx = self.local_pindex(pintid)?;
+        let v_idx = self.local_vindex(entry.vintid)?;
+
+        if let Some(existing_pintid) = self.local_v2p[t_idx][v_idx] {
+            if existing_pintid != pintid {
+                return Err(GicError::InvalidState);
+            }
+        }
+
+        match self.local_entries[t_idx][p_idx] {
+            Some(existing) if existing == entry => {
+                self.local_v2p[t_idx][v_idx] = Some(pintid);
+                Ok(false)
+            }
+            Some(_) => Err(GicError::InvalidState),
+            None => {
+                self.local_entries[t_idx][p_idx] = Some(entry);
+                self.local_v2p[t_idx][v_idx] = Some(pintid);
+                Ok(true)
+            }
+        }
+    }
+
+    pub(crate) fn resolve_spi(
+        &mut self,
+        pintid: PIntId,
+        sense: IrqSense,
+    ) -> Result<bool, GicError> {
+        let idx = self.index(pintid)?;
+        let Some(entry) = self.global_entries[idx].as_mut() else {
+            return Err(GicError::UnsupportedIntId);
+        };
+
+        match &mut entry.delivery {
+            PirqDelivery::Local { .. } => Err(GicError::InvalidState),
+            PirqDelivery::Spi { physical } => {
+                let changed = *physical != PassthroughPhysicalConfig::Resolved { sense };
+                *physical = PassthroughPhysicalConfig::Resolved { sense };
+                Ok(changed)
+            }
+        }
+    }
+
+    pub(crate) fn resolve_local(
+        &mut self,
+        target: VcpuId,
+        pintid: PIntId,
+        sense: IrqSense,
+    ) -> Result<bool, GicError> {
+        let t_idx = self.tindex(target)?;
+        let p_idx = self.local_pindex(pintid)?;
+        let Some(entry) = self.local_entries[t_idx][p_idx].as_mut() else {
+            return Err(GicError::UnsupportedIntId);
+        };
+
+        match &mut entry.delivery {
+            PirqDelivery::Local { physical, .. } => {
+                let changed = *physical != PassthroughPhysicalConfig::Resolved { sense };
+                *physical = PassthroughPhysicalConfig::Resolved { sense };
+                Ok(changed)
+            }
+            PirqDelivery::Spi { .. } => Err(GicError::InvalidState),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn lookup_by_vintid(&self, vintid: VIntId) -> Result<Option<PIntId>, GicError> {
         let idx = self.vindex(vintid)?;
-        Ok(self.v2p[idx])
+        Ok(self.global_v2p[idx])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup_local_by_vintid(
+        &self,
+        target: VcpuId,
+        vintid: VIntId,
+    ) -> Result<Option<PIntId>, GicError> {
+        let t_idx = self.tindex(target)?;
+        let v_idx = self.local_vindex(vintid)?;
+        Ok(self.local_v2p[t_idx][v_idx])
     }
 
     pub(crate) fn v2p(&self, vintid: VIntId) -> Option<PIntId> {
         let idx = vintid.0 as usize;
-        self.v2p.get(idx).copied().flatten()
+        self.global_v2p.get(idx).copied().flatten()
+    }
+
+    pub(crate) fn v2p_local(&self, target: VcpuId, vintid: VIntId) -> Option<PIntId> {
+        let t_idx = target.0 as usize;
+        let v_idx = vintid.0 as usize;
+        self.local_v2p
+            .get(t_idx)
+            .and_then(|table| table.get(v_idx))
+            .copied()
+            .flatten()
     }
 }
 
@@ -125,7 +317,7 @@ where
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); crate::vm::pending_cap_for_vcpus(VCPUS)]:,
 {
-    pub(crate) fn map_pirq_inner(
+    pub(crate) fn map_pirq_inner_configured(
         &self,
         pintid: PIntId,
         target: VcpuId,
@@ -137,16 +329,72 @@ where
         self.map_pirq_inner_with_enable(pintid, target, vintid, sense, group, priority, true)
     }
 
-    pub(crate) fn map_pirq_inner_prepared(
+    pub(crate) fn bind_local_pirq_inner_prepared(
         &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
-        sense: IrqSense,
-        group: IrqGroup,
-        priority: u8,
     ) -> Result<VgicUpdate, GicError> {
-        self.map_pirq_inner_with_enable(pintid, target, vintid, sense, group, priority, false)
+        if vintid.0 >= LOCAL_INTID_COUNT as u32 {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        self.common.vcpu_index(target)?;
+
+        let max = crate::max_intids_for_vcpus(VCPUS) as u32;
+        if vintid.0 >= max || pintid.0 >= max {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let entry = PirqEntry {
+            vintid,
+            delivery: PirqDelivery::Local {
+                target,
+                physical: PassthroughPhysicalConfig::Unresolved,
+            },
+        };
+
+        let mut routing = self.common.routing_lock.lock_irqsave();
+        let existing = routing.pirqs.get_local(target, pintid)?;
+        if let Some(prev) = existing {
+            if prev != entry {
+                return Err(GicError::InvalidState);
+            }
+        }
+        let _ = routing.pirqs.ensure_local_entry(target, pintid, entry)?;
+        Ok(VgicUpdate::None)
+    }
+
+    pub(crate) fn bind_spi_pirq_inner_prepared(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        if vintid.0 < LOCAL_INTID_COUNT as u32 {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let max = crate::max_intids_for_vcpus(VCPUS) as u32;
+        if vintid.0 >= max || pintid.0 >= max {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let entry = PirqEntry {
+            vintid,
+            delivery: PirqDelivery::Spi {
+                physical: PassthroughPhysicalConfig::Unresolved,
+            },
+        };
+
+        let mut routing = self.common.routing_lock.lock_irqsave();
+        let existing = routing.pirqs.get(pintid)?;
+        if let Some(prev) = existing {
+            if prev != entry {
+                return Err(GicError::InvalidState);
+            }
+        }
+        let _ = routing.pirqs.ensure_entry(pintid, entry)?;
+        Ok(VgicUpdate::None)
     }
 
     fn map_pirq_inner_with_enable(
@@ -159,18 +407,27 @@ where
         priority: u8,
         enable: bool,
     ) -> Result<VgicUpdate, GicError> {
-        self.common.vcpu_index(target)?; // validate target
-
-        let entry = PirqEntry {
-            target,
-            vintid,
-            sense,
-        };
-
         let scope = if vintid.0 < LOCAL_INTID_COUNT as u32 {
+            self.common.vcpu_index(target)?; // validate target
             VgicIrqScope::Local(target)
         } else {
             VgicIrqScope::Global
+        };
+
+        let entry = match scope {
+            VgicIrqScope::Local(local_target) => PirqEntry {
+                vintid,
+                delivery: PirqDelivery::Local {
+                    target: local_target,
+                    physical: PassthroughPhysicalConfig::Resolved { sense },
+                },
+            },
+            VgicIrqScope::Global => PirqEntry {
+                vintid,
+                delivery: PirqDelivery::Spi {
+                    physical: PassthroughPhysicalConfig::Resolved { sense },
+                },
+            },
         };
 
         let max = crate::max_intids_for_vcpus(VCPUS) as u32;
@@ -178,30 +435,34 @@ where
             return Err(GicError::UnsupportedIntId);
         }
 
-        let (inserted, route_to_apply) = {
+        let (inserted, inserted_local_target) = {
             let mut routing = self.common.routing_lock.lock_irqsave();
-            let existing = routing.pirqs.get(pintid)?;
-            if let Some(prev) = existing {
-                if prev != entry {
-                    return Err(GicError::InvalidState);
+            match scope {
+                VgicIrqScope::Local(local_target) => {
+                    let existing = routing.pirqs.get_local(local_target, pintid)?;
+                    if let Some(prev) = existing {
+                        if prev != entry {
+                            return Err(GicError::InvalidState);
+                        }
+                    }
+                    (
+                        routing
+                            .pirqs
+                            .ensure_local_entry(local_target, pintid, entry)?,
+                        Some(local_target),
+                    )
+                }
+                VgicIrqScope::Global => {
+                    let existing = routing.pirqs.get(pintid)?;
+                    if let Some(prev) = existing {
+                        if prev != entry {
+                            return Err(GicError::InvalidState);
+                        }
+                    }
+                    (routing.pirqs.ensure_entry(pintid, entry)?, None)
                 }
             }
-            let inserted = routing.pirqs.ensure_entry(pintid, entry)?;
-            let route = if inserted && matches!(scope, VgicIrqScope::Global) {
-                Some(routing.routing.get_route(vintid)?)
-            } else {
-                None
-            };
-            (inserted, route)
         };
-
-        if let Some(route) = route_to_apply {
-            if let Err(err) = self.call_pirq_route_hook(pintid, route) {
-                let mut routing = self.common.routing_lock.lock_irqsave();
-                let _ = routing.pirqs.take(pintid);
-                return Err(err);
-            }
-        }
 
         let trigger = match sense {
             IrqSense::Edge => TriggerMode::Edge,
@@ -224,7 +485,11 @@ where
                     let _ = self.set_enable(scope, vintid, false);
                 }
                 let mut routing = self.common.routing_lock.lock_irqsave();
-                let _ = routing.pirqs.take(pintid);
+                if let Some(local_target) = inserted_local_target {
+                    let _ = routing.pirqs.take_local(local_target, pintid);
+                } else {
+                    let _ = routing.pirqs.take(pintid);
+                }
             }
             return Err(err);
         }
@@ -234,34 +499,77 @@ where
 
     #[cfg(test)]
     pub(crate) fn unmap_pirq_inner(&self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
-        let entry = {
+        let mut local_entries: [Option<PirqEntry>; VCPUS] = [None; VCPUS];
+        let global_entry = {
             let mut routing = self.common.routing_lock.lock_irqsave();
-            match routing.pirqs.take(pintid) {
-                Ok(Some(entry)) => entry,
-                Ok(None) => return Ok(VgicUpdate::None),
-                Err(GicError::UnsupportedIntId) => return Ok(VgicUpdate::None),
+            let global_entry = match routing.pirqs.take(pintid) {
+                Ok(entry) => entry,
+                Err(GicError::UnsupportedIntId) => None,
                 Err(err) => return Err(err),
+            };
+
+            if (pintid.0 as usize) < LOCAL_INTID_COUNT {
+                for cpu in 0..self.common.vcpu_count() {
+                    let target = VcpuId(cpu as u16);
+                    local_entries[cpu] = match routing.pirqs.take_local(target, pintid) {
+                        Ok(entry) => entry,
+                        Err(GicError::UnsupportedIntId) => None,
+                        Err(err) => return Err(err),
+                    };
+                }
             }
+
+            global_entry
         };
-        let scope = if entry.vintid.0 < LOCAL_INTID_COUNT as u32 {
-            VgicIrqScope::Local(entry.target)
-        } else {
-            VgicIrqScope::Global
-        };
-        self.set_enable(scope, entry.vintid, false)
+
+        let mut update = VgicUpdate::None;
+        let mut removed = false;
+
+        if let Some(entry) = global_entry {
+            removed = true;
+            update.combine(&self.set_enable(entry.scope(), entry.vintid, false)?);
+        }
+
+        for maybe_entry in local_entries.into_iter().take(self.common.vcpu_count()) {
+            if let Some(entry) = maybe_entry {
+                removed = true;
+                update.combine(&self.set_enable(entry.scope(), entry.vintid, false)?);
+            }
+        }
+
+        if !removed {
+            return Ok(VgicUpdate::None);
+        }
+
+        Ok(update)
     }
 
     pub(crate) fn on_physical_irq_inner(
         &self,
+        source_vcpu: VcpuId,
         pintid: PIntId,
         level: bool,
     ) -> Result<VgicUpdate, GicError> {
+        self.common.vcpu_index(source_vcpu)?;
+
         let (entry, global_targets) = {
             let routing = self.common.routing_lock.lock_irqsave();
-            let Some(entry) = routing.pirqs.get(pintid)? else {
-                return Err(GicError::UnsupportedIntId);
+            let local_entry = if (pintid.0 as usize) < LOCAL_INTID_COUNT {
+                routing.pirqs.get_local(source_vcpu, pintid)?
+            } else {
+                None
             };
-            let targets = if entry.vintid.0 >= LOCAL_INTID_COUNT as u32 {
+
+            let entry = if let Some(local_entry) = local_entry {
+                local_entry
+            } else {
+                let Some(global_entry) = routing.pirqs.get(pintid)? else {
+                    return Err(GicError::UnsupportedIntId);
+                };
+                global_entry
+            };
+
+            let targets = if matches!(entry.delivery, PirqDelivery::Spi { .. }) {
                 routing
                     .routing
                     .targets_for_spi(entry.vintid, self.common.vcpu_count())?
@@ -271,11 +579,7 @@ where
             (entry, targets)
         };
 
-        let scope = if entry.vintid.0 < LOCAL_INTID_COUNT as u32 {
-            VgicIrqScope::Local(entry.target)
-        } else {
-            VgicIrqScope::Global
-        };
+        let scope = entry.scope();
 
         let mut update = VgicUpdate::None;
         let mut changed = false;
@@ -287,7 +591,7 @@ where
         // - For edge-sensitive pIRQs, callers must pass `level=true` exactly once per detected
         //   edge (pulse). Passing repeated `level=true` while the virtual IRQ is still pending
         //   can inject duplicates; `level=false` is ignored for edge-sensitive pIRQs.
-        let set_pending = match entry.sense {
+        let set_pending = match entry.sense()? {
             IrqSense::Edge => level,
             IrqSense::Level => level,
         };
@@ -320,7 +624,7 @@ where
                         source: None,
                     });
                 }
-            } else if matches!(entry.sense, IrqSense::Level) {
+            } else if matches!(entry.sense()?, IrqSense::Level) {
                 changed = regs.irq_state.set_pending(scope, entry.vintid, false)?;
             }
         }
@@ -336,7 +640,7 @@ where
                     }
                 }
             }
-        } else if !set_pending && matches!(entry.sense, IrqSense::Level) {
+        } else if !set_pending && matches!(entry.sense()?, IrqSense::Level) {
             match scope {
                 VgicIrqScope::Local(target) => {
                     self.common.vcpu(target)?.cancel_irq(entry.vintid, None)?;

@@ -361,11 +361,16 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                     if intid > MAX_VIRTUAL_INTID {
                         VgicUpdate::None
                     } else {
-                        self.vgic_model.set_priority(
-                            Self::scope_for_intid(vcpu, intid).ok_or(GicError::UnsupportedIntId)?,
-                            VIntId(intid),
-                            (value as u8) & 0xF8,
-                        )?
+                        let scope =
+                            Self::scope_for_intid(vcpu, intid).ok_or(GicError::UnsupportedIntId)?;
+                        let lane_shift = (intid - base_intid) * 8;
+                        let mut merged = self
+                            .vgic_model
+                            .read_priority_word(scope, VIntId(base_intid))?;
+                        merged &= !(0xffu32 << lane_shift);
+                        merged |= (((value as u8) & 0xF8) as u32) << lane_shift;
+                        self.vgic_model
+                            .write_priority_word(scope, VIntId(base_intid), merged)?
                     }
                 }
             },
@@ -1135,14 +1140,19 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
-        fn map_pirq_prepared(
+        fn bind_local_pirq_prepared(
             &self,
             _pintid: PIntId,
             _target: VcpuId,
             _vintid: VIntId,
-            _sense: IrqSense,
-            _group: IrqGroup,
-            _priority: u8,
+        ) -> Result<VgicUpdate, GicError> {
+            Ok(VgicUpdate::None)
+        }
+
+        fn bind_spi_pirq_prepared(
+            &self,
+            _pintid: PIntId,
+            _vintid: VIntId,
         ) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }
@@ -1151,7 +1161,12 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
-        fn on_physical_irq(&self, _pintid: PIntId, _level: bool) -> Result<VgicUpdate, GicError> {
+        fn on_physical_irq(
+            &self,
+            _source_vcpu: VcpuId,
+            _pintid: PIntId,
+            _level: bool,
+        ) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }
     }

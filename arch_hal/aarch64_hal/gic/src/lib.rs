@@ -1086,6 +1086,10 @@ pub(crate) trait VgicSgiRegs: VgicVmInfo {
 
 /// Host-side physical IRQ mapping and ingress hooks.
 pub(crate) trait VgicPirqModel: VgicVmInfo {
+    /// Explicit host-configured pIRQ mapping.
+    ///
+    /// This path is intended for cases where EL2 owns virtual attributes at mapping time.
+    /// For guest-owned passthrough, use the binding-only prepared APIs instead.
     fn map_pirq(
         &self,
         pintid: PIntId,
@@ -1095,20 +1099,36 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         group: IrqGroup,
         priority: u8,
     ) -> Result<VgicUpdate, GicError>;
-    /// Map host pIRQ to guest vIRQ without enabling the virtual interrupt;
-    /// guest will enable via GICD/SGI registers later.
-    fn map_pirq_prepared(
+
+    /// Bind a host local pIRQ (PPI) to a guest local vIRQ without forcing virtual attributes.
+    ///
+    /// Physical ingress semantics are resolved lazily from guest-visible virtual state when the
+    /// guest configuration becomes meaningful (typically first enable).
+    fn bind_local_pirq_prepared(
         &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
-        sense: IrqSense,
-        group: IrqGroup,
-        priority: u8,
     ) -> Result<VgicUpdate, GicError>;
+
+    /// Bind a host SPI pIRQ to a guest SPI vIRQ without touching physical Distributor state.
+    ///
+    /// Physical configuration is resolved lazily from guest-visible virtual state when the
+    /// guest configuration becomes meaningful (typically first enable).
+    fn bind_spi_pirq_prepared(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError>;
+
     #[cfg(test)]
     fn unmap_pirq(&self, pintid: PIntId) -> Result<VgicUpdate, GicError>;
-    fn on_physical_irq(&self, pintid: PIntId, level: bool) -> Result<VgicUpdate, GicError>;
+    fn on_physical_irq(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+        level: bool,
+    ) -> Result<VgicUpdate, GicError>;
 }
 
 /// VM logical state model marker (version-independent core).

@@ -14,8 +14,13 @@ pub enum IrqSense {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PirqHookOp {
-    Enable { enable: bool },
-    Route { targets: u32 },
+    Configure {
+        group: u8,
+        priority: u8,
+        trigger: TriggerMode,
+        targets: u32,
+        enable: bool,
+    },
     Eoi,
     Deactivate,
     Resample,
