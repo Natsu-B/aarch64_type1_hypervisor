@@ -71,7 +71,7 @@ pub fn pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
     }
 
     match op {
-        PirqHookOp::Enable { enable } => {
+        PirqHookOp::Configure { enable, .. } => {
             if enable {
                 rp1_interrupt::enable_interrupt(int_id)
             } else {
@@ -81,6 +81,6 @@ pub fn pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
             Ok(())
         }
         PirqHookOp::Eoi => rp1_msix_iack(int_id),
-        PirqHookOp::Route { .. } | PirqHookOp::Deactivate | PirqHookOp::Resample => Ok(()),
+        PirqHookOp::Deactivate | PirqHookOp::Resample => Ok(()),
     }
 }
