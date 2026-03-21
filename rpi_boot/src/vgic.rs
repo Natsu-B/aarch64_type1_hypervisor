@@ -3,7 +3,6 @@ use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
 use arch_hal::gic::GicPpi;
 use arch_hal::gic::GicSgi;
-use arch_hal::gic::IrqGroup;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::SgiTarget;
@@ -32,9 +31,9 @@ pub(crate) struct UartIrq {
 
 const MIP_SPI_OFFSET: u32 = 128;
 const VCPU_COUNT: usize = 4;
-const DEFAULT_SPI_PRIORITY: u8 = 0x80;
 const KICK_SGI_ID: u8 = 15;
 const KICK_INTID: u32 = KICK_SGI_ID as u32;
+const GUEST_EL1_VTIMER_PPI_INTID: u32 = 27;
 
 struct RpiVgicDelegate;
 
@@ -87,9 +86,10 @@ impl VgicDelegate for RpiVgicDelegate {
 }
 
 pub(crate) fn guest_local_intid_allowed(intid: u32) -> bool {
-    // Allow only PMU overflow (23) and EL1 virtual timer (27).
-    // This keeps EL2/EL1 physical timer PPIs (26/30) and all other local IRQs denied by default.
-    matches!(intid, 23 | 27)
+    // Allow only EL1 virtual timer PPI (27).
+    // This keeps EL2/EL1 physical timer PPIs (26/30), PMU overflow (23), and all other
+    // local IRQs denied by default.
+    matches!(intid, GUEST_EL1_VTIMER_PPI_INTID)
 }
 
 fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
@@ -97,6 +97,15 @@ fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
         gic.set_ppi_enable(intid, guest_local_intid_allowed(intid))?;
     }
     Ok(())
+}
+
+fn map_guest_local_ppis_for_vcpu(gic: &Gicv2, vcpu: VcpuId) -> Result<(), GicError> {
+    VGIC.bind_local_pirq_prepared(
+        gic,
+        PIntId(GUEST_EL1_VTIMER_PPI_INTID),
+        vcpu,
+        VIntId(GUEST_EL1_VTIMER_PPI_INTID),
+    )
 }
 
 fn current_vcpu_id() -> Result<VcpuId, GicError> {
@@ -181,22 +190,18 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     register_vcpu_affinity(boot_vcpu_id, boot_affinity).map_err(|_| "vgic: register affinity")?;
     VGIC.switch_in(gic, boot_vcpu_id, boot_affinity)
         .map_err(|_| "vgic: switch in")?;
+    map_guest_local_ppis_for_vcpu(gic, boot_vcpu_id).map_err(|x| {
+        println!("vgic: map guest local ppis failed: {:?}", x);
+        "vgic: map guest local ppis failed"
+    })?;
     mark_vcpu_online(boot_vcpu_id).map_err(|_| "vgic: mark online")?;
 
     if let Some(uart_irq) = uart_irq {
-        VGIC.map_pirq_prepared(
-            gic,
-            PIntId(uart_irq.pintid),
-            boot_vcpu_id,
-            VIntId(uart_irq.pintid),
-            uart_irq.sense,
-            IrqGroup::Group1,
-            DEFAULT_SPI_PRIORITY,
-        )
-        .map_err(|x| {
-            println!("vgic: map uart pirq failed: {:?}", x);
-            "vgic: map uart pirq failed"
-        })?;
+        VGIC.bind_spi_pirq_prepared(gic, PIntId(uart_irq.pintid), VIntId(uart_irq.pintid))
+            .map_err(|x| {
+                println!("vgic: map uart pirq failed: {:?}", x);
+                "vgic: map uart pirq failed"
+            })?;
     }
 
     let max_intid = gic.max_intid();
@@ -205,15 +210,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             continue;
         }
         let pintid = PIntId(intid);
-        match VGIC.map_pirq_prepared(
-            gic,
-            pintid,
-            boot_vcpu_id,
-            VIntId(intid),
-            IrqSense::Level,
-            IrqGroup::Group1,
-            DEFAULT_SPI_PRIORITY,
-        ) {
+        match VGIC.bind_spi_pirq_prepared(gic, pintid, VIntId(intid)) {
             Ok(()) => {}
             Err(GicError::InvalidState) => continue,
             Err(x) => {
@@ -243,6 +240,7 @@ pub fn on_cpu_online(gic: &Gicv2) -> Result<(), GicError> {
     let affinity = cpu::get_current_core_id();
     register_vcpu_affinity(vcpu, affinity)?;
     VGIC.switch_in(gic, vcpu, affinity)?;
+    map_guest_local_ppis_for_vcpu(gic, vcpu)?;
     mark_vcpu_online(vcpu)
 }
 
