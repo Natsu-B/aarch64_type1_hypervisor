@@ -3,8 +3,6 @@ use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
 use arch_hal::gic::GicPpi;
 use arch_hal::gic::GicSgi;
-use arch_hal::gic::IrqGroup;
-use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::SgiTarget;
 use arch_hal::gic::VIntId;
@@ -27,7 +25,6 @@ use crate::irq_monitor;
 
 struct BootVgicDelegate;
 
-const DEFAULT_SPI_PRIORITY: u8 = 0x80;
 const KICK_SGI_ID: u8 = 15;
 const KICK_INTID: u32 = KICK_SGI_ID as u32;
 
@@ -85,7 +82,7 @@ fn boot_pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
     match op {
         PirqHookOp::Eoi => irq_monitor::record_pirq_eoi(int_id),
         PirqHookOp::Deactivate => irq_monitor::record_pirq_deactivate(int_id),
-        PirqHookOp::Enable { .. } | PirqHookOp::Route { .. } | PirqHookOp::Resample => {}
+        PirqHookOp::Configure { .. } | PirqHookOp::Resample => {}
     }
     Ok(())
 }
@@ -108,19 +105,11 @@ pub(crate) fn init(
 
     if let Some(pintid) = guest_uart.irq {
         if Some(pintid) != gdb_uart_intid {
-            VGIC.map_pirq_prepared(
-                gic,
-                PIntId(pintid),
-                VcpuId(0),
-                VIntId(pintid),
-                IrqSense::Level,
-                IrqGroup::Group1,
-                DEFAULT_SPI_PRIORITY,
-            )
-            .map_err(|e| {
-                println!("Failed to map guest UART PIRQ {}: {:?}", pintid, e);
-                "vgic: map pirq"
-            })?;
+            VGIC.bind_spi_pirq_prepared(gic, PIntId(pintid), VIntId(pintid))
+                .map_err(|e| {
+                    println!("Failed to map guest UART PIRQ {}: {:?}", pintid, e);
+                    "vgic: map pirq"
+                })?;
         }
     }
 
@@ -129,15 +118,7 @@ pub(crate) fn init(
         if Some(intid) == gdb_uart_intid || guest_uart.irq == Some(intid) {
             continue;
         }
-        match VGIC.map_pirq_prepared(
-            gic,
-            PIntId(intid),
-            VcpuId(0),
-            VIntId(intid),
-            IrqSense::Level,
-            IrqGroup::Group1,
-            DEFAULT_SPI_PRIORITY,
-        ) {
+        match VGIC.bind_spi_pirq_prepared(gic, PIntId(intid), VIntId(intid)) {
             Ok(()) => {}
             Err(GicError::InvalidState) => continue,
             Err(e) => {
