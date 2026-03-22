@@ -89,8 +89,47 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
     Ok(())
 }
 
-fn passthrough_probe(_ctx: *const (), _ipa: u64, size: u8, _is_write: bool) -> bool {
-    matches!(size, 1 | 2 | 4 | 8) && !vgic::handles_gicd(_ipa as usize)
+fn passthrough_probe(_ctx: *const (), ipa: u64, size: u8, _is_write: bool) -> bool {
+    let addr = ipa as usize;
+    matches!(size, 1 | 2 | 4 | 8) && !vgic::handles_gicd(addr) && !vgic::handles_gicc_phys(addr)
+}
+
+fn read_guest_mmio_source_reg(
+    regs: &cpu::Registers,
+    reg_num: usize,
+    reg_size: InstructionRegisterSize,
+) -> u64 {
+    if reg_num >= 32 {
+        panic!("invalid register {}", reg_num);
+    }
+    let raw = if reg_num == 31 {
+        0
+    } else {
+        regs.gprs()[reg_num]
+    };
+    match reg_size {
+        InstructionRegisterSize::Instruction32bit => raw & (u32::MAX as u64),
+        InstructionRegisterSize::Instruction64bit => raw,
+    }
+}
+
+fn write_guest_mmio_dest_reg(
+    regs: &mut cpu::Registers,
+    reg_num: usize,
+    reg_size: InstructionRegisterSize,
+    value: u64,
+) {
+    if reg_num >= 32 {
+        panic!("invalid register {}", reg_num);
+    }
+    if reg_num == 31 {
+        return;
+    }
+    let val = match reg_size {
+        InstructionRegisterSize::Instruction32bit => value & (u32::MAX as u64),
+        InstructionRegisterSize::Instruction64bit => value,
+    };
+    regs.gprs_mut()[reg_num] = val;
 }
 
 fn data_abort_handler(
@@ -102,6 +141,9 @@ fn data_abort_handler(
     if let Some(plan) = decoded {
         if handle_gicd_decoded(plan, regs) {
             return;
+        }
+        if gicc_access_denied(plan) {
+            panic!("gicc: physical GICC access denied; guest must use GICV");
         }
         log_uart_write(plan, regs);
         match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
@@ -127,13 +169,13 @@ fn data_abort_handler(
         );
     };
 
-    let Some(register) = info.register_mut(regs) else {
+    let reg_num = access.reg_num;
+    if reg_num >= 32 {
         panic!(
             "data abort at IPA 0x{:X} with invalid register {}",
-            address, access.reg_num
+            address, reg_num
         );
-    };
-
+    }
     let reg_size: InstructionRegisterSize = access.reg_size;
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
@@ -152,22 +194,19 @@ fn data_abort_handler(
             WriteNotRead::ReadingMemoryAbort => {
                 let value =
                     vgic::handle_gicd_read(address as usize, gic_access).expect("gicd read failed");
-                *register = match reg_size {
-                    InstructionRegisterSize::Instruction32bit => value as u64 & (u32::MAX as u64),
-                    InstructionRegisterSize::Instruction64bit => value as u64,
-                };
+                write_guest_mmio_dest_reg(regs, reg_num, reg_size, value as u64);
             }
             WriteNotRead::WritingMemoryAbort => {
-                let reg_val = match reg_size {
-                    InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
-                    InstructionRegisterSize::Instruction64bit => *register,
-                };
+                let reg_val = read_guest_mmio_source_reg(regs, reg_num, reg_size);
                 vgic::handle_gicd_write(address as usize, gic_access, reg_val as u32)
                     .expect("gicd write failed");
             }
         }
         cpu::set_elr_el2(cpu::get_elr_el2() + 4);
         return;
+    }
+    if vgic::handles_gicc_phys(address as usize) {
+        panic!("gicc: physical GICC access denied; guest must use GICV");
     }
 
     unsafe {
@@ -180,16 +219,15 @@ fn data_abort_handler(
                     SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
                 };
 
-                *register = match reg_size {
-                    InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
-                    InstructionRegisterSize::Instruction64bit => v,
-                };
+                write_guest_mmio_dest_reg(regs, reg_num, reg_size, v);
             }
 
             WriteNotRead::WritingMemoryAbort => {
-                let reg_val = match reg_size {
-                    InstructionRegisterSize::Instruction32bit => *register & (u32::MAX as u64),
-                    InstructionRegisterSize::Instruction64bit => *register,
+                let reg_val = read_guest_mmio_source_reg(regs, reg_num, reg_size);
+                let log_value = if reg_num == 31 {
+                    0
+                } else {
+                    regs.gprs()[reg_num]
                 };
                 let uart = PL011_UART_ADDR.0;
                 if (uart..uart + 0x1000).contains(&(address as usize)) {
@@ -202,7 +240,7 @@ fn data_abort_handler(
                         address,
                         access_width,
                         write_access == WriteNotRead::WritingMemoryAbort,
-                        *register
+                        log_value
                     );
                 };
                 match access_width {
@@ -247,13 +285,14 @@ fn handle_gicd_decoded(plan: &MmioDecoded, regs: &mut cpu::Registers) -> bool {
             } else {
                 let value =
                     vgic::handle_gicd_read(*ipa as usize, access).expect("gicd read failed");
-                let Some(register) = regs.gpr_mut(desc.rt) else {
-                    panic!("gicd: invalid register {}", desc.rt);
-                };
-                *register = match desc.rt_size {
-                    InstructionRegisterSize::Instruction32bit => value as u64 & (u32::MAX as u64),
-                    InstructionRegisterSize::Instruction64bit => value as u64,
-                };
+                if desc.rt == 31 {
+                    // x31 reads as zero; discard the loaded value.
+                } else {
+                    if desc.rt >= 32 {
+                        panic!("gicd: invalid register {}", desc.rt);
+                    }
+                    write_guest_mmio_dest_reg(regs, desc.rt as usize, desc.rt_size, value as u64);
+                }
             }
             cpu::set_elr_el2(cpu::get_elr_el2() + 4);
             true
@@ -263,6 +302,16 @@ fn handle_gicd_decoded(plan: &MmioDecoded, regs: &mut cpu::Registers) -> bool {
                 panic!("gicd: pair access not supported");
             }
             false
+        }
+        MmioDecoded::Prefetch { .. } => false,
+    }
+}
+
+fn gicc_access_denied(plan: &MmioDecoded) -> bool {
+    match plan {
+        MmioDecoded::Single { ipa, .. } => vgic::handles_gicc_phys(*ipa as usize),
+        MmioDecoded::Pair { ipa0, ipa1, .. } => {
+            vgic::handles_gicc_phys(*ipa0 as usize) || vgic::handles_gicc_phys(*ipa1 as usize)
         }
         MmioDecoded::Prefetch { .. } => false,
     }
