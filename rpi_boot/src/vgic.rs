@@ -4,7 +4,7 @@ use arch_hal::gic::GicIrqMirror;
 use arch_hal::gic::GicSgi;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
-use arch_hal::gic::PhysicalIrqBindingKind;
+use arch_hal::gic::PhysicalIrqGuestState;
 use arch_hal::gic::SgiTarget;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
@@ -295,15 +295,10 @@ pub fn on_physical_irq_asserted(pintid: PIntId) -> Result<(), GicError> {
     VGIC.handle_physical_irq_asserted(gic, pintid)
 }
 
-pub(crate) fn physical_irq_binding_kind(
+pub(crate) fn physical_irq_guest_state(
     pintid: PIntId,
-) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
-    VGIC.physical_irq_binding_kind(pintid)
-}
-
-pub(crate) fn inject_physical_irq_as_pending(pintid: PIntId, level: bool) -> Result<(), GicError> {
-    let gic = handler::gic().ok_or(GicError::InvalidState)?;
-    VGIC.inject_physical_irq_as_pending(gic, pintid.0, level)
+) -> Result<Option<PhysicalIrqGuestState>, GicError> {
+    VGIC.physical_irq_guest_state(pintid)
 }
 
 pub fn handle_maintenance_irq() -> Result<(), GicError> {

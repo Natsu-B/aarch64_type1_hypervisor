@@ -1186,6 +1186,14 @@ mod tests {
         ) -> Result<Option<crate::PhysicalIrqBindingKind>, GicError> {
             Ok(None)
         }
+
+        fn physical_irq_guest_state(
+            &self,
+            _source_vcpu: VcpuId,
+            _pintid: PIntId,
+        ) -> Result<Option<crate::PhysicalIrqGuestState>, GicError> {
+            Ok(None)
+        }
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]

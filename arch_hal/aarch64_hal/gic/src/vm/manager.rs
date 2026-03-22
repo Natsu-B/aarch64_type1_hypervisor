@@ -8,6 +8,7 @@ use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
 use crate::PhysicalIrqBindingKind;
+use crate::PhysicalIrqGuestState;
 use crate::VIntId;
 use crate::VcpuId;
 use crate::VgicGuestRegs;
@@ -175,6 +176,15 @@ where
         let vm = self.model()?;
         let source_vcpu = VcpuId(u16::from(cpu_if().ok_or(GicError::UninitCpuId)?));
         vm.physical_irq_binding_kind(source_vcpu, pintid)
+    }
+
+    pub fn physical_irq_guest_state(
+        &self,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqGuestState>, GicError> {
+        let vm = self.model()?;
+        let source_vcpu = VcpuId(u16::from(cpu_if().ok_or(GicError::UninitCpuId)?));
+        vm.physical_irq_guest_state(source_vcpu, pintid)
     }
 
     pub fn inject_ppi<H: VgicHw>(

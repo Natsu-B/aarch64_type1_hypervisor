@@ -1240,6 +1240,19 @@ pub enum PhysicalIrqBindingKind {
     HardwareLr,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalIrqGuestState {
+    pub binding_kind: PhysicalIrqBindingKind,
+    pub guest_enable: bool,
+    pub distributor_enable: bool,
+}
+
+impl PhysicalIrqGuestState {
+    pub const fn accepts_asserted_ingress(self) -> bool {
+        self.guest_enable && self.distributor_enable
+    }
+}
+
 /// Host-side physical IRQ mapping and ingress hooks.
 pub(crate) trait VgicPirqModel: VgicVmInfo {
     /// Explicit host-configured pIRQ mapping.
@@ -1302,6 +1315,13 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         source_vcpu: VcpuId,
         pintid: PIntId,
     ) -> Result<Option<PhysicalIrqBindingKind>, GicError>;
+
+    /// Report guest-visible delivery readiness for a bound `pintid` without mutating VM state.
+    fn physical_irq_guest_state(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqGuestState>, GicError>;
 }
 
 /// VM logical state model marker (version-independent core).

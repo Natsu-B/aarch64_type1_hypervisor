@@ -344,26 +344,29 @@ static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecke
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum AckedPirqDelivery {
     Bound(PhysicalIrqBindingKind),
-    UnboundPending,
     Error(GicError),
 }
 
 fn handle_acknowledged_pirq(irq_intid: u32) -> AckedPirqDelivery {
     let pintid = PIntId(irq_intid);
-    match vgic::on_physical_irq_asserted(pintid) {
-        Ok(()) => match vgic::physical_irq_binding_kind(pintid) {
-            Ok(Some(kind)) => AckedPirqDelivery::Bound(kind),
-            Ok(None) => AckedPirqDelivery::Error(GicError::InvalidState),
-            Err(err) => AckedPirqDelivery::Error(err),
-        },
-        Err(GicError::UnsupportedIntId) => match vgic::physical_irq_binding_kind(pintid) {
-            Ok(None) => match vgic::inject_physical_irq_as_pending(pintid, true) {
-                Ok(()) => AckedPirqDelivery::UnboundPending,
+    match vgic::physical_irq_guest_state(pintid) {
+        Ok(Some(state)) if state.accepts_asserted_ingress() => {
+            match vgic::on_physical_irq_asserted(pintid) {
+                Ok(()) => AckedPirqDelivery::Bound(state.binding_kind),
                 Err(err) => AckedPirqDelivery::Error(err),
-            },
-            Ok(Some(_)) => AckedPirqDelivery::Error(GicError::UnsupportedIntId),
-            Err(err) => AckedPirqDelivery::Error(err),
-        },
+            }
+        }
+        Ok(Some(state)) => {
+            panic!(
+                "vgic: physical IRQ {} reached EL2 before guest enable (binding={:?}, guest_enable={}, distributor_enable={}, cpu_if={:?})",
+                irq_intid,
+                state.binding_kind,
+                state.guest_enable,
+                state.distributor_enable,
+                tls::cpu_if(),
+            );
+        }
+        Ok(None) => AckedPirqDelivery::Error(GicError::UnsupportedIntId),
         Err(err) => AckedPirqDelivery::Error(err),
     }
 }
@@ -379,8 +382,7 @@ fn needs_deactivate_after_ack(
     }
 
     match pirq_delivery.expect("physical IRQs must provide a vGIC delivery result") {
-        AckedPirqDelivery::Bound(PhysicalIrqBindingKind::SoftwareLr)
-        | AckedPirqDelivery::UnboundPending => true,
+        AckedPirqDelivery::Bound(PhysicalIrqBindingKind::SoftwareLr) => true,
         AckedPirqDelivery::Bound(PhysicalIrqBindingKind::HardwareLr) => false,
         AckedPirqDelivery::Error(GicError::UnsupportedIntId) => {
             panic!(
@@ -416,7 +418,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         }
     } else {
         if irq.intid == 27 {
-            // println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
+            println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
         }
         let delivery = handle_acknowledged_pirq(irq.intid);
         if let AckedPirqDelivery::Error(err) = delivery {

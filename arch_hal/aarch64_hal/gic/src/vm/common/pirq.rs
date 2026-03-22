@@ -4,6 +4,7 @@ use crate::IrqSense;
 use crate::IrqState as IrqStateKind;
 use crate::PIntId;
 use crate::PhysicalIrqBindingKind;
+use crate::PhysicalIrqGuestState;
 use crate::TriggerMode;
 use crate::VIntId;
 use crate::VcpuId;
@@ -707,5 +708,29 @@ where
             return Ok(None);
         };
         Ok(Some(entry.delivery.cpu_mode().binding_kind()))
+    }
+
+    pub(crate) fn physical_irq_guest_state_inner(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqGuestState>, GicError> {
+        let Some((entry, _)) = self.physical_irq_binding_inner(source_vcpu, pintid)? else {
+            return Ok(None);
+        };
+
+        let scope = entry.scope();
+        let regs = self.common.regs_lock.lock_irqsave();
+        let attrs = regs.irq_state.irq_attrs(scope, entry.vintid)?;
+        let distributor_enable = match attrs.group {
+            IrqGroup::Group0 => regs.dist_enable.0,
+            IrqGroup::Group1 => regs.dist_enable.1,
+        };
+
+        Ok(Some(PhysicalIrqGuestState {
+            binding_kind: entry.delivery.cpu_mode().binding_kind(),
+            guest_enable: attrs.enable,
+            distributor_enable,
+        }))
     }
 }

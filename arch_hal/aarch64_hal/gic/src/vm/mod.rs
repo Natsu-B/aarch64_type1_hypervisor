@@ -12,6 +12,7 @@ use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
 use crate::PhysicalIrqBindingKind;
+use crate::PhysicalIrqGuestState;
 use crate::TriggerMode;
 use crate::VIntId;
 use crate::VSpiRouting;
@@ -993,6 +994,14 @@ where
     ) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
         self.physical_irq_binding_kind_inner(source_vcpu, pintid)
     }
+
+    fn physical_irq_guest_state(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqGuestState>, GicError> {
+        self.physical_irq_guest_state_inner(source_vcpu, pintid)
+    }
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -1007,6 +1016,7 @@ mod tests {
     use crate::IrqState;
     use crate::MaintenanceReasons;
     use crate::PhysicalIrqBindingKind;
+    use crate::PhysicalIrqGuestState;
     use crate::VcpuMask;
     use crate::VgicHw;
     use crate::VgicSgiRegs;
@@ -1342,6 +1352,135 @@ mod tests {
             vm.physical_irq_binding_kind(target, PIntId(28)).unwrap(),
             None
         );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn physical_irq_guest_state_reports_unbound_as_none() {
+        let vm = recording_vm(1);
+        let target = VcpuId(0);
+
+        vm.bind_local_pirq_write_through_software_lr(PIntId(27), target, VIntId(27))
+            .unwrap();
+
+        assert_eq!(
+            vm.physical_irq_guest_state(target, PIntId(28)).unwrap(),
+            None
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn physical_irq_guest_state_for_local_ppi_is_false_until_guest_enable() {
+        let vm = recording_vm(1);
+        let target = VcpuId(0);
+        let pintid = PIntId(27);
+        let vintid = VIntId(27);
+        let bit = 1u32 << vintid.0;
+
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_local_pirq_write_through_software_lr(pintid, target, vintid)
+            .unwrap();
+
+        let state_before = vm
+            .physical_irq_guest_state(target, pintid)
+            .unwrap()
+            .expect("expected bound pIRQ state");
+        assert_eq!(
+            state_before,
+            PhysicalIrqGuestState {
+                binding_kind: PhysicalIrqBindingKind::SoftwareLr,
+                guest_enable: false,
+                distributor_enable: true,
+            }
+        );
+        assert!(!state_before.accepts_asserted_ingress());
+
+        vm.write_set_enable_word(VgicIrqScope::Local(target), VIntId(0), bit)
+            .unwrap();
+
+        let state_after = vm
+            .physical_irq_guest_state(target, pintid)
+            .unwrap()
+            .expect("expected bound pIRQ state");
+        assert_eq!(
+            state_after,
+            PhysicalIrqGuestState {
+                binding_kind: PhysicalIrqBindingKind::SoftwareLr,
+                guest_enable: true,
+                distributor_enable: true,
+            }
+        );
+        assert!(state_after.accepts_asserted_ingress());
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn physical_irq_guest_state_for_spi_is_false_until_guest_enable() {
+        let vm = recording_vm(1);
+        let source_vcpu = VcpuId(0);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+        let bit = 1u32 << (vintid.0 - 32);
+
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_spi_pirq_passthrough(pintid, vintid).unwrap();
+
+        let state_before = vm
+            .physical_irq_guest_state(source_vcpu, pintid)
+            .unwrap()
+            .expect("expected bound pIRQ state");
+        assert_eq!(
+            state_before,
+            PhysicalIrqGuestState {
+                binding_kind: PhysicalIrqBindingKind::HardwareLr,
+                guest_enable: false,
+                distributor_enable: true,
+            }
+        );
+        assert!(!state_before.accepts_asserted_ingress());
+
+        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), bit)
+            .unwrap();
+
+        let state_after = vm
+            .physical_irq_guest_state(source_vcpu, pintid)
+            .unwrap()
+            .expect("expected bound pIRQ state");
+        assert_eq!(
+            state_after,
+            PhysicalIrqGuestState {
+                binding_kind: PhysicalIrqBindingKind::HardwareLr,
+                guest_enable: true,
+                distributor_enable: true,
+            }
+        );
+        assert!(state_after.accepts_asserted_ingress());
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn physical_irq_guest_state_is_blocked_when_distributor_disabled() {
+        let vm = recording_vm(1);
+        let target = VcpuId(0);
+        let pintid = PIntId(27);
+        let vintid = VIntId(27);
+        let bit = 1u32 << vintid.0;
+
+        vm.bind_local_pirq_write_through_software_lr(pintid, target, vintid)
+            .unwrap();
+        vm.write_set_enable_word(VgicIrqScope::Local(target), VIntId(0), bit)
+            .unwrap();
+
+        let state = vm
+            .physical_irq_guest_state(target, pintid)
+            .unwrap()
+            .expect("expected bound pIRQ state");
+        assert_eq!(
+            state,
+            PhysicalIrqGuestState {
+                binding_kind: PhysicalIrqBindingKind::SoftwareLr,
+                guest_enable: true,
+                distributor_enable: false,
+            }
+        );
+        assert!(!state.accepts_asserted_ingress());
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
@@ -2021,6 +2160,19 @@ mod tests {
         }
 
         assert_signature(manager::VgicManager::<TEST_VCPUS>::physical_irq_binding_kind);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn manager_exposes_physical_irq_guest_state_wrapper() {
+        fn assert_signature(
+            _: fn(
+                &manager::VgicManager<TEST_VCPUS>,
+                PIntId,
+            ) -> Result<Option<PhysicalIrqGuestState>, GicError>,
+        ) {
+        }
+
+        assert_signature(manager::VgicManager::<TEST_VCPUS>::physical_irq_guest_state);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
