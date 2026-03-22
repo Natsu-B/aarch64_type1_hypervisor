@@ -49,3 +49,13 @@ harness = false
 name = "vgic_e2e_irq"
 path = "tests/vgic_e2e_irq.rs"
 harness = false
+
+[[test]]
+name = "vgic_e2e_physical_ppi"
+path = "tests/vgic_e2e_physical_ppi.rs"
+harness = false
+
+[[test]]
+name = "vgic_e2e_physical_ppi_rpi_boot"
+path = "tests/vgic_e2e_physical_ppi_rpi_boot.rs"
+harness = false

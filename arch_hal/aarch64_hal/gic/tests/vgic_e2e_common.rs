@@ -86,6 +86,10 @@ pub const POLL_TIMEOUT_ITERS: usize = 200_000;
 pub const DUPLICATE_CHECK_ITERS: usize = 8_192;
 pub const IRQ_WAIT_ITERS: usize = 200_000;
 
+pub const TEST_CTRL_BASE: usize = 0x0810_0000;
+pub const TEST_CTRL_SIZE: usize = 0x1000;
+pub const TEST_CTRL_CMD_OFF: usize = 0x000;
+
 pub const FAIL_EL2_STAGE2_INIT: u32 = 0x1001;
 pub const FAIL_EL2_GIC_INIT: u32 = 0x1002;
 pub const FAIL_EL2_VGIC_INIT: u32 = 0x1003;
@@ -95,9 +99,12 @@ pub const FAIL_EL2_DABORT_BAD_REGISTER: u32 = 0x1103;
 pub const FAIL_EL2_DABORT_BAD_ADDR: u32 = 0x1104;
 pub const FAIL_EL2_DABORT_READ: u32 = 0x1105;
 pub const FAIL_EL2_DABORT_WRITE: u32 = 0x1106;
+pub const FAIL_EL2_TEST_CTRL_BAD_ACCESS: u32 = 0x1107;
+pub const FAIL_EL2_TEST_CTRL_UNSUPPORTED_CMD: u32 = 0x1108;
 pub const FAIL_EL2_IRQ_UNSUPPORTED: u32 = 0x1201;
 pub const FAIL_EL2_IRQ_HANDLE: u32 = 0x1202;
 pub const FAIL_EL2_IRQ_EOI: u32 = 0x1203;
+pub const FAIL_EL2_IRQ_DEACT: u32 = 0x1204;
 
 pub const FAIL_POLL_SGI_TIMEOUT: u32 = 0x2001;
 pub const FAIL_POLL_SGI_UNEXPECTED: u32 = 0x2002;
@@ -117,6 +124,16 @@ pub const FAIL_IRQ_SGI_SECOND_WAIT_TIMEOUT: u32 = 0x3002;
 pub const FAIL_IRQ_PPI_WAIT_TIMEOUT: u32 = 0x3011;
 pub const FAIL_IRQ_UART_WAIT_TIMEOUT: u32 = 0x3021;
 pub const FAIL_IRQ_UNEXPECTED_INTID: u32 = 0x3031;
+
+pub const FAIL_PHYS_PPI_WAIT_TIMEOUT: u32 = 0x4001;
+pub const FAIL_PHYS_PPI_SECOND_WAIT_TIMEOUT: u32 = 0x4002;
+pub const FAIL_PHYS_PPI_DELIVERED_AFTER_DISABLE: u32 = 0x4003;
+pub const FAIL_PHYS_PPI_UNEXPECTED_INTID: u32 = 0x4031;
+
+pub const FAIL_RPI_BOOT_PPI_WAIT_TIMEOUT: u32 = 0x4101;
+pub const FAIL_RPI_BOOT_PPI_SECOND_WAIT_TIMEOUT: u32 = 0x4102;
+pub const FAIL_RPI_BOOT_PPI_DELIVERED_AFTER_DISABLE: u32 = 0x4103;
+pub const FAIL_RPI_BOOT_PPI_UNEXPECTED_INTID: u32 = 0x4131;
 
 const GICD_CTLR_OFF: usize = 0x000;
 const GICD_IGROUPR0_OFF: usize = 0x080;
@@ -144,6 +161,9 @@ const UART_CR_TXE: u32 = 1 << 8;
 const UART_CR_RXE: u32 = 1 << 9;
 const UART_IMSC_TXIM: u32 = 1 << 5;
 const UART_ICR_ALL: u32 = 0x7ff;
+
+const TEST_CTRL_CMD_PPI27_STICKY_ENABLE: u32 = 0x0000_0001;
+const TEST_CTRL_CMD_PPI27_STICKY_DISABLE: u32 = 0x0000_0002;
 
 const EL1_STACK_SIZE: usize = 0x4000;
 const TLS_BUF_SIZE: usize = 4096;
@@ -192,6 +212,12 @@ struct TlsBuf([u8; TLS_BUF_SIZE]);
 
 struct TestVgicDelegate;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TestPpi27Mode {
+    DirectVgicSticky,
+    RpiBootLikeSticky,
+}
+
 static DELEGATE: TestVgicDelegate = TestVgicDelegate;
 static VGIC: VgicManager<1> = VgicManager::new(&DELEGATE, 0);
 
@@ -211,6 +237,8 @@ static mut TLS_BUF: TlsBuf = TlsBuf([0; TLS_BUF_SIZE]);
 static mut TEST_HEAP: [u8; TEST_HEAP_SIZE] = [0; TEST_HEAP_SIZE];
 static mut EL1_STACK: El1Stack = El1Stack([0; EL1_STACK_SIZE]);
 static mut UART_PHYS_INJECTED: bool = false;
+static mut TEST_PPI27_STICKY_ACTIVE: bool = false;
+static mut TEST_PPI27_MODE: TestPpi27Mode = TestPpi27Mode::DirectVgicSticky;
 
 impl VgicDelegate for TestVgicDelegate {
     fn irq_mirror(&self) -> Result<&'static dyn GicIrqMirror, GicError> {
@@ -265,6 +293,21 @@ pub fn panic_exit(test_name: &str, info: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 pub fn run_el2(test_name: &'static str, guest_entry: extern "C" fn(*mut Shared) -> !) -> ! {
+    run_el2_with_ppi27_mode(test_name, guest_entry, TestPpi27Mode::DirectVgicSticky)
+}
+
+pub fn run_el2_rpi_boot_like(
+    test_name: &'static str,
+    guest_entry: extern "C" fn(*mut Shared) -> !,
+) -> ! {
+    run_el2_with_ppi27_mode(test_name, guest_entry, TestPpi27Mode::RpiBootLikeSticky)
+}
+
+fn run_el2_with_ppi27_mode(
+    test_name: &'static str,
+    guest_entry: extern "C" fn(*mut Shared) -> !,
+    ppi27_mode: TestPpi27Mode,
+) -> ! {
     // SAFETY: masking interrupts is required before EL2 bring-up sequencing.
     unsafe {
         asm!("msr daifset, #0b1111", options(nostack, preserves_flags));
@@ -272,8 +315,10 @@ pub fn run_el2(test_name: &'static str, guest_entry: extern "C" fn(*mut Shared) 
 
     debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
 
-    // SAFETY: single-core test init writes the test label once before guest entry.
+    // SAFETY: single-core test init publishes the selected harness mode and test label before
+    // any EL2 handler can observe them.
     unsafe {
+        *ptr::addr_of_mut!(TEST_PPI27_MODE) = ppi27_mode;
         *ptr::addr_of_mut!(TEST_NAME) = test_name;
     }
 
@@ -321,9 +366,10 @@ fn install_el2_handlers() {
 fn reset_shared() {
     let shared = shared_mut_static();
     *shared = Shared::new();
-    // SAFETY: single-core test flow resets one-shot physical UART injection state.
+    // SAFETY: single-core test flow resets synthetic physical source latches before guest entry.
     unsafe {
         *ptr::addr_of_mut!(UART_PHYS_INJECTED) = false;
+        *ptr::addr_of_mut!(TEST_PPI27_STICKY_ACTIVE) = false;
     }
 }
 
@@ -528,11 +574,167 @@ fn current_test_name() -> &'static str {
     unsafe { *ptr::addr_of!(TEST_NAME) }
 }
 
+fn current_test_ppi27_mode() -> TestPpi27Mode {
+    // SAFETY: single-core test init sets the harness mode before any handler can read it.
+    unsafe { *ptr::addr_of!(TEST_PPI27_MODE) }
+}
+
 fn record_fail(code: u32) {
     let shared = shared_mut_static();
     if shared.fail == 0 {
         shared.fail = code;
     }
+}
+
+#[inline]
+fn is_test_ctrl_addr(addr: usize) -> bool {
+    (TEST_CTRL_BASE..TEST_CTRL_BASE + TEST_CTRL_SIZE).contains(&addr)
+}
+
+fn set_test_physical_ppi27(level: bool) -> Result<(), GicError> {
+    VGIC.handle_physical_irq(gic_ref(), PIntId(TIMER_TEST_PPI_INTID), level)
+}
+
+fn inject_test_physical_ppi27() -> Result<(), GicError> {
+    set_test_physical_ppi27(true)
+}
+
+fn clear_test_physical_ppi27() -> Result<(), GicError> {
+    set_test_physical_ppi27(false)
+}
+
+fn set_test_physical_ppi27_or_panic(level: bool, context: &'static str) {
+    let result = if level {
+        inject_test_physical_ppi27()
+    } else {
+        clear_test_physical_ppi27()
+    };
+
+    match result {
+        Ok(()) => {}
+        Err(GicError::UnsupportedIntId) => {
+            record_fail(FAIL_EL2_IRQ_UNSUPPORTED);
+            panic!(
+                "{}: unsupported physical test PPI {}",
+                context, TIMER_TEST_PPI_INTID
+            );
+        }
+        Err(err) => {
+            record_fail(FAIL_EL2_IRQ_HANDLE);
+            println!(
+                "{}: physical irq injection failed (intid={}): {:?}",
+                context, TIMER_TEST_PPI_INTID, err
+            );
+            panic!("{}: physical irq injection failed", context);
+        }
+    }
+}
+
+fn inject_test_physical_ppi27_or_panic(context: &'static str) {
+    set_test_physical_ppi27_or_panic(true, context);
+}
+
+fn clear_test_physical_ppi27_or_panic(context: &'static str) {
+    set_test_physical_ppi27_or_panic(false, context);
+}
+
+fn set_test_physical_ppi27_pending(pending: bool) {
+    let reg_off = if pending {
+        GICD_ISPENDR0_OFF
+    } else {
+        GICD_ICPENDR0_OFF
+    };
+    mmio_write32(GICD_BASE + reg_off, 1u32 << TIMER_TEST_PPI_INTID);
+    cpu::dsb_sy();
+    cpu::isb();
+}
+
+fn assert_test_physical_ppi27_pending() {
+    set_test_physical_ppi27_pending(true);
+}
+
+fn clear_test_physical_ppi27_pending() {
+    set_test_physical_ppi27_pending(false);
+}
+
+fn quiesce_test_physical_ppi27_source_or_panic() {
+    match current_test_ppi27_mode() {
+        TestPpi27Mode::DirectVgicSticky => {
+            clear_test_physical_ppi27_or_panic("test control sticky disable");
+        }
+        TestPpi27Mode::RpiBootLikeSticky => {
+            clear_test_physical_ppi27_or_panic("test control sticky disable");
+            clear_test_physical_ppi27_pending();
+        }
+    }
+}
+
+fn reassert_test_physical_ppi27_source_or_panic() {
+    match current_test_ppi27_mode() {
+        TestPpi27Mode::DirectVgicSticky => {
+            clear_test_physical_ppi27_or_panic("trapped wf sticky ppi27 clear");
+            inject_test_physical_ppi27_or_panic("trapped wf sticky ppi27");
+        }
+        TestPpi27Mode::RpiBootLikeSticky => {
+            clear_test_physical_ppi27_or_panic("trapped wf rpi_boot sticky ppi27 clear");
+            clear_test_physical_ppi27_pending();
+            assert_test_physical_ppi27_pending();
+        }
+    }
+}
+
+fn handle_test_ctrl_command(cmd: u32) {
+    match cmd {
+        TEST_CTRL_CMD_PPI27_STICKY_ENABLE => {
+            // SAFETY: single-core EL2 test mutates this synthetic source latch in one place.
+            unsafe {
+                *ptr::addr_of_mut!(TEST_PPI27_STICKY_ACTIVE) = true;
+            }
+        }
+        TEST_CTRL_CMD_PPI27_STICKY_DISABLE => {
+            // SAFETY: single-core EL2 test mutates this synthetic source latch in one place.
+            unsafe {
+                *ptr::addr_of_mut!(TEST_PPI27_STICKY_ACTIVE) = false;
+            }
+            quiesce_test_physical_ppi27_source_or_panic();
+        }
+        _ => {
+            record_fail(FAIL_EL2_TEST_CTRL_UNSUPPORTED_CMD);
+            panic!("unsupported test control command 0x{cmd:08x}");
+        }
+    }
+}
+
+fn handle_test_ctrl_data_abort(regs: &mut cpu::Registers, info: &DataAbortInfo, addr: usize) {
+    let Some(access) = info.access else {
+        record_fail(FAIL_EL2_TEST_CTRL_BAD_ACCESS);
+        panic!("missing test-control access metadata at 0x{:x}", addr);
+    };
+
+    if access.access_width != SyndromeAccessSize::Word
+        || !matches!(access.reg_size, InstructionRegisterSize::Instruction32bit)
+        || !matches!(access.write_access, WriteNotRead::WritingMemoryAbort)
+    {
+        record_fail(FAIL_EL2_TEST_CTRL_BAD_ACCESS);
+        panic!(
+            "unsupported test-control access width={:?} reg_size={:?} write_access={:?} at 0x{:x}",
+            access.access_width, access.reg_size, access.write_access, addr
+        );
+    }
+
+    let offset = addr - TEST_CTRL_BASE;
+    if offset != TEST_CTRL_CMD_OFF {
+        record_fail(FAIL_EL2_TEST_CTRL_BAD_ACCESS);
+        panic!("unexpected test-control offset 0x{:x}", offset);
+    }
+
+    let Some(reg) = info.register_mut(regs) else {
+        record_fail(FAIL_EL2_TEST_CTRL_BAD_ACCESS);
+        panic!("invalid test-control register index {}", access.reg_num);
+    };
+
+    let cmd = (*reg & (u32::MAX as u64)) as u32;
+    handle_test_ctrl_command(cmd);
 }
 
 fn el2_data_abort_handler(
@@ -543,60 +745,62 @@ fn el2_data_abort_handler(
 ) {
     let addr = info.fault_ipa.unwrap_or(info.far_el2) as usize;
 
-    if !(GICD_BASE..GICD_BASE + GICV2_GICD_FRAME_SIZE).contains(&addr) {
-        record_fail(FAIL_EL2_DABORT_BAD_ADDR);
-        panic!("unexpected data abort at IPA/FAR 0x{:x}", addr);
-    }
+    if (GICD_BASE..GICD_BASE + GICV2_GICD_FRAME_SIZE).contains(&addr) {
+        let Some(access) = info.access else {
+            record_fail(FAIL_EL2_DABORT_NO_ACCESS);
+            panic!("missing data-abort access metadata at 0x{:x}", addr);
+        };
 
-    let Some(access) = info.access else {
-        record_fail(FAIL_EL2_DABORT_NO_ACCESS);
-        panic!("missing data-abort access metadata at 0x{:x}", addr);
-    };
-
-    if access.access_width != SyndromeAccessSize::Word {
-        record_fail(FAIL_EL2_DABORT_BAD_WIDTH);
-        panic!(
-            "unsupported trapped GICD access width {:?} at 0x{:x}",
-            access.access_width, addr
-        );
-    }
-
-    let Some(reg) = info.register_mut(regs) else {
-        record_fail(FAIL_EL2_DABORT_BAD_REGISTER);
-        panic!("invalid trapped register index {}", access.reg_num);
-    };
-
-    let offset = (addr - GICD_BASE) as u32;
-    match access.write_access {
-        WriteNotRead::ReadingMemoryAbort => {
-            let value = VGIC
-                .handle_distributor_read(VcpuId(0), dist_id(), offset, Gicv2AccessSize::U32)
-                .unwrap_or_else(|err| {
-                    record_fail(FAIL_EL2_DABORT_READ);
-                    panic!("vgic dist read failed at 0x{:x}: {:?}", addr, err);
-                });
-            *reg = match access.reg_size {
-                InstructionRegisterSize::Instruction32bit => (value as u64) & (u32::MAX as u64),
-                InstructionRegisterSize::Instruction64bit => value as u64,
-            };
+        if access.access_width != SyndromeAccessSize::Word {
+            record_fail(FAIL_EL2_DABORT_BAD_WIDTH);
+            panic!(
+                "unsupported trapped GICD access width {:?} at 0x{:x}",
+                access.access_width, addr
+            );
         }
-        WriteNotRead::WritingMemoryAbort => {
-            let value = match access.reg_size {
-                InstructionRegisterSize::Instruction32bit => *reg & (u32::MAX as u64),
-                InstructionRegisterSize::Instruction64bit => *reg,
-            } as u32;
-            if let Err(err) = VGIC.handle_distributor_write(
-                gic_ref(),
-                VcpuId(0),
-                dist_id(),
-                offset,
-                Gicv2AccessSize::U32,
-                value,
-            ) {
-                record_fail(FAIL_EL2_DABORT_WRITE);
-                panic!("vgic dist write failed at 0x{:x}: {:?}", addr, err);
+
+        let Some(reg) = info.register_mut(regs) else {
+            record_fail(FAIL_EL2_DABORT_BAD_REGISTER);
+            panic!("invalid trapped register index {}", access.reg_num);
+        };
+
+        let offset = (addr - GICD_BASE) as u32;
+        match access.write_access {
+            WriteNotRead::ReadingMemoryAbort => {
+                let value = VGIC
+                    .handle_distributor_read(VcpuId(0), dist_id(), offset, Gicv2AccessSize::U32)
+                    .unwrap_or_else(|err| {
+                        record_fail(FAIL_EL2_DABORT_READ);
+                        panic!("vgic dist read failed at 0x{:x}: {:?}", addr, err);
+                    });
+                *reg = match access.reg_size {
+                    InstructionRegisterSize::Instruction32bit => (value as u64) & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => value as u64,
+                };
+            }
+            WriteNotRead::WritingMemoryAbort => {
+                let value = match access.reg_size {
+                    InstructionRegisterSize::Instruction32bit => *reg & (u32::MAX as u64),
+                    InstructionRegisterSize::Instruction64bit => *reg,
+                } as u32;
+                if let Err(err) = VGIC.handle_distributor_write(
+                    gic_ref(),
+                    VcpuId(0),
+                    dist_id(),
+                    offset,
+                    Gicv2AccessSize::U32,
+                    value,
+                ) {
+                    record_fail(FAIL_EL2_DABORT_WRITE);
+                    panic!("vgic dist write failed at 0x{:x}: {:?}", addr, err);
+                }
             }
         }
+    } else if is_test_ctrl_addr(addr) {
+        handle_test_ctrl_data_abort(regs, info, addr);
+    } else {
+        record_fail(FAIL_EL2_DABORT_BAD_ADDR);
+        panic!("unexpected data abort at IPA/FAR 0x{:x}", addr);
     }
 
     cpu::set_elr_el2(cpu::get_elr_el2().wrapping_add(4));
@@ -616,6 +820,7 @@ fn el2_irq_handler(_regs: &mut cpu::Registers) {
 
     let intid = ack.intid;
     let mut panic_after_eoi: Option<&'static str> = None;
+    let mut needs_deactivate = false;
 
     if intid == MAINT_INTID {
         if let Err(err) = VGIC.handle_maintenance(gic, VcpuId(0)) {
@@ -661,8 +866,18 @@ fn el2_irq_handler(_regs: &mut cpu::Registers) {
             mmio_write32(UART_BASE + UART_ICR_OFF, UART_ICR_ALL);
         }
     } else {
-        match VGIC.handle_physical_irq(gic, PIntId(intid), true) {
-            Ok(()) => {}
+        let rpi_boot_like = intid == TIMER_TEST_PPI_INTID
+            && current_test_ppi27_mode() == TestPpi27Mode::RpiBootLikeSticky;
+        let result = if rpi_boot_like {
+            VGIC.handle_physical_irq_asserted(gic, PIntId(intid))
+        } else {
+            VGIC.handle_physical_irq(gic, PIntId(intid), true)
+        };
+
+        match result {
+            Ok(()) => {
+                needs_deactivate = rpi_boot_like;
+            }
             Err(GicError::UnsupportedIntId) => {
                 record_fail(FAIL_EL2_IRQ_UNSUPPORTED);
             }
@@ -677,6 +892,13 @@ fn el2_irq_handler(_regs: &mut cpu::Registers) {
     if let Err(err) = gic.end_of_interrupt(ack) {
         record_fail(FAIL_EL2_IRQ_EOI);
         panic!("physical EOI failed for intid {}: {:?}", intid, err);
+    }
+
+    if needs_deactivate {
+        if let Err(err) = gic.deactivate(ack) {
+            record_fail(FAIL_EL2_IRQ_DEACT);
+            panic!("physical deactivate failed for intid {}: {:?}", intid, err);
+        }
     }
 
     if let Some(msg) = panic_after_eoi {
@@ -703,6 +925,15 @@ fn el2_trapped_wf_handler(_regs: &mut cpu::Registers, info: &TrappedWfInfo) {
             shared.last_iar_raw
         );
         exit_failure();
+    }
+
+    let sticky_active = {
+        // SAFETY: single-core EL2 test reads this synthetic source latch without races.
+        unsafe { *ptr::addr_of!(TEST_PPI27_STICKY_ACTIVE) }
+    };
+    if sticky_active {
+        reassert_test_physical_ppi27_source_or_panic();
+        return;
     }
 
     match info.ti {
@@ -864,8 +1095,22 @@ fn mmio_read32(addr: usize) -> u32 {
 }
 
 fn mmio_write32(addr: usize, value: u32) {
-    // SAFETY: caller provides a valid 32-bit MMIO address for write access.
+    // SAFETY: caller provides an address intended for a 32-bit MMIO-style or trapped write access.
     unsafe { ptr::write_volatile(addr as *mut u32, value) }
+}
+
+pub fn guest_test_ctrl_write(cmd: u32) {
+    mmio_write32(TEST_CTRL_BASE + TEST_CTRL_CMD_OFF, cmd);
+    cpu::dsb_sy();
+    cpu::isb();
+}
+
+pub fn guest_enable_sticky_physical_ppi27() {
+    guest_test_ctrl_write(TEST_CTRL_CMD_PPI27_STICKY_ENABLE);
+}
+
+pub fn guest_disable_sticky_physical_ppi27() {
+    guest_test_ctrl_write(TEST_CTRL_CMD_PPI27_STICKY_DISABLE);
 }
 
 pub fn guest_init_virtual_interfaces(gic: &GuestGic) {
@@ -1062,6 +1307,53 @@ pub fn guest_wait_for_irq_count(
         }
 
         cpu::isb();
+    }
+
+    guest_fail(shared, timeout_fail);
+}
+
+pub fn guest_wait_for_irq_count_wfe(
+    shared: *mut Shared,
+    idx: usize,
+    expected: u32,
+    timeout_iters: usize,
+    timeout_fail: u32,
+) {
+    for _ in 0..timeout_iters {
+        if shared_read_irq_seen(shared, idx) >= expected {
+            return;
+        }
+
+        let fail = shared_read_fail(shared);
+        if fail != 0 {
+            guest_fail(shared, fail);
+        }
+
+        cpu::isb();
+        // SAFETY: guest waits via trapped WFE so EL2 can model the persistent physical source.
+        // `sevl; wfe; wfe` clears any stale event-latch before the trapping wait.
+        unsafe {
+            asm!(
+                "sevl",
+                "wfe",
+                "wfe",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+
+        if shared_read_irq_seen(shared, idx) >= expected {
+            return;
+        }
+
+        let fail = shared_read_fail(shared);
+        if fail != 0 {
+            guest_fail(shared, fail);
+        }
+
+        // SAFETY: WFI is a deterministic trapped wait fallback when WFE does not block.
+        unsafe {
+            asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
     }
 
     guest_fail(shared, timeout_fail);
