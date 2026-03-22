@@ -1159,6 +1159,12 @@ pub(crate) trait VgicSgiRegs: VgicVmInfo {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PhysicalIrqBindingKind {
+    SoftwareLr,
+    HardwareLr,
+}
+
 /// Host-side physical IRQ mapping and ingress hooks.
 pub(crate) trait VgicPirqModel: VgicVmInfo {
     /// Explicit host-configured pIRQ mapping.
@@ -1186,6 +1192,15 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         vintid: VIntId,
     ) -> Result<VgicUpdate, GicError>;
 
+    /// Bind a host local pIRQ (PPI) to a guest local vIRQ while keeping write-through
+    /// Distributor mirroring but forcing software-backed LR delivery.
+    fn bind_local_pirq_write_through_software_lr(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError>;
+
     /// Bind a host SPI pIRQ to a guest SPI vIRQ for passthrough.
     ///
     /// Guest Distributor writes remain authoritative in the virtual shadow state and are mirrored
@@ -1204,6 +1219,14 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         pintid: PIntId,
         level: bool,
     ) -> Result<VgicUpdate, GicError>;
+
+    /// Report whether `pintid` is explicitly bound for `source_vcpu`, and if so which CPU
+    /// delivery mode that binding uses.
+    fn physical_irq_binding_kind(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqBindingKind>, GicError>;
 }
 
 /// VM logical state model marker (version-independent core).

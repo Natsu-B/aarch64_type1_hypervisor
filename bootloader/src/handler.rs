@@ -17,7 +17,7 @@ use arch_hal::exceptions::memory_hook::MmioError;
 use arch_hal::exceptions::memory_hook::MmioHandler;
 use arch_hal::exceptions::memory_hook::SplitPolicy;
 use arch_hal::gic::GicCpuInterface;
-use arch_hal::gic::GicError;
+use arch_hal::gic::PhysicalIrqBindingKind;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::println;
@@ -706,14 +706,27 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         vgic::handle_kick_sgi().unwrap();
     } else {
         let level = true;
-        match vgic::on_physical_irq(ack.intid, level) {
-            Ok(()) => {}
-            Err(GicError::UnsupportedIntId) => {
-                vgic::passthrough_physical_irq(ack.intid, level).unwrap();
+        match vgic::physical_irq_binding_kind(ack.intid) {
+            Ok(Some(PhysicalIrqBindingKind::SoftwareLr))
+            | Ok(Some(PhysicalIrqBindingKind::HardwareLr)) => {
+                vgic::on_physical_irq(ack.intid, level).unwrap_or_else(|err| {
+                    panic!(
+                        "irq_handler: failed to handle bound physical irq intid {}: {:?}",
+                        ack.intid, err
+                    )
+                });
+            }
+            Ok(None) => {
+                vgic::passthrough_physical_irq(ack.intid, level).unwrap_or_else(|err| {
+                    panic!(
+                        "irq_handler: failed to passthrough unbound physical irq intid {}: {:?}",
+                        ack.intid, err
+                    )
+                });
             }
             Err(err) => {
                 panic!(
-                    "irq_handler: failed to handle physical irq intid {}: {:?}",
+                    "irq_handler: failed to classify physical irq intid {}: {:?}",
                     ack.intid, err
                 );
             }

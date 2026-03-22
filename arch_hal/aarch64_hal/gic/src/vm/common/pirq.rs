@@ -3,6 +3,7 @@ use crate::IrqGroup;
 use crate::IrqSense;
 use crate::IrqState as IrqStateKind;
 use crate::PIntId;
+use crate::PhysicalIrqBindingKind;
 use crate::TriggerMode;
 use crate::VIntId;
 use crate::VcpuId;
@@ -70,6 +71,15 @@ impl PirqDelivery {
     pub(crate) const fn cpu_mode(self) -> CpuDeliveryMode {
         match self {
             PirqDelivery::Local { cpu_mode, .. } | PirqDelivery::Spi { cpu_mode, .. } => cpu_mode,
+        }
+    }
+}
+
+impl CpuDeliveryMode {
+    pub(crate) const fn binding_kind(self) -> PhysicalIrqBindingKind {
+        match self {
+            CpuDeliveryMode::SoftwareLr => PhysicalIrqBindingKind::SoftwareLr,
+            CpuDeliveryMode::HardwareLr => PhysicalIrqBindingKind::HardwareLr,
         }
     }
 }
@@ -298,6 +308,35 @@ where
         target: VcpuId,
         vintid: VIntId,
     ) -> Result<VgicUpdate, GicError> {
+        self.bind_local_pirq_inner_write_through(
+            pintid,
+            target,
+            vintid,
+            CpuDeliveryMode::HardwareLr,
+        )
+    }
+
+    pub(crate) fn bind_local_pirq_inner_write_through_software_lr(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        self.bind_local_pirq_inner_write_through(
+            pintid,
+            target,
+            vintid,
+            CpuDeliveryMode::SoftwareLr,
+        )
+    }
+
+    fn bind_local_pirq_inner_write_through(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+        cpu_mode: CpuDeliveryMode,
+    ) -> Result<VgicUpdate, GicError> {
         if vintid.0 >= LOCAL_INTID_COUNT as u32 {
             return Err(GicError::UnsupportedIntId);
         }
@@ -314,7 +353,7 @@ where
             delivery: PirqDelivery::Local {
                 target,
                 dist_mode: DistMirrorMode::WriteThrough,
-                cpu_mode: CpuDeliveryMode::HardwareLr,
+                cpu_mode,
             },
         };
 
@@ -517,33 +556,9 @@ where
         pintid: PIntId,
         level: bool,
     ) -> Result<VgicUpdate, GicError> {
-        self.common.vcpu_index(source_vcpu)?;
-
-        let (entry, global_targets) = {
-            let routing = self.common.routing_lock.lock_irqsave();
-            let local_entry = if (pintid.0 as usize) < LOCAL_INTID_COUNT {
-                routing.pirqs.get_local(source_vcpu, pintid)?
-            } else {
-                None
-            };
-
-            let entry = if let Some(local_entry) = local_entry {
-                local_entry
-            } else {
-                let Some(global_entry) = routing.pirqs.get(pintid)? else {
-                    return Err(GicError::UnsupportedIntId);
-                };
-                global_entry
-            };
-
-            let targets = if matches!(entry.delivery, PirqDelivery::Spi { .. }) {
-                routing
-                    .routing
-                    .targets_for_spi(entry.vintid, self.common.vcpu_count())?
-            } else {
-                VcpuMask::EMPTY
-            };
-            (entry, targets)
+        let Some((entry, global_targets)) = self.physical_irq_binding_inner(source_vcpu, pintid)?
+        else {
+            return Err(GicError::UnsupportedIntId);
         };
 
         let scope = entry.scope();
@@ -647,5 +662,50 @@ where
             scope, changed,
         ));
         Ok(update)
+    }
+
+    fn physical_irq_binding_inner(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<(PirqEntry, VcpuMask)>, GicError> {
+        self.common.vcpu_index(source_vcpu)?;
+
+        let routing = self.common.routing_lock.lock_irqsave();
+        let local_entry = if (pintid.0 as usize) < LOCAL_INTID_COUNT {
+            routing.pirqs.get_local(source_vcpu, pintid)?
+        } else {
+            None
+        };
+
+        let entry = if let Some(local_entry) = local_entry {
+            local_entry
+        } else {
+            let Some(global_entry) = routing.pirqs.get(pintid)? else {
+                return Ok(None);
+            };
+            global_entry
+        };
+
+        let targets = if matches!(entry.delivery, PirqDelivery::Spi { .. }) {
+            routing
+                .routing
+                .targets_for_spi(entry.vintid, self.common.vcpu_count())?
+        } else {
+            VcpuMask::EMPTY
+        };
+
+        Ok(Some((entry, targets)))
+    }
+
+    pub(crate) fn physical_irq_binding_kind_inner(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
+        let Some((entry, _)) = self.physical_irq_binding_inner(source_vcpu, pintid)? else {
+            return Ok(None);
+        };
+        Ok(Some(entry.delivery.cpu_mode().binding_kind()))
     }
 }

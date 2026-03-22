@@ -1149,6 +1149,15 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
+        fn bind_local_pirq_write_through_software_lr(
+            &self,
+            _pintid: PIntId,
+            _target: VcpuId,
+            _vintid: VIntId,
+        ) -> Result<VgicUpdate, GicError> {
+            Ok(VgicUpdate::None)
+        }
+
         fn bind_spi_pirq_passthrough(
             &self,
             _pintid: PIntId,
@@ -1168,6 +1177,14 @@ mod tests {
             _level: bool,
         ) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
+        }
+
+        fn physical_irq_binding_kind(
+            &self,
+            _source_vcpu: VcpuId,
+            _pintid: PIntId,
+        ) -> Result<Option<crate::PhysicalIrqBindingKind>, GicError> {
+            Ok(None)
         }
     }
 

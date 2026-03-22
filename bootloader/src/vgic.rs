@@ -1,10 +1,10 @@
 use arch_hal::cpu;
-use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
 use arch_hal::gic::GicIrqMirror;
 use arch_hal::gic::GicPpi;
 use arch_hal::gic::GicSgi;
 use arch_hal::gic::PIntId;
+use arch_hal::gic::PhysicalIrqBindingKind;
 use arch_hal::gic::SgiTarget;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
@@ -28,6 +28,7 @@ struct BootVgicDelegate;
 
 const KICK_SGI_ID: u8 = 15;
 const KICK_INTID: u32 = KICK_SGI_ID as u32;
+const GUEST_EL1_VTIMER_PPI_INTID: u32 = 27;
 
 static DELEGATE: BootVgicDelegate = BootVgicDelegate;
 static VGIC: VgicManager<1> = VgicManager::new(&DELEGATE, 0);
@@ -103,6 +104,20 @@ pub(crate) fn init(
 
     VGIC.switch_in(gic, VcpuId(0), cpu::get_current_core_id())
         .map_err(|_| "vgic: switch in")?;
+
+    VGIC.bind_local_pirq_write_through_software_lr(
+        gic,
+        PIntId(GUEST_EL1_VTIMER_PPI_INTID),
+        VcpuId(0),
+        VIntId(GUEST_EL1_VTIMER_PPI_INTID),
+    )
+    .map_err(|e| {
+        println!(
+            "Failed to bind guest timer PIRQ {}: {:?}",
+            GUEST_EL1_VTIMER_PPI_INTID, e
+        );
+        "vgic: map guest timer pirq"
+    })?;
 
     if let Some(pintid) = guest_uart.irq {
         if Some(pintid) != gdb_uart_intid {
@@ -186,6 +201,12 @@ pub(crate) fn on_physical_irq(intid: u32, level: bool) -> Result<(), GicError> {
     let result = VGIC.handle_physical_irq(gic, PIntId(intid), level);
     irq_monitor::record_injected_pirq(intid, result.is_ok());
     result
+}
+
+pub(crate) fn physical_irq_binding_kind(
+    intid: u32,
+) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
+    VGIC.physical_irq_binding_kind(PIntId(intid))
 }
 
 pub(crate) fn passthrough_physical_irq(intid: u32, level: bool) -> Result<(), GicError> {

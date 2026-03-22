@@ -7,6 +7,7 @@ use crate::GicMirrorOp;
 use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
+use crate::PhysicalIrqBindingKind;
 use crate::VIntId;
 use crate::VcpuId;
 use crate::VgicGuestRegs;
@@ -167,6 +168,15 @@ where
         self.handle_physical_irq(hw, pintid, true)
     }
 
+    pub fn physical_irq_binding_kind(
+        &self,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
+        let vm = self.model()?;
+        let source_vcpu = VcpuId(u16::from(cpu_if().ok_or(GicError::UninitCpuId)?));
+        vm.physical_irq_binding_kind(source_vcpu, pintid)
+    }
+
     pub fn inject_ppi<H: VgicHw>(
         &self,
         hw: &H,
@@ -220,6 +230,18 @@ where
     ) -> Result<(), GicError> {
         let vm = self.model()?;
         let update = vm.bind_local_pirq_passthrough(pintid, target, vintid)?;
+        self.apply_update(hw, update)
+    }
+
+    pub fn bind_local_pirq_write_through_software_lr<H: VgicHw>(
+        &self,
+        hw: &H,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+    ) -> Result<(), GicError> {
+        let vm = self.model()?;
+        let update = vm.bind_local_pirq_write_through_software_lr(pintid, target, vintid)?;
         self.apply_update(hw, update)
     }
 

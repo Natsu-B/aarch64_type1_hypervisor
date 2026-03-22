@@ -11,6 +11,7 @@ use crate::GicMirrorScope;
 use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
+use crate::PhysicalIrqBindingKind;
 use crate::TriggerMode;
 use crate::VIntId;
 use crate::VSpiRouting;
@@ -954,6 +955,15 @@ where
         self.bind_local_pirq_inner_passthrough(pintid, target, vintid)
     }
 
+    fn bind_local_pirq_write_through_software_lr(
+        &self,
+        pintid: PIntId,
+        target: VcpuId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        self.bind_local_pirq_inner_write_through_software_lr(pintid, target, vintid)
+    }
+
     fn bind_spi_pirq_passthrough(
         &self,
         pintid: PIntId,
@@ -975,6 +985,14 @@ where
     ) -> Result<VgicUpdate, GicError> {
         self.on_physical_irq_inner(source_vcpu, pintid, level)
     }
+
+    fn physical_irq_binding_kind(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
+        self.physical_irq_binding_kind_inner(source_vcpu, pintid)
+    }
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -988,6 +1006,7 @@ mod tests {
     use crate::GicMirrorScope;
     use crate::IrqState;
     use crate::MaintenanceReasons;
+    use crate::PhysicalIrqBindingKind;
     use crate::VcpuMask;
     use crate::VgicHw;
     use crate::VgicSgiRegs;
@@ -1215,6 +1234,101 @@ mod tests {
             }
             _ => panic!("expected hardware virq"),
         }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn write_through_local_ppi_software_lr_uses_software_delivery() {
+        let vm = recording_vm(1);
+        let target = VcpuId(0);
+        let pintid = PIntId(27);
+        let vintid = VIntId(27);
+
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_local_pirq_write_through_software_lr(pintid, target, vintid)
+            .unwrap();
+        vm.set_enable(VgicIrqScope::Local(target), vintid, true)
+            .unwrap();
+
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            let entry = routing
+                .pirqs
+                .get_local(target, pintid)
+                .unwrap()
+                .expect("expected pIRQ map");
+            assert!(matches!(
+                entry.delivery,
+                PirqDelivery::Local {
+                    target: entry_target,
+                    dist_mode: DistMirrorMode::WriteThrough,
+                    cpu_mode: CpuDeliveryMode::SoftwareLr,
+                } if entry_target == target
+            ));
+        }
+
+        assert_eq!(
+            vm.physical_irq_binding_kind(target, pintid).unwrap(),
+            Some(PhysicalIrqBindingKind::SoftwareLr)
+        );
+
+        vm.on_physical_irq(target, pintid, true).unwrap();
+        let vcpu = vm.vcpu(target).unwrap();
+        match vcpu.enqueued.borrow().last.as_ref().expect("expected virq") {
+            VirtualInterrupt::Software { vintid, state, .. } => {
+                assert_eq!(*vintid, 27);
+                assert_eq!(*state, IrqState::Pending);
+            }
+            _ => panic!("expected software virq"),
+        }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn passthrough_spi_binding_remains_write_through_hardware_lr() {
+        let vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+
+        vm.bind_spi_pirq_passthrough(pintid, vintid).unwrap();
+
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            let entry = routing
+                .pirqs
+                .get(pintid)
+                .unwrap()
+                .expect("expected pIRQ map");
+            assert!(matches!(
+                entry.delivery,
+                PirqDelivery::Spi {
+                    dist_mode: DistMirrorMode::WriteThrough,
+                    cpu_mode: CpuDeliveryMode::HardwareLr,
+                }
+            ));
+        }
+
+        assert_eq!(
+            vm.physical_irq_binding_kind(VcpuId(0), pintid).unwrap(),
+            Some(PhysicalIrqBindingKind::HardwareLr)
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn physical_irq_binding_kind_distinguishes_bound_local_ppi_from_unbound_ppi() {
+        let vm = recording_vm(1);
+        let target = VcpuId(0);
+        let bound_pintid = PIntId(27);
+
+        vm.bind_local_pirq_write_through_software_lr(bound_pintid, target, VIntId(27))
+            .unwrap();
+
+        assert_eq!(
+            vm.physical_irq_binding_kind(target, bound_pintid).unwrap(),
+            Some(PhysicalIrqBindingKind::SoftwareLr)
+        );
+        assert_eq!(
+            vm.physical_irq_binding_kind(target, PIntId(28)).unwrap(),
+            None
+        );
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
@@ -1881,6 +1995,19 @@ mod tests {
         assert_signature(
             manager::VgicManager::<TEST_VCPUS>::handle_physical_irq_asserted::<SignatureOnlyHw>,
         );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn manager_exposes_physical_irq_binding_kind_wrapper() {
+        fn assert_signature(
+            _: fn(
+                &manager::VgicManager<TEST_VCPUS>,
+                PIntId,
+            ) -> Result<Option<PhysicalIrqBindingKind>, GicError>,
+        ) {
+        }
+
+        assert_signature(manager::VgicManager::<TEST_VCPUS>::physical_irq_binding_kind);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
