@@ -1,5 +1,6 @@
 #![cfg_attr(target_arch = "aarch64", no_std)]
 #![cfg_attr(target_arch = "aarch64", no_main)]
+#![feature(generic_const_exprs)]
 
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("This test is intended to run on aarch64 targets only");
@@ -71,6 +72,9 @@ fn clear_bss() {
 
 fn entry() -> Result<(), &'static str> {
     test_vcpu_mask_basic()?;
+    test_vcpu_mask_multiword()?;
+    test_vcpu_mask_from_bits_large_width()?;
+    test_vcpu_mask_width_edges()?;
     test_virtual_interrupt_helpers()?;
     Ok(())
 }
@@ -110,6 +114,146 @@ fn test_vcpu_mask_basic() -> Result<(), &'static str> {
     if mask.clear(VcpuId(16)).is_ok() {
         return Err("out-of-range clear should fail");
     }
+    Ok(())
+}
+
+fn test_vcpu_mask_multiword() -> Result<(), &'static str> {
+    let mut mask: VcpuMask<130> = VcpuMask::EMPTY;
+    if !mask.is_empty() {
+        return Err("multiword mask not empty initially");
+    }
+
+    mask.set(VcpuId(0)).map_err(|_| "set id0 failed")?;
+    mask.set(VcpuId(63)).map_err(|_| "set id63 failed")?;
+    mask.set(VcpuId(64)).map_err(|_| "set id64 failed")?;
+    mask.set(VcpuId(129)).map_err(|_| "set id129 failed")?;
+
+    if !mask.contains(VcpuId(0))
+        || !mask.contains(VcpuId(63))
+        || !mask.contains(VcpuId(64))
+        || !mask.contains(VcpuId(129))
+    {
+        return Err("multiword contains check failed");
+    }
+
+    mask.clear(VcpuId(63)).map_err(|_| "clear id63 failed")?;
+    if mask.contains(VcpuId(63)) {
+        return Err("multiword clear did not clear");
+    }
+
+    let mut other: VcpuMask<130> = VcpuMask::EMPTY;
+    other.set(VcpuId(63)).map_err(|_| "set other id63 failed")?;
+    other.set(VcpuId(65)).map_err(|_| "set other id65 failed")?;
+    mask.union_assign(&other);
+
+    if !mask.contains(VcpuId(63)) || !mask.contains(VcpuId(65)) {
+        return Err("multiword union_assign failed");
+    }
+    if mask.contains(VcpuId(130)) {
+        return Err("multiword contains accepted out-of-range id");
+    }
+    if mask.set(VcpuId(130)).is_ok() {
+        return Err("multiword out-of-range set should fail");
+    }
+    if mask.clear(VcpuId(130)).is_ok() {
+        return Err("multiword out-of-range clear should fail");
+    }
+
+    let mut ids = [0u16; 5];
+    let mut count = 0;
+    for id in mask.iter() {
+        if count >= ids.len() {
+            return Err("multiword iter produced too many ids");
+        }
+        ids[count] = id.0;
+        count += 1;
+    }
+    if count != ids.len() || ids != [0, 63, 64, 65, 129] {
+        return Err("multiword iter contents unexpected");
+    }
+
+    Ok(())
+}
+
+fn test_vcpu_mask_from_bits_large_width() -> Result<(), &'static str> {
+    let mask: VcpuMask<130> = VcpuMask::from_bits(0b0011_0000_0000_0101);
+
+    if !mask.contains(VcpuId(0))
+        || !mask.contains(VcpuId(2))
+        || !mask.contains(VcpuId(12))
+        || !mask.contains(VcpuId(13))
+    {
+        return Err("from_bits large-width low bits mismatch");
+    }
+    if mask.contains(VcpuId(16)) || mask.contains(VcpuId(64)) || mask.contains(VcpuId(129)) {
+        return Err("from_bits large-width set bits above low 16");
+    }
+
+    let mut ids = [0u16; 4];
+    let mut count = 0;
+    for id in mask.iter() {
+        if count >= ids.len() {
+            return Err("from_bits large-width iter produced too many ids");
+        }
+        ids[count] = id.0;
+        count += 1;
+    }
+    if count != ids.len() || ids != [0, 2, 12, 13] {
+        return Err("from_bits large-width iter contents unexpected");
+    }
+
+    Ok(())
+}
+
+fn test_vcpu_mask_width_edges() -> Result<(), &'static str> {
+    let mut zero: VcpuMask<0> = VcpuMask::EMPTY;
+    if !zero.is_empty() {
+        return Err("zero-width mask not empty initially");
+    }
+    if zero.contains(VcpuId(0)) {
+        return Err("zero-width contains accepted id0");
+    }
+    if zero.set(VcpuId(0)).is_ok() || zero.clear(VcpuId(0)).is_ok() {
+        return Err("zero-width set or clear should fail");
+    }
+    if VcpuMask::<0>::from_bits(u16::MAX).iter().next().is_some() {
+        return Err("zero-width from_bits yielded ids");
+    }
+
+    let clipped = VcpuMask::<9>::from_bits(u16::MAX);
+    let mut clipped_ids = [0u16; 9];
+    let mut clipped_count = 0;
+    for id in clipped.iter() {
+        if clipped_count >= clipped_ids.len() {
+            return Err("clipped iter produced too many ids");
+        }
+        clipped_ids[clipped_count] = id.0;
+        clipped_count += 1;
+    }
+    if clipped_count != clipped_ids.len() || clipped_ids != [0, 1, 2, 3, 4, 5, 6, 7, 8] {
+        return Err("from_bits did not clip to width under 16");
+    }
+
+    let raw = VcpuMask::<65>([0, u64::MAX]);
+    let mut raw_ids = [0u16; 1];
+    let mut raw_count = 0;
+    for id in raw.iter() {
+        if raw_count >= raw_ids.len() {
+            return Err("tail-masked iter produced too many ids");
+        }
+        raw_ids[raw_count] = id.0;
+        raw_count += 1;
+    }
+    if raw_count != raw_ids.len() || raw_ids != [64] {
+        return Err("iter leaked bits from the unused tail");
+    }
+
+    let mut normalized: VcpuMask<65> = VcpuMask::EMPTY;
+    normalized.union_assign(&raw);
+    if normalized != VcpuMask::<65>([0, 1]) {
+        return Err("union_assign did not clear unused tail bits");
+    }
+
     Ok(())
 }
 

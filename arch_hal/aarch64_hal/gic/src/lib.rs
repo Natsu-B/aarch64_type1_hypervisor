@@ -829,42 +829,91 @@ pub trait VgicHw {
     fn restore_state(&self, state: &Self::SavedState) -> Result<(), GicError>;
 }
 
-/// Dense vCPU mask: element i corresponds to vCPU i.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct VcpuMask<const N: usize = 64>(pub [bool; N]);
+const VCPU_MASK_WORD_BITS: usize = u64::BITS as usize;
 
-impl<const N: usize> VcpuMask<N> {
-    pub const EMPTY: Self = Self([false; N]);
+#[doc(hidden)]
+pub const fn vcpu_mask_words(bits: usize) -> usize {
+    if bits == 0 {
+        0
+    } else {
+        ((bits - 1) / VCPU_MASK_WORD_BITS) + 1
+    }
+}
+
+#[doc(hidden)]
+pub const fn vcpu_mask_last_word_mask(bits: usize) -> u64 {
+    let remainder = bits % VCPU_MASK_WORD_BITS;
+    if bits == 0 {
+        0
+    } else if remainder == 0 {
+        u64::MAX
+    } else {
+        (1u64 << remainder) - 1
+    }
+}
+
+/// Compact vCPU mask: bit i corresponds to vCPU i.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VcpuMask<const N: usize = 64>(pub [u64; vcpu_mask_words(N)])
+where
+    [(); vcpu_mask_words(N)]:;
+
+impl<const N: usize> VcpuMask<N>
+where
+    [(); vcpu_mask_words(N)]:,
+{
+    const fn new_masked(mut words: [u64; vcpu_mask_words(N)]) -> Self {
+        let word_count = vcpu_mask_words(N);
+        if word_count > 0 {
+            words[word_count - 1] &= vcpu_mask_last_word_mask(N);
+        }
+        Self(words)
+    }
+
+    fn mask_tail(&mut self) {
+        let word_count = vcpu_mask_words(N);
+        if word_count > 0 {
+            self.0[word_count - 1] &= vcpu_mask_last_word_mask(N);
+        }
+    }
+
+    pub const EMPTY: Self = Self::new_masked([0; vcpu_mask_words(N)]);
 
     pub const fn from_bits(bits: u16) -> Self {
-        let mut arr = [false; N];
-        let mut i = 0;
-        while i < N {
-            // Only the lower 16 bits are representable in `bits`.
-            if i < 16 {
-                arr[i] = (bits & (1u16 << i)) != 0;
-            } else {
-                arr[i] = false;
-            }
-            i += 1;
+        let mut words = [0u64; vcpu_mask_words(N)];
+        if vcpu_mask_words(N) > 0 {
+            let representable_bits = if N < 16 { N } else { 16 };
+            words[0] = (bits as u64) & vcpu_mask_last_word_mask(representable_bits);
         }
-        Self(arr)
+        Self::new_masked(words)
     }
 
     pub const fn is_empty(&self) -> bool {
+        let word_count = vcpu_mask_words(N);
+        if word_count == 0 {
+            return true;
+        }
+
         let mut i = 0;
-        while i < N {
-            if self.0[i] {
+        while i + 1 < word_count {
+            if self.0[i] != 0 {
                 return false;
             }
             i += 1;
         }
-        true
+
+        (self.0[word_count - 1] & vcpu_mask_last_word_mask(N)) == 0
     }
 
     pub const fn contains(&self, id: VcpuId) -> bool {
         let idx = id.0 as usize;
-        if idx >= N { false } else { self.0[idx] }
+        if idx >= N {
+            return false;
+        }
+
+        let word = idx / VCPU_MASK_WORD_BITS;
+        let bit = idx % VCPU_MASK_WORD_BITS;
+        (self.0[word] & (1u64 << bit)) != 0
     }
 
     pub fn set(&mut self, id: VcpuId) -> Result<(), GicError> {
@@ -872,7 +921,10 @@ impl<const N: usize> VcpuMask<N> {
         if idx >= N {
             return Err(GicError::InvalidVcpuId);
         }
-        self.0[idx] = true;
+
+        let word = idx / VCPU_MASK_WORD_BITS;
+        let bit = idx % VCPU_MASK_WORD_BITS;
+        self.0[word] |= 1u64 << bit;
         Ok(())
     }
 
@@ -881,7 +933,10 @@ impl<const N: usize> VcpuMask<N> {
         if idx >= N {
             return Err(GicError::InvalidVcpuId);
         }
-        self.0[idx] = false;
+
+        let word = idx / VCPU_MASK_WORD_BITS;
+        let bit = idx % VCPU_MASK_WORD_BITS;
+        self.0[word] &= !(1u64 << bit);
         Ok(())
     }
 
@@ -889,14 +944,34 @@ impl<const N: usize> VcpuMask<N> {
         for (dst, src) in self.0.iter_mut().zip(other.0.iter()) {
             *dst |= *src;
         }
+        self.mask_tail();
     }
 
     pub fn iter(&self) -> impl Iterator<Item = VcpuId> + '_ {
-        self.0
-            .iter()
-            .enumerate()
-            .filter(|(_, set)| **set)
-            .map(|(idx, _)| VcpuId(idx as u16))
+        let mut next_word = 0usize;
+        let mut word_bits = 0u64;
+        let mut base = 0usize;
+
+        core::iter::from_fn(move || {
+            loop {
+                if word_bits != 0 {
+                    let bit = word_bits.trailing_zeros() as usize;
+                    word_bits &= word_bits - 1;
+                    return Some(VcpuId((base + bit) as u16));
+                }
+
+                if next_word >= self.0.len() {
+                    return None;
+                }
+
+                word_bits = self.0[next_word];
+                if next_word + 1 == self.0.len() {
+                    word_bits &= vcpu_mask_last_word_mask(N);
+                }
+                base = next_word * VCPU_MASK_WORD_BITS;
+                next_word += 1;
+            }
+        })
     }
 }
 
@@ -927,11 +1002,11 @@ pub enum VgicUpdate {
 }
 impl VgicUpdate {
     fn combine(&mut self, other: &VgicUpdate) {
-        fn set_infallible<const N: usize>(mask: &mut VcpuMask<N>, id: VcpuId) {
-            let idx = id.0 as usize;
-            if idx < N {
-                mask.0[idx] = true;
-            }
+        fn set_infallible<const N: usize>(mask: &mut VcpuMask<N>, id: VcpuId)
+        where
+            [(); vcpu_mask_words(N)]:,
+        {
+            let _ = mask.set(id);
         }
 
         *self = match (*self, *other) {
