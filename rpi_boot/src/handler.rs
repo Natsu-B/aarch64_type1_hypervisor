@@ -41,8 +41,10 @@ pub(crate) fn setup_handler() {
     exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // intercept guest PSCI CPU_ON for hypervisor-controlled AP bring-up.
-    psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, ap_on);
-    psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, ap_on);
+    // psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, ap_on);
+    // psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, ap_on);
+    psci::set_psci_handler(PsciFunctionId::CpuOnSmc64, deny_handler);
+    psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, deny_handler);
     psci::set_psci_handler(PsciFunctionId::CpuSuspendSmc32, deny_handler);
     psci::set_psci_handler(PsciFunctionId::CpuSuspendSmc64, deny_handler);
     psci::set_psci_handler(PsciFunctionId::CpuDefaultSuspendSmc32, deny_handler);
@@ -414,7 +416,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         }
     } else {
         if irq.intid == 27 {
-            println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
+            // println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
         }
         let delivery = handle_acknowledged_pirq(irq.intid);
         if let AckedPirqDelivery::Error(err) = delivery {
