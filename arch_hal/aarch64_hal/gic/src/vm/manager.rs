@@ -154,6 +154,19 @@ where
         self.apply_update(hw, update)
     }
 
+    /// Handle asserted physical IRQ ingress observed from the EL2 IRQ exception path.
+    ///
+    /// Callers should use this after `acknowledge()` and still perform `end_of_interrupt()` once
+    /// vGIC handling completes. This wrapper is intentionally narrower than the boolean-based
+    /// ingress API because the EL2 IRQ exception path only observes asserted ingress.
+    pub fn handle_physical_irq_asserted<H: VgicHw>(
+        &self,
+        hw: &H,
+        pintid: PIntId,
+    ) -> Result<(), GicError> {
+        self.handle_physical_irq(hw, pintid, true)
+    }
+
     pub fn inject_ppi<H: VgicHw>(
         &self,
         hw: &H,
@@ -363,5 +376,65 @@ where
 {
     // SAFETY: `ctx` was installed by `init_from_gicv2` for this manager const instantiation.
     let manager = unsafe { manager_from_ctx::<VCPUS>(ctx)? };
+
+    let local_target = match op {
+        GicMirrorOp::SetGroup {
+            scope: crate::GicMirrorScope::Local(target),
+            ..
+        }
+        | GicMirrorOp::SetPriority {
+            scope: crate::GicMirrorScope::Local(target),
+            ..
+        }
+        | GicMirrorOp::SetTrigger {
+            scope: crate::GicMirrorScope::Local(target),
+            ..
+        }
+        | GicMirrorOp::SetEnable {
+            scope: crate::GicMirrorScope::Local(target),
+            ..
+        }
+        | GicMirrorOp::SetPending {
+            scope: crate::GicMirrorScope::Local(target),
+            ..
+        }
+        | GicMirrorOp::SetActive {
+            scope: crate::GicMirrorScope::Local(target),
+            ..
+        } => Some(target),
+        GicMirrorOp::SetGroup {
+            scope: crate::GicMirrorScope::Global,
+            ..
+        }
+        | GicMirrorOp::SetPriority {
+            scope: crate::GicMirrorScope::Global,
+            ..
+        }
+        | GicMirrorOp::SetTrigger {
+            scope: crate::GicMirrorScope::Global,
+            ..
+        }
+        | GicMirrorOp::SetEnable {
+            scope: crate::GicMirrorScope::Global,
+            ..
+        }
+        | GicMirrorOp::SetPending {
+            scope: crate::GicMirrorScope::Global,
+            ..
+        }
+        | GicMirrorOp::SetActive {
+            scope: crate::GicMirrorScope::Global,
+            ..
+        }
+        | GicMirrorOp::SetRoute { .. } => None,
+    };
+
+    if let Some(target) = local_target {
+        let current = manager.delegate.get_current_vcpu(manager.vm_id)?;
+        if target != current {
+            return Err(GicError::InvalidState);
+        }
+    }
+
     manager.delegate.irq_mirror()?.apply_mirror_op(op)
 }

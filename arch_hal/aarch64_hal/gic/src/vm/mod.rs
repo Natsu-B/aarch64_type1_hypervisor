@@ -981,12 +981,15 @@ where
 mod tests {
     use self::common::pirq::CpuDeliveryMode;
     use super::*;
+    use crate::EoiMode;
     use crate::GicIrqMirror;
     use crate::GicMirrorOp;
     use crate::GicMirrorRoute;
     use crate::GicMirrorScope;
     use crate::IrqState;
+    use crate::MaintenanceReasons;
     use crate::VcpuMask;
+    use crate::VgicHw;
     use crate::VgicSgiRegs;
     use crate::VirtualInterrupt;
     use core::cell::RefCell;
@@ -1185,7 +1188,10 @@ mod tests {
         vm.on_physical_irq(VcpuId(0), PIntId(48), true).unwrap();
         let vcpu = vm.vcpu(VcpuId(0)).unwrap();
         match vcpu.enqueued.borrow().last.as_ref().expect("expected virq") {
-            VirtualInterrupt::Software { vintid, .. } => assert_eq!(*vintid, 40),
+            VirtualInterrupt::Software { vintid, state, .. } => {
+                assert_eq!(*vintid, 40);
+                assert_eq!(*state, IrqState::Pending);
+            }
             _ => panic!("expected software virq"),
         }
     }
@@ -1203,7 +1209,10 @@ mod tests {
         vm.on_physical_irq(VcpuId(0), PIntId(48), true).unwrap();
         let vcpu = vm.vcpu(VcpuId(0)).unwrap();
         match vcpu.enqueued.borrow().last.as_ref().expect("expected virq") {
-            VirtualInterrupt::Hardware { pintid, .. } => assert_eq!(*pintid, 48),
+            VirtualInterrupt::Hardware { pintid, state, .. } => {
+                assert_eq!(*pintid, 48);
+                assert_eq!(*state, IrqState::Active);
+            }
             _ => panic!("expected hardware virq"),
         }
     }
@@ -1449,6 +1458,7 @@ mod tests {
 
     struct RecordingMirror;
     struct MirrorRecordingDelegate;
+    struct SignatureOnlyHw;
 
     static RECORDING_MIRROR: RecordingMirror = RecordingMirror;
     static MIRROR_DELEGATE: MirrorRecordingDelegate = MirrorRecordingDelegate;
@@ -1598,6 +1608,74 @@ mod tests {
         }
     }
 
+    impl VgicHw for SignatureOnlyHw {
+        type SavedState = ();
+
+        fn hw_init(&self) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn set_enabled(&self, _enabled: bool) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn set_underflow_irq(&self, _enable: bool) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn current_eoi_mode(&self) -> Result<EoiMode, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn num_lrs(&self) -> Result<usize, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn empty_lr_bitmap(&self) -> Result<u64, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn eoi_lr_bitmap(&self) -> Result<u64, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn clear_eoi_lr_bitmap(&self, _bitmap: u64) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn take_eoi_count(&self) -> Result<u32, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn read_lr(&self, _index: usize) -> Result<VirtualInterrupt, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn write_lr(&self, _index: usize, _irq: VirtualInterrupt) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn read_apr(&self, _index: usize) -> Result<u32, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn write_apr(&self, _index: usize, _value: u32) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn maintenance_reasons(&self) -> Result<MaintenanceReasons, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn save_state(&self) -> Result<Self::SavedState, GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+
+        fn restore_state(&self, _state: &Self::SavedState) -> Result<(), GicError> {
+            panic!("signature-only hardware should not be executed")
+        }
+    }
+
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn pirq_reverse_lookup_updates_on_bind_and_unmap() {
         let vm = recording_vm(1);
@@ -1731,6 +1809,37 @@ mod tests {
                 intid: 27,
                 priority: 0x60,
             }
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn local_ppi_write_through_rejects_non_current_target_vcpu() {
+        let vm = mirrored_vm(2);
+        let target = VcpuId(1);
+        let vintid = VIntId(27);
+
+        reset_mirror_state();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
+            .unwrap();
+
+        let res = vm.write_group_word(VgicIrqScope::Local(target), VIntId(0), 1u32 << vintid.0);
+        assert!(matches!(res, Err(GicError::InvalidState)));
+        assert_eq!(recorded_mirror_count(), 0);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn manager_exposes_asserted_physical_irq_wrapper() {
+        fn assert_signature(
+            _: fn(
+                &manager::VgicManager<TEST_VCPUS>,
+                &SignatureOnlyHw,
+                PIntId,
+            ) -> Result<(), GicError>,
+        ) {
+        }
+
+        assert_signature(
+            manager::VgicManager::<TEST_VCPUS>::handle_physical_irq_asserted::<SignatureOnlyHw>,
         );
     }
 

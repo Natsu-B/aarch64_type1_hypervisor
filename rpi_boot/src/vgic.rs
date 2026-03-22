@@ -288,6 +288,12 @@ pub fn on_physical_irq(pintid: PIntId, level: bool) -> Result<(), GicError> {
     VGIC.handle_physical_irq(gic, pintid, level)
 }
 
+/// Handle asserted physical IRQ ingress observed by the EL2 IRQ exception path after GIC ACK.
+pub fn on_physical_irq_asserted(pintid: PIntId) -> Result<(), GicError> {
+    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    VGIC.handle_physical_irq_asserted(gic, pintid)
+}
+
 pub fn handle_maintenance_irq() -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     VGIC.handle_maintenance(gic, current_vcpu_id()?)

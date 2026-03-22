@@ -355,8 +355,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             }
         }
     } else {
-        let level = true;
-        match vgic::on_physical_irq(PIntId(irq.intid), level) {
+        match vgic::on_physical_irq_asserted(PIntId(irq.intid)) {
             Ok(()) => {}
             Err(GicError::UnsupportedIntId) => {
                 panic!(

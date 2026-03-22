@@ -578,7 +578,7 @@ where
                     IrqGroup::Group1 => regs.dist_enable.1,
                 };
                 if attrs.pending && attrs.enable && dist_enabled {
-                    let state = if attrs.pending && attrs.active {
+                    let shadow_state = if attrs.pending && attrs.active {
                         IrqStateKind::PendingActive
                     } else if attrs.pending {
                         IrqStateKind::Pending
@@ -587,13 +587,14 @@ where
                     } else {
                         IrqStateKind::Inactive
                     };
+                    let hw_ingress_state = IrqStateKind::Active;
                     enqueue_irq = Some(match entry.delivery.cpu_mode() {
                         CpuDeliveryMode::HardwareLr => VirtualInterrupt::Hardware {
                             vintid: entry.vintid.0,
                             pintid: pintid.0,
                             priority: attrs.priority,
                             group: attrs.group,
-                            state,
+                            state: hw_ingress_state,
                             source: None,
                         },
                         CpuDeliveryMode::SoftwareLr => VirtualInterrupt::Software {
@@ -601,7 +602,7 @@ where
                             eoi_maintenance: false,
                             priority: attrs.priority,
                             group: attrs.group,
-                            state,
+                            state: shadow_state,
                             source: None,
                         },
                     });
