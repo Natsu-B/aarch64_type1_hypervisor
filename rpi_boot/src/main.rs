@@ -338,20 +338,83 @@ extern "C" fn main() -> ! {
     }
     let memory_last = paging_data.last().unwrap();
     let memory_last_addr = memory_last.ipa + memory_last.size;
-    paging_data.push(Stage2PagingSetting {
-        ipa: memory_last_addr,
-        pa: memory_last_addr,
-        size: PL011_UART_ADDR.0 - memory_last_addr,
-        types: Stage2PageTypes::Device,
-        perm: Stage2AccessPermission::ReadWrite,
-    });
-    paging_data.push(Stage2PagingSetting {
-        ipa: PL011_UART_ADDR.0 + 0x1000,
-        pa: PL011_UART_ADDR.0 + 0x1000,
-        size: ipa_space - PL011_UART_ADDR.0 - 0x1000,
-        types: Stage2PageTypes::Device,
-        perm: Stage2AccessPermission::ReadWrite,
-    });
+    #[derive(Copy, Clone, Debug)]
+    struct TrapWindow {
+        start: usize,
+        end: usize,
+    }
+
+    fn trap_window(start: usize, size: usize, label: &str) -> TrapWindow {
+        const PAGE_SIZE: usize = 0x1000;
+        let end = start
+            .checked_add(size)
+            .unwrap_or_else(|| panic!("trap window {} end overflow", label));
+        assert!(start < end, "trap window {} is empty", label);
+        assert_eq!(
+            start & (PAGE_SIZE - 1),
+            0,
+            "trap window {} start not 4KB aligned",
+            label
+        );
+        assert_eq!(
+            end & (PAGE_SIZE - 1),
+            0,
+            "trap window {} end not 4KB aligned",
+            label
+        );
+        TrapWindow { start, end }
+    }
+
+    fn push_stage2_gap(paging_data: &mut Vec<Stage2PagingSetting>, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let size = end
+            .checked_sub(start)
+            .expect("stage2 device mapping underflow");
+        paging_data.push(Stage2PagingSetting {
+            ipa: start,
+            pa: start,
+            size,
+            types: Stage2PageTypes::Device,
+            perm: Stage2AccessPermission::ReadWrite,
+        });
+    }
+
+    let mut trap_windows = [
+        trap_window(gic_info.dist.base, gic_info.dist.size, "gicd"),
+        trap_window(gic_info.cpu.base, gic_info.cpu.size, "gicc"),
+        trap_window(PL011_UART_ADDR.0, 0x1000, "pl011"),
+    ];
+
+    if trap_windows[0].start > trap_windows[1].start {
+        trap_windows.swap(0, 1);
+    }
+    if trap_windows[1].start > trap_windows[2].start {
+        trap_windows.swap(1, 2);
+    }
+    if trap_windows[0].start > trap_windows[1].start {
+        trap_windows.swap(0, 1);
+    }
+
+    let mut cursor = memory_last_addr;
+    for window in trap_windows.iter() {
+        assert!(
+            window.start >= cursor,
+            "trap windows overlap or go backwards (start=0x{:X}, cursor=0x{:X})",
+            window.start,
+            cursor
+        );
+        assert!(
+            window.end <= ipa_space,
+            "trap window exceeds IPA space (end=0x{:X}, ipa_space=0x{:X})",
+            window.end,
+            ipa_space
+        );
+        push_stage2_gap(&mut paging_data, cursor, window.start);
+        cursor = window.end;
+    }
+    push_stage2_gap(&mut paging_data, cursor, ipa_space);
     stage1_paging_data.push(EL2Stage1PagingSetting {
         va: memory_last_addr,
         pa: memory_last_addr,

@@ -43,6 +43,7 @@ struct RpiVgicDelegate;
 static DELEGATE: RpiVgicDelegate = RpiVgicDelegate;
 static VGIC: VgicManager<VCPU_COUNT> = VgicManager::new(&DELEGATE, 0);
 static GICD_RANGE: SyncUnsafeCell<Option<(usize, usize)>> = SyncUnsafeCell::new(None);
+static GICC_RANGE: SyncUnsafeCell<Option<(usize, usize)>> = SyncUnsafeCell::new(None);
 static MAINT_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
 static GICD_ID: SyncUnsafeCell<Option<Gicv2DistIdRegs>> = SyncUnsafeCell::new(None);
 static VCPU_ONLINE_BITMAP: AtomicUsize = AtomicUsize::new(0);
@@ -231,6 +232,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     // SAFETY: vGIC state is initialized once before guest entry.
     unsafe {
         *GICD_RANGE.get() = Some((info.dist.base, info.dist.size));
+        *GICC_RANGE.get() = Some((info.cpu.base, info.cpu.size));
         *MAINT_INTID.get() = info.maintenance_intid;
         *GICD_ID.get() = Some(Gicv2DistIdRegs::from_hw_gicd(gic.distributor()));
     }
@@ -268,6 +270,14 @@ pub fn handles_gicd(addr: usize) -> bool {
     (base..base + size).contains(&addr)
 }
 
+pub fn handles_gicc_phys(addr: usize) -> bool {
+    // SAFETY: range set once during init and then treated as read-only.
+    let Some((base, size)) = (unsafe { *GICC_RANGE.get() }) else {
+        return false;
+    };
+    (base..base + size).contains(&addr)
+}
+
 pub fn handle_gicd_read(addr: usize, access_size: Gicv2AccessSize) -> Result<u32, GicError> {
     // SAFETY: GICD range is initialized once before guest entry.
     let (base, _) = unsafe { (*GICD_RANGE.get()).ok_or(GicError::InvalidAddress)? };
@@ -292,12 +302,12 @@ pub fn handle_gicd_write(
 }
 
 pub fn on_physical_irq(pintid: PIntId, level: bool) -> Result<(), GicError> {
-    println!(
-        "vgic CpuId {}: physical IRQ received: pintid={}, level={}",
-        tls::cpu_if().unwrap(),
-        pintid.0,
-        level
-    );
+    // println!(
+    //     "vgic CpuId {}: physical IRQ received: pintid={}, level={}",
+    //     tls::cpu_if().unwrap(),
+    //     pintid.0,
+    //     level
+    // );
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     VGIC.handle_physical_irq(gic, pintid, level)
 }
