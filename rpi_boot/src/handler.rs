@@ -332,6 +332,28 @@ const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
+fn needs_deactivate_after_ack(
+    irq_intid: u32,
+    maintenance_intid: Option<u32>,
+    kick_sgi_intid: u32,
+    passthrough_result: Option<Result<(), GicError>>,
+) -> bool {
+    if Some(irq_intid) == maintenance_intid || irq_intid == kick_sgi_intid {
+        return true;
+    }
+
+    match passthrough_result.expect("passthrough IRQs must provide a vGIC ingress result") {
+        Ok(()) => true,
+        Err(GicError::UnsupportedIntId) => {
+            panic!(
+                "vgic: unbound/policy-denied physical IRQ {} reached EL2",
+                irq_intid
+            );
+        }
+        Err(_) => true,
+    }
+}
+
 fn irq_handler(_regs: &mut cpu::Registers) {
     let Some(gicv2) = gic() else {
         return;
@@ -339,44 +361,46 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     let Ok(Some(irq)) = gicv2.acknowledge() else {
         return;
     };
-    let mut is_hypervisor_owned = false;
-    if Some(irq.intid) == vgic::maintenance_intid() {
-        is_hypervisor_owned = true;
+    let maintenance_intid = vgic::maintenance_intid();
+    let kick_sgi_intid = vgic::kick_sgi_intid();
+    let mut passthrough_result = None;
+    if Some(irq.intid) == maintenance_intid {
         if let Err(err) = vgic::handle_maintenance_irq() {
             if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
                 println!("vgic: maintenance IRQ failed: {:?}", err);
             }
         }
-    } else if irq.intid == vgic::kick_sgi_intid() {
-        is_hypervisor_owned = true;
+    } else if irq.intid == kick_sgi_intid {
         if let Err(err) = vgic::handle_kick_sgi() {
             if IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0 {
                 println!("vgic: kick SGI handling failed: {:?}", err);
             }
         }
     } else {
-        match vgic::on_physical_irq_asserted(PIntId(irq.intid)) {
+        let result = vgic::on_physical_irq_asserted(PIntId(irq.intid));
+        passthrough_result = Some(result);
+        match result {
             Ok(()) => {}
-            Err(GicError::UnsupportedIntId) => {
-                panic!(
-                    "vgic: unbound/policy-denied physical IRQ {} reached EL2",
-                    irq.intid
-                );
-            }
+            Err(GicError::UnsupportedIntId) => {}
             Err(err) => {
-                is_hypervisor_owned = true;
                 if IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0 {
                     println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
                 }
             }
         }
     }
+    let needs_deactivate = needs_deactivate_after_ack(
+        irq.intid,
+        maintenance_intid,
+        kick_sgi_intid,
+        passthrough_result,
+    );
     if let Err(err) = gicv2.end_of_interrupt(irq) {
         if IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0 {
             println!("gic: end_of_interrupt failed: {:?}", err);
         }
     }
-    if is_hypervisor_owned {
+    if needs_deactivate {
         if let Err(err) = gicv2.deactivate(irq) {
             if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
                 println!("gic: deactivate failed: {:?}", err);
@@ -475,4 +499,28 @@ fn unknown_psci_handler(fid_raw: u32, regs: &mut cpu::Registers) {
         regs.x28, regs.x29, regs.x30, regs.x31
     );
     default_psci_handler(regs);
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn acknowledged_passthrough_and_el2_local_irqs_request_deactivate() {
+        assert!(needs_deactivate_after_ack(27, Some(25), 15, Some(Ok(()))));
+        assert!(needs_deactivate_after_ack(
+            27,
+            Some(25),
+            15,
+            Some(Err(GicError::InvalidState))
+        ));
+        assert!(needs_deactivate_after_ack(25, Some(25), 15, None));
+        assert!(needs_deactivate_after_ack(15, Some(25), 15, None));
+    }
+
+    #[test_case]
+    #[should_panic(expected = "vgic: unbound/policy-denied physical IRQ 27 reached EL2")]
+    fn unsupported_passthrough_still_panics() {
+        let _ = needs_deactivate_after_ack(27, Some(25), 15, Some(Err(GicError::UnsupportedIntId)));
+    }
 }

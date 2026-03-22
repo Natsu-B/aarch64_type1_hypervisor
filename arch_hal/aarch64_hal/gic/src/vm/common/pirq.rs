@@ -587,14 +587,13 @@ where
                     } else {
                         IrqStateKind::Inactive
                     };
-                    let hw_ingress_state = IrqStateKind::Active;
                     enqueue_irq = Some(match entry.delivery.cpu_mode() {
                         CpuDeliveryMode::HardwareLr => VirtualInterrupt::Hardware {
                             vintid: entry.vintid.0,
                             pintid: pintid.0,
                             priority: attrs.priority,
                             group: attrs.group,
-                            state: hw_ingress_state,
+                            state: shadow_state,
                             source: None,
                         },
                         CpuDeliveryMode::SoftwareLr => VirtualInterrupt::Software {

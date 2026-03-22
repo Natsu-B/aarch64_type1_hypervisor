@@ -1,3 +1,12 @@
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
 #![no_std]
 #![no_main]
 #![feature(generic_const_exprs)]
@@ -9,6 +18,10 @@ mod multicore;
 mod pcie;
 mod stack_overflow;
 mod vgic;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);
+
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -109,8 +122,14 @@ impl LinuxHeader {
     const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
 }
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 define_global_allocator!(GLOBAL_ALLOCATOR, 4096);
 
+#[cfg(all(test, target_arch = "aarch64"))]
+static GLOBAL_ALLOCATOR: allocator::MemoryAllocator<4096, { allocator::levels!(4096) }> =
+    allocator::MemoryAllocator::new();
+
+#[cfg(not(all(test, target_arch = "aarch64")))]
 global_asm!(
     r#"
 .global _start
@@ -137,6 +156,7 @@ loop:
     "#
 );
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     let program_start = &raw mut _PROGRAM_START as *const _ as usize;
@@ -1091,8 +1111,10 @@ fn write_be_u32s(
     Ok(())
 }
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 static ALREADY_PANICKED: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 
+#[cfg(not(all(test, target_arch = "aarch64")))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     if ALREADY_PANICKED.swap(true, core::sync::atomic::Ordering::AcqRel) {

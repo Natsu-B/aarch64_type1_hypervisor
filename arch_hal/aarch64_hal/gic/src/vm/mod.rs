@@ -1211,7 +1211,7 @@ mod tests {
         match vcpu.enqueued.borrow().last.as_ref().expect("expected virq") {
             VirtualInterrupt::Hardware { pintid, state, .. } => {
                 assert_eq!(*pintid, 48);
-                assert_eq!(*state, IrqState::Active);
+                assert_eq!(*state, IrqState::Pending);
             }
             _ => panic!("expected hardware virq"),
         }

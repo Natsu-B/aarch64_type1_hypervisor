@@ -12,3 +12,7 @@ file = { path = "../file" }
 elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
 mutex = { path = "../mutex" }
+
+[target.'cfg(target_arch = "aarch64")'.dev-dependencies]
+aarch64_test = { path = "../arch_hal/aarch64_hal/aarch64_test" }
+aarch64_unit_test = { path = "../arch_hal/aarch64_hal/aarch64_unit_test" }
