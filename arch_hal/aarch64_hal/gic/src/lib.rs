@@ -1274,6 +1274,14 @@ pub(crate) trait VgicVcpuModel {
 
     /// Switch out this vCPU's HW state from this PE, synchronizing HW to software state.
     fn switch_out_sync<H: VgicHw>(&self, hw: &H) -> Result<(), GicError>;
+
+    fn sync_lr_shadow<H: VgicHw>(&self, _hw: &H) -> Result<(), GicError> {
+        Ok(())
+    }
+
+    fn contains_irq(&self, _vintid: VIntId, _source: Option<VcpuId>) -> bool {
+        false
+    }
 }
 
 /// Minimal queue API exposed by vCPU models for the VM model to stage deliverable interrupts.

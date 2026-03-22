@@ -147,7 +147,6 @@ impl<const MAX_VCPUS: usize, const MAX_INTIDS: usize, const PENDING_CAP: usize>
         Ok(slot)
     }
 
-    #[cfg(test)]
     fn contains_key(&self, key: LrKey) -> bool {
         let Ok(slot) = Self::slot_for_key(key) else {
             return false;
@@ -446,6 +445,79 @@ impl<
     const PENDING_CAP: usize,
 > VgicVcpuModel for GicVCpuGeneric<MAX_VCPUS, MAX_INTIDS, MAX_LRS, PENDING_CAP>
 {
+    fn sync_lr_shadow<H: crate::VgicHw>(&self, hw: &H) -> Result<(), GicError> {
+        let current = cpu::get_current_core_id();
+        let mut inner = self.inner.lock_irqsave();
+        if let Some(resident) = inner.resident {
+            if resident != current {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+
+        let num_lrs = hw.num_lrs()?.min(MAX_LRS).min(u64::BITS as usize);
+        let mask = u64_lsb_mask(num_lrs);
+        inner.sw_empty_lrs &= mask;
+        let empty_bits = (hw.empty_lr_bitmap()? | inner.sw_empty_lrs) & mask;
+
+        for idx in 0..num_lrs {
+            let bit = 1u64 << idx;
+            if (empty_bits & bit) != 0 {
+                inner.in_lr[idx] = None;
+                inner.lr_state[idx] = IrqState::Inactive;
+                inner.lr_updates[idx] = None;
+                inner.lr_pintid[idx] = None;
+                inner.sw_empty_lrs |= bit;
+                continue;
+            }
+
+            if inner.in_lr[idx].is_none() && inner.lr_updates[idx].is_none() {
+                continue;
+            }
+
+            let irq = hw.read_lr(idx)?;
+            inner.lr_state[idx] = irq.state();
+            inner.lr_pintid[idx] = irq.pintid().map(PIntId);
+
+            if irq.state() == IrqState::Inactive {
+                inner.in_lr[idx] = None;
+                inner.lr_updates[idx] = None;
+                inner.lr_pintid[idx] = None;
+                inner.sw_empty_lrs |= bit;
+            } else {
+                if inner.in_lr[idx].is_none() {
+                    inner.in_lr[idx] = Some(LrKey {
+                        vintid: VIntId(irq.vintid()),
+                        source: irq.source(),
+                    });
+                }
+                inner.sw_empty_lrs &= !bit;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn contains_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> bool {
+        let key = LrKey { vintid, source };
+        let inner = self.inner.lock_irqsave();
+
+        if inner.pending.contains_key(key) {
+            return true;
+        }
+
+        if inner.in_lr.contains(&Some(key)) {
+            return true;
+        }
+
+        inner
+            .lr_updates
+            .iter()
+            .flatten()
+            .any(|irq| VIntId(irq.vintid()) == vintid && irq.source() == source)
+    }
+
     fn set_resident(&self, core: CoreAffinity) -> Result<(), GicError> {
         let mut inner = self.inner.lock_irqsave();
         match inner.resident {

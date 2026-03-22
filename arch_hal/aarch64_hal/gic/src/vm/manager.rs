@@ -262,6 +262,10 @@ where
         value: u32,
     ) -> Result<(), GicError> {
         let vm = self.model()?;
+        if offset == 0xF00 {
+            let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
+            vcpu_model.sync_lr_shadow(hw)?;
+        }
         let frontend = Gicv2Frontend::new(vm, dist_id);
         let update = frontend.handle_distributor_write(vcpu, offset, access_size, value)?;
         self.apply_update(hw, update)

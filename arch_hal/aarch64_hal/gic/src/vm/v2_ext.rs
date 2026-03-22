@@ -153,35 +153,57 @@ where
         let mut update = VgicUpdate::None;
         let mut pending_enqueues: [(u8, VcpuId); 32] = [(0, VcpuId(0)); 32];
         let mut pending_enqueue_count = 0usize;
-        let (new_entry, changed) = {
+        let scope = VgicIrqScope::Local(target);
+        let target_vcpu = self.common.vcpu(target)?;
+        let (prev, new_entry, changed) = {
             let mut v2 = self.v2.lock_irqsave();
             let prev = v2.sgi_sources[idx][word];
-            let new_bits = sources & !prev;
-
-            for bit in 0..32 {
-                if (new_bits & (1u32 << bit)) == 0 {
-                    continue;
-                }
-                let lane = bit / 8;
-                let sender = bit % 8;
-                if sender as usize >= self.common.vcpu_count() || sender >= 8 {
-                    return Err(GicError::InvalidVcpuId);
-                }
-                if lane >= 4 {
-                    return Err(GicError::UnsupportedIntId);
-                }
-                let sgi_id = word * 4 + lane;
-                if sgi_id >= SGI_COUNT {
-                    return Err(GicError::UnsupportedIntId);
-                }
-                pending_enqueues[pending_enqueue_count] = (sgi_id as u8, VcpuId(sender as u16));
-                pending_enqueue_count += 1;
-            }
             let new_entry = prev | sources;
             let changed = new_entry != prev;
             v2.sgi_sources[idx][word] = new_entry;
-            (new_entry, changed)
+            (prev, new_entry, changed)
         };
+
+        for bit in 0..32 {
+            let source_bit = 1u32 << bit;
+            if (sources & source_bit) == 0 {
+                continue;
+            }
+
+            let lane = bit / 8;
+            let sender = bit % 8;
+            if sender as usize >= self.common.vcpu_count() || sender >= 8 {
+                return Err(GicError::InvalidVcpuId);
+            }
+            if lane >= 4 {
+                return Err(GicError::UnsupportedIntId);
+            }
+
+            let sgi_id = word * 4 + lane;
+            if sgi_id >= SGI_COUNT {
+                return Err(GicError::UnsupportedIntId);
+            }
+
+            let sender_id = VcpuId(sender as u16);
+            if (prev & source_bit) != 0 {
+                let vintid = VIntId(sgi_id as u32);
+                let deliverable = {
+                    let regs = self.common.regs_lock.lock_irqsave();
+                    let attrs = regs.irq_state.irq_attrs(scope, vintid)?;
+                    let group_enabled = match attrs.group {
+                        crate::IrqGroup::Group0 => regs.dist_enable.0,
+                        crate::IrqGroup::Group1 => regs.dist_enable.1,
+                    };
+                    attrs.enable && group_enabled
+                };
+                if !deliverable || target_vcpu.contains_irq(vintid, Some(sender_id)) {
+                    continue;
+                }
+            }
+
+            pending_enqueues[pending_enqueue_count] = (sgi_id as u8, sender_id);
+            pending_enqueue_count += 1;
+        }
 
         {
             let mut regs = self.common.regs_lock.lock_irqsave();
