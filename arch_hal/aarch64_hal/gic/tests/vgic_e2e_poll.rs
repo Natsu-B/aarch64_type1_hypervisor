@@ -41,6 +41,14 @@ extern "C" fn guest_entry_poll(shared: *mut common::Shared) -> ! {
     common::guest_init_virtual_interfaces(&gic);
 
     common::guest_set_group1_intid(&gic, common::SGI_ID);
+    common::guest_send_sgi_self(&gic, common::SGI_ID);
+    common::guest_assert_only_spurious(
+        shared,
+        &gic,
+        common::DUPLICATE_CHECK_ITERS,
+        common::FAIL_POLL_SGI_DISABLED_DELIVERED,
+    );
+
     common::guest_enable_intid(&gic, common::SGI_ID);
     common::guest_send_sgi_self(&gic, common::SGI_ID);
     let sgi_raw = common::guest_poll_for_intid(
@@ -48,11 +56,40 @@ extern "C" fn guest_entry_poll(shared: *mut common::Shared) -> ! {
         &gic,
         common::SGI_ID,
         common::POLL_TIMEOUT_ITERS,
-        common::FAIL_POLL_SGI_TIMEOUT,
+        common::FAIL_POLL_SGI_REENABLE_TIMEOUT,
         common::FAIL_POLL_SGI_UNEXPECTED,
     );
     common::shared_increment_poll_seen(shared, common::IDX_SGI);
     common::guest_eoi_virtual_irq(&gic, sgi_raw);
+    common::guest_assert_not_redelivered(
+        shared,
+        &gic,
+        common::SGI_ID,
+        common::DUPLICATE_CHECK_ITERS,
+        common::FAIL_POLL_SGI_DUPLICATE,
+    );
+
+    common::guest_disable_intid(&gic, common::SGI_ID);
+    common::guest_send_sgi_self(&gic, common::SGI_ID);
+    common::guest_assert_only_spurious(
+        shared,
+        &gic,
+        common::DUPLICATE_CHECK_ITERS,
+        common::FAIL_POLL_SGI_DISABLE_AFTER_DELIVER_DUPLICATE,
+    );
+
+    common::guest_enable_intid(&gic, common::SGI_ID);
+    common::guest_send_sgi_self(&gic, common::SGI_ID);
+    let sgi_raw2 = common::guest_poll_for_intid(
+        shared,
+        &gic,
+        common::SGI_ID,
+        common::POLL_TIMEOUT_ITERS,
+        common::FAIL_POLL_SGI_REENABLE_TIMEOUT,
+        common::FAIL_POLL_SGI_UNEXPECTED,
+    );
+    common::shared_increment_poll_seen(shared, common::IDX_SGI);
+    common::guest_eoi_virtual_irq(&gic, sgi_raw2);
     common::guest_assert_not_redelivered(
         shared,
         &gic,

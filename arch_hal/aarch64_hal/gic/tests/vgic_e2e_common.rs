@@ -102,6 +102,9 @@ pub const FAIL_EL2_IRQ_EOI: u32 = 0x1203;
 pub const FAIL_POLL_SGI_TIMEOUT: u32 = 0x2001;
 pub const FAIL_POLL_SGI_UNEXPECTED: u32 = 0x2002;
 pub const FAIL_POLL_SGI_DUPLICATE: u32 = 0x2003;
+pub const FAIL_POLL_SGI_DISABLED_DELIVERED: u32 = 0x2004;
+pub const FAIL_POLL_SGI_REENABLE_TIMEOUT: u32 = 0x2005;
+pub const FAIL_POLL_SGI_DISABLE_AFTER_DELIVER_DUPLICATE: u32 = 0x2006;
 pub const FAIL_POLL_PPI_TIMEOUT: u32 = 0x2011;
 pub const FAIL_POLL_PPI_UNEXPECTED: u32 = 0x2012;
 pub const FAIL_POLL_PPI_DUPLICATE: u32 = 0x2013;
@@ -110,6 +113,7 @@ pub const FAIL_POLL_UART_UNEXPECTED: u32 = 0x2022;
 pub const FAIL_POLL_UART_DUPLICATE: u32 = 0x2023;
 
 pub const FAIL_IRQ_SGI_WAIT_TIMEOUT: u32 = 0x3001;
+pub const FAIL_IRQ_SGI_SECOND_WAIT_TIMEOUT: u32 = 0x3002;
 pub const FAIL_IRQ_PPI_WAIT_TIMEOUT: u32 = 0x3011;
 pub const FAIL_IRQ_UART_WAIT_TIMEOUT: u32 = 0x3021;
 pub const FAIL_IRQ_UNEXPECTED_INTID: u32 = 0x3031;
@@ -1010,6 +1014,28 @@ pub fn guest_assert_not_redelivered(
         }
 
         guest_fail(shared, duplicate_fail);
+    }
+}
+
+pub fn guest_assert_only_spurious(
+    shared: *mut Shared,
+    gic: &GuestGic,
+    check_iters: usize,
+    unexpected_fail: u32,
+) {
+    for _ in 0..check_iters {
+        let raw = guest_ack_virtual_irq(gic);
+        let intid = guest_acked_intid(raw);
+
+        if is_spurious_intid(intid) {
+            cpu::isb();
+            continue;
+        }
+
+        guest_eoi_virtual_irq(gic, raw);
+        shared_set_unexpected_intid(shared, intid);
+        shared_set_last_iar_raw(shared, raw);
+        guest_fail(shared, unexpected_fail);
     }
 }
 

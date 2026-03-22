@@ -158,6 +158,14 @@ extern "C" fn guest_entry_irq(shared: *mut common::Shared) -> ! {
         common::IRQ_WAIT_ITERS,
         common::FAIL_IRQ_SGI_WAIT_TIMEOUT,
     );
+    common::guest_send_sgi_self(&gic, common::SGI_ID);
+    common::guest_wait_for_irq_count(
+        shared,
+        common::IDX_SGI,
+        2,
+        common::IRQ_WAIT_ITERS,
+        common::FAIL_IRQ_SGI_SECOND_WAIT_TIMEOUT,
+    );
 
     common::guest_set_group1_intid(&gic, common::TIMER_TEST_PPI_INTID);
     common::guest_enable_intid(&gic, common::TIMER_TEST_PPI_INTID);
