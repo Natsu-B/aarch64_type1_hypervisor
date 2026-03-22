@@ -577,7 +577,7 @@ where
                     IrqGroup::Group0 => regs.dist_enable.0,
                     IrqGroup::Group1 => regs.dist_enable.1,
                 };
-                if attrs.pending && attrs.enable && dist_enabled {
+                if changed && attrs.pending && attrs.enable && dist_enabled {
                     let shadow_state = if attrs.pending && attrs.active {
                         IrqStateKind::PendingActive
                     } else if attrs.pending {

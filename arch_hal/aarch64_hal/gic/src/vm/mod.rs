@@ -1218,6 +1218,46 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn guest_pending_passthrough_ppi_is_not_overwritten_by_physical_reentry() {
+        let vm = mirrored_vm(1);
+        let target = VcpuId(0);
+        let vintid = VIntId(27);
+        let bit = 1u32 << vintid.0;
+
+        reset_mirror_state();
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
+            .unwrap();
+        vm.write_set_enable_word(VgicIrqScope::Local(target), VIntId(0), bit)
+            .unwrap();
+
+        vm.write_set_pending_word(VgicIrqScope::Local(target), VIntId(0), bit)
+            .unwrap();
+        {
+            let log = vm.vcpu(target).unwrap().enqueued.borrow();
+            assert_eq!(log.count, 1);
+            match log.last.as_ref().expect("expected pending virq") {
+                VirtualInterrupt::Hardware { pintid, state, .. } => {
+                    assert_eq!(*pintid, 27);
+                    assert_eq!(*state, IrqState::Pending);
+                }
+                _ => panic!("expected hardware virq"),
+            }
+        }
+
+        vm.on_physical_irq(target, PIntId(27), true).unwrap();
+        let log = vm.vcpu(target).unwrap().enqueued.borrow();
+        assert_eq!(log.count, 1);
+        match log.last.as_ref().expect("expected pending virq") {
+            VirtualInterrupt::Hardware { pintid, state, .. } => {
+                assert_eq!(*pintid, 27);
+                assert_eq!(*state, IrqState::Pending);
+            }
+            _ => panic!("expected hardware virq"),
+        }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn passthrough_local_ppi_targets_single_vcpu() {
         let vm = recording_vm(2);
         let target_vcpu = VcpuId(1);
