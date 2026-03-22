@@ -220,7 +220,7 @@ mod bootsector {
         #[allow(clippy::assertions_on_constants)]
         const _: () = assert!(size_of::<MasterBootRecord>() == 512);
 
-        #[repr(packed)]
+        #[repr(C, packed)]
         pub(crate) struct MasterBootRecord {
             loader: [u8; 446],
             pub(crate) first_partition: MasterBootRecordPartitionTable,

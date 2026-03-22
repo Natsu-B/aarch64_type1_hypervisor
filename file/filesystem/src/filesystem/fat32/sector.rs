@@ -12,7 +12,7 @@ const _: () = assert!(size_of::<FAT32FSInfoSector>() == 512);
 const _: () = assert!(size_of::<FAT32ByteDirectoryEntry>() == 32);
 const _: () = assert!(size_of::<FAT32LongDirectoryEntry>() == 32);
 
-#[repr(packed)]
+#[repr(C, packed)]
 pub(crate) struct FAT32BootSector {
     bs_jmp_boot: [u8; 3],
     bs_oem_name: [u8; 8],
@@ -45,7 +45,7 @@ pub(crate) struct FAT32BootSector {
     pub(crate) bs_boot_sign: Le<Unaligned<u16>>,
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 struct FAT32FSInfoSector {
     fsi_lead_sig: Le<Unaligned<u32>>,
     fsi_reserved1: [u8; 480],
