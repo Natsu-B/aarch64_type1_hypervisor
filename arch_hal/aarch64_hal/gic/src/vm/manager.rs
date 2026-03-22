@@ -39,6 +39,16 @@ use tls::cpu_if;
 /// manager lock is held.
 pub trait VgicDelegate: Send + Sync {
     fn distributor(&self) -> Result<&'static dyn GicDistributor, GicError>;
+    fn configure_local_ppi(
+        &self,
+        vm_id: usize,
+        target_vcpu: u16,
+        intid: u32,
+        group: IrqGroup,
+        priority: u8,
+        trigger: TriggerMode,
+        enable: EnableOp,
+    ) -> Result<(), GicError>;
     fn get_resident_affinity(
         &self,
         vm_id: usize,
@@ -405,4 +415,33 @@ where
         .delegate
         .distributor()?
         .configure_spi(pintid.0, group, priority, trigger, route, enable)
+}
+
+pub(crate) unsafe fn passthrough_local_configure_from_ctx<const VCPUS: usize>(
+    ctx: *mut (),
+    target_vcpu: VcpuId,
+    pintid: PIntId,
+    group: IrqGroup,
+    priority: u8,
+    trigger: TriggerMode,
+    enable: EnableOp,
+) -> Result<(), GicError>
+where
+    [(); crate::max_intids_for_vcpus(VCPUS)]:,
+    [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+    [(); pending_cap_for_vcpus(VCPUS)]:,
+{
+    // SAFETY: `ctx` was installed by `init_from_gicv2` for this manager const instantiation.
+    let manager = unsafe { manager_from_ctx::<VCPUS>(ctx)? };
+    manager.delegate.configure_local_ppi(
+        manager.vm_id,
+        target_vcpu.0,
+        pintid.0,
+        group,
+        priority,
+        trigger,
+        enable,
+    )
 }

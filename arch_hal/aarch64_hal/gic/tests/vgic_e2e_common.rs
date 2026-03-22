@@ -212,6 +212,22 @@ impl VgicDelegate for TestVgicDelegate {
         Ok(gic_ref() as &'static dyn GicDistributor)
     }
 
+    fn configure_local_ppi(
+        &self,
+        _vm_id: usize,
+        target_vcpu: u16,
+        intid: u32,
+        group: IrqGroup,
+        priority: u8,
+        trigger: TriggerMode,
+        enable: EnableOp,
+    ) -> Result<(), GicError> {
+        if target_vcpu != 0 {
+            return Err(GicError::InvalidState);
+        }
+        gic_ref().configure_ppi(intid, group, priority, trigger, enable)
+    }
+
     fn get_resident_affinity(
         &self,
         _vm_id: usize,
@@ -441,6 +457,14 @@ fn init_gic_and_vgic() -> Result<(), &'static str> {
 
     VGIC.switch_in(gic, VcpuId(0), cpu::get_current_core_id())
         .map_err(|_| "vgic switch_in failed")?;
+
+    VGIC.bind_local_pirq_prepared(
+        gic,
+        PIntId(TIMER_TEST_PPI_INTID),
+        VcpuId(0),
+        VIntId(TIMER_TEST_PPI_INTID),
+    )
+    .map_err(|_| "vgic bind local ppi failed")?;
 
     VGIC.map_pirq(
         gic,

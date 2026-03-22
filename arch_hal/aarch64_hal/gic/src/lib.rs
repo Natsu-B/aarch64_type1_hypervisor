@@ -977,6 +977,10 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
     ) -> Result<VgicUpdate, GicError>;
 
     fn read_enable_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
+    /// Set enable bits for a 32-interrupt register window.
+    ///
+    /// Implementations may reject guest attempts to enable PPIs/SPIs that are not bound to a
+    /// passthrough pIRQ mapping, returning `GicError::UnsupportedIntId`.
     fn write_set_enable_word(
         &self,
         scope: VgicIrqScope,

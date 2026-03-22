@@ -278,11 +278,9 @@ fn gic_access_size_from_bytes(access_bytes: u8) -> Option<Gicv2AccessSize> {
 
 const LOG_MAINT_ERR: u32 = 1 << 0;
 const LOG_PIRQ_ERR: u32 = 1 << 1;
-const LOG_PASSTHROUGH_ERR: u32 = 1 << 2;
 const LOG_EOI_ERR: u32 = 1 << 3;
 const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
-const LOG_DROP_DENIED_LOCAL: u32 = 1 << 6;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
 fn irq_handler(_regs: &mut cpu::Registers) {
@@ -312,25 +310,10 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         match vgic::on_physical_irq(PIntId(irq.intid), level) {
             Ok(()) => {}
             Err(GicError::UnsupportedIntId) => {
-                is_hypervisor_owned = true;
-                if irq.intid >= 32 || vgic::guest_local_intid_allowed(irq.intid) {
-                    if let Err(err) = vgic::passthrough_physical_irq(irq.intid, level) {
-                        if IRQ_LOG_ONCE.fetch_or(LOG_PASSTHROUGH_ERR, Ordering::Relaxed)
-                            & LOG_PASSTHROUGH_ERR
-                            == 0
-                        {
-                            println!("vgic: passthrough pIRQ {} failed: {:?}", irq.intid, err);
-                        }
-                    }
-                } else if IRQ_LOG_ONCE.fetch_or(LOG_DROP_DENIED_LOCAL, Ordering::Relaxed)
-                    & LOG_DROP_DENIED_LOCAL
-                    == 0
-                {
-                    println!(
-                        "vgic: drop unsupported local IRQ {} (not allowlisted)",
-                        irq.intid
-                    );
-                }
+                panic!(
+                    "vgic: unbound/policy-denied physical IRQ {} reached EL2",
+                    irq.intid
+                );
             }
             Err(err) => {
                 is_hypervisor_owned = true;

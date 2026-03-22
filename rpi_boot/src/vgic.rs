@@ -1,11 +1,14 @@
 use arch_hal::cpu;
+use arch_hal::gic::EnableOp;
 use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
 use arch_hal::gic::GicPpi;
 use arch_hal::gic::GicSgi;
+use arch_hal::gic::IrqGroup;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::SgiTarget;
+use arch_hal::gic::TriggerMode;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
 use arch_hal::gic::VgicHw;
@@ -53,6 +56,26 @@ impl VgicDelegate for RpiVgicDelegate {
             .map(|gic| gic as &'static dyn GicDistributor)
     }
 
+    fn configure_local_ppi(
+        &self,
+        _vm_id: usize,
+        target_vcpu: u16,
+        intid: u32,
+        group: IrqGroup,
+        priority: u8,
+        trigger: TriggerMode,
+        enable: EnableOp,
+    ) -> Result<(), GicError> {
+        let current = current_vcpu_id()?;
+        let target = VcpuId(target_vcpu);
+        if target != current {
+            return Err(GicError::InvalidState);
+        }
+
+        let gic = handler::gic().ok_or(GicError::InvalidState)?;
+        gic.configure_ppi(intid, group, priority, trigger, enable)
+    }
+
     fn get_resident_affinity(
         &self,
         _vm_id: usize,
@@ -83,20 +106,6 @@ impl VgicDelegate for RpiVgicDelegate {
         let targets = [target];
         gic.send_sgi(KICK_SGI_ID, SgiTarget::Specific(&targets))
     }
-}
-
-pub(crate) fn guest_local_intid_allowed(intid: u32) -> bool {
-    // Allow only EL1 virtual timer PPI (27).
-    // This keeps EL2/EL1 physical timer PPIs (26/30), PMU overflow (23), and all other
-    // local IRQs denied by default.
-    matches!(intid, GUEST_EL1_VTIMER_PPI_INTID)
-}
-
-fn enable_guest_ppis(gic: &Gicv2) -> Result<(), GicError> {
-    for intid in 16u32..32u32 {
-        gic.set_ppi_enable(intid, guest_local_intid_allowed(intid))?;
-    }
-    Ok(())
 }
 
 fn map_guest_local_ppis_for_vcpu(gic: &Gicv2, vcpu: VcpuId) -> Result<(), GicError> {
@@ -176,7 +185,6 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     reset_online_state_for_init();
     reset_vcpu_affinities_for_init();
     gic.hw_init().map_err(|_| "vgic: hw init failed")?;
-    enable_guest_ppis(gic).map_err(|_| "vgic: enable guest ppis")?;
 
     // SAFETY: Called exactly once on BSP during single-core bring-up before concurrent vGIC use.
     // `VGIC` is a `'static` manager, so in-place model storage has a stable address for lifetime.
@@ -234,7 +242,6 @@ pub fn set_pirq_hook(hook: Option<PirqHookFn>) -> Result<(), GicError> {
 }
 
 pub fn on_cpu_online(gic: &Gicv2) -> Result<(), GicError> {
-    enable_guest_ppis(gic)?;
     gic.hw_init()?;
     let vcpu = current_vcpu_id()?;
     let affinity = cpu::get_current_core_id();
@@ -293,11 +300,6 @@ pub fn on_physical_irq(pintid: PIntId, level: bool) -> Result<(), GicError> {
     );
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     VGIC.handle_physical_irq(gic, pintid, level)
-}
-
-pub fn passthrough_physical_irq(intid: u32, level: bool) -> Result<(), GicError> {
-    let gic = handler::gic().ok_or(GicError::InvalidState)?;
-    VGIC.inject_physical_irq_as_pending(gic, intid, level)
 }
 
 pub fn handle_maintenance_irq() -> Result<(), GicError> {

@@ -41,6 +41,23 @@ impl VgicDelegate for BootVgicDelegate {
             .map(|gic| gic as &'static dyn GicDistributor)
     }
 
+    fn configure_local_ppi(
+        &self,
+        _vm_id: usize,
+        target_vcpu: u16,
+        intid: u32,
+        group: arch_hal::gic::IrqGroup,
+        priority: u8,
+        trigger: arch_hal::gic::TriggerMode,
+        enable: arch_hal::gic::EnableOp,
+    ) -> Result<(), GicError> {
+        if target_vcpu != 0 {
+            return Err(GicError::InvalidState);
+        }
+        let gic = handler::gic().ok_or(GicError::InvalidState)?;
+        gic.configure_ppi(intid, group, priority, trigger, enable)
+    }
+
     fn get_resident_affinity(
         &self,
         _vm_id: usize,
