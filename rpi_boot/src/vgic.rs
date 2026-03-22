@@ -4,6 +4,7 @@ use arch_hal::gic::GicIrqMirror;
 use arch_hal::gic::GicSgi;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
+use arch_hal::gic::PhysicalIrqBindingKind;
 use arch_hal::gic::SgiTarget;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
@@ -86,7 +87,7 @@ impl VgicDelegate for RpiVgicDelegate {
 }
 
 fn map_guest_local_ppis_for_vcpu(gic: &Gicv2, vcpu: VcpuId) -> Result<(), GicError> {
-    VGIC.bind_local_pirq_passthrough(
+    VGIC.bind_local_pirq_write_through_software_lr(
         gic,
         PIntId(GUEST_EL1_VTIMER_PPI_INTID),
         vcpu,
@@ -292,6 +293,17 @@ pub fn on_physical_irq(pintid: PIntId, level: bool) -> Result<(), GicError> {
 pub fn on_physical_irq_asserted(pintid: PIntId) -> Result<(), GicError> {
     let gic = handler::gic().ok_or(GicError::InvalidState)?;
     VGIC.handle_physical_irq_asserted(gic, pintid)
+}
+
+pub(crate) fn physical_irq_binding_kind(
+    pintid: PIntId,
+) -> Result<Option<PhysicalIrqBindingKind>, GicError> {
+    VGIC.physical_irq_binding_kind(pintid)
+}
+
+pub(crate) fn inject_physical_irq_as_pending(pintid: PIntId, level: bool) -> Result<(), GicError> {
+    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    VGIC.inject_physical_irq_as_pending(gic, pintid.0, level)
 }
 
 pub fn handle_maintenance_irq() -> Result<(), GicError> {

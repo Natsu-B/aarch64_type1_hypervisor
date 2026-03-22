@@ -10,6 +10,7 @@ use arch_hal::exceptions::memory_hook::SplitPolicy;
 use arch_hal::gic::GicCpuInterface;
 use arch_hal::gic::GicError;
 use arch_hal::gic::PIntId;
+use arch_hal::gic::PhysicalIrqBindingKind;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::println;
@@ -17,6 +18,7 @@ use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
+use arch_hal::tls;
 use core::ffi::c_void;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
@@ -199,7 +201,12 @@ fn data_abort_handler(
             WriteNotRead::WritingMemoryAbort => {
                 let reg_val = read_guest_mmio_source_reg(regs, reg_num, reg_size);
                 vgic::handle_gicd_write(address as usize, gic_access, reg_val as u32)
-                    .expect("gicd write failed");
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "gicd write failed {:?}: addr: 0x{:x}, size: {:?}, value: 0x{:x}",
+                            e, address, gic_access, reg_val
+                        )
+                    });
             }
         }
         cpu::set_elr_el2(cpu::get_elr_el2() + 4);
@@ -332,25 +339,54 @@ const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AckedPirqDelivery {
+    Bound(PhysicalIrqBindingKind),
+    UnboundPending,
+    Error(GicError),
+}
+
+fn handle_acknowledged_pirq(irq_intid: u32) -> AckedPirqDelivery {
+    let pintid = PIntId(irq_intid);
+    match vgic::on_physical_irq_asserted(pintid) {
+        Ok(()) => match vgic::physical_irq_binding_kind(pintid) {
+            Ok(Some(kind)) => AckedPirqDelivery::Bound(kind),
+            Ok(None) => AckedPirqDelivery::Error(GicError::InvalidState),
+            Err(err) => AckedPirqDelivery::Error(err),
+        },
+        Err(GicError::UnsupportedIntId) => match vgic::physical_irq_binding_kind(pintid) {
+            Ok(None) => match vgic::inject_physical_irq_as_pending(pintid, true) {
+                Ok(()) => AckedPirqDelivery::UnboundPending,
+                Err(err) => AckedPirqDelivery::Error(err),
+            },
+            Ok(Some(_)) => AckedPirqDelivery::Error(GicError::UnsupportedIntId),
+            Err(err) => AckedPirqDelivery::Error(err),
+        },
+        Err(err) => AckedPirqDelivery::Error(err),
+    }
+}
+
 fn needs_deactivate_after_ack(
     irq_intid: u32,
     maintenance_intid: Option<u32>,
     kick_sgi_intid: u32,
-    passthrough_result: Option<Result<(), GicError>>,
+    pirq_delivery: Option<AckedPirqDelivery>,
 ) -> bool {
     if Some(irq_intid) == maintenance_intid || irq_intid == kick_sgi_intid {
         return true;
     }
 
-    match passthrough_result.expect("passthrough IRQs must provide a vGIC ingress result") {
-        Ok(()) => true,
-        Err(GicError::UnsupportedIntId) => {
+    match pirq_delivery.expect("physical IRQs must provide a vGIC delivery result") {
+        AckedPirqDelivery::Bound(PhysicalIrqBindingKind::SoftwareLr)
+        | AckedPirqDelivery::UnboundPending => true,
+        AckedPirqDelivery::Bound(PhysicalIrqBindingKind::HardwareLr) => false,
+        AckedPirqDelivery::Error(GicError::UnsupportedIntId) => {
             panic!(
                 "vgic: unbound/policy-denied physical IRQ {} reached EL2",
                 irq_intid
             );
         }
-        Err(_) => true,
+        AckedPirqDelivery::Error(_) => true,
     }
 }
 
@@ -363,7 +399,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     };
     let maintenance_intid = vgic::maintenance_intid();
     let kick_sgi_intid = vgic::kick_sgi_intid();
-    let mut passthrough_result = None;
+    let mut pirq_delivery = None;
     if Some(irq.intid) == maintenance_intid {
         if let Err(err) = vgic::handle_maintenance_irq() {
             if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
@@ -377,24 +413,21 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             }
         }
     } else {
-        let result = vgic::on_physical_irq_asserted(PIntId(irq.intid));
-        passthrough_result = Some(result);
-        match result {
-            Ok(()) => {}
-            Err(GicError::UnsupportedIntId) => {}
-            Err(err) => {
-                if IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0 {
-                    println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
-                }
+        if irq.intid == 27 {
+            println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
+        }
+        let delivery = handle_acknowledged_pirq(irq.intid);
+        if let AckedPirqDelivery::Error(err) = delivery {
+            if err != GicError::UnsupportedIntId
+                && IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0
+            {
+                println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
             }
         }
+        pirq_delivery = Some(delivery);
     }
-    let needs_deactivate = needs_deactivate_after_ack(
-        irq.intid,
-        maintenance_intid,
-        kick_sgi_intid,
-        passthrough_result,
-    );
+    let needs_deactivate =
+        needs_deactivate_after_ack(irq.intid, maintenance_intid, kick_sgi_intid, pirq_delivery);
     if let Err(err) = gicv2.end_of_interrupt(irq) {
         if IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0 {
             println!("gic: end_of_interrupt failed: {:?}", err);
@@ -506,21 +539,43 @@ mod tests {
     use super::*;
 
     #[test_case]
-    fn acknowledged_passthrough_and_el2_local_irqs_request_deactivate() {
-        assert!(needs_deactivate_after_ack(27, Some(25), 15, Some(Ok(()))));
+    fn maintenance_irq_still_requests_deactivate() {
+        assert!(needs_deactivate_after_ack(25, Some(25), 15, None));
+    }
+
+    #[test_case]
+    fn kick_sgi_still_requests_deactivate() {
+        assert!(needs_deactivate_after_ack(15, Some(25), 15, None));
+    }
+
+    #[test_case]
+    fn acknowledged_software_lr_pirq_requests_deactivate() {
         assert!(needs_deactivate_after_ack(
             27,
             Some(25),
             15,
-            Some(Err(GicError::InvalidState))
+            Some(AckedPirqDelivery::Bound(PhysicalIrqBindingKind::SoftwareLr))
         ));
-        assert!(needs_deactivate_after_ack(25, Some(25), 15, None));
-        assert!(needs_deactivate_after_ack(15, Some(25), 15, None));
+    }
+
+    #[test_case]
+    fn acknowledged_hardware_lr_pirq_skips_deactivate() {
+        assert!(!needs_deactivate_after_ack(
+            27,
+            Some(25),
+            15,
+            Some(AckedPirqDelivery::Bound(PhysicalIrqBindingKind::HardwareLr))
+        ));
     }
 
     #[test_case]
     #[should_panic(expected = "vgic: unbound/policy-denied physical IRQ 27 reached EL2")]
     fn unsupported_passthrough_still_panics() {
-        let _ = needs_deactivate_after_ack(27, Some(25), 15, Some(Err(GicError::UnsupportedIntId)));
+        let _ = needs_deactivate_after_ack(
+            27,
+            Some(25),
+            15,
+            Some(AckedPirqDelivery::Error(GicError::UnsupportedIntId)),
+        );
     }
 }

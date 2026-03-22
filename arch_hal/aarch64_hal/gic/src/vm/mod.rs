@@ -1238,7 +1238,7 @@ mod tests {
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn write_through_local_ppi_software_lr_uses_software_delivery() {
-        let vm = recording_vm(1);
+        let vm = mirrored_vm(1);
         let target = VcpuId(0);
         let pintid = PIntId(27);
         let vintid = VIntId(27);
@@ -1269,6 +1269,19 @@ mod tests {
         assert_eq!(
             vm.physical_irq_binding_kind(target, pintid).unwrap(),
             Some(PhysicalIrqBindingKind::SoftwareLr)
+        );
+
+        reset_mirror_state();
+        vm.write_group_word(VgicIrqScope::Local(target), VIntId(0), 1u32 << vintid.0)
+            .unwrap();
+        assert_eq!(recorded_mirror_count(), 1);
+        assert_eq!(
+            recorded_mirror_op(0),
+            RecordedMirrorOp::SetGroup {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                group: IrqGroup::Group1,
+            }
         );
 
         vm.on_physical_irq(target, pintid, true).unwrap();
