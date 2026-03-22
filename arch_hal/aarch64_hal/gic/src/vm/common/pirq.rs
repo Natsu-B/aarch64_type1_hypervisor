@@ -19,19 +19,27 @@ use crate::vm::GicVmModelGeneric;
 use crate::vm::common::LOCAL_INTID_COUNT;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-pub(crate) enum PassthroughPhysicalConfig {
-    Unresolved,
-    Resolved { sense: IrqSense },
+pub(crate) enum DistMirrorMode {
+    ShadowOnly,
+    WriteThrough,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) enum CpuDeliveryMode {
+    SoftwareLr,
+    HardwareLr,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) enum PirqDelivery {
     Local {
         target: VcpuId,
-        physical: PassthroughPhysicalConfig,
+        dist_mode: DistMirrorMode,
+        cpu_mode: CpuDeliveryMode,
     },
     Spi {
-        physical: PassthroughPhysicalConfig,
+        dist_mode: DistMirrorMode,
+        cpu_mode: CpuDeliveryMode,
     },
 }
 
@@ -48,23 +56,20 @@ impl PirqEntry {
             PirqDelivery::Spi { .. } => VgicIrqScope::Global,
         }
     }
+}
 
-    pub(crate) fn sense(&self) -> Result<IrqSense, GicError> {
-        match self.delivery {
-            PirqDelivery::Local {
-                physical: PassthroughPhysicalConfig::Resolved { sense },
-                ..
-            } => Ok(sense),
-            PirqDelivery::Spi {
-                physical: PassthroughPhysicalConfig::Resolved { sense },
-            } => Ok(sense),
-            PirqDelivery::Local {
-                physical: PassthroughPhysicalConfig::Unresolved,
-                ..
+impl PirqDelivery {
+    pub(crate) const fn dist_mode(self) -> DistMirrorMode {
+        match self {
+            PirqDelivery::Local { dist_mode, .. } | PirqDelivery::Spi { dist_mode, .. } => {
+                dist_mode
             }
-            | PirqDelivery::Spi {
-                physical: PassthroughPhysicalConfig::Unresolved,
-            } => Err(GicError::InvalidState),
+        }
+    }
+
+    pub(crate) const fn cpu_mode(self) -> CpuDeliveryMode {
+        match self {
+            PirqDelivery::Local { cpu_mode, .. } | PirqDelivery::Spi { cpu_mode, .. } => cpu_mode,
         }
     }
 }
@@ -234,48 +239,6 @@ where
         }
     }
 
-    pub(crate) fn resolve_spi(
-        &mut self,
-        pintid: PIntId,
-        sense: IrqSense,
-    ) -> Result<bool, GicError> {
-        let idx = self.index(pintid)?;
-        let Some(entry) = self.global_entries[idx].as_mut() else {
-            return Err(GicError::UnsupportedIntId);
-        };
-
-        match &mut entry.delivery {
-            PirqDelivery::Local { .. } => Err(GicError::InvalidState),
-            PirqDelivery::Spi { physical } => {
-                let changed = *physical != PassthroughPhysicalConfig::Resolved { sense };
-                *physical = PassthroughPhysicalConfig::Resolved { sense };
-                Ok(changed)
-            }
-        }
-    }
-
-    pub(crate) fn resolve_local(
-        &mut self,
-        target: VcpuId,
-        pintid: PIntId,
-        sense: IrqSense,
-    ) -> Result<bool, GicError> {
-        let t_idx = self.tindex(target)?;
-        let p_idx = self.local_pindex(pintid)?;
-        let Some(entry) = self.local_entries[t_idx][p_idx].as_mut() else {
-            return Err(GicError::UnsupportedIntId);
-        };
-
-        match &mut entry.delivery {
-            PirqDelivery::Local { physical, .. } => {
-                let changed = *physical != PassthroughPhysicalConfig::Resolved { sense };
-                *physical = PassthroughPhysicalConfig::Resolved { sense };
-                Ok(changed)
-            }
-            PirqDelivery::Spi { .. } => Err(GicError::InvalidState),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn lookup_by_vintid(&self, vintid: VIntId) -> Result<Option<PIntId>, GicError> {
         let idx = self.vindex(vintid)?;
@@ -329,7 +292,7 @@ where
         self.map_pirq_inner_with_enable(pintid, target, vintid, sense, group, priority, true)
     }
 
-    pub(crate) fn bind_local_pirq_inner_prepared(
+    pub(crate) fn bind_local_pirq_inner_passthrough(
         &self,
         pintid: PIntId,
         target: VcpuId,
@@ -350,7 +313,8 @@ where
             vintid,
             delivery: PirqDelivery::Local {
                 target,
-                physical: PassthroughPhysicalConfig::Unresolved,
+                dist_mode: DistMirrorMode::WriteThrough,
+                cpu_mode: CpuDeliveryMode::HardwareLr,
             },
         };
 
@@ -365,7 +329,7 @@ where
         Ok(VgicUpdate::None)
     }
 
-    pub(crate) fn bind_spi_pirq_inner_prepared(
+    pub(crate) fn bind_spi_pirq_inner_passthrough(
         &self,
         pintid: PIntId,
         vintid: VIntId,
@@ -382,7 +346,8 @@ where
         let entry = PirqEntry {
             vintid,
             delivery: PirqDelivery::Spi {
-                physical: PassthroughPhysicalConfig::Unresolved,
+                dist_mode: DistMirrorMode::WriteThrough,
+                cpu_mode: CpuDeliveryMode::HardwareLr,
             },
         };
 
@@ -419,13 +384,15 @@ where
                 vintid,
                 delivery: PirqDelivery::Local {
                     target: local_target,
-                    physical: PassthroughPhysicalConfig::Resolved { sense },
+                    dist_mode: DistMirrorMode::ShadowOnly,
+                    cpu_mode: CpuDeliveryMode::SoftwareLr,
                 },
             },
             VgicIrqScope::Global => PirqEntry {
                 vintid,
                 delivery: PirqDelivery::Spi {
-                    physical: PassthroughPhysicalConfig::Resolved { sense },
+                    dist_mode: DistMirrorMode::ShadowOnly,
+                    cpu_mode: CpuDeliveryMode::SoftwareLr,
                 },
             },
         };
@@ -591,7 +558,12 @@ where
         // - For edge-sensitive pIRQs, callers must pass `level=true` exactly once per detected
         //   edge (pulse). Passing repeated `level=true` while the virtual IRQ is still pending
         //   can inject duplicates; `level=false` is ignored for edge-sensitive pIRQs.
-        let set_pending = match entry.sense()? {
+        let sense = {
+            let regs = self.common.regs_lock.lock_irqsave();
+            let trigger = regs.irq_state.trigger_mode(scope, entry.vintid)?;
+            GicVmModelGeneric::<VCPUS, V>::trigger_to_sense(trigger)
+        };
+        let set_pending = match sense {
             IrqSense::Edge => level,
             IrqSense::Level => level,
         };
@@ -615,16 +587,26 @@ where
                     } else {
                         IrqStateKind::Inactive
                     };
-                    enqueue_irq = Some(VirtualInterrupt::Hardware {
-                        vintid: entry.vintid.0,
-                        pintid: pintid.0,
-                        priority: attrs.priority,
-                        group: attrs.group,
-                        state,
-                        source: None,
+                    enqueue_irq = Some(match entry.delivery.cpu_mode() {
+                        CpuDeliveryMode::HardwareLr => VirtualInterrupt::Hardware {
+                            vintid: entry.vintid.0,
+                            pintid: pintid.0,
+                            priority: attrs.priority,
+                            group: attrs.group,
+                            state,
+                            source: None,
+                        },
+                        CpuDeliveryMode::SoftwareLr => VirtualInterrupt::Software {
+                            vintid: entry.vintid.0,
+                            eoi_maintenance: false,
+                            priority: attrs.priority,
+                            group: attrs.group,
+                            state,
+                            source: None,
+                        },
                     });
                 }
-            } else if matches!(entry.sense()?, IrqSense::Level) {
+            } else if matches!(sense, IrqSense::Level) {
                 changed = regs.irq_state.set_pending(scope, entry.vintid, false)?;
             }
         }
@@ -640,7 +622,7 @@ where
                     }
                 }
             }
-        } else if !set_pending && matches!(entry.sense()?, IrqSense::Level) {
+        } else if !set_pending && matches!(sense, IrqSense::Level) {
             match scope {
                 VgicIrqScope::Local(target) => {
                     self.common.vcpu(target)?.cancel_irq(entry.vintid, None)?;

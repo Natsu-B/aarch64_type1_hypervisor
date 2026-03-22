@@ -1140,7 +1140,7 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
-        fn bind_local_pirq_prepared(
+        fn bind_local_pirq_passthrough(
             &self,
             _pintid: PIntId,
             _target: VcpuId,
@@ -1149,7 +1149,7 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
-        fn bind_spi_pirq_prepared(
+        fn bind_spi_pirq_passthrough(
             &self,
             _pintid: PIntId,
             _vintid: VIntId,

@@ -419,6 +419,79 @@ pub trait GicDistributor {
     fn set_pending(&self, intid: u32, pending: bool) -> Result<(), GicError>;
 }
 
+/// Scope selector for field-wise physical Distributor mirroring.
+///
+/// This interface is intended for vGIC passthrough write-through paths that mirror guest-visible
+/// Distributor state into the host physical GIC a field at a time.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum GicMirrorScope {
+    /// Banked PPI state for the selected vCPU. SGIs are never valid with this scope.
+    Local(VcpuId),
+    /// Shared SPI state in the global Distributor view.
+    Global,
+}
+
+/// Physical route encoding for field-wise Distributor mirroring.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum GicMirrorRoute {
+    /// Exact GICv2 `GICD_ITARGETSRn` byte semantics.
+    Gicv2TargetMask(u8),
+    /// Abstract route model for backends that prefer affinity routing.
+    Abstract(SpiRoute),
+}
+
+/// Single-field physical Distributor mirror operation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum GicMirrorOp {
+    SetGroup {
+        scope: GicMirrorScope,
+        intid: u32,
+        group: IrqGroup,
+    },
+    SetPriority {
+        scope: GicMirrorScope,
+        intid: u32,
+        priority: u8,
+    },
+    SetTrigger {
+        scope: GicMirrorScope,
+        intid: u32,
+        trigger: TriggerMode,
+    },
+    SetEnable {
+        scope: GicMirrorScope,
+        intid: u32,
+        enable: bool,
+    },
+    SetPending {
+        scope: GicMirrorScope,
+        intid: u32,
+        pending: bool,
+    },
+    SetActive {
+        scope: GicMirrorScope,
+        intid: u32,
+        active: bool,
+    },
+    SetRoute {
+        intid: u32,
+        route: GicMirrorRoute,
+    },
+}
+
+/// Field-wise physical IRQ mirroring for vGIC passthrough.
+///
+/// Unlike [`GicPpi`] and [`GicDistributor`], this API does not express whole-interrupt snapshots.
+/// It is intended for guest write interception paths that must mirror the exact field being
+/// modified without rewriting unrelated state.
+pub trait GicIrqMirror {
+    /// Return the maximum supported INTID (exclusive upper bound for valid mirror INTIDs).
+    fn max_intid(&self) -> u32;
+
+    /// Apply a single field-wise mirror operation.
+    fn apply_mirror_op(&self, op: GicMirrorOp) -> Result<(), GicError>;
+}
+
 /// Target set for an SGI (Software Generated Interrupt).
 ///
 /// Implementations may coalesce or re-encode targets as required by the hardware:
@@ -979,8 +1052,6 @@ pub(crate) trait VgicGuestRegs: VgicVmInfo {
     fn read_enable_word(&self, scope: VgicIrqScope, base: VIntId) -> Result<u32, GicError>;
     /// Set enable bits for a 32-interrupt register window.
     ///
-    /// Implementations may reject guest attempts to enable PPIs/SPIs that are not bound to a
-    /// passthrough pIRQ mapping, returning `GicError::UnsupportedIntId`.
     fn write_set_enable_word(
         &self,
         scope: VgicIrqScope,
@@ -1092,8 +1163,8 @@ pub(crate) trait VgicSgiRegs: VgicVmInfo {
 pub(crate) trait VgicPirqModel: VgicVmInfo {
     /// Explicit host-configured pIRQ mapping.
     ///
-    /// This path is intended for cases where EL2 owns virtual attributes at mapping time.
-    /// For guest-owned passthrough, use the binding-only prepared APIs instead.
+    /// This path is intended for full virtualization where EL2 owns the virtual Distributor
+    /// state at mapping time and physical delivery still injects software-backed LRs.
     fn map_pirq(
         &self,
         pintid: PIntId,
@@ -1104,22 +1175,22 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
         priority: u8,
     ) -> Result<VgicUpdate, GicError>;
 
-    /// Bind a host local pIRQ (PPI) to a guest local vIRQ without forcing virtual attributes.
+    /// Bind a host local pIRQ (PPI) to a guest local vIRQ for passthrough.
     ///
-    /// Physical ingress semantics are resolved lazily from guest-visible virtual state when the
-    /// guest configuration becomes meaningful (typically first enable).
-    fn bind_local_pirq_prepared(
+    /// Guest Distributor writes remain authoritative in the virtual shadow state and are mirrored
+    /// immediately into the physical Distributor, while delivery uses hardware-backed LRs.
+    fn bind_local_pirq_passthrough(
         &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
     ) -> Result<VgicUpdate, GicError>;
 
-    /// Bind a host SPI pIRQ to a guest SPI vIRQ without touching physical Distributor state.
+    /// Bind a host SPI pIRQ to a guest SPI vIRQ for passthrough.
     ///
-    /// Physical configuration is resolved lazily from guest-visible virtual state when the
-    /// guest configuration becomes meaningful (typically first enable).
-    fn bind_spi_pirq_prepared(
+    /// Guest Distributor writes remain authoritative in the virtual shadow state and are mirrored
+    /// immediately into the physical Distributor, while delivery uses hardware-backed LRs.
+    fn bind_spi_pirq_passthrough(
         &self,
         pintid: PIntId,
         vintid: VIntId,

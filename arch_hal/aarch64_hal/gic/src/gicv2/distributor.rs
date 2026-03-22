@@ -1,6 +1,10 @@
 use crate::EnableOp;
 use crate::GicDistributor;
 use crate::GicError;
+use crate::GicIrqMirror;
+use crate::GicMirrorOp;
+use crate::GicMirrorRoute;
+use crate::GicMirrorScope;
 use crate::GicPpi;
 use crate::GicSgi;
 use crate::IrqGroup;
@@ -72,6 +76,280 @@ impl Gicv2 {
         // has been checked as an SPI in-range for this GIC instance, and this byte write targets
         // only the ITARGETSR slot for the selected SPI without modifying other interrupt state.
         target.write(cpu_targets);
+        Ok(())
+    }
+
+    fn set_spi_route_byte_inner(&self, intid: u32, cpu_targets: u8) -> Result<(), GicError> {
+        if intid < 32 || intid >= self.max_intid() {
+            return Err(GicError::UnsupportedIntId);
+        }
+
+        let spi = (intid - 32) as usize;
+        let reg = spi / 4;
+        let byte = spi % 4;
+        let target = self
+            .gicd
+            .itargetsr
+            .get(reg)
+            .and_then(|entry| entry.get(byte))
+            .ok_or(GicError::UnsupportedIntId)?;
+
+        // SAFETY: The Distributor MMIO frame is validated and mapped by `Gicv2::new`, `intid`
+        // has been checked as an SPI in-range for this GIC instance, and this byte write targets
+        // only the ITARGETSR slot for the selected SPI without modifying other interrupt state.
+        target.write(cpu_targets);
+        Ok(())
+    }
+
+    fn apply_group_local(&self, intid: u32, group: IrqGroup) -> Result<(), GicError> {
+        let security_ext = self.is_security_extension_implemented();
+        if !(16..32).contains(&intid) {
+            return Err(GicError::UnsupportedIntId);
+        }
+        if security_ext && group == IrqGroup::Group0 {
+            return Err(GicError::UnsupportedFeature);
+        }
+
+        let bit = 1u32 << (intid % 32);
+        if security_ext {
+            let igroupr = self.gicd.igroupr[0].read();
+            self.gicd.igroupr[0].write(igroupr | bit);
+        } else {
+            self.set_shadow_group(intid, group)?;
+            let igroupr = self.gicd.igroupr[0].read() & !bit;
+            self.gicd.igroupr[0].write(igroupr);
+        }
+        Ok(())
+    }
+
+    fn apply_group_global(&self, intid: u32, group: IrqGroup) -> Result<(), GicError> {
+        let security_ext = self.is_security_extension_implemented();
+        if intid < 32 || intid >= self.max_intid() {
+            return Err(GicError::UnsupportedIntId);
+        }
+        if security_ext && group == IrqGroup::Group0 {
+            return Err(GicError::UnsupportedFeature);
+        }
+
+        let word = (intid / 32) as usize;
+        let bit = 1u32 << (intid % 32);
+        if security_ext {
+            let igroupr = self.gicd.igroupr[word].read();
+            self.gicd.igroupr[word].write(igroupr | bit);
+        } else {
+            self.set_shadow_group(intid, group)?;
+            let igroupr = self.gicd.igroupr[word].read() & !bit;
+            self.gicd.igroupr[word].write(igroupr);
+        }
+        Ok(())
+    }
+
+    fn apply_priority(
+        &self,
+        scope: GicMirrorScope,
+        intid: u32,
+        priority: u8,
+    ) -> Result<(), GicError> {
+        match scope {
+            GicMirrorScope::Local(_) if !(16..32).contains(&intid) => {
+                return Err(GicError::UnsupportedIntId);
+            }
+            GicMirrorScope::Global if intid < 32 || intid >= self.max_intid() => {
+                return Err(GicError::UnsupportedIntId);
+            }
+            _ => {}
+        }
+
+        self.gicd.ipriorityr[intid as usize / 4][intid as usize % 4].write(priority);
+        Ok(())
+    }
+
+    fn apply_trigger(
+        &self,
+        scope: GicMirrorScope,
+        intid: u32,
+        trigger: TriggerMode,
+    ) -> Result<(), GicError> {
+        match scope {
+            GicMirrorScope::Local(_) if !(16..32).contains(&intid) => {
+                return Err(GicError::UnsupportedIntId);
+            }
+            GicMirrorScope::Global if intid < 32 || intid >= self.max_intid() => {
+                return Err(GicError::UnsupportedIntId);
+            }
+            _ => {}
+        }
+
+        let reg = intid as usize / 16;
+        let shift = (intid as usize % 16) * 2;
+        self.gicd.icfgr[reg].clear_bits(0b11 << shift);
+        self.gicd.icfgr[reg].set_bits(
+            match trigger {
+                TriggerMode::Edge => 0b10,
+                TriggerMode::Level => 0b00,
+            } << shift,
+        );
+        Ok(())
+    }
+
+    fn apply_enable(
+        &self,
+        scope: GicMirrorScope,
+        intid: u32,
+        enable: bool,
+    ) -> Result<(), GicError> {
+        match scope {
+            GicMirrorScope::Local(_) => {
+                if !(16..32).contains(&intid) {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let bit = 1u32 << (intid % 32);
+                if enable {
+                    self.gicd.isenabler[0].write(bit);
+                } else {
+                    self.gicd.icenabler[0].write(bit);
+                }
+            }
+            GicMirrorScope::Global => {
+                if intid < 32 || intid >= self.max_intid() {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let word = (intid / 32) as usize;
+                let bit = 1u32 << (intid % 32);
+                if enable {
+                    self.gicd.isenabler[word].write(bit);
+                } else {
+                    self.gicd.icenabler[word].write(bit);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_pending(
+        &self,
+        scope: GicMirrorScope,
+        intid: u32,
+        pending: bool,
+    ) -> Result<(), GicError> {
+        match scope {
+            GicMirrorScope::Local(_) => {
+                if !(16..32).contains(&intid) {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let bit = 1u32 << (intid % 32);
+                if pending {
+                    self.gicd.ispendr[0].write(bit);
+                } else {
+                    self.gicd.icpendr[0].write(bit);
+                }
+            }
+            GicMirrorScope::Global => {
+                if intid < 32 || intid >= self.max_intid() {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let word = (intid / 32) as usize;
+                let bit = 1u32 << (intid % 32);
+                if pending {
+                    self.gicd.ispendr[word].write(bit);
+                } else {
+                    self.gicd.icpendr[word].write(bit);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_active(
+        &self,
+        scope: GicMirrorScope,
+        intid: u32,
+        active: bool,
+    ) -> Result<(), GicError> {
+        match scope {
+            GicMirrorScope::Local(_) => {
+                if !(16..32).contains(&intid) {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let bit = 1u32 << (intid % 32);
+                if active {
+                    self.gicd.isactiver[0].write(bit);
+                } else {
+                    self.gicd.icactiver[0].write(bit);
+                }
+            }
+            GicMirrorScope::Global => {
+                if intid < 32 || intid >= self.max_intid() {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                let word = (intid / 32) as usize;
+                let bit = 1u32 << (intid % 32);
+                if active {
+                    self.gicd.isactiver[word].write(bit);
+                } else {
+                    self.gicd.icactiver[word].write(bit);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GicIrqMirror for Gicv2 {
+    fn max_intid(&self) -> u32 {
+        Gicv2::max_intid(self)
+    }
+
+    fn apply_mirror_op(&self, op: GicMirrorOp) -> Result<(), GicError> {
+        match op {
+            GicMirrorOp::SetGroup {
+                scope,
+                intid,
+                group,
+            } => match scope {
+                GicMirrorScope::Local(_) => self.apply_group_local(intid, group)?,
+                GicMirrorScope::Global => self.apply_group_global(intid, group)?,
+            },
+            GicMirrorOp::SetPriority {
+                scope,
+                intid,
+                priority,
+            } => self.apply_priority(scope, intid, priority)?,
+            GicMirrorOp::SetTrigger {
+                scope,
+                intid,
+                trigger,
+            } => self.apply_trigger(scope, intid, trigger)?,
+            GicMirrorOp::SetEnable {
+                scope,
+                intid,
+                enable,
+            } => self.apply_enable(scope, intid, enable)?,
+            GicMirrorOp::SetPending {
+                scope,
+                intid,
+                pending,
+            } => self.apply_pending(scope, intid, pending)?,
+            GicMirrorOp::SetActive {
+                scope,
+                intid,
+                active,
+            } => self.apply_active(scope, intid, active)?,
+            GicMirrorOp::SetRoute { intid, route } => {
+                if intid < 32 || intid >= self.max_intid() {
+                    return Err(GicError::UnsupportedIntId);
+                }
+                match route {
+                    GicMirrorRoute::Gicv2TargetMask(mask) => {
+                        self.set_spi_route_byte_inner(intid, mask)?;
+                    }
+                    GicMirrorRoute::Abstract(route) => self.set_spi_route_inner(intid, route)?,
+                }
+            }
+        }
+
+        cpu::dsb_sy();
+        cpu::isb();
         Ok(())
     }
 }

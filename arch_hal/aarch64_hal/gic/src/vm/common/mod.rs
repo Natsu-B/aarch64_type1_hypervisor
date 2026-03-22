@@ -6,6 +6,7 @@ pub(crate) mod vcpu_array;
 use crate::GicError;
 use crate::IrqGroup;
 use crate::IrqState as IrqStateKind;
+use crate::PIntId;
 use crate::VIntId;
 use crate::VcpuId;
 use crate::VcpuMask;
@@ -19,6 +20,8 @@ use aarch64_mutex::RawSpinLockIrqSave;
 
 use irq_state::IrqAttrs;
 use irq_state::IrqState as IrqStateTable;
+use pirq::CpuDeliveryMode;
+use pirq::PirqDelivery;
 use pirq::PirqTable;
 use routing::SpiRouting;
 use vcpu_array::VcpuArray;
@@ -132,6 +135,34 @@ where
         let routing = self.routing_lock.lock_irqsave();
         routing.routing.targets_for_spi(vintid, self.vcpu_count)
     }
+
+    pub(crate) fn pirq_binding(
+        &self,
+        scope: VgicIrqScope,
+        vintid: VIntId,
+    ) -> Result<Option<(PIntId, PirqDelivery)>, GicError> {
+        let routing = self.routing_lock.lock_irqsave();
+        match scope {
+            VgicIrqScope::Local(target) => {
+                let Some(pintid) = routing.pirqs.v2p_local(target, vintid) else {
+                    return Ok(None);
+                };
+                let Some(entry) = routing.pirqs.get_local(target, pintid)? else {
+                    return Ok(None);
+                };
+                Ok(Some((pintid, entry.delivery)))
+            }
+            VgicIrqScope::Global => {
+                let Some(pintid) = routing.pirqs.v2p(vintid) else {
+                    return Ok(None);
+                };
+                let Some(entry) = routing.pirqs.get(pintid)? else {
+                    return Ok(None);
+                };
+                Ok(Some((pintid, entry.delivery)))
+            }
+        }
+    }
 }
 
 impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VmCommon<VCPUS, V>
@@ -173,6 +204,7 @@ where
     ) -> Result<VgicUpdate, GicError> {
         match scope {
             VgicIrqScope::Local(vcpu) => {
+                let binding = self.pirq_binding(scope, vintid)?;
                 let attrs = {
                     let regs = self.regs_lock.lock_irqsave();
                     let attrs = regs.irq_state.irq_attrs(scope, vintid)?;
@@ -185,17 +217,32 @@ where
                     attrs
                 };
 
-                let irq = VirtualInterrupt::Software {
-                    vintid: vintid.0,
-                    eoi_maintenance: false,
-                    priority: attrs.priority,
-                    group: attrs.group,
-                    state: Self::state_from_attrs(attrs),
-                    source,
+                let irq = match binding {
+                    Some((pintid, delivery))
+                        if matches!(delivery.cpu_mode(), CpuDeliveryMode::HardwareLr) =>
+                    {
+                        VirtualInterrupt::Hardware {
+                            vintid: vintid.0,
+                            pintid: pintid.0,
+                            priority: attrs.priority,
+                            group: attrs.group,
+                            state: Self::state_from_attrs(attrs),
+                            source,
+                        }
+                    }
+                    _ => VirtualInterrupt::Software {
+                        vintid: vintid.0,
+                        eoi_maintenance: false,
+                        priority: attrs.priority,
+                        group: attrs.group,
+                        state: Self::state_from_attrs(attrs),
+                        source,
+                    },
                 };
                 self.enqueue_to_target(vcpu, irq)
             }
             VgicIrqScope::Global => {
+                let binding = self.pirq_binding(scope, vintid)?;
                 let targets = {
                     let routing = self.routing_lock.lock_irqsave();
                     routing.routing.targets_for_spi(vintid, self.vcpu_count)?
@@ -216,13 +263,27 @@ where
                     attrs
                 };
 
-                let irq = VirtualInterrupt::Software {
-                    vintid: vintid.0,
-                    eoi_maintenance: false,
-                    priority: attrs.priority,
-                    group: attrs.group,
-                    state: Self::state_from_attrs(attrs),
-                    source,
+                let irq = match binding {
+                    Some((pintid, delivery))
+                        if matches!(delivery.cpu_mode(), CpuDeliveryMode::HardwareLr) =>
+                    {
+                        VirtualInterrupt::Hardware {
+                            vintid: vintid.0,
+                            pintid: pintid.0,
+                            priority: attrs.priority,
+                            group: attrs.group,
+                            state: Self::state_from_attrs(attrs),
+                            source,
+                        }
+                    }
+                    _ => VirtualInterrupt::Software {
+                        vintid: vintid.0,
+                        eoi_maintenance: false,
+                        priority: attrs.priority,
+                        group: attrs.group,
+                        state: Self::state_from_attrs(attrs),
+                        source,
+                    },
                 };
 
                 let mut update = VgicUpdate::None;

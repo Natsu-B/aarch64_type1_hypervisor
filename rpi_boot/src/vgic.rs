@@ -1,14 +1,10 @@
 use arch_hal::cpu;
-use arch_hal::gic::EnableOp;
-use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
-use arch_hal::gic::GicPpi;
+use arch_hal::gic::GicIrqMirror;
 use arch_hal::gic::GicSgi;
-use arch_hal::gic::IrqGroup;
 use arch_hal::gic::IrqSense;
 use arch_hal::gic::PIntId;
 use arch_hal::gic::SgiTarget;
-use arch_hal::gic::TriggerMode;
 use arch_hal::gic::VIntId;
 use arch_hal::gic::VcpuId;
 use arch_hal::gic::VgicHw;
@@ -51,30 +47,10 @@ static VCPU_AFFINITIES: SyncUnsafeCell<[Option<cpu::CoreAffinity>; VCPU_COUNT]> 
     SyncUnsafeCell::new([None; VCPU_COUNT]);
 
 impl VgicDelegate for RpiVgicDelegate {
-    fn distributor(&self) -> Result<&'static dyn GicDistributor, GicError> {
+    fn irq_mirror(&self) -> Result<&'static dyn GicIrqMirror, GicError> {
         handler::gic()
             .ok_or(GicError::InvalidState)
-            .map(|gic| gic as &'static dyn GicDistributor)
-    }
-
-    fn configure_local_ppi(
-        &self,
-        _vm_id: usize,
-        target_vcpu: u16,
-        intid: u32,
-        group: IrqGroup,
-        priority: u8,
-        trigger: TriggerMode,
-        enable: EnableOp,
-    ) -> Result<(), GicError> {
-        let current = current_vcpu_id()?;
-        let target = VcpuId(target_vcpu);
-        if target != current {
-            return Err(GicError::InvalidState);
-        }
-
-        let gic = handler::gic().ok_or(GicError::InvalidState)?;
-        gic.configure_ppi(intid, group, priority, trigger, enable)
+            .map(|gic| gic as &'static dyn GicIrqMirror)
     }
 
     fn get_resident_affinity(
@@ -110,7 +86,7 @@ impl VgicDelegate for RpiVgicDelegate {
 }
 
 fn map_guest_local_ppis_for_vcpu(gic: &Gicv2, vcpu: VcpuId) -> Result<(), GicError> {
-    VGIC.bind_local_pirq_prepared(
+    VGIC.bind_local_pirq_passthrough(
         gic,
         PIntId(GUEST_EL1_VTIMER_PPI_INTID),
         vcpu,
@@ -206,7 +182,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     mark_vcpu_online(boot_vcpu_id).map_err(|_| "vgic: mark online")?;
 
     if let Some(uart_irq) = uart_irq {
-        VGIC.bind_spi_pirq_prepared(gic, PIntId(uart_irq.pintid), VIntId(uart_irq.pintid))
+        VGIC.bind_spi_pirq_passthrough(gic, PIntId(uart_irq.pintid), VIntId(uart_irq.pintid))
             .map_err(|x| {
                 println!("vgic: map uart pirq failed: {:?}", x);
                 "vgic: map uart pirq failed"
@@ -219,7 +195,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
             continue;
         }
         let pintid = PIntId(intid);
-        match VGIC.bind_spi_pirq_prepared(gic, pintid, VIntId(intid)) {
+        match VGIC.bind_spi_pirq_passthrough(gic, pintid, VIntId(intid)) {
             Ok(()) => {}
             Err(GicError::InvalidState) => continue,
             Err(x) => {

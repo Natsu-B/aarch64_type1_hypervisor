@@ -1,16 +1,13 @@
 use super::GicVmModelForVcpus;
 use super::common::LOCAL_INTID_COUNT;
 use super::pending_cap_for_vcpus;
-use crate::EnableOp;
-use crate::GicDistributor;
 use crate::GicError;
+use crate::GicIrqMirror;
+use crate::GicMirrorOp;
 use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
-use crate::SpiRoute;
-use crate::TriggerMode;
 use crate::VIntId;
-use crate::VSpiRouting;
 use crate::VcpuId;
 use crate::VgicGuestRegs;
 use crate::VgicHw;
@@ -38,17 +35,7 @@ use tls::cpu_if;
 /// Callbacks can run concurrently with VM model operations and are never invoked while a global
 /// manager lock is held.
 pub trait VgicDelegate: Send + Sync {
-    fn distributor(&self) -> Result<&'static dyn GicDistributor, GicError>;
-    fn configure_local_ppi(
-        &self,
-        vm_id: usize,
-        target_vcpu: u16,
-        intid: u32,
-        group: IrqGroup,
-        priority: u8,
-        trigger: TriggerMode,
-        enable: EnableOp,
-    ) -> Result<(), GicError>;
+    fn irq_mirror(&self) -> Result<&'static dyn GicIrqMirror, GicError>;
     fn get_resident_affinity(
         &self,
         vm_id: usize,
@@ -211,7 +198,7 @@ where
         self.apply_update(hw, update)
     }
 
-    pub fn bind_local_pirq_prepared<H: VgicHw>(
+    pub fn bind_local_pirq_passthrough<H: VgicHw>(
         &self,
         hw: &H,
         pintid: PIntId,
@@ -219,18 +206,18 @@ where
         vintid: VIntId,
     ) -> Result<(), GicError> {
         let vm = self.model()?;
-        let update = vm.bind_local_pirq_prepared(pintid, target, vintid)?;
+        let update = vm.bind_local_pirq_passthrough(pintid, target, vintid)?;
         self.apply_update(hw, update)
     }
 
-    pub fn bind_spi_pirq_prepared<H: VgicHw>(
+    pub fn bind_spi_pirq_passthrough<H: VgicHw>(
         &self,
         hw: &H,
         pintid: PIntId,
         vintid: VIntId,
     ) -> Result<(), GicError> {
         let vm = self.model()?;
-        let update = vm.bind_spi_pirq_prepared(pintid, vintid)?;
+        let update = vm.bind_spi_pirq_passthrough(pintid, vintid)?;
         self.apply_update(hw, update)
     }
 
@@ -363,43 +350,9 @@ where
     Ok(unsafe { &*(ctx as *const VgicManager<VCPUS>) })
 }
 
-fn vspi_route_to_spi_route<const VCPUS: usize>(
-    manager: &VgicManager<VCPUS>,
-    route: VSpiRouting,
-) -> Result<SpiRoute, GicError>
-where
-    [(); crate::max_intids_for_vcpus(VCPUS)]:,
-    [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
-    [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
-    [(); pending_cap_for_vcpus(VCPUS)]:,
-{
-    let target = match route {
-        VSpiRouting::Targets(mask) => {
-            let Some(vcpu_id) = mask.iter().next() else {
-                return Err(GicError::InvalidRoute);
-            };
-            vcpu_id
-        }
-        VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
-            return Err(GicError::UnsupportedFeature);
-        }
-    };
-    let affinity = manager
-        .delegate
-        .get_home_affinity(manager.vm_id, target.0)?;
-
-    Ok(SpiRoute::Specific(affinity))
-}
-
-pub(crate) unsafe fn passthrough_spi_configure_from_ctx<const VCPUS: usize>(
+pub(crate) unsafe fn apply_mirror_op_from_ctx<const VCPUS: usize>(
     ctx: *mut (),
-    pintid: PIntId,
-    group: IrqGroup,
-    priority: u8,
-    trigger: TriggerMode,
-    route: VSpiRouting,
-    enable: EnableOp,
+    op: GicMirrorOp,
 ) -> Result<(), GicError>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
@@ -410,38 +363,5 @@ where
 {
     // SAFETY: `ctx` was installed by `init_from_gicv2` for this manager const instantiation.
     let manager = unsafe { manager_from_ctx::<VCPUS>(ctx)? };
-    let route = vspi_route_to_spi_route(manager, route)?;
-    manager
-        .delegate
-        .distributor()?
-        .configure_spi(pintid.0, group, priority, trigger, route, enable)
-}
-
-pub(crate) unsafe fn passthrough_local_configure_from_ctx<const VCPUS: usize>(
-    ctx: *mut (),
-    target_vcpu: VcpuId,
-    pintid: PIntId,
-    group: IrqGroup,
-    priority: u8,
-    trigger: TriggerMode,
-    enable: EnableOp,
-) -> Result<(), GicError>
-where
-    [(); crate::max_intids_for_vcpus(VCPUS)]:,
-    [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
-    [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
-    [(); pending_cap_for_vcpus(VCPUS)]:,
-{
-    // SAFETY: `ctx` was installed by `init_from_gicv2` for this manager const instantiation.
-    let manager = unsafe { manager_from_ctx::<VCPUS>(ctx)? };
-    manager.delegate.configure_local_ppi(
-        manager.vm_id,
-        target_vcpu.0,
-        pintid.0,
-        group,
-        priority,
-        trigger,
-        enable,
-    )
+    manager.delegate.irq_mirror()?.apply_mirror_op(op)
 }

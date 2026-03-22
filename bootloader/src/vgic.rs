@@ -1,6 +1,7 @@
 use arch_hal::cpu;
 use arch_hal::gic::GicDistributor;
 use arch_hal::gic::GicError;
+use arch_hal::gic::GicIrqMirror;
 use arch_hal::gic::GicPpi;
 use arch_hal::gic::GicSgi;
 use arch_hal::gic::PIntId;
@@ -35,27 +36,10 @@ static MAINT_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
 static GICD_ID: SyncUnsafeCell<Option<Gicv2DistIdRegs>> = SyncUnsafeCell::new(None);
 
 impl VgicDelegate for BootVgicDelegate {
-    fn distributor(&self) -> Result<&'static dyn GicDistributor, GicError> {
+    fn irq_mirror(&self) -> Result<&'static dyn GicIrqMirror, GicError> {
         handler::gic()
             .ok_or(GicError::InvalidState)
-            .map(|gic| gic as &'static dyn GicDistributor)
-    }
-
-    fn configure_local_ppi(
-        &self,
-        _vm_id: usize,
-        target_vcpu: u16,
-        intid: u32,
-        group: arch_hal::gic::IrqGroup,
-        priority: u8,
-        trigger: arch_hal::gic::TriggerMode,
-        enable: arch_hal::gic::EnableOp,
-    ) -> Result<(), GicError> {
-        if target_vcpu != 0 {
-            return Err(GicError::InvalidState);
-        }
-        let gic = handler::gic().ok_or(GicError::InvalidState)?;
-        gic.configure_ppi(intid, group, priority, trigger, enable)
+            .map(|gic| gic as &'static dyn GicIrqMirror)
     }
 
     fn get_resident_affinity(
@@ -122,7 +106,7 @@ pub(crate) fn init(
 
     if let Some(pintid) = guest_uart.irq {
         if Some(pintid) != gdb_uart_intid {
-            VGIC.bind_spi_pirq_prepared(gic, PIntId(pintid), VIntId(pintid))
+            VGIC.bind_spi_pirq_passthrough(gic, PIntId(pintid), VIntId(pintid))
                 .map_err(|e| {
                     println!("Failed to map guest UART PIRQ {}: {:?}", pintid, e);
                     "vgic: map pirq"
@@ -135,7 +119,7 @@ pub(crate) fn init(
         if Some(intid) == gdb_uart_intid || guest_uart.irq == Some(intid) {
             continue;
         }
-        match VGIC.bind_spi_pirq_prepared(gic, PIntId(intid), VIntId(intid)) {
+        match VGIC.bind_spi_pirq_passthrough(gic, PIntId(intid), VIntId(intid)) {
             Ok(()) => {}
             Err(GicError::InvalidState) => continue,
             Err(e) => {

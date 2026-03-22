@@ -1,11 +1,13 @@
 use self::common::LOCAL_INTID_COUNT;
 use self::common::SGI_COUNT;
 use self::common::VmCommon;
-use self::common::pirq::PassthroughPhysicalConfig;
+use self::common::pirq::DistMirrorMode;
 use self::common::pirq::PirqDelivery;
 use self::v2_ext::V2SgiState;
-use crate::EnableOp;
 use crate::GicError;
+use crate::GicMirrorOp;
+use crate::GicMirrorRoute;
+use crate::GicMirrorScope;
 use crate::IrqGroup;
 use crate::IrqSense;
 use crate::PIntId;
@@ -175,283 +177,86 @@ where
         }
     }
 
-    fn call_pirq_configure_hook(
-        &self,
-        pintid: PIntId,
-        group: IrqGroup,
-        priority: u8,
-        trigger: TriggerMode,
-        route: VSpiRouting,
-        enable: bool,
-    ) -> Result<(), GicError>
-    where
-        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
-        [(); pending_cap_for_vcpus(VCPUS)]:,
-    {
-        let (ctx, hook) = self.pirq_hook_snapshot();
-        let enable_op = if enable {
-            EnableOp::Enable
-        } else {
-            EnableOp::Disable
-        };
-
-        if !ctx.is_null() {
-            // SAFETY: `ctx` is installed by the manager and points to a stable `VgicManager`
-            // for this VM model instance. This call happens after dropping VM locks.
-            unsafe {
-                manager::passthrough_spi_configure_from_ctx::<VCPUS>(
-                    ctx, pintid, group, priority, trigger, route, enable_op,
-                )?;
+    fn route_targets_to_gicv2_mask(mask: VcpuMask) -> Result<u8, GicError> {
+        let mut bits = 0u8;
+        for target in mask.iter() {
+            if target.0 >= 8 {
+                return Err(GicError::UnsupportedFeature);
             }
+            bits |= 1u8 << target.0;
         }
-
-        if let Some(hook) = hook {
-            let targets = match route {
-                VSpiRouting::Targets(mask) => {
-                    Self::route_targets_to_bits(mask).map_err(Self::map_pirq_hook_error)?
-                }
-                VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
-                    return Err(GicError::UnsupportedFeature);
-                }
-            };
-
-            hook(
-                pintid.0,
-                PirqHookOp::Configure {
-                    group: Self::irq_group_to_hook(group),
-                    priority,
-                    trigger,
-                    targets,
-                    enable,
-                },
-            )
-            .map_err(Self::map_pirq_hook_error)?;
-        }
-        Ok(())
+        Ok(bits)
     }
 
-    fn call_local_pirq_configure_callback(
+    fn mirror_scope(scope: VgicIrqScope) -> GicMirrorScope {
+        match scope {
+            VgicIrqScope::Local(target) => GicMirrorScope::Local(target),
+            VgicIrqScope::Global => GicMirrorScope::Global,
+        }
+    }
+
+    fn pirq_binding_for_irq(
         &self,
-        target_vcpu: VcpuId,
-        pintid: PIntId,
-        group: IrqGroup,
-        priority: u8,
-        trigger: TriggerMode,
-        enable: bool,
-    ) -> Result<(), GicError>
+        scope: VgicIrqScope,
+        vintid: VIntId,
+    ) -> Result<Option<(PIntId, PirqDelivery)>, GicError> {
+        self.common.pirq_binding(scope, vintid)
+    }
+
+    fn emit_mirror_op(&self, op: GicMirrorOp) -> Result<(), GicError>
     where
         [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
         [(); pending_cap_for_vcpus(VCPUS)]:,
     {
         let (ctx, _) = self.pirq_hook_snapshot();
-        let enable_op = if enable {
-            EnableOp::Enable
-        } else {
-            EnableOp::Disable
-        };
-
-        if !ctx.is_null() {
-            // SAFETY: `ctx` is installed by the manager and points to a stable `VgicManager`
-            // for this VM model instance. This call happens after dropping VM locks.
-            unsafe {
-                manager::passthrough_local_configure_from_ctx::<VCPUS>(
-                    ctx,
-                    target_vcpu,
-                    pintid,
-                    group,
-                    priority,
-                    trigger,
-                    enable_op,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn ensure_passthrough_bound_for_guest_enable(
-        &self,
-        scope: VgicIrqScope,
-        vintid: VIntId,
-    ) -> Result<(), GicError> {
-        let intid = vintid.0;
-        let requires_binding = match scope {
-            VgicIrqScope::Local(_) => (SGI_COUNT as u32..LOCAL_INTID_COUNT as u32).contains(&intid),
-            VgicIrqScope::Global => intid >= LOCAL_INTID_COUNT as u32,
-        };
-
-        if !requires_binding {
+        if ctx.is_null() {
             return Ok(());
         }
 
-        let has_binding = {
+        // SAFETY: `ctx` is installed by the manager and points to a stable `VgicManager`
+        // for this VM model instance. This call happens after dropping VM locks.
+        unsafe { manager::apply_mirror_op_from_ctx::<VCPUS>(ctx, op) }
+    }
+
+    fn call_pirq_enable_hook(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+        enable: bool,
+    ) -> Result<(), GicError> {
+        let (_, hook) = self.pirq_hook_snapshot();
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+
+        let route = {
             let routing = self.common.routing_lock.lock_irqsave();
-            match scope {
-                VgicIrqScope::Local(target_vcpu) => {
-                    let Some(pintid) = routing.pirqs.v2p_local(target_vcpu, vintid) else {
-                        return Err(GicError::UnsupportedIntId);
-                    };
-                    let Some(entry) = routing.pirqs.get_local(target_vcpu, pintid)? else {
-                        return Err(GicError::UnsupportedIntId);
-                    };
-                    matches!(
-                        entry.delivery,
-                        PirqDelivery::Local {
-                            target,
-                            physical: _
-                        } if target == target_vcpu
-                    )
-                }
-                VgicIrqScope::Global => {
-                    let Some(pintid) = routing.pirqs.v2p(vintid) else {
-                        return Err(GicError::UnsupportedIntId);
-                    };
-                    let Some(entry) = routing.pirqs.get(pintid)? else {
-                        return Err(GicError::UnsupportedIntId);
-                    };
-                    matches!(entry.delivery, PirqDelivery::Spi { .. })
+            match routing.routing.get_route(vintid)? {
+                VSpiRouting::Targets(mask) => mask,
+                VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
+                    return Err(GicError::UnsupportedFeature);
                 }
             }
         };
 
-        if has_binding {
-            Ok(())
-        } else {
-            Err(GicError::UnsupportedIntId)
-        }
-    }
-
-    fn ensure_passthrough_bound_for_enable_word(
-        &self,
-        scope: VgicIrqScope,
-        base: VIntId,
-        set_bits: u32,
-    ) -> Result<(), GicError> {
-        for bit in 0..32 {
-            if (set_bits & (1u32 << bit)) == 0 {
-                continue;
-            }
-            self.ensure_passthrough_bound_for_guest_enable(scope, VIntId(base.0 + bit))?;
-        }
-        Ok(())
-    }
-
-    fn sync_passthrough_spi_for_vintid(
-        &self,
-        vintid: VIntId,
-        resolve_on_enable: bool,
-    ) -> Result<(), GicError>
-    where
-        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
-        [(); pending_cap_for_vcpus(VCPUS)]:,
-    {
-        if vintid.0 < LOCAL_INTID_COUNT as u32 {
-            return Ok(());
-        }
-
-        let prepared = {
-            let mut routing = self.common.routing_lock.lock_irqsave();
-            let Some(pintid) = routing.pirqs.v2p(vintid) else {
-                return Ok(());
-            };
-            let Some(entry) = routing.pirqs.get(pintid)? else {
-                return Ok(());
-            };
-
-            let PirqDelivery::Spi { physical } = entry.delivery else {
-                return Ok(());
-            };
-
-            let route = routing.routing.get_route(vintid)?;
-            let (group, priority, trigger, enable) = {
-                let regs = self.common.regs_lock.lock_irqsave();
-                let attrs = regs.irq_state.irq_attrs(VgicIrqScope::Global, vintid)?;
-                let trigger = regs.irq_state.trigger_mode(VgicIrqScope::Global, vintid)?;
-                (attrs.group, attrs.priority, trigger, attrs.enable)
-            };
-
-            if matches!(physical, PassthroughPhysicalConfig::Unresolved) {
-                if !resolve_on_enable || !enable {
-                    return Ok(());
-                }
-            }
-
-            let sense = Self::trigger_to_sense(trigger);
-            routing.pirqs.resolve_spi(pintid, sense)?;
-
-            Some((pintid, group, priority, trigger, route, enable))
+        let (group, priority, trigger) = {
+            let regs = self.common.regs_lock.lock_irqsave();
+            let attrs = regs.irq_state.irq_attrs(VgicIrqScope::Global, vintid)?;
+            let trigger = regs.irq_state.trigger_mode(VgicIrqScope::Global, vintid)?;
+            (attrs.group, attrs.priority, trigger)
         };
 
-        let Some((pintid, group, priority, trigger, route, enable)) = prepared else {
-            return Ok(());
-        };
-        self.call_pirq_configure_hook(pintid, group, priority, trigger, route, enable)
-    }
-
-    fn sync_passthrough_local_for_vintid(
-        &self,
-        target: VcpuId,
-        vintid: VIntId,
-        resolve_on_enable: bool,
-    ) -> Result<(), GicError>
-    where
-        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
-        [(); pending_cap_for_vcpus(VCPUS)]:,
-    {
-        if !(SGI_COUNT as u32..LOCAL_INTID_COUNT as u32).contains(&vintid.0) {
-            return Ok(());
-        }
-
-        let prepared = {
-            let mut routing = self.common.routing_lock.lock_irqsave();
-            let Some(pintid) = routing.pirqs.v2p_local(target, vintid) else {
-                return Ok(());
-            };
-            let Some(entry) = routing.pirqs.get_local(target, pintid)? else {
-                return Ok(());
-            };
-
-            let PirqDelivery::Local {
-                physical,
-                target: mapped_target,
-            } = entry.delivery
-            else {
-                return Ok(());
-            };
-            if mapped_target != target {
-                return Ok(());
-            }
-
-            let local_scope = VgicIrqScope::Local(target);
-            let (group, priority, trigger, enable) = {
-                let regs = self.common.regs_lock.lock_irqsave();
-                let attrs = regs.irq_state.irq_attrs(local_scope, vintid)?;
-                let trigger = regs.irq_state.trigger_mode(local_scope, vintid)?;
-                (attrs.group, attrs.priority, trigger, attrs.enable)
-            };
-
-            if matches!(physical, PassthroughPhysicalConfig::Unresolved) {
-                if !resolve_on_enable || !enable {
-                    return Ok(());
-                }
-            }
-
-            let sense = Self::trigger_to_sense(trigger);
-            routing.pirqs.resolve_local(target, pintid, sense)?;
-
-            Some((target, pintid, group, priority, trigger, enable))
-        };
-
-        let Some((target_vcpu, pintid, group, priority, trigger, enable)) = prepared else {
-            return Ok(());
-        };
-        self.call_local_pirq_configure_callback(
-            target_vcpu,
-            pintid,
-            group,
-            priority,
-            trigger,
-            enable,
+        hook(
+            pintid.0,
+            PirqHookOp::Configure {
+                group: Self::irq_group_to_hook(group),
+                priority,
+                trigger,
+                targets: Self::route_targets_to_bits(route).map_err(Self::map_pirq_hook_error)?,
+                enable,
+            },
         )
+        .map_err(Self::map_pirq_hook_error)
     }
 
     pub(crate) fn dispatch_pirq_notifications(
@@ -626,16 +431,27 @@ where
         vintid: VIntId,
         enable: bool,
     ) -> Result<VgicUpdate, GicError> {
-        if enable {
-            self.ensure_passthrough_bound_for_guest_enable(scope, vintid)?;
-        }
-
         let changed = {
             let mut regs = self.common.regs_lock.lock_irqsave();
             regs.irq_state.set_enable(scope, vintid, enable)?
         };
         let mut update = VgicUpdate::None;
         let intid = vintid.0 as usize;
+
+        if changed {
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
+                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                    self.emit_mirror_op(GicMirrorOp::SetEnable {
+                        scope: Self::mirror_scope(scope),
+                        intid: pintid.0,
+                        enable,
+                    })?;
+                }
+                if matches!(scope, VgicIrqScope::Global) {
+                    self.call_pirq_enable_hook(pintid, vintid, enable)?;
+                }
+            }
+        }
 
         if enable {
             match scope {
@@ -654,14 +470,6 @@ where
         }
 
         update.combine(&Self::update_for_scope(scope, changed));
-        if changed {
-            match scope {
-                VgicIrqScope::Global => self.sync_passthrough_spi_for_vintid(vintid, enable)?,
-                VgicIrqScope::Local(vcpu) => {
-                    self.sync_passthrough_local_for_vintid(vcpu, vintid, enable)?;
-                }
-            }
-        }
         Ok(update)
     }
 
@@ -704,20 +512,33 @@ where
         base: VIntId,
         value: u32,
     ) -> Result<VgicUpdate, GicError> {
-        let changed_mask = {
+        let (after, changed_mask) = {
             let mut regs = self.common.regs_lock.lock_irqsave();
             let before = regs.irq_state.read_group_word(scope, base)?;
             let _changed = regs.irq_state.write_group_word(scope, base, value)?;
             let after = regs.irq_state.read_group_word(scope, base)?;
-            before ^ after
+            (after, before ^ after)
         };
 
-        if matches!(scope, VgicIrqScope::Global) {
-            for bit in 0..32 {
-                if (changed_mask & (1u32 << bit)) == 0 {
-                    continue;
-                }
-                self.sync_passthrough_spi_for_vintid(VIntId(base.0 + bit), false)?;
+        for bit in 0..32 {
+            let lane_mask = 1u32 << bit;
+            if (changed_mask & lane_mask) == 0 {
+                continue;
+            }
+            let vintid = VIntId(base.0 + bit);
+            let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? else {
+                continue;
+            };
+            if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                self.emit_mirror_op(GicMirrorOp::SetGroup {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    group: if (after & lane_mask) != 0 {
+                        IrqGroup::Group1
+                    } else {
+                        IrqGroup::Group0
+                    },
+                })?;
             }
         }
 
@@ -735,8 +556,6 @@ where
         base: VIntId,
         set_bits: u32,
     ) -> Result<VgicUpdate, GicError> {
-        self.ensure_passthrough_bound_for_enable_word(scope, base, set_bits)?;
-
         let mask = {
             let mut regs = self.common.regs_lock.lock_irqsave();
             regs.irq_state
@@ -749,6 +568,18 @@ where
                 continue;
             }
             let vintid = VIntId(base.0 + bit);
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
+                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                    self.emit_mirror_op(GicMirrorOp::SetEnable {
+                        scope: Self::mirror_scope(scope),
+                        intid: pintid.0,
+                        enable: true,
+                    })?;
+                }
+                if matches!(scope, VgicIrqScope::Global) {
+                    self.call_pirq_enable_hook(pintid, vintid, true)?;
+                }
+            }
             match scope {
                 VgicIrqScope::Local(vcpu) if (base.0 + bit) < SGI_COUNT as u32 => {
                     update.combine(&self.enqueue_sgi_for_target(vcpu, (base.0 + bit) as usize)?);
@@ -758,12 +589,6 @@ where
                     if attrs.pending {
                         update.combine(&self.common.maybe_enqueue_irq(scope, vintid, None)?);
                     }
-                }
-            }
-            match scope {
-                VgicIrqScope::Global => self.sync_passthrough_spi_for_vintid(vintid, true)?,
-                VgicIrqScope::Local(vcpu) => {
-                    self.sync_passthrough_local_for_vintid(vcpu, vintid, true)?;
                 }
             }
         }
@@ -790,13 +615,19 @@ where
                 continue;
             }
             let vintid = VIntId(base.0 + bit);
-            update.combine(&self.cancel_for_scope(scope, vintid, None)?);
-            match scope {
-                VgicIrqScope::Global => self.sync_passthrough_spi_for_vintid(vintid, false)?,
-                VgicIrqScope::Local(vcpu) => {
-                    self.sync_passthrough_local_for_vintid(vcpu, vintid, false)?;
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
+                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                    self.emit_mirror_op(GicMirrorOp::SetEnable {
+                        scope: Self::mirror_scope(scope),
+                        intid: pintid.0,
+                        enable: false,
+                    })?;
+                }
+                if matches!(scope, VgicIrqScope::Global) {
+                    self.call_pirq_enable_hook(pintid, vintid, false)?;
                 }
             }
+            update.combine(&self.cancel_for_scope(scope, vintid, None)?);
         }
 
         update.combine(&Self::update_for_scope(scope, mask != 0));
@@ -826,6 +657,15 @@ where
                 continue;
             }
             let vintid = VIntId(base.0 + bit);
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
+                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                    self.emit_mirror_op(GicMirrorOp::SetPending {
+                        scope: Self::mirror_scope(scope),
+                        intid: pintid.0,
+                        pending: true,
+                    })?;
+                }
+            }
             match scope {
                 VgicIrqScope::Local(vcpu) if (base.0 + bit) < SGI_COUNT as u32 => {
                     update.combine(&self.enqueue_sgi_for_target(vcpu, (base.0 + bit) as usize)?);
@@ -856,6 +696,15 @@ where
                 continue;
             }
             let vintid = VIntId(base.0 + bit);
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
+                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                    self.emit_mirror_op(GicMirrorOp::SetPending {
+                        scope: Self::mirror_scope(scope),
+                        intid: pintid.0,
+                        pending: false,
+                    })?;
+                }
+            }
             update.combine(&self.cancel_for_scope(scope, vintid, None)?);
         }
 
@@ -879,6 +728,24 @@ where
             regs.irq_state
                 .write_set_active_word(scope, base, set_bits)?
         };
+
+        for bit in 0..32 {
+            if (mask & (1u32 << bit)) == 0 {
+                continue;
+            }
+            let vintid = VIntId(base.0 + bit);
+            let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? else {
+                continue;
+            };
+            if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                self.emit_mirror_op(GicMirrorOp::SetActive {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    active: true,
+                })?;
+            }
+        }
+
         Ok(Self::update_for_scope(scope, mask != 0))
     }
 
@@ -893,6 +760,24 @@ where
             regs.irq_state
                 .write_clear_active_word(scope, base, clear_bits)?
         };
+
+        for bit in 0..32 {
+            if (mask & (1u32 << bit)) == 0 {
+                continue;
+            }
+            let vintid = VIntId(base.0 + bit);
+            let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? else {
+                continue;
+            };
+            if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                self.emit_mirror_op(GicMirrorOp::SetActive {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    active: false,
+                })?;
+            }
+        }
+
         Ok(Self::update_for_scope(scope, mask != 0))
     }
 
@@ -922,15 +807,24 @@ where
             (before, after)
         };
 
-        if matches!(scope, VgicIrqScope::Global) {
-            for lane in 0..4 {
-                let shift = lane * 8;
-                let before_lane = (before >> shift) & 0xff;
-                let after_lane = (after >> shift) & 0xff;
-                if before_lane == after_lane {
-                    continue;
-                }
-                self.sync_passthrough_spi_for_vintid(VIntId(base.0 + lane as u32), false)?;
+        for lane in 0..4 {
+            let shift = lane * 8;
+            let before_lane = (before >> shift) & 0xff;
+            let after_lane = (after >> shift) & 0xff;
+            if before_lane == after_lane {
+                continue;
+            }
+
+            let vintid = VIntId(base.0 + lane as u32);
+            let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? else {
+                continue;
+            };
+            if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                self.emit_mirror_op(GicMirrorOp::SetPriority {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    priority: after_lane as u8,
+                })?;
             }
         }
 
@@ -965,11 +859,19 @@ where
             }
 
             let vintid = VIntId(base.0 + lane as u32);
-            match scope {
-                VgicIrqScope::Global => self.sync_passthrough_spi_for_vintid(vintid, false)?,
-                VgicIrqScope::Local(vcpu) => {
-                    self.sync_passthrough_local_for_vintid(vcpu, vintid, false)?;
-                }
+            let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? else {
+                continue;
+            };
+            if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                self.emit_mirror_op(GicMirrorOp::SetTrigger {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    trigger: if after_lane == 0b10 {
+                        TriggerMode::Edge
+                    } else {
+                        TriggerMode::Level
+                    },
+                })?;
             }
         }
 
@@ -994,7 +896,18 @@ where
                 };
 
                 if changed {
-                    self.sync_passthrough_spi_for_vintid(vintid, false)?;
+                    if let Some((pintid, delivery)) =
+                        self.pirq_binding_for_irq(VgicIrqScope::Global, vintid)?
+                    {
+                        if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                            self.emit_mirror_op(GicMirrorOp::SetRoute {
+                                intid: pintid.0,
+                                route: GicMirrorRoute::Gicv2TargetMask(
+                                    Self::route_targets_to_gicv2_mask(mask)?,
+                                ),
+                            })?;
+                        }
+                    }
                 }
 
                 Ok(Self::update_for_scope(VgicIrqScope::Global, changed))
@@ -1032,21 +945,21 @@ where
         self.map_pirq_inner_configured(pintid, target, vintid, sense, group, priority)
     }
 
-    fn bind_local_pirq_prepared(
+    fn bind_local_pirq_passthrough(
         &self,
         pintid: PIntId,
         target: VcpuId,
         vintid: VIntId,
     ) -> Result<VgicUpdate, GicError> {
-        self.bind_local_pirq_inner_prepared(pintid, target, vintid)
+        self.bind_local_pirq_inner_passthrough(pintid, target, vintid)
     }
 
-    fn bind_spi_pirq_prepared(
+    fn bind_spi_pirq_passthrough(
         &self,
         pintid: PIntId,
         vintid: VIntId,
     ) -> Result<VgicUpdate, GicError> {
-        self.bind_spi_pirq_inner_prepared(pintid, vintid)
+        self.bind_spi_pirq_inner_passthrough(pintid, vintid)
     }
 
     #[cfg(test)]
@@ -1066,13 +979,18 @@ where
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
+    use self::common::pirq::CpuDeliveryMode;
     use super::*;
+    use crate::GicIrqMirror;
+    use crate::GicMirrorOp;
+    use crate::GicMirrorRoute;
+    use crate::GicMirrorScope;
     use crate::IrqState;
     use crate::VcpuMask;
     use crate::VgicSgiRegs;
     use crate::VirtualInterrupt;
     use core::cell::RefCell;
-    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::AtomicBool;
     use core::sync::atomic::Ordering;
 
     const TEST_VCPUS: usize = 4;
@@ -1251,7 +1169,7 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn hardware_irq_enqueues_hw_entry() {
+    fn full_virtualization_still_uses_software_lr_delivery() {
         let vm = recording_vm(1);
         vm.set_dist_enable(true, true).unwrap();
         vm.map_pirq(
@@ -1263,55 +1181,45 @@ mod tests {
             0x20,
         )
         .unwrap();
+
         vm.on_physical_irq(VcpuId(0), PIntId(48), true).unwrap();
         let vcpu = vm.vcpu(VcpuId(0)).unwrap();
-        let enqueued = vcpu.enqueued.borrow();
-        assert_eq!(enqueued.count, 1);
-        match enqueued.last.as_ref().expect("expected hardware virq") {
-            VirtualInterrupt::Hardware { pintid, .. } => {
-                assert_eq!(*pintid, 48);
-            }
+        match vcpu.enqueued.borrow().last.as_ref().expect("expected virq") {
+            VirtualInterrupt::Software { vintid, .. } => assert_eq!(*vintid, 40),
+            _ => panic!("expected software virq"),
+        }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn passthrough_uses_hardware_lr_delivery() {
+        let vm = recording_vm(1);
+        let vintid = VIntId(40);
+        let bit = 1u32 << (vintid.0 - 32);
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_spi_pirq_passthrough(PIntId(48), vintid).unwrap();
+        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), bit)
+            .unwrap();
+
+        vm.on_physical_irq(VcpuId(0), PIntId(48), true).unwrap();
+        let vcpu = vm.vcpu(VcpuId(0)).unwrap();
+        match vcpu.enqueued.borrow().last.as_ref().expect("expected virq") {
+            VirtualInterrupt::Hardware { pintid, .. } => assert_eq!(*pintid, 48),
             _ => panic!("expected hardware virq"),
         }
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn prepared_spi_bind_rejects_ingress_until_guest_enables() {
-        let vm = recording_vm(1);
-        let pintid = PIntId(48);
-        let vintid = VIntId(40);
-        vm.set_dist_enable(true, true).unwrap();
-        vm.bind_spi_pirq_prepared(pintid, vintid).unwrap();
-
-        let unresolved = vm.on_physical_irq(VcpuId(0), pintid, true);
-        assert!(matches!(unresolved, Err(GicError::InvalidState)));
-        {
-            let vcpu = vm.vcpu(VcpuId(0)).unwrap();
-            assert_eq!(vcpu.enqueued.borrow().count, 0);
-        }
-
-        vm.set_enable(VgicIrqScope::Global, vintid, true).unwrap();
-        {
-            let vcpu = vm.vcpu(VcpuId(0)).unwrap();
-            assert_eq!(vcpu.enqueued.borrow().count, 0);
-        }
-
-        vm.on_physical_irq(VcpuId(0), pintid, true).unwrap();
-        let vcpu = vm.vcpu(VcpuId(0)).unwrap();
-        let enqueued = vcpu.enqueued.borrow();
-        assert_eq!(enqueued.count, 1);
-    }
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn prepared_local_ppi_bind_targets_single_vcpu() {
+    fn passthrough_local_ppi_targets_single_vcpu() {
         let vm = recording_vm(2);
         let target_vcpu = VcpuId(1);
         let other_vcpu = VcpuId(0);
         let pintid = PIntId(27);
         let vintid = VIntId(27);
-        vm.set_dist_enable(true, true).unwrap();
 
-        vm.bind_local_pirq_prepared(pintid, target_vcpu, vintid)
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_local_pirq_passthrough(pintid, target_vcpu, vintid)
+            .unwrap();
+        vm.set_enable(VgicIrqScope::Local(target_vcpu), vintid, true)
             .unwrap();
 
         {
@@ -1332,61 +1240,15 @@ mod tests {
                 entry.delivery,
                 PirqDelivery::Local {
                     target,
-                    physical: PassthroughPhysicalConfig::Unresolved
-                } if target == target_vcpu
-            ));
-            assert_eq!(entry.vintid, vintid);
-        }
-
-        let unresolved = vm.on_physical_irq(target_vcpu, pintid, true);
-        assert!(matches!(unresolved, Err(GicError::InvalidState)));
-        {
-            let target = vm.vcpu(target_vcpu).unwrap();
-            assert_eq!(target.enqueued.borrow().count, 0);
-        }
-        {
-            let other = vm.vcpu(other_vcpu).unwrap();
-            assert_eq!(other.enqueued.borrow().count, 0);
-        }
-
-        vm.set_enable(VgicIrqScope::Local(target_vcpu), vintid, true)
-            .unwrap();
-
-        {
-            let routing = vm.common.routing_lock.lock_irqsave();
-            let entry = routing
-                .pirqs
-                .get_local(target_vcpu, pintid)
-                .unwrap()
-                .expect("expected resolved pIRQ map");
-            assert_eq!(
-                routing
-                    .pirqs
-                    .lookup_local_by_vintid(target_vcpu, vintid)
-                    .unwrap(),
-                Some(pintid)
-            );
-            assert!(matches!(
-                entry.delivery,
-                PirqDelivery::Local {
-                    target,
-                    physical: PassthroughPhysicalConfig::Resolved {
-                        sense: IrqSense::Level
-                    }
+                    dist_mode: DistMirrorMode::WriteThrough,
+                    cpu_mode: CpuDeliveryMode::HardwareLr,
                 } if target == target_vcpu
             ));
         }
 
         vm.on_physical_irq(target_vcpu, pintid, true).unwrap();
-
-        {
-            let target = vm.vcpu(target_vcpu).unwrap();
-            assert_eq!(target.enqueued.borrow().count, 1);
-        }
-        {
-            let other = vm.vcpu(other_vcpu).unwrap();
-            assert_eq!(other.enqueued.borrow().count, 0);
-        }
+        assert_eq!(vm.vcpu(target_vcpu).unwrap().enqueued.borrow().count, 1);
+        assert_eq!(vm.vcpu(other_vcpu).unwrap().enqueued.borrow().count, 0);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
@@ -1398,21 +1260,10 @@ mod tests {
         let vcpu1 = VcpuId(1);
 
         vm.set_dist_enable(true, true).unwrap();
-        vm.bind_local_pirq_prepared(pintid, vcpu0, vintid).unwrap();
-        vm.bind_local_pirq_prepared(pintid, vcpu1, vintid).unwrap();
-
-        {
-            let routing = vm.common.routing_lock.lock_irqsave();
-            assert_eq!(
-                routing.pirqs.lookup_local_by_vintid(vcpu0, vintid).unwrap(),
-                Some(pintid)
-            );
-            assert_eq!(
-                routing.pirqs.lookup_local_by_vintid(vcpu1, vintid).unwrap(),
-                Some(pintid)
-            );
-        }
-
+        vm.bind_local_pirq_passthrough(pintid, vcpu0, vintid)
+            .unwrap();
+        vm.bind_local_pirq_passthrough(pintid, vcpu1, vintid)
+            .unwrap();
         vm.set_enable(VgicIrqScope::Local(vcpu0), vintid, true)
             .unwrap();
         vm.set_enable(VgicIrqScope::Local(vcpu1), vintid, true)
@@ -1421,59 +1272,17 @@ mod tests {
         vm.on_physical_irq(vcpu0, pintid, true).unwrap();
         vm.on_physical_irq(vcpu1, pintid, true).unwrap();
 
-        {
-            let target = vm.vcpu(vcpu0).unwrap();
-            assert_eq!(target.enqueued.borrow().count, 1);
-        }
-        {
-            let target = vm.vcpu(vcpu1).unwrap();
-            assert_eq!(target.enqueued.borrow().count, 1);
-        }
+        assert_eq!(vm.vcpu(vcpu0).unwrap().enqueued.borrow().count, 1);
+        assert_eq!(vm.vcpu(vcpu1).unwrap().enqueued.borrow().count, 1);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn local_ppi_edge_trigger_before_enable_resolves_as_edge() {
-        let vm = recording_vm(1);
-        let target_vcpu = VcpuId(0);
-        let pintid = PIntId(27);
-        let vintid = VIntId(27);
-
-        vm.bind_local_pirq_prepared(pintid, target_vcpu, vintid)
-            .unwrap();
-        vm.write_trigger_word(
-            VgicIrqScope::Local(target_vcpu),
-            VIntId(16),
-            0b10u32 << ((vintid.0 - 16) * 2),
-        )
-        .unwrap();
-
-        vm.set_enable(VgicIrqScope::Local(target_vcpu), vintid, true)
-            .unwrap();
-
-        let routing = vm.common.routing_lock.lock_irqsave();
-        let entry = routing
-            .pirqs
-            .get_local(target_vcpu, pintid)
-            .unwrap()
-            .expect("expected resolved pIRQ map");
-        assert!(matches!(
-            entry.delivery,
-            PirqDelivery::Local {
-                target,
-                physical: PassthroughPhysicalConfig::Resolved {
-                    sense: IrqSense::Edge
-                }
-            } if target == target_vcpu
-        ));
-    }
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn bind_spi_pirq_does_not_touch_spi_route() {
+    fn bind_spi_pirq_passthrough_does_not_touch_spi_route() {
         let vm = recording_vm(2);
         let vintid = VIntId(40);
         vm.set_spi_route(vintid, VSpiRouting::Targets(VcpuMask::from_bits(0b10)))
             .unwrap();
-        vm.bind_spi_pirq_prepared(PIntId(48), vintid).unwrap();
+        vm.bind_spi_pirq_passthrough(PIntId(48), vintid).unwrap();
         assert_eq!(
             vm.get_spi_route(vintid).unwrap(),
             VSpiRouting::Targets(VcpuMask::from_bits(0b10))
@@ -1505,9 +1314,9 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn bind_local_pirq_prepared_rejects_invalid_target_vcpu() {
+    fn bind_local_pirq_passthrough_rejects_invalid_target_vcpu() {
         let vm = recording_vm(1);
-        let res = vm.bind_local_pirq_prepared(PIntId(48), VcpuId(2), VIntId(27));
+        let res = vm.bind_local_pirq_passthrough(PIntId(48), VcpuId(2), VIntId(27));
         assert!(matches!(res, Err(GicError::InvalidVcpuId)));
     }
 
@@ -1539,14 +1348,14 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn unmapped_local_ppi_enable_is_rejected() {
+    fn unmapped_local_ppi_enable_updates_shadow_only() {
         let vm = recording_vm(1);
         let target = VcpuId(0);
         let vintid = VIntId(27);
 
-        let res = vm.set_enable(VgicIrqScope::Local(target), vintid, true);
-        assert!(matches!(res, Err(GicError::UnsupportedIntId)));
-        assert_eq!(
+        vm.set_enable(VgicIrqScope::Local(target), vintid, true)
+            .unwrap();
+        assert_ne!(
             vm.read_enable_word(VgicIrqScope::Local(target), VIntId(0))
                 .unwrap()
                 & (1u32 << vintid.0),
@@ -1555,14 +1364,14 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn unmapped_spi_enable_is_rejected() {
+    fn unmapped_spi_enable_updates_shadow_only() {
         let vm = recording_vm(1);
         let vintid = VIntId(40);
         let bit = 1u32 << (vintid.0 - 32);
 
-        let res = vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), bit);
-        assert!(matches!(res, Err(GicError::UnsupportedIntId)));
-        assert_eq!(
+        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), bit)
+            .unwrap();
+        assert_ne!(
             vm.read_enable_word(VgicIrqScope::Global, VIntId(32))
                 .unwrap()
                 & bit,
@@ -1579,95 +1388,189 @@ mod tests {
         assert!(vm_size >= common_size + v2_size);
     }
 
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn pirq_reverse_lookup_updates_on_bind_and_unmap() {
-        let vm = recording_vm(1);
-        let pintid = PIntId(48);
-        let vintid = VIntId(40);
-        vm.bind_spi_pirq_prepared(pintid, vintid).unwrap();
-        {
-            let routing = vm.common.routing_lock.lock_irqsave();
-            assert_eq!(
-                routing.pirqs.lookup_by_vintid(vintid).unwrap(),
-                Some(pintid)
-            );
-        }
-        vm.unmap_pirq(pintid).unwrap();
-        {
-            let routing = vm.common.routing_lock.lock_irqsave();
-            assert_eq!(routing.pirqs.lookup_by_vintid(vintid).unwrap(), None);
-        }
-    }
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn pirq_duplicate_vintid_rejected_for_bindings() {
-        let vm = recording_vm(1);
-        let vintid = VIntId(40);
-        vm.bind_spi_pirq_prepared(PIntId(48), vintid).unwrap();
-        let res = vm.bind_spi_pirq_prepared(PIntId(49), vintid);
-        assert!(matches!(res, Err(GicError::InvalidState)));
-    }
-
-    struct LocalConfigureRecordingDelegate;
-
-    static LOCAL_CONFIG_DELEGATE: LocalConfigureRecordingDelegate = LocalConfigureRecordingDelegate;
-    static LOCAL_CONFIG_MANAGER: manager::VgicManager<TEST_VCPUS> =
-        manager::VgicManager::new(&LOCAL_CONFIG_DELEGATE, 9);
-
-    static LOCAL_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    static LOCAL_CONFIG_TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static LOCAL_CONFIG_INTID: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static LOCAL_CONFIG_GROUP: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static LOCAL_CONFIG_PRIORITY: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static LOCAL_CONFIG_TRIGGER: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static LOCAL_CONFIG_ENABLE: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-    fn reset_local_config_state() {
-        LOCAL_CONFIG_COUNTER.store(0, Ordering::SeqCst);
-        LOCAL_CONFIG_TARGET.store(usize::MAX, Ordering::SeqCst);
-        LOCAL_CONFIG_INTID.store(usize::MAX, Ordering::SeqCst);
-        LOCAL_CONFIG_GROUP.store(usize::MAX, Ordering::SeqCst);
-        LOCAL_CONFIG_PRIORITY.store(usize::MAX, Ordering::SeqCst);
-        LOCAL_CONFIG_TRIGGER.store(usize::MAX, Ordering::SeqCst);
-        LOCAL_CONFIG_ENABLE.store(usize::MAX, Ordering::SeqCst);
-    }
-
-    impl manager::VgicDelegate for LocalConfigureRecordingDelegate {
-        fn distributor(&self) -> Result<&'static dyn crate::GicDistributor, GicError> {
-            Err(GicError::InvalidState)
-        }
-
-        fn configure_local_ppi(
-            &self,
-            _vm_id: usize,
-            target_vcpu: u16,
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    enum RecordedMirrorOp {
+        SetGroup {
+            scope: GicMirrorScope,
             intid: u32,
             group: IrqGroup,
+        },
+        SetPriority {
+            scope: GicMirrorScope,
+            intid: u32,
             priority: u8,
+        },
+        SetTrigger {
+            scope: GicMirrorScope,
+            intid: u32,
             trigger: TriggerMode,
-            enable: EnableOp,
-        ) -> Result<(), GicError> {
-            LOCAL_CONFIG_COUNTER.fetch_add(1, Ordering::SeqCst);
-            LOCAL_CONFIG_TARGET.store(target_vcpu as usize, Ordering::SeqCst);
-            LOCAL_CONFIG_INTID.store(intid as usize, Ordering::SeqCst);
-            LOCAL_CONFIG_GROUP.store(
-                match group {
-                    IrqGroup::Group0 => 0,
-                    IrqGroup::Group1 => 1,
+        },
+        SetEnable {
+            scope: GicMirrorScope,
+            intid: u32,
+            enable: bool,
+        },
+        SetPending {
+            scope: GicMirrorScope,
+            intid: u32,
+            pending: bool,
+        },
+        SetActive {
+            scope: GicMirrorScope,
+            intid: u32,
+            active: bool,
+        },
+        SetRoute {
+            intid: u32,
+            route: GicMirrorRoute,
+        },
+    }
+
+    const MAX_RECORDED_MIRROR_OPS: usize = 32;
+
+    struct MirrorLog {
+        count: usize,
+        ops: [Option<RecordedMirrorOp>; MAX_RECORDED_MIRROR_OPS],
+    }
+
+    impl MirrorLog {
+        const fn new() -> Self {
+            Self {
+                count: 0,
+                ops: [None; MAX_RECORDED_MIRROR_OPS],
+            }
+        }
+
+        fn clear(&mut self) {
+            self.count = 0;
+            self.ops = [None; MAX_RECORDED_MIRROR_OPS];
+        }
+    }
+
+    struct RecordingMirror;
+    struct MirrorRecordingDelegate;
+
+    static RECORDING_MIRROR: RecordingMirror = RecordingMirror;
+    static MIRROR_DELEGATE: MirrorRecordingDelegate = MirrorRecordingDelegate;
+    static MIRROR_MANAGER: manager::VgicManager<TEST_VCPUS> =
+        manager::VgicManager::new(&MIRROR_DELEGATE, 11);
+    static MIRROR_LOG: RawSpinLockIrqSave<MirrorLog> = RawSpinLockIrqSave::new(MirrorLog::new());
+    static MIRROR_REJECT_GROUP0: AtomicBool = AtomicBool::new(false);
+
+    fn reset_mirror_state() {
+        MIRROR_REJECT_GROUP0.store(false, Ordering::SeqCst);
+        let mut log = MIRROR_LOG.lock_irqsave();
+        log.clear();
+    }
+
+    fn recorded_mirror_count() -> usize {
+        let log = MIRROR_LOG.lock_irqsave();
+        log.count
+    }
+
+    fn recorded_mirror_op(index: usize) -> RecordedMirrorOp {
+        let log = MIRROR_LOG.lock_irqsave();
+        log.ops[index].expect("missing recorded mirror op")
+    }
+
+    fn mirrored_vm(vcpu_count: u16) -> RecordingVm {
+        let vm = recording_vm(vcpu_count);
+        vm.set_pirq_manager_ctx(&MIRROR_MANAGER as *const _ as *mut ());
+        vm
+    }
+
+    impl GicIrqMirror for RecordingMirror {
+        fn max_intid(&self) -> u32 {
+            crate::max_intids_for_vcpus(TEST_VCPUS) as u32
+        }
+
+        fn apply_mirror_op(&self, op: GicMirrorOp) -> Result<(), GicError> {
+            if MIRROR_REJECT_GROUP0.load(Ordering::SeqCst)
+                && matches!(
+                    op,
+                    GicMirrorOp::SetGroup {
+                        group: IrqGroup::Group0,
+                        ..
+                    }
+                )
+            {
+                return Err(GicError::UnsupportedFeature);
+            }
+
+            let recorded = match op {
+                GicMirrorOp::SetGroup {
+                    scope,
+                    intid,
+                    group,
+                } => RecordedMirrorOp::SetGroup {
+                    scope,
+                    intid,
+                    group,
                 },
-                Ordering::SeqCst,
-            );
-            LOCAL_CONFIG_PRIORITY.store(priority as usize, Ordering::SeqCst);
-            LOCAL_CONFIG_TRIGGER.store(trigger_to_index(trigger), Ordering::SeqCst);
-            LOCAL_CONFIG_ENABLE.store(
-                match enable {
-                    EnableOp::Keep => 0,
-                    EnableOp::Enable => 1,
-                    EnableOp::Disable => 2,
+                GicMirrorOp::SetPriority {
+                    scope,
+                    intid,
+                    priority,
+                } => RecordedMirrorOp::SetPriority {
+                    scope,
+                    intid,
+                    priority,
                 },
-                Ordering::SeqCst,
-            );
+                GicMirrorOp::SetTrigger {
+                    scope,
+                    intid,
+                    trigger,
+                } => RecordedMirrorOp::SetTrigger {
+                    scope,
+                    intid,
+                    trigger,
+                },
+                GicMirrorOp::SetEnable {
+                    scope,
+                    intid,
+                    enable,
+                } => RecordedMirrorOp::SetEnable {
+                    scope,
+                    intid,
+                    enable,
+                },
+                GicMirrorOp::SetPending {
+                    scope,
+                    intid,
+                    pending,
+                } => RecordedMirrorOp::SetPending {
+                    scope,
+                    intid,
+                    pending,
+                },
+                GicMirrorOp::SetActive {
+                    scope,
+                    intid,
+                    active,
+                } => RecordedMirrorOp::SetActive {
+                    scope,
+                    intid,
+                    active,
+                },
+                GicMirrorOp::SetRoute { intid, route } => {
+                    RecordedMirrorOp::SetRoute { intid, route }
+                }
+            };
+
+            let mut log = MIRROR_LOG.lock_irqsave();
+            if log.count >= log.ops.len() {
+                return Err(GicError::OutOfResources);
+            }
+            let index = log.count;
+            log.ops[index] = Some(recorded);
+            log.count = index + 1;
             Ok(())
+        }
+    }
+
+    impl manager::VgicDelegate for MirrorRecordingDelegate {
+        fn irq_mirror(&self) -> Result<&'static dyn GicIrqMirror, GicError> {
+            Ok(&RECORDING_MIRROR)
         }
 
         fn get_resident_affinity(
@@ -1695,225 +1598,178 @@ mod tests {
         }
     }
 
-    static CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    static CONFIG_GROUP: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static CONFIG_PRIORITY: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static CONFIG_TRIGGER: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static CONFIG_TARGETS: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static CONFIG_ENABLE: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-    fn reset_config_hook_state() {
-        CONFIG_COUNTER.store(0, Ordering::SeqCst);
-        CONFIG_GROUP.store(usize::MAX, Ordering::SeqCst);
-        CONFIG_PRIORITY.store(usize::MAX, Ordering::SeqCst);
-        CONFIG_TRIGGER.store(usize::MAX, Ordering::SeqCst);
-        CONFIG_TARGETS.store(usize::MAX, Ordering::SeqCst);
-        CONFIG_ENABLE.store(usize::MAX, Ordering::SeqCst);
-    }
-
-    fn trigger_to_index(trigger: TriggerMode) -> usize {
-        match trigger {
-            TriggerMode::Level => 0,
-            TriggerMode::Edge => 1,
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn pirq_reverse_lookup_updates_on_bind_and_unmap() {
+        let vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+        vm.bind_spi_pirq_passthrough(pintid, vintid).unwrap();
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            assert_eq!(
+                routing.pirqs.lookup_by_vintid(vintid).unwrap(),
+                Some(pintid)
+            );
+        }
+        vm.unmap_pirq(pintid).unwrap();
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            assert_eq!(routing.pirqs.lookup_by_vintid(vintid).unwrap(), None);
         }
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn local_first_enable_invokes_local_configure_callback() {
+    fn pirq_duplicate_vintid_rejected_for_bindings() {
         let vm = recording_vm(1);
-        let target_vcpu = VcpuId(0);
+        let vintid = VIntId(40);
+        vm.bind_spi_pirq_passthrough(PIntId(48), vintid).unwrap();
+        let res = vm.bind_spi_pirq_passthrough(PIntId(49), vintid);
+        assert!(matches!(res, Err(GicError::InvalidState)));
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn no_first_enable_resolution_remains_for_local_ppi() {
+        let vm = mirrored_vm(1);
+        let target = VcpuId(0);
         let vintid = VIntId(27);
-        let bit = 1u32 << vintid.0;
-        vm.set_pirq_manager_ctx(&LOCAL_CONFIG_MANAGER as *const _ as *mut ());
+        let group_bit = 1u32 << vintid.0;
 
-        reset_local_config_state();
-        vm.bind_local_pirq_prepared(PIntId(27), target_vcpu, vintid)
+        reset_mirror_state();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
             .unwrap();
-        assert_eq!(LOCAL_CONFIG_COUNTER.load(Ordering::SeqCst), 0);
 
-        vm.set_group(VgicIrqScope::Local(target_vcpu), vintid, IrqGroup::Group1)
+        vm.write_group_word(VgicIrqScope::Local(target), VIntId(0), group_bit)
             .unwrap();
-        vm.set_priority(VgicIrqScope::Local(target_vcpu), vintid, 0x68)
+        vm.write_priority_word(VgicIrqScope::Local(target), VIntId(24), 0x68u32 << 24)
             .unwrap();
         vm.write_trigger_word(
-            VgicIrqScope::Local(target_vcpu),
+            VgicIrqScope::Local(target),
             VIntId(16),
             0b10u32 << ((vintid.0 - 16) * 2),
         )
         .unwrap();
-        assert_eq!(LOCAL_CONFIG_COUNTER.load(Ordering::SeqCst), 0);
 
-        vm.write_set_enable_word(VgicIrqScope::Local(target_vcpu), VIntId(0), bit)
-            .unwrap();
-
-        assert_eq!(LOCAL_CONFIG_COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded_mirror_count(), 3);
         assert_eq!(
-            LOCAL_CONFIG_TARGET.load(Ordering::SeqCst),
-            target_vcpu.0 as usize
+            recorded_mirror_op(0),
+            RecordedMirrorOp::SetGroup {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                group: IrqGroup::Group1,
+            }
         );
-        assert_eq!(LOCAL_CONFIG_INTID.load(Ordering::SeqCst), 27);
-        assert_eq!(LOCAL_CONFIG_GROUP.load(Ordering::SeqCst), 1);
-        assert_eq!(LOCAL_CONFIG_PRIORITY.load(Ordering::SeqCst), 0x68);
-        assert_eq!(LOCAL_CONFIG_TRIGGER.load(Ordering::SeqCst), 1);
-        assert_eq!(LOCAL_CONFIG_ENABLE.load(Ordering::SeqCst), 1);
-    }
+        assert_eq!(
+            recorded_mirror_op(1),
+            RecordedMirrorOp::SetPriority {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                priority: 0x68,
+            }
+        );
+        assert_eq!(
+            recorded_mirror_op(2),
+            RecordedMirrorOp::SetTrigger {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                trigger: TriggerMode::Edge,
+            }
+        );
 
-    fn configure_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
-        if int_id != 48 {
-            return Ok(());
-        }
-        let PirqHookOp::Configure {
-            group,
-            priority,
-            trigger,
-            targets,
-            enable,
-        } = op
-        else {
-            return Ok(());
-        };
-        CONFIG_COUNTER.fetch_add(1, Ordering::SeqCst);
-        CONFIG_GROUP.store(group as usize, Ordering::SeqCst);
-        CONFIG_PRIORITY.store(priority as usize, Ordering::SeqCst);
-        CONFIG_TRIGGER.store(trigger_to_index(trigger), Ordering::SeqCst);
-        CONFIG_TARGETS.store(targets as usize, Ordering::SeqCst);
-        CONFIG_ENABLE.store(enable as usize, Ordering::SeqCst);
-        Ok(())
-    }
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn bind_spi_pirq_prepared_does_not_emit_initial_configure_hook() {
-        let vm = recording_vm(1);
-        vm.set_pirq_hook(Some(configure_hook));
-        reset_config_hook_state();
-        vm.bind_spi_pirq_prepared(PIntId(48), VIntId(40)).unwrap();
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 0);
+        vm.write_set_enable_word(VgicIrqScope::Local(target), VIntId(0), group_bit)
+            .unwrap();
+        assert_eq!(recorded_mirror_count(), 4);
+        assert_eq!(
+            recorded_mirror_op(3),
+            RecordedMirrorOp::SetEnable {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                enable: true,
+            }
+        );
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn first_guest_enable_resolves_spi_with_full_guest_configuration() {
-        let vm = recording_vm(2);
+    fn local_ppi_group_write_through_emits_mirror_op() {
+        let vm = mirrored_vm(1);
+        let target = VcpuId(0);
+        let vintid = VIntId(27);
+
+        reset_mirror_state();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
+            .unwrap();
+        vm.write_group_word(VgicIrqScope::Local(target), VIntId(0), 1u32 << vintid.0)
+            .unwrap();
+
+        assert_eq!(recorded_mirror_count(), 1);
+        assert_eq!(
+            recorded_mirror_op(0),
+            RecordedMirrorOp::SetGroup {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                group: IrqGroup::Group1,
+            }
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn local_ppi_priority_write_through_emits_mirror_op() {
+        let vm = mirrored_vm(1);
+        let target = VcpuId(0);
+        let vintid = VIntId(27);
+
+        reset_mirror_state();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
+            .unwrap();
+        vm.write_priority_word(VgicIrqScope::Local(target), VIntId(24), 0x60u32 << 24)
+            .unwrap();
+
+        assert_eq!(recorded_mirror_count(), 1);
+        assert_eq!(
+            recorded_mirror_op(0),
+            RecordedMirrorOp::SetPriority {
+                scope: GicMirrorScope::Local(target),
+                intid: 27,
+                priority: 0x60,
+            }
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn exact_gicv2_itargetsr_byte_is_mirrored() {
+        let vm = mirrored_vm(4);
         let vintid = VIntId(40);
-        vm.bind_spi_pirq_prepared(PIntId(48), vintid).unwrap();
-        vm.set_spi_route(vintid, VSpiRouting::Targets(VcpuMask::from_bits(0b10)))
-            .unwrap();
-        vm.write_group_word(VgicIrqScope::Global, VIntId(32), 1u32 << (vintid.0 - 32))
-            .unwrap();
-        vm.write_priority_word(VgicIrqScope::Global, VIntId(40), 0x58)
-            .unwrap();
-        vm.write_trigger_word(
-            VgicIrqScope::Global,
-            VIntId(32),
-            0b10u32 << ((vintid.0 - 32) * 2),
+
+        reset_mirror_state();
+        vm.bind_spi_pirq_passthrough(PIntId(48), vintid).unwrap();
+        vm.set_spi_route(
+            vintid,
+            VSpiRouting::Targets(VcpuMask::from_bits(0b0000_1011)),
         )
         .unwrap();
 
-        vm.set_pirq_hook(Some(configure_hook));
-        reset_config_hook_state();
-
-        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), 1u32 << (vintid.0 - 32))
-            .unwrap();
-
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_GROUP.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_PRIORITY.load(Ordering::SeqCst), 0x58);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_TARGETS.load(Ordering::SeqCst), 0b10);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded_mirror_count(), 1);
+        assert_eq!(
+            recorded_mirror_op(0),
+            RecordedMirrorOp::SetRoute {
+                intid: 48,
+                route: GicMirrorRoute::Gicv2TargetMask(0b0000_1011),
+            }
+        );
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn first_enable_uses_default_level_trigger_without_icfgr_write() {
-        let vm = recording_vm(1);
-        let vintid = VIntId(40);
-        vm.bind_spi_pirq_prepared(PIntId(48), vintid).unwrap();
-        vm.set_pirq_hook(Some(configure_hook));
-        reset_config_hook_state();
-
-        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), 1u32 << (vintid.0 - 32))
-            .unwrap();
-
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn edge_trigger_before_enable_resolves_as_edge() {
-        let vm = recording_vm(1);
-        let vintid = VIntId(40);
-        vm.bind_spi_pirq_prepared(PIntId(48), vintid).unwrap();
-        vm.write_trigger_word(
-            VgicIrqScope::Global,
-            VIntId(32),
-            0b10u32 << ((vintid.0 - 32) * 2),
-        )
-        .unwrap();
-
-        vm.set_pirq_hook(Some(configure_hook));
-        reset_config_hook_state();
-        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), 1u32 << (vintid.0 - 32))
-            .unwrap();
-
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
-    fn resolved_spi_reconfiguration_uses_full_snapshot() {
-        let vm = recording_vm(2);
+    fn security_policy_error_surfaces_on_group_write() {
+        let vm = mirrored_vm(1);
         let vintid = VIntId(40);
         let bit = 1u32 << (vintid.0 - 32);
-        vm.bind_spi_pirq_prepared(PIntId(48), vintid).unwrap();
-        vm.write_set_enable_word(VgicIrqScope::Global, VIntId(32), bit)
-            .unwrap();
 
-        vm.set_pirq_hook(Some(configure_hook));
-        reset_config_hook_state();
-
-        vm.set_spi_route(vintid, VSpiRouting::Targets(VcpuMask::from_bits(0b10)))
-            .unwrap();
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_GROUP.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_PRIORITY.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_TARGETS.load(Ordering::SeqCst), 0b10);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 1);
-
+        reset_mirror_state();
+        vm.bind_spi_pirq_passthrough(PIntId(48), vintid).unwrap();
         vm.write_group_word(VgicIrqScope::Global, VIntId(32), bit)
             .unwrap();
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 2);
-        assert_eq!(CONFIG_GROUP.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_PRIORITY.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_TARGETS.load(Ordering::SeqCst), 0b10);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 1);
 
-        vm.write_priority_word(VgicIrqScope::Global, VIntId(40), 0x68)
-            .unwrap();
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 3);
-        assert_eq!(CONFIG_GROUP.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_PRIORITY.load(Ordering::SeqCst), 0x68);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 0);
-        assert_eq!(CONFIG_TARGETS.load(Ordering::SeqCst), 0b10);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 1);
-
-        vm.write_trigger_word(
-            VgicIrqScope::Global,
-            VIntId(32),
-            0b10u32 << ((vintid.0 - 32) * 2),
-        )
-        .unwrap();
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 4);
-        assert_eq!(CONFIG_GROUP.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_PRIORITY.load(Ordering::SeqCst), 0x68);
-        assert_eq!(CONFIG_TRIGGER.load(Ordering::SeqCst), 1);
-        assert_eq!(CONFIG_TARGETS.load(Ordering::SeqCst), 0b10);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 1);
-
-        vm.write_clear_enable_word(VgicIrqScope::Global, VIntId(32), bit)
-            .unwrap();
-        assert_eq!(CONFIG_COUNTER.load(Ordering::SeqCst), 5);
-        assert_eq!(CONFIG_ENABLE.load(Ordering::SeqCst), 0);
+        MIRROR_REJECT_GROUP0.store(true, Ordering::SeqCst);
+        let res = vm.write_group_word(VgicIrqScope::Global, VIntId(32), 0);
+        assert!(matches!(res, Err(GicError::UnsupportedFeature)));
     }
 }
