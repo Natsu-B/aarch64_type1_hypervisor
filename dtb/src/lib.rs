@@ -39,6 +39,9 @@ pub use ast::ValueRef;
 pub use tree_copy::copy_node_properties;
 pub use tree_copy::copy_node_with_ancestors;
 pub use tree_copy::copy_subtree;
+pub use tree_copy::copy_subtree_to_path;
+pub use tree_copy::encode_gic_spi_interrupts_with_mapper;
+pub use tree_copy::encode_reg_entries;
 pub use tree_copy::node_path;
 
 #[cfg(test)]

@@ -1,19 +1,21 @@
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
-use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::String;
-use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
 use allocator::AlignedSliceBox;
+use arch_hal::gic::IrqSense;
 use arch_hal::gic::MmioRegion;
+use arch_hal::soc::bcm2712;
 use core::convert::TryInto;
+use core::ops::ControlFlow;
 
-use ::dtb::Borrowed;
 use ::dtb::DeviceTree;
+use ::dtb::DeviceTreeBorrowed;
 use ::dtb::DeviceTreeEditExt;
 use ::dtb::DeviceTreeQueryExt;
+use ::dtb::DtbNodeView;
 use ::dtb::DtbParser;
 use ::dtb::MemReserve;
 use ::dtb::NameRef;
@@ -22,65 +24,129 @@ use ::dtb::NodeId;
 use ::dtb::NodeQueryExt;
 use ::dtb::Owned;
 use ::dtb::ValueRef;
-use ::dtb::patch::Pl011Spec;
-use ::dtb::tree_copy::copy_node_properties;
-use ::dtb::tree_copy::copy_node_with_ancestors;
-use ::dtb::tree_copy::copy_subtree;
-use ::dtb::tree_copy::node_path;
+use ::dtb::WalkError;
+use ::dtb::copy_node_properties;
+use ::dtb::copy_subtree_to_path;
+use ::dtb::encode_gic_spi_interrupts_with_mapper;
+use ::dtb::encode_reg_entries;
+use ::dtb::node_path;
 
 use crate::Gicv2Info;
 use crate::PL011_UART_ADDR;
+use crate::RP1_BASE;
 use crate::vgic;
 
-type SourceTree<'dtb> = DeviceTree<'dtb, Borrowed>;
+type SourceTree<'dtb> = DeviceTreeBorrowed<'dtb>;
 type TargetTree<'dtb> = DeviceTree<'dtb, Owned>;
 
-const CORE_GIC_PATHS: [&str; 2] = [
-    "/soc@107c000000/interrupt-controller@7fff9000",
-    "/soc/interrupt-controller@7fff9000",
+const SOURCE_SOC_PATHS: [&str; 2] = ["/soc@107c000000", "/soc"];
+const SOURCE_CLOCKS_PATH: &str = "/clocks";
+const SOURCE_AXI_PATH: &str = "/axi";
+
+const TARGET_SOC_PATH: &str = "/soc@107c000000";
+const TARGET_UART_PATH: &str = "/soc@107c000000/serial@1c00030000";
+const TARGET_GPIO_PATH: &str = "/soc@107c000000/gpio@1c000d0000";
+const TARGET_I2C0_PATH: &str = "/soc@107c000000/i2c@1c00070000";
+const TARGET_I2C10_PATH: &str = "/soc@107c000000/i2c@1c00088000";
+const TARGET_RP1_CLOCKS_PATH: &str = "/soc@107c000000/clocks@1c00018000";
+const TARGET_CSI0_PATH: &str = "/soc@107c000000/csi@1c0110000";
+const TARGET_CSI1_PATH: &str = "/soc@107c000000/csi@1c0128000";
+const TARGET_MAILBOX_PATH: &str = "/soc@107c000000/mailbox@7c013880";
+
+const SOURCE_UART0_PATH: &str = "/axi/pcie@1000120000/rp1/serial@30000";
+const SOURCE_GPIO_PATH: &str = "/axi/pcie@1000120000/rp1/gpio@d0000";
+const SOURCE_I2C0_PATH: &str = "/axi/pcie@1000120000/rp1/i2c@70000";
+const SOURCE_I2C10_PATH: &str = "/axi/pcie@1000120000/rp1/i2c@88000";
+const SOURCE_RP1_CLOCKS_PATH: &str = "/axi/pcie@1000120000/rp1/clocks@18000";
+const SOURCE_CSI0_PATH: &str = "/axi/pcie@1000120000/rp1/csi@110000";
+const SOURCE_CSI1_PATH: &str = "/axi/pcie@1000120000/rp1/csi@128000";
+
+const SOURCE_CLK_XOSC_PATH: &str = "/clocks/clk_xosc";
+const SOURCE_CLK_EMMC2_PATH: &str = "/clocks/clk-emmc2";
+const SOURCE_IOMMU5_PATH: &str = "/axi/iommu@5280";
+const SOURCE_IOMMUC_PATH: &str = "/axi/iommuc@5b00";
+const SOURCE_SD_IO_1V8_REG_PATH: &str = "/sd-io-1v8-reg";
+const SOURCE_SD_VCC_REG_PATH: &str = "/sd-vcc-reg";
+const SOURCE_CAM0_CLK_PATH: &str = "/cam0_clk";
+const SOURCE_CAM1_CLK_PATH: &str = "/cam1_clk";
+const SOURCE_CAM0_REG_PATH: &str = "/cam0_reg";
+const SOURCE_CAM1_REG_PATH: &str = "/cam1_reg";
+const SOURCE_CAM_DUMMY_REG_PATH: &str = "/cam_dummy_reg";
+const SOURCE_I2C0IF_PATH: &str = "/i2c0if";
+const SOURCE_I2C0MUX_PATH: &str = "/i2c0mux";
+
+const ROOT_PROPERTY_NAMES: [&str; 5] = [
+    "#address-cells",
+    "#size-cells",
+    "model",
+    "compatible",
+    "interrupt-parent",
 ];
-const CORE_MAILBOX_PATHS: [&str; 2] = ["/soc@107c000000/mailbox@7c013880", "/soc/mailbox@7c013880"];
-const CORE_SDIO1_PATHS: [&str; 2] = ["/soc@107c000000/mmc@fff000", "/soc/mmc@fff000"];
-const CORE_PCIE_HOST_PATH: &str = "/axi/pcie@1000120000";
-const CORE_RP1_PATH: &str = "/axi/pcie@1000120000/rp1";
-const CAMERA_SEED_PATHS: [&str; 18] = [
-    "/axi/pcie@1000120000/rp1/i2c@70000",
-    "/axi/pcie@1000120000/rp1/i2c@88000",
-    "/axi/pcie@1000120000/rp1/csi@110000",
-    "/axi/pcie@1000120000/rp1/csi@128000",
-    "/axi/pcie@1000120000/rp1/mailbox@8000",
-    "/axi/pcie@1000120000/rp1/clocks@18000",
-    "/axi/iommu@5280",
-    "/axi/iommuc@5b00",
-    "/axi/msi-controller@1000130000",
-    "/soc@107c000000/reset-controller@119500",
-    "/soc@107c000000/reset-controller@1504318",
-    "/clocks/clk_xosc",
-    "/clocks/clk_emmc2",
-    "/clocks/clk_uart",
-    "/clocks/clk_vpu",
-    "/clocks/sdio_src",
-    "/clocks/sdhci_core",
-    "/rp1_firmware",
-];
-const HELPER_SEED_PATHS: [&str; 10] = [
-    "/sd_io_1v8_reg",
-    "/sd_vcc_reg",
-    "/cam0_clk",
-    "/cam1_clk",
-    "/cam0_reg",
-    "/cam1_reg",
-    "/cam_dummy_reg",
-    "/i2c0if",
-    "/i2c0mux",
-    "/rp1_firmware",
-];
+const SOC_PROPERTY_NAMES: [&str; 2] = ["compatible", "interrupt-parent"];
 const CPU_KEEP_NAMES: [&str; 3] = ["cpu@0", "cpu@1", "cpu@2"];
-const SOURCE_METADATA_NODES: [&str; 4] = [
-    "/__symbols__",
-    "/__fixups__",
-    "/__local_fixups__",
-    "/__overrides__",
+
+const SOC_PHYS_BASE: u64 = 0x10_0000_0000;
+const SOC_PHYS_SIZE: u64 = 0x8000_0000;
+const RP1_SOC_WINDOW_SIZE: u64 = 0x40_0000;
+
+#[derive(Clone, Copy)]
+enum ProjectionInterrupts {
+    None,
+    Rp1Msix,
+    Uart0,
+}
+
+#[derive(Clone, Copy)]
+struct Rp1Projection {
+    source: &'static str,
+    target: &'static str,
+    interrupts: ProjectionInterrupts,
+    force_status_ok: bool,
+}
+
+const RP1_PROJECTIONS: [Rp1Projection; 7] = [
+    Rp1Projection {
+        source: SOURCE_UART0_PATH,
+        target: TARGET_UART_PATH,
+        interrupts: ProjectionInterrupts::Uart0,
+        force_status_ok: true,
+    },
+    Rp1Projection {
+        source: SOURCE_GPIO_PATH,
+        target: TARGET_GPIO_PATH,
+        interrupts: ProjectionInterrupts::Rp1Msix,
+        force_status_ok: false,
+    },
+    Rp1Projection {
+        source: SOURCE_I2C0_PATH,
+        target: TARGET_I2C0_PATH,
+        interrupts: ProjectionInterrupts::Rp1Msix,
+        force_status_ok: false,
+    },
+    Rp1Projection {
+        source: SOURCE_I2C10_PATH,
+        target: TARGET_I2C10_PATH,
+        interrupts: ProjectionInterrupts::Rp1Msix,
+        force_status_ok: false,
+    },
+    Rp1Projection {
+        source: SOURCE_RP1_CLOCKS_PATH,
+        target: TARGET_RP1_CLOCKS_PATH,
+        interrupts: ProjectionInterrupts::None,
+        force_status_ok: false,
+    },
+    Rp1Projection {
+        source: SOURCE_CSI0_PATH,
+        target: TARGET_CSI0_PATH,
+        interrupts: ProjectionInterrupts::Rp1Msix,
+        force_status_ok: false,
+    },
+    Rp1Projection {
+        source: SOURCE_CSI1_PATH,
+        target: TARGET_CSI1_PATH,
+        interrupts: ProjectionInterrupts::Rp1Msix,
+        force_status_ok: false,
+    },
 ];
 
 pub(crate) fn build_guest_dtb(
@@ -89,102 +155,210 @@ pub(crate) fn build_guest_dtb(
     gic_info: &Gicv2Info,
     uart_irq: vgic::UartIrq,
 ) -> Result<AlignedSliceBox<u8>, &'static str> {
-    let source_tree = DeviceTree::from_parser(source)?;
+    let source_tree = DeviceTreeBorrowed::from_parser(source)?;
     let mut target = DeviceTree::with_root(NameRef::Borrowed("/"));
     target.header = source_tree.header.clone();
-    let target_root = target.root;
-    copy_node_properties(&source_tree, source_tree.root, &mut target, target_root)?;
     target.mem_reserve = source_tree.mem_reserve.clone();
 
+    copy_root_properties(&source_tree, &mut target)?;
     let chosen_id = copy_chosen(&source_tree, &mut target)?;
     let initrd_range = remove_initrd(&mut target, chosen_id);
     remove_initrd_memreserve(&mut target, initrd_range);
 
     copy_memory_nodes(&source_tree, &mut target)?;
     copy_cpus(&source_tree, &mut target)?;
-    copy_required_subtree(
+    copy_optional_same_path_subtree(&source_tree, &mut target, "/psci")?;
+    copy_optional_same_path_subtree(&source_tree, &mut target, "/timer")?;
+
+    init_required_same_path_node(
         &source_tree,
         &mut target,
-        &CORE_GIC_PATHS,
+        SOURCE_CLOCKS_PATH,
+        "dtb: missing /clocks node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_CLK_XOSC_PATH,
+        "dtb: missing clk_xosc node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_CLK_EMMC2_PATH,
+        "dtb: missing clk-emmc2 node",
+    )?;
+
+    init_required_same_path_node(
+        &source_tree,
+        &mut target,
+        SOURCE_AXI_PATH,
+        "dtb: missing /axi node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_IOMMU5_PATH,
+        "dtb: missing iommu5 node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_IOMMUC_PATH,
+        "dtb: missing iommuc node",
+    )?;
+
+    init_soc_node(&source_tree, &mut target)?;
+    copy_required_soc_child(
+        &source_tree,
+        source,
+        &mut target,
+        "interrupt-controller@7fff9000",
         "dtb: missing GIC node",
     )?;
-    copy_required_subtree(
+    copy_required_soc_child(
         &source_tree,
+        source,
         &mut target,
-        &CORE_MAILBOX_PATHS,
+        "mailbox@7c013880",
         "dtb: missing mailbox node",
     )?;
-    copy_required_subtree(
+    copy_required_soc_child(
         &source_tree,
+        source,
         &mut target,
-        &CORE_SDIO1_PATHS,
+        "mmc@fff000",
         "dtb: missing sdio1 node",
     )?;
-    copy_required_shallow(
+    copy_optional_soc_child(&source_tree, source, &mut target, "pinctrl@7d504100")?;
+
+    copy_required_same_path_subtree(
         &source_tree,
         &mut target,
-        &[CORE_PCIE_HOST_PATH],
-        "dtb: missing PCIe host node",
+        SOURCE_SD_IO_1V8_REG_PATH,
+        "dtb: missing sd-io-1v8-reg node",
     )?;
-    copy_required_shallow(
+    copy_required_same_path_subtree(
         &source_tree,
         &mut target,
-        &[CORE_RP1_PATH],
-        "dtb: missing RP1 node",
+        SOURCE_SD_VCC_REG_PATH,
+        "dtb: missing sd-vcc-reg node",
     )?;
-    copy_optional_subtree(&source_tree, &mut target, "/psci")?;
-    copy_optional_subtree(&source_tree, &mut target, "/timer")?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_CAM0_CLK_PATH,
+        "dtb: missing cam0_clk node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_CAM1_CLK_PATH,
+        "dtb: missing cam1_clk node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_CAM0_REG_PATH,
+        "dtb: missing cam0_reg node",
+    )?;
+    copy_optional_same_path_subtree(&source_tree, &mut target, SOURCE_CAM1_REG_PATH)?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_CAM_DUMMY_REG_PATH,
+        "dtb: missing cam_dummy_reg node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_I2C0IF_PATH,
+        "dtb: missing i2c0if node",
+    )?;
+    copy_required_same_path_subtree(
+        &source_tree,
+        &mut target,
+        SOURCE_I2C0MUX_PATH,
+        "dtb: missing i2c0mux node",
+    )?;
 
-    let phandle_map = build_phandle_map(&source_tree)?;
-    let mut seed_roots = collect_existing_paths(&source_tree, &CAMERA_SEED_PATHS);
-    seed_roots.extend(collect_existing_paths(&source_tree, &HELPER_SEED_PATHS));
-    let mut allow_all = |_| Ok(true);
-    let (camera_keep_nodes, camera_copy_roots) =
-        collect_subtree_phandle_closure(&source_tree, &seed_roots, &phandle_map, &mut allow_all)?;
-
-    let pcie_host_id = source_tree.find_node_by_path(CORE_PCIE_HOST_PATH);
-    let rp1_id = source_tree.find_node_by_path(CORE_RP1_PATH);
-    for root_id in camera_copy_roots {
-        if is_source_metadata_node(&source_tree, root_id)? {
-            continue;
-        }
-        if is_reserved_memory_child(&source_tree, root_id)? {
-            continue;
-        }
-        if Some(root_id) == pcie_host_id || Some(root_id) == rp1_id {
-            copy_node_with_ancestors(&source_tree, &mut target, root_id)?;
-            continue;
-        }
-        copy_subtree(&source_tree, &mut target, root_id)?;
+    let gic_phandle = find_source_gic_phandle(&source_tree)?;
+    for projection in RP1_PROJECTIONS {
+        project_rp1_subtree(
+            &source_tree,
+            source,
+            &mut target,
+            projection,
+            gic_phandle,
+            uart_irq,
+        )?;
     }
 
-    copy_reserved_memory(&source_tree, &mut target, &camera_keep_nodes)?;
-
-    ::dtb::patch::inject_standalone_pl011(
-        &mut target,
-        Pl011Spec {
-            base: PL011_UART_ADDR.0 as u64,
-            size: 0x1000,
-            uartclk_hz: PL011_UART_ADDR.1 as u32,
-            pintid: uart_irq.pintid,
-            irq_sense: uart_irq.sense,
-        },
-    )?;
-
-    copy_filtered_aliases(&source_tree, &mut target)?;
-    copy_symbols(&source_tree, &mut target)?;
-    copy_fixups(&source_tree, &mut target)?;
-    copy_local_fixups(&source_tree, &mut target)?;
-    copy_overrides(&source_tree, &mut target, &phandle_map)?;
-
+    copy_reserved_memory(&source_tree, &mut target)?;
+    rebuild_aliases(&source_tree, &mut target)?;
     configure_uart_console(&mut target, chosen_id, PL011_UART_ADDR.0)?;
+    append_reserved_memory(&mut target, reserved_memory);
+
     let gicv = gic_info
         .gicv
         .ok_or("gic: missing GICV region for DT update")?;
     update_gicv2_cpu_interface_reg(&mut target, gicv)?;
-    append_reserved_memory(&mut target, reserved_memory);
 
     target.into_dtb_box()
+}
+
+fn copy_root_properties(
+    source: &SourceTree<'_>,
+    target: &mut TargetTree<'_>,
+) -> Result<(), &'static str> {
+    copy_selected_properties(
+        source,
+        source.root,
+        target,
+        target.root,
+        &ROOT_PROPERTY_NAMES,
+    )
+}
+
+fn init_required_same_path_node(
+    source: &SourceTree<'_>,
+    target: &mut TargetTree<'_>,
+    path: &str,
+    error: &'static str,
+) -> Result<NodeId, &'static str> {
+    let source_id = source.find_node_by_path(path).ok_or(error)?;
+    let target_id = target.get_or_create_node_by_path(path)?;
+    copy_node_properties(source, source_id, target, target_id)?;
+    Ok(target_id)
+}
+
+fn init_soc_node(
+    source: &SourceTree<'_>,
+    target: &mut TargetTree<'_>,
+) -> Result<NodeId, &'static str> {
+    let source_path = source_soc_path(source)?;
+    let source_id = source
+        .find_node_by_path(source_path)
+        .ok_or("dtb: missing /soc node")?;
+    let target_id = target.get_or_create_node_by_path(TARGET_SOC_PATH)?;
+    copy_selected_properties(source, source_id, target, target_id, &SOC_PROPERTY_NAMES)?;
+
+    let target_node = target
+        .node_mut(target_id)
+        .ok_or("dtb: missing target /soc node")?;
+    target_node.set_property(
+        NameRef::Borrowed("#address-cells"),
+        ValueRef::Owned(2u32.to_be_bytes().to_vec()),
+    );
+    target_node.set_property(
+        NameRef::Borrowed("#size-cells"),
+        ValueRef::Owned(1u32.to_be_bytes().to_vec()),
+    );
+    target_node.set_property(
+        NameRef::Borrowed("ranges"),
+        ValueRef::Owned(encode_target_soc_ranges()?),
+    );
+    Ok(target_id)
 }
 
 fn copy_chosen(
@@ -210,7 +384,8 @@ fn copy_memory_nodes(
     let mut copied_any = false;
     for child_id in root_children {
         if is_memory_node(source, child_id)? {
-            copy_subtree(source, target, child_id)?;
+            let path = node_path(source, child_id)?;
+            copy_subtree_to_path(source, target, child_id, &path)?;
             copied_any = true;
         }
     }
@@ -225,37 +400,25 @@ fn copy_cpus(source: &SourceTree<'_>, target: &mut TargetTree<'_>) -> Result<(),
     let cpus_id = source
         .find_node_by_path("/cpus")
         .ok_or("dtb: missing /cpus node")?;
-    copy_node_with_ancestors(source, target, cpus_id)?;
+    let target_id = target.get_or_create_node_by_path("/cpus")?;
+    copy_node_properties(source, cpus_id, target, target_id)?;
 
-    let phandle_map = build_phandle_map(source)?;
-    let cpus_node = source.node(cpus_id).ok_or("dtb: invalid /cpus node")?;
-    let mut seed_roots = Vec::new();
-    for cpu_name in CPU_KEEP_NAMES {
-        let cpu_id = cpus_node
-            .children
-            .iter()
-            .copied()
-            .find(|&child_id| {
-                source
-                    .node(child_id)
-                    .map(|child| child.name.as_str() == cpu_name)
-                    .unwrap_or(false)
-            })
-            .ok_or("dtb: missing required CPU node")?;
-        seed_roots.push(cpu_id);
-    }
-
-    let mut allow_cpu_ref = |node_id| {
-        Ok(is_same_or_descendant_of(source, node_id, cpus_id)?
-            && node_path(source, node_id)? != "/cpus/cpu@3")
-    };
-    let (keep_nodes, copy_roots) =
-        collect_subtree_phandle_closure(source, &seed_roots, &phandle_map, &mut allow_cpu_ref)?;
-
-    for root_id in copy_roots {
-        if keep_nodes.contains(&root_id) {
-            copy_subtree(source, target, root_id)?;
+    let children = source
+        .node(cpus_id)
+        .ok_or("dtb: invalid /cpus node")?
+        .children
+        .clone();
+    for child_id in children {
+        let child = source.node(child_id).ok_or("dtb: invalid /cpus child")?;
+        let name = child.name.as_str();
+        let keep_cpu = CPU_KEEP_NAMES.iter().any(|candidate| *candidate == name);
+        let keep_shared_cache =
+            !name.starts_with("cpu@") && property_string_equals(child, "compatible", "cache");
+        if !(keep_cpu || keep_shared_cache) {
+            continue;
         }
+        let path = format!("/cpus/{name}");
+        copy_subtree_to_path(source, target, child_id, &path)?;
     }
     Ok(())
 }
@@ -263,523 +426,486 @@ fn copy_cpus(source: &SourceTree<'_>, target: &mut TargetTree<'_>) -> Result<(),
 fn copy_reserved_memory(
     source: &SourceTree<'_>,
     target: &mut TargetTree<'_>,
-    keep_nodes: &BTreeSet<NodeId>,
 ) -> Result<(), &'static str> {
-    let Some(reserved_id) = source.find_node_by_path("/reserved-memory") else {
+    let Some(source_id) = source.find_node_by_path("/reserved-memory") else {
         return Ok(());
     };
+    let target_id = target.get_or_create_node_by_path("/reserved-memory")?;
+    copy_node_properties(source, source_id, target, target_id)?;
+
     let children = source
-        .node(reserved_id)
+        .node(source_id)
         .ok_or("dtb: invalid reserved-memory node")?
         .children
         .clone();
     for child_id in children {
-        if is_linux_cma_node(source, child_id)? || keep_nodes.contains(&child_id) {
-            copy_subtree(source, target, child_id)?;
+        if !is_linux_cma_node(source, child_id)? {
+            continue;
         }
+        let child_name = source
+            .node(child_id)
+            .ok_or("dtb: invalid reserved-memory child")?
+            .name
+            .as_str();
+        let path = format!("/reserved-memory/{child_name}");
+        copy_subtree_to_path(source, target, child_id, &path)?;
     }
     Ok(())
 }
 
-fn copy_filtered_aliases(
+fn rebuild_aliases(
     source: &SourceTree<'_>,
     target: &mut TargetTree<'_>,
 ) -> Result<(), &'static str> {
-    let Some(source_id) = source.find_node_by_path("/aliases") else {
-        return Ok(());
-    };
-    let source_node = source.node(source_id).ok_or("dtb: invalid aliases node")?;
-    let mut kept = Vec::new();
-
-    for prop in &source_node.properties {
-        let name = prop.name.as_str();
-        if matches!(name, "serial0" | "uart0") {
-            continue;
+    let target_id = target.get_or_create_node_by_path("/aliases")?;
+    if let Some(source_id) = source.find_node_by_path("/aliases") {
+        let source_node = source.node(source_id).ok_or("dtb: invalid aliases node")?;
+        for prop in &source_node.properties {
+            let Some(path) = first_cstr(prop.value.as_slice()) else {
+                continue;
+            };
+            let remapped = remap_alias_path(path);
+            if target.find_node_by_path(&remapped).is_none() {
+                continue;
+            }
+            target
+                .node_mut(target_id)
+                .ok_or("dtb: invalid aliases target node")?
+                .set_property(
+                    NameRef::Owned(prop.name.as_str().into()),
+                    ValueRef::Owned(path_property_bytes(&remapped)),
+                );
         }
-        let Some(path) = first_cstr(prop.value.as_slice()) else {
-            continue;
-        };
+    }
+
+    for (name, path) in [
+        ("serial0", TARGET_UART_PATH),
+        ("uart0", TARGET_UART_PATH),
+        ("i2c0", TARGET_I2C0_PATH),
+        ("i2c10", TARGET_I2C10_PATH),
+        ("mailbox", TARGET_MAILBOX_PATH),
+    ] {
         if target.find_node_by_path(path).is_none() {
             continue;
         }
-        kept.push((name.to_string(), prop.value.as_slice().to_vec()));
-    }
-    if kept.is_empty() {
-        return Ok(());
-    }
-    let target_id = target.get_or_create_node_by_path("/aliases")?;
-    let target_node = target
-        .node_mut(target_id)
-        .ok_or("dtb: invalid aliases target node")?;
-    for (name, value) in kept {
-        target_node.set_property(NameRef::Owned(name), ValueRef::Owned(value));
+        target
+            .node_mut(target_id)
+            .ok_or("dtb: invalid aliases target node")?
+            .set_property(
+                NameRef::Borrowed(name),
+                ValueRef::Owned(path_property_bytes(path)),
+            );
     }
     Ok(())
 }
 
-fn copy_symbols(source: &SourceTree<'_>, target: &mut TargetTree<'_>) -> Result<(), &'static str> {
-    let Some(source_id) = source.find_node_by_path("/__symbols__") else {
-        return Ok(());
-    };
-    let source_node = source
-        .node(source_id)
-        .ok_or("dtb: invalid __symbols__ node")?;
-    let mut kept = Vec::new();
-    for prop in &source_node.properties {
-        let Some(path) = first_cstr(prop.value.as_slice()) else {
-            continue;
-        };
-        if target.find_node_by_path(path).is_some() {
-            kept.push((
-                prop.name.as_str().to_string(),
-                prop.value.as_slice().to_vec(),
-            ));
-        }
+fn remap_alias_path(path: &str) -> String {
+    match path {
+        SOURCE_UART0_PATH => return TARGET_UART_PATH.into(),
+        SOURCE_GPIO_PATH => return TARGET_GPIO_PATH.into(),
+        SOURCE_I2C0_PATH => return TARGET_I2C0_PATH.into(),
+        SOURCE_I2C10_PATH => return TARGET_I2C10_PATH.into(),
+        _ => {}
     }
-    if kept.is_empty() {
-        return Ok(());
+    if let Some(suffix) = path.strip_prefix("/soc/") {
+        return format!("{TARGET_SOC_PATH}/{suffix}");
     }
-    let target_id = target.get_or_create_node_by_path("/__symbols__")?;
-    let target_node = target
-        .node_mut(target_id)
-        .ok_or("dtb: invalid __symbols__ target node")?;
-    for (name, value) in kept {
-        target_node.set_property(NameRef::Owned(name), ValueRef::Owned(value));
-    }
-    Ok(())
+    path.into()
 }
 
-fn copy_fixups(source: &SourceTree<'_>, target: &mut TargetTree<'_>) -> Result<(), &'static str> {
-    let Some(source_id) = source.find_node_by_path("/__fixups__") else {
-        return Ok(());
-    };
-    let source_node = source
-        .node(source_id)
-        .ok_or("dtb: invalid __fixups__ node")?;
-    let mut kept = Vec::new();
-    for prop in &source_node.properties {
-        let value = filter_fixup_entries(prop.value.as_slice(), target)?;
-        if !value.is_empty() {
-            kept.push((prop.name.as_str().to_string(), value));
-        }
-    }
-    if kept.is_empty() {
-        return Ok(());
-    }
-    let target_id = target.get_or_create_node_by_path("/__fixups__")?;
-    let target_node = target
-        .node_mut(target_id)
-        .ok_or("dtb: invalid __fixups__ target node")?;
-    for (name, value) in kept {
-        target_node.set_property(NameRef::Owned(name), ValueRef::Owned(value));
-    }
-    Ok(())
-}
-
-fn copy_local_fixups(
-    source: &SourceTree<'_>,
-    target: &mut TargetTree<'_>,
-) -> Result<(), &'static str> {
-    let Some(source_id) = source.find_node_by_path("/__local_fixups__") else {
-        return Ok(());
-    };
-    copy_local_fixups_node(source, target, source_id, String::new())?;
-    Ok(())
-}
-
-fn copy_local_fixups_node(
-    source: &SourceTree<'_>,
-    target: &mut TargetTree<'_>,
-    source_id: NodeId,
-    relative_path: String,
-) -> Result<bool, &'static str> {
-    let source_node = source
-        .node(source_id)
-        .ok_or("dtb: invalid __local_fixups__ node")?;
-    let children = source_node.children.clone();
-    let mut kept_child = false;
-    for child_id in children {
-        let child_name = source
-            .node(child_id)
-            .ok_or("dtb: invalid __local_fixups__ child")?
-            .name
-            .as_str()
-            .to_string();
-        let child_rel = if relative_path.is_empty() {
-            child_name
-        } else {
-            format!("{relative_path}/{child_name}")
-        };
-        if copy_local_fixups_node(source, target, child_id, child_rel)? {
-            kept_child = true;
-        }
-    }
-
-    let mirrored_exists = if relative_path.is_empty() {
-        true
-    } else {
-        let mirrored_path = format!("/{relative_path}");
-        target.find_node_by_path(&mirrored_path).is_some()
-    };
-    if !mirrored_exists && !kept_child {
-        return Ok(false);
-    }
-
-    let target_path = if relative_path.is_empty() {
-        "/__local_fixups__".to_string()
-    } else {
-        format!("/__local_fixups__/{relative_path}")
-    };
-    let target_id = target.get_or_create_node_by_path(&target_path)?;
-    if mirrored_exists {
-        copy_node_properties(source, source_id, target, target_id)?;
-    }
-    Ok(true)
-}
-
-fn copy_overrides(
-    source: &SourceTree<'_>,
-    target: &mut TargetTree<'_>,
-    phandle_map: &BTreeMap<u32, NodeId>,
-) -> Result<(), &'static str> {
-    let Some(source_id) = source.find_node_by_path("/__overrides__") else {
-        return Ok(());
-    };
-    let source_node = source
-        .node(source_id)
-        .ok_or("dtb: invalid __overrides__ node")?;
-    let mut kept = Vec::new();
-    for prop in &source_node.properties {
-        let keep =
-            property_references_target_node(source, target, prop.value.as_slice(), phandle_map)?
-                || is_camera_override_name(prop.name.as_str());
-        if keep {
-            kept.push((
-                prop.name.as_str().to_string(),
-                prop.value.as_slice().to_vec(),
-            ));
-        }
-    }
-    if kept.is_empty() {
-        return Ok(());
-    }
-    let target_id = target.get_or_create_node_by_path("/__overrides__")?;
-    let target_node = target
-        .node_mut(target_id)
-        .ok_or("dtb: invalid __overrides__ target node")?;
-    for (name, value) in kept {
-        target_node.set_property(NameRef::Owned(name), ValueRef::Owned(value));
-    }
-    Ok(())
-}
-
-fn copy_required_subtree(
-    source: &SourceTree<'_>,
-    target: &mut TargetTree<'_>,
-    paths: &[&str],
-    err: &'static str,
-) -> Result<(), &'static str> {
-    let source_id = find_node_by_any_path(source, paths).ok_or(err)?;
-    copy_subtree(source, target, source_id)?;
-    Ok(())
-}
-
-fn copy_required_shallow(
-    source: &SourceTree<'_>,
-    target: &mut TargetTree<'_>,
-    paths: &[&str],
-    err: &'static str,
-) -> Result<(), &'static str> {
-    let source_id = find_node_by_any_path(source, paths).ok_or(err)?;
-    copy_node_with_ancestors(source, target, source_id)?;
-    Ok(())
-}
-
-fn copy_optional_subtree(
+fn copy_required_same_path_subtree(
     source: &SourceTree<'_>,
     target: &mut TargetTree<'_>,
     path: &str,
-) -> Result<(), &'static str> {
-    if let Some(source_id) = source.find_node_by_path(path) {
-        copy_subtree(source, target, source_id)?;
+    error: &'static str,
+) -> Result<NodeId, &'static str> {
+    let source_id = source.find_node_by_path(path).ok_or(error)?;
+    copy_subtree_to_path(source, target, source_id, path)
+}
+
+fn copy_optional_same_path_subtree(
+    source: &SourceTree<'_>,
+    target: &mut TargetTree<'_>,
+    path: &str,
+) -> Result<Option<NodeId>, &'static str> {
+    let Some(source_id) = source.find_node_by_path(path) else {
+        return Ok(None);
+    };
+    Ok(Some(copy_subtree_to_path(source, target, source_id, path)?))
+}
+
+fn copy_required_soc_child(
+    source: &SourceTree<'_>,
+    source_parser: &DtbParser,
+    target: &mut TargetTree<'_>,
+    child_name: &str,
+    error: &'static str,
+) -> Result<NodeId, &'static str> {
+    let source_path = source_soc_child_path(source, child_name)?;
+    let source_id = source.find_node_by_path(&source_path).ok_or(error)?;
+    let target_path = format!("{TARGET_SOC_PATH}/{child_name}");
+    let target_id = copy_subtree_to_path(source, target, source_id, &target_path)?;
+    rewrite_soc_child_reg_from_source(source_parser, &source_path, target, target_id)?;
+    Ok(target_id)
+}
+
+fn copy_optional_soc_child(
+    source: &SourceTree<'_>,
+    source_parser: &DtbParser,
+    target: &mut TargetTree<'_>,
+    child_name: &str,
+) -> Result<Option<NodeId>, &'static str> {
+    let source_path = source_soc_child_path(source, child_name)?;
+    let Some(source_id) = source.find_node_by_path(&source_path) else {
+        return Ok(None);
+    };
+    let target_path = format!("{TARGET_SOC_PATH}/{child_name}");
+    let target_id = copy_subtree_to_path(source, target, source_id, &target_path)?;
+    rewrite_soc_child_reg_from_source(source_parser, &source_path, target, target_id)?;
+    Ok(Some(target_id))
+}
+
+fn project_rp1_subtree(
+    source: &SourceTree<'_>,
+    source_parser: &DtbParser,
+    target: &mut TargetTree<'_>,
+    projection: Rp1Projection,
+    gic_phandle: u32,
+    uart_irq: vgic::UartIrq,
+) -> Result<NodeId, &'static str> {
+    let source_id = source
+        .find_node_by_path(projection.source)
+        .ok_or("dtb: missing projected RP1 node")?;
+    let target_id = copy_subtree_to_path(source, target, source_id, projection.target)?;
+    rewrite_projected_rp1_reg_from_source(
+        source_parser,
+        projection.source,
+        projection.target,
+        target,
+        target_id,
+    )?;
+
+    {
+        let node = target
+            .node_mut(target_id)
+            .ok_or("dtb: missing projected RP1 target node")?;
+        node.remove_property("ranges");
+        node.remove_property("dma-ranges");
+        node.remove_property("msi-parent");
+        node.remove_property("interrupt-parent");
+        if projection.force_status_ok {
+            node.set_property(
+                NameRef::Borrowed("status"),
+                ValueRef::Owned(b"okay\0".to_vec()),
+            );
+        }
     }
+
+    match projection.interrupts {
+        ProjectionInterrupts::None => {}
+        ProjectionInterrupts::Rp1Msix => {
+            rewrite_rp1_interrupts_from_source(
+                source_parser,
+                projection.source,
+                target,
+                target_id,
+                gic_phandle,
+                None,
+            )?;
+        }
+        ProjectionInterrupts::Uart0 => {
+            rewrite_rp1_interrupts_from_source(
+                source_parser,
+                projection.source,
+                target,
+                target_id,
+                gic_phandle,
+                Some(uart_irq),
+            )?;
+        }
+    }
+    Ok(target_id)
+}
+
+fn rewrite_soc_child_reg_from_source(
+    source: &DtbParser,
+    source_path: &str,
+    target: &mut TargetTree<'_>,
+    target_id: NodeId,
+) -> Result<(), &'static str> {
+    let regs = with_source_node_view(source, source_path, &mut |view| {
+        let mut values = Vec::new();
+        let mut iter = view.reg_raw_iter()?;
+        while let Some(entry) = iter.next() {
+            let (base, size) = entry?;
+            values.push((base as u64, size as u64));
+        }
+        Ok(values)
+    })?
+    .ok_or("dtb: missing source node view")?;
+    if regs.is_empty() {
+        return Ok(());
+    }
+    target
+        .node_mut(target_id)
+        .ok_or("dtb: missing target node for reg rewrite")?
+        .set_property(
+            NameRef::Borrowed("reg"),
+            ValueRef::Owned(encode_reg_entries(&regs, 2, 1)?),
+        );
     Ok(())
 }
 
-fn collect_existing_paths(source: &SourceTree<'_>, paths: &[&str]) -> Vec<NodeId> {
-    paths
-        .iter()
-        .filter_map(|path| source.find_node_by_path(path))
-        .collect()
+fn rewrite_projected_rp1_reg_from_source(
+    source: &DtbParser,
+    source_path: &str,
+    target_path: &str,
+    target: &mut TargetTree<'_>,
+    target_id: NodeId,
+) -> Result<(), &'static str> {
+    let source_regs = with_source_node_view(source, source_path, &mut |view| {
+        let mut values = Vec::new();
+        let mut iter = view.reg_iter()?;
+        while let Some(entry) = iter.next() {
+            let (phys, size) = entry?;
+            values.push((phys as u64, size as u64));
+        }
+        Ok(values)
+    })?
+    .ok_or("dtb: missing source node view")?;
+    if source_regs.is_empty() {
+        return Ok(());
+    }
+
+    let target_base = target_node_unit_address(target_path)?;
+    let source_base = source_regs[0].0;
+    let regs = source_regs
+        .into_iter()
+        .map(|(phys, size)| {
+            let offset = phys
+                .checked_sub(source_base)
+                .ok_or("dtb: RP1 reg entries are not monotonic")?;
+            let guest = target_base
+                .checked_add(offset)
+                .ok_or("dtb: RP1 guest reg overflow")?;
+            Ok((guest, size))
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+
+    target
+        .node_mut(target_id)
+        .ok_or("dtb: missing target node for reg rewrite")?
+        .set_property(
+            NameRef::Borrowed("reg"),
+            ValueRef::Owned(encode_reg_entries(&regs, 2, 1)?),
+        );
+    Ok(())
 }
 
-fn build_phandle_map(source: &SourceTree<'_>) -> Result<BTreeMap<u32, NodeId>, &'static str> {
-    let mut map = BTreeMap::new();
-    for node_id in 0..source.nodes.len() {
-        let Some(node) = source.node(node_id) else {
-            continue;
-        };
-        for key in ["phandle", "linux,phandle"] {
-            let Some(prop) = node.property(key) else {
-                continue;
+fn rewrite_rp1_interrupts_from_source(
+    source: &DtbParser,
+    source_path: &str,
+    target: &mut TargetTree<'_>,
+    target_id: NodeId,
+    gic_phandle: u32,
+    uart_irq: Option<vgic::UartIrq>,
+) -> Result<(), &'static str> {
+    let specifiers = if let Some(uart_irq) = uart_irq {
+        vec![(uart_irq.pintid, gic_dt_irq_flags_from_sense(uart_irq.sense))]
+    } else {
+        with_source_node_view(source, source_path, &mut |view| {
+            let Some(iter) = view.interrupts_iter::<2>()? else {
+                return Ok(Vec::new());
             };
-            if prop.value.as_slice().len() != 4 {
-                continue;
+            let mut values = Vec::new();
+            for entry in iter {
+                let [cell0, flags] = entry?;
+                values.push((cell0, flags));
             }
-            let phandle = read_be_u32(prop.value.as_slice(), 0)?;
-            map.entry(phandle).or_insert(node_id);
-        }
+            Ok(values)
+        })?
+        .ok_or("dtb: missing source node view")?
+    };
+    if specifiers.is_empty() {
+        return Ok(());
     }
-    Ok(map)
+
+    let interrupts = if uart_irq.is_some() {
+        encode_gic_spi_interrupts_with_mapper(&specifiers, |intid| Ok(intid))?
+    } else {
+        encode_gic_spi_interrupts_with_mapper(&specifiers, rp1_msix_index_to_intid)?
+    };
+
+    let node = target
+        .node_mut(target_id)
+        .ok_or("dtb: missing target node for interrupt rewrite")?;
+    node.set_property(
+        NameRef::Borrowed("interrupt-parent"),
+        ValueRef::Owned(gic_phandle.to_be_bytes().to_vec()),
+    );
+    node.set_property(NameRef::Borrowed("interrupts"), ValueRef::Owned(interrupts));
+    Ok(())
 }
 
-fn collect_subtree_phandle_closure(
-    source: &SourceTree<'_>,
-    seed_roots: &[NodeId],
-    phandle_map: &BTreeMap<u32, NodeId>,
-    allow_ref: &mut impl FnMut(NodeId) -> Result<bool, &'static str>,
-) -> Result<(BTreeSet<NodeId>, BTreeSet<NodeId>), &'static str> {
-    let mut keep_nodes = BTreeSet::new();
-    let mut processed_roots = BTreeSet::new();
-    let mut pending = seed_roots.to_vec();
-    while let Some(root_id) = pending.pop() {
-        if !processed_roots.insert(root_id) {
-            continue;
+fn with_source_node_view<R>(
+    parser: &DtbParser,
+    path: &str,
+    f: &mut impl for<'a, 's> FnMut(DtbNodeView<'a, 's>) -> Result<R, &'static str>,
+) -> Result<Option<R>, &'static str> {
+    fn descend<R>(
+        node: DtbNodeView<'_, '_>,
+        segments: &[&str],
+        f: &mut impl for<'a, 's> FnMut(DtbNodeView<'a, 's>) -> Result<R, &'static str>,
+    ) -> Result<Option<R>, &'static str> {
+        if segments.is_empty() {
+            return Ok(Some(f(node)?));
         }
-        walk_seed_subtree(
-            source,
-            root_id,
-            phandle_map,
-            allow_ref,
-            &mut keep_nodes,
-            &mut pending,
-        )?;
+
+        let mut found = None;
+        match node.for_each_child_view(&mut |child| {
+            if child.name() != segments[0] {
+                return Ok(ControlFlow::Continue(()));
+            }
+            found = descend(child, &segments[1..], f).map_err(WalkError::User)?;
+            Ok(ControlFlow::Break(()))
+        }) {
+            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(())) => Ok(found),
+            Err(WalkError::Dtb(err)) => Err(err),
+            Err(WalkError::User(err)) => Err(err),
+        }
     }
-    Ok((keep_nodes, processed_roots))
+
+    if path == "/" {
+        return Ok(Some(f(parser.root_node_view()?)?));
+    }
+    if !path.starts_with('/') {
+        return Err("dtb: path must start with '/'");
+    }
+
+    let root = parser.root_node_view()?;
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    descend(root, &segments, f)
 }
 
-fn walk_seed_subtree(
+fn source_soc_path(source: &SourceTree<'_>) -> Result<&'static str, &'static str> {
+    SOURCE_SOC_PATHS
+        .into_iter()
+        .find(|path| source.find_node_by_path(path).is_some())
+        .ok_or("dtb: missing /soc node")
+}
+
+fn source_soc_child_path(
     source: &SourceTree<'_>,
-    node_id: NodeId,
-    phandle_map: &BTreeMap<u32, NodeId>,
-    allow_ref: &mut impl FnMut(NodeId) -> Result<bool, &'static str>,
-    keep_nodes: &mut BTreeSet<NodeId>,
-    pending: &mut Vec<NodeId>,
+    child_name: &str,
+) -> Result<String, &'static str> {
+    Ok(format!("{}/{}", source_soc_path(source)?, child_name))
+}
+
+fn find_source_gic_phandle(source: &SourceTree<'_>) -> Result<u32, &'static str> {
+    let gic_path = source_soc_child_path(source, "interrupt-controller@7fff9000")?;
+    let node_id = source
+        .find_node_by_path(&gic_path)
+        .ok_or("dtb: missing GIC node")?;
+    node_phandle(source, node_id).ok_or("dtb: missing GIC phandle")
+}
+
+fn copy_selected_properties(
+    source: &SourceTree<'_>,
+    source_id: NodeId,
+    target: &mut TargetTree<'_>,
+    target_id: NodeId,
+    names: &[&'static str],
 ) -> Result<(), &'static str> {
-    let node = source.node(node_id).ok_or("dtb: invalid source node id")?;
-    keep_nodes.insert(node_id);
-
-    for prop in &node.properties {
-        try_for_each_tree_property_phandle_candidate(
-            prop.name.as_str(),
-            prop.value.as_slice(),
-            &mut |candidate| {
-                let Some(&target_id) = phandle_map.get(&candidate) else {
-                    return Ok(());
-                };
-                if allow_ref(target_id)? {
-                    pending.push(target_id);
-                }
-                Ok(())
-            },
-        )?;
-    }
-
-    let children = node.children.clone();
-    for child_id in children {
-        walk_seed_subtree(
-            source,
-            child_id,
-            phandle_map,
-            allow_ref,
-            keep_nodes,
-            pending,
-        )?;
+    let source_node = source
+        .node(source_id)
+        .ok_or("dtb: invalid source node id")?;
+    let target_node = target
+        .node_mut(target_id)
+        .ok_or("dtb: invalid target node id")?;
+    for &name in names {
+        let Some(prop) = source_node.property(name) else {
+            continue;
+        };
+        target_node.set_property(
+            NameRef::Borrowed(name),
+            ValueRef::Owned(prop.value.as_slice().to_vec()),
+        );
     }
     Ok(())
 }
 
-fn try_for_each_tree_property_phandle_candidate(
-    name: &str,
-    bytes: &[u8],
-    f: &mut impl FnMut(u32) -> Result<(), &'static str>,
-) -> Result<(), &'static str> {
-    if name.starts_with('#') || matches!(name, "phandle" | "linux,phandle") {
-        return Ok(());
-    }
-    if bytes.len() < 4 {
-        return Ok(());
-    }
-    if property_looks_like_string_list(bytes) {
-        return Ok(());
-    }
-    if bytes.len() == 4 && !property_can_hold_scalar_phandle(name) {
-        return Ok(());
-    }
-    for chunk in bytes.chunks_exact(4) {
-        f(u32::from_be_bytes(
-            chunk.try_into().map_err(|_| "dtb: invalid u32 cell")?,
-        ))?;
-    }
-    Ok(())
+fn node_phandle(tree: &SourceTree<'_>, node_id: NodeId) -> Option<u32> {
+    property_u32(tree, node_id, "phandle")
+        .ok()
+        .flatten()
+        .or_else(|| property_u32(tree, node_id, "linux,phandle").ok().flatten())
 }
 
-fn property_looks_like_string_list(bytes: &[u8]) -> bool {
-    if !bytes.contains(&0) {
-        return false;
+const fn gic_dt_irq_flags_from_sense(sense: IrqSense) -> u32 {
+    match sense {
+        IrqSense::Edge => 1,
+        IrqSense::Level => 4,
     }
-    bytes.split(|byte| *byte == 0).all(|segment| {
-        segment.is_empty() || segment.iter().all(|byte| matches!(*byte, b' '..=b'~'))
-    })
 }
 
-fn property_can_hold_scalar_phandle(name: &str) -> bool {
-    matches!(
-        name,
-        "interrupt-parent"
-            | "msi-parent"
-            | "memory-region"
-            | "operating-points-v2"
-            | "backlight"
-            | "remote-endpoint"
-            | "sound-dai"
-            | "firmware"
-            | "cooling-device"
-    ) || name.starts_with("pinctrl-")
-        || name.ends_with("-parent")
-        || name.ends_with("-supply")
-        || name.ends_with("-endpoint")
-}
-
-fn property_references_target_node(
-    source: &SourceTree<'_>,
-    target: &TargetTree<'_>,
-    bytes: &[u8],
-    phandle_map: &BTreeMap<u32, NodeId>,
-) -> Result<bool, &'static str> {
-    for chunk in bytes.chunks_exact(4) {
-        let candidate = u32::from_be_bytes(chunk.try_into().map_err(|_| "dtb: invalid u32 cell")?);
-        let Some(&node_id) = phandle_map.get(&candidate) else {
-            continue;
-        };
-        let path = node_path(source, node_id)?;
-        if target.find_node_by_path(&path).is_some() {
-            return Ok(true);
-        }
+fn rp1_msix_index_to_intid(msix_index: u32) -> Result<u32, &'static str> {
+    let index = usize::try_from(msix_index).map_err(|_| "dtb: RP1 MSI-X index overflow")?;
+    if !bcm2712::pirq_hook::GUEST_RP1_PASSTHROUGH_MSIX_INDICES.contains(&index) {
+        return Err("dtb: RP1 MSI-X index is not guest-pass-through");
     }
-    Ok(false)
+    Ok(bcm2712::pirq_hook::RP1_MSIX_SPI_START + msix_index)
 }
 
-fn filter_fixup_entries(bytes: &[u8], target: &TargetTree<'_>) -> Result<Vec<u8>, &'static str> {
-    let mut out = Vec::new();
-    for entry in split_nul_terminated(bytes) {
-        let text = core::str::from_utf8(entry).map_err(|_| "dtb: invalid __fixups__ entry")?;
-        let Some((path, _)) = text.split_once(':') else {
-            continue;
-        };
-        if target.find_node_by_path(path).is_none() {
-            continue;
-        }
-        out.extend_from_slice(entry);
-        out.push(0);
+fn target_node_unit_address(path: &str) -> Result<u64, &'static str> {
+    let name = path.rsplit('/').next().ok_or("dtb: invalid node path")?;
+    let (_, unit_address) = name
+        .rsplit_once('@')
+        .ok_or("dtb: node path missing unit address")?;
+    u64::from_str_radix(unit_address, 16).map_err(|_| "dtb: invalid node unit address")
+}
+
+fn soc_bus_address_from_phys(address: u64) -> Result<u64, &'static str> {
+    let soc_end = SOC_PHYS_BASE
+        .checked_add(SOC_PHYS_SIZE)
+        .ok_or("dtb: /soc range overflow")?;
+    if (SOC_PHYS_BASE..soc_end).contains(&address) {
+        return Ok(address - SOC_PHYS_BASE);
     }
-    Ok(out)
-}
 
-fn split_nul_terminated(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut entries = Vec::new();
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&byte| byte == 0)
-            .map(|offset| start + offset)
-            .unwrap_or(bytes.len());
-        if end > start {
-            entries.push(&bytes[start..end]);
-        }
-        if end == bytes.len() {
-            break;
-        }
-        start = end + 1;
+    let rp1_base = RP1_BASE as u64;
+    let rp1_end = rp1_base
+        .checked_add(RP1_SOC_WINDOW_SIZE)
+        .ok_or("dtb: RP1 /soc range overflow")?;
+    if (rp1_base..rp1_end).contains(&address) {
+        return Ok(address);
     }
-    entries
+
+    Err("dtb: address is outside guest /soc ranges")
 }
 
-fn first_cstr(bytes: &[u8]) -> Option<&str> {
-    let raw = bytes.split(|byte| *byte == 0).next()?;
-    if raw.is_empty() {
-        return None;
+fn encode_target_soc_ranges() -> Result<Vec<u8>, &'static str> {
+    const ENTRY_CELLS: usize = 5;
+    let mut bytes = vec![0u8; ENTRY_CELLS * 4 * 2];
+
+    write_be_u32s(&mut bytes, 0, 2, 0)?;
+    write_be_u32s(&mut bytes, 8, 2, SOC_PHYS_BASE)?;
+    write_be_u32s(&mut bytes, 16, 1, SOC_PHYS_SIZE)?;
+
+    write_be_u32s(&mut bytes, 20, 2, RP1_BASE as u64)?;
+    write_be_u32s(&mut bytes, 28, 2, RP1_BASE as u64)?;
+    write_be_u32s(&mut bytes, 36, 1, RP1_SOC_WINDOW_SIZE)?;
+    Ok(bytes)
+}
+
+fn path_property_bytes(path: &str) -> Vec<u8> {
+    let mut bytes = path.as_bytes().to_vec();
+    if !bytes.ends_with(&[0]) {
+        bytes.push(0);
     }
-    core::str::from_utf8(raw).ok()
-}
-
-fn is_camera_override_name(name: &str) -> bool {
-    name.starts_with("cam0_") || name.starts_with("cam1_") || name.starts_with("i2c_csi_dsi")
-}
-
-fn is_memory_node(source: &SourceTree<'_>, node_id: NodeId) -> Result<bool, &'static str> {
-    let node = source.node(node_id).ok_or("dtb: invalid memory node")?;
-    if node.name.as_str().starts_with("memory@") {
-        return Ok(true);
-    }
-    Ok(property_string_equals(node, "device_type", "memory"))
-}
-
-fn is_linux_cma_node(source: &SourceTree<'_>, node_id: NodeId) -> Result<bool, &'static str> {
-    let node = source
-        .node(node_id)
-        .ok_or("dtb: invalid reserved-memory child")?;
-    if node.name.as_str().starts_with("linux,cma") {
-        return Ok(true);
-    }
-    if node.property("linux,cma-default").is_some() {
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn property_string_equals(node: &::dtb::ast::Node<'_>, key: &str, expected: &str) -> bool {
-    let Some(prop) = node.property(key) else {
-        return false;
-    };
-    first_cstr(prop.value.as_slice()).is_some_and(|text| text == expected)
-}
-
-fn is_same_or_descendant_of(
-    source: &SourceTree<'_>,
-    node_id: NodeId,
-    ancestor_id: NodeId,
-) -> Result<bool, &'static str> {
-    let mut current = Some(node_id);
-    while let Some(id) = current {
-        if id == ancestor_id {
-            return Ok(true);
-        }
-        current = source.node(id).ok_or("dtb: invalid source node id")?.parent;
-    }
-    Ok(false)
-}
-
-fn is_reserved_memory_child(
-    source: &SourceTree<'_>,
-    node_id: NodeId,
-) -> Result<bool, &'static str> {
-    let Some(reserved_id) = source.find_node_by_path("/reserved-memory") else {
-        return Ok(false);
-    };
-    Ok(node_id != reserved_id && is_same_or_descendant_of(source, node_id, reserved_id)?)
-}
-
-fn is_source_metadata_node(source: &SourceTree<'_>, node_id: NodeId) -> Result<bool, &'static str> {
-    let path = node_path(source, node_id)?;
-    Ok(SOURCE_METADATA_NODES
-        .iter()
-        .any(|candidate| path == *candidate || path.starts_with(&format!("{candidate}/"))))
-}
-
-fn find_node_by_any_path(source: &SourceTree<'_>, paths: &[&str]) -> Option<NodeId> {
-    paths.iter().find_map(|path| source.find_node_by_path(path))
+    bytes
 }
 
 fn be_bytes_to_u64(bytes: &[u8]) -> Option<u64> {
@@ -957,8 +1083,16 @@ fn update_gicv2_cpu_interface_reg(
     if bytes.len() < stride * 2 {
         return Err("gic: reg property too short");
     }
+
+    let parent_path = node_path(tree, parent)?;
+    let cpu_if_base = if parent_path == TARGET_SOC_PATH {
+        soc_bus_address_from_phys(gicv.base as u64)?
+    } else {
+        gicv.base as u64
+    };
+
     let base_offset = stride;
-    write_be_u32s(&mut bytes, base_offset, addr_cells, gicv.base as u64)?;
+    write_be_u32s(&mut bytes, base_offset, addr_cells, cpu_if_base)?;
     write_be_u32s(
         &mut bytes,
         base_offset + addr_cells * 4,
@@ -1001,8 +1135,44 @@ fn node_compatible_contains(
     Ok(false)
 }
 
-fn property_u32(
-    tree: &DeviceTree<'_>,
+fn is_memory_node(source: &SourceTree<'_>, node_id: NodeId) -> Result<bool, &'static str> {
+    let node = source.node(node_id).ok_or("dtb: invalid memory node")?;
+    if node.name.as_str().starts_with("memory@") {
+        return Ok(true);
+    }
+    Ok(property_string_equals(node, "device_type", "memory"))
+}
+
+fn is_linux_cma_node(source: &SourceTree<'_>, node_id: NodeId) -> Result<bool, &'static str> {
+    let node = source
+        .node(node_id)
+        .ok_or("dtb: invalid reserved-memory child")?;
+    if node.name.as_str().starts_with("linux,cma") {
+        return Ok(true);
+    }
+    if node.property("linux,cma-default").is_some() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn property_string_equals(node: &::dtb::ast::Node<'_>, key: &str, expected: &str) -> bool {
+    let Some(prop) = node.property(key) else {
+        return false;
+    };
+    first_cstr(prop.value.as_slice()).is_some_and(|text| text == expected)
+}
+
+fn first_cstr(bytes: &[u8]) -> Option<&str> {
+    let raw = bytes.split(|byte| *byte == 0).next()?;
+    if raw.is_empty() {
+        return None;
+    }
+    core::str::from_utf8(raw).ok()
+}
+
+fn property_u32<State>(
+    tree: &DeviceTree<'_, State>,
     node_id: NodeId,
     key: &str,
 ) -> Result<Option<u32>, &'static str> {
