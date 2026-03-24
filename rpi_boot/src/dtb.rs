@@ -52,6 +52,7 @@ const TARGET_RP1_CLOCKS_PATH: &str = "/soc@107c000000/clocks@1c00018000";
 const TARGET_CSI0_PATH: &str = "/soc@107c000000/csi@1c0110000";
 const TARGET_CSI1_PATH: &str = "/soc@107c000000/csi@1c0128000";
 const TARGET_MAILBOX_PATH: &str = "/soc@107c000000/mailbox@7c013880";
+const TARGET_GIO_AON_PATH: &str = "/soc@107c000000/gpio@7d517c00";
 
 const SOURCE_UART0_PATH: &str = "/axi/pcie@1000120000/rp1/serial@30000";
 const SOURCE_GPIO_PATH: &str = "/axi/pcie@1000120000/rp1/gpio@d0000";
@@ -231,7 +232,13 @@ pub(crate) fn build_guest_dtb(
         "dtb: missing sdio1 node",
     )?;
     copy_optional_soc_child(&source_tree, source, &mut target, "pinctrl@7d504100")?;
-
+    copy_required_soc_child(
+        &source_tree,
+        source,
+        &mut target,
+        "gpio@7d517c00",
+        "dtb: missing AON GPIO node for SD regulators",
+    )?;
     copy_required_same_path_subtree(
         &source_tree,
         &mut target,
@@ -295,6 +302,7 @@ pub(crate) fn build_guest_dtb(
     }
 
     copy_reserved_memory(&source_tree, &mut target)?;
+    validate_sd_regulator_gpio_providers(&target)?;
     rebuild_aliases(&source_tree, &mut target)?;
     configure_uart_console(&mut target, chosen_id, PL011_UART_ADDR.0)?;
     append_reserved_memory(&mut target, reserved_memory);
@@ -484,6 +492,7 @@ fn rebuild_aliases(
         ("i2c0", TARGET_I2C0_PATH),
         ("i2c10", TARGET_I2C10_PATH),
         ("mailbox", TARGET_MAILBOX_PATH),
+        ("gpio2", TARGET_GIO_AON_PATH),
     ] {
         if target.find_node_by_path(path).is_none() {
             continue;
@@ -842,6 +851,59 @@ fn node_phandle(tree: &SourceTree<'_>, node_id: NodeId) -> Option<u32> {
         .ok()
         .flatten()
         .or_else(|| property_u32(tree, node_id, "linux,phandle").ok().flatten())
+}
+
+fn find_node_by_phandle_owned(tree: &TargetTree<'_>, phandle: u32) -> Option<NodeId> {
+    tree.nodes.iter().enumerate().find_map(|(id, node)| {
+        let matches = node
+            .property("phandle")
+            .and_then(|prop| {
+                let bytes = prop.value.as_slice();
+                if bytes.len() != 4 {
+                    return None;
+                }
+                Some(u32::from_be_bytes(bytes.try_into().ok()?))
+            })
+            .or_else(|| {
+                node.property("linux,phandle").and_then(|prop| {
+                    let bytes = prop.value.as_slice();
+                    if bytes.len() != 4 {
+                        return None;
+                    }
+                    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+                })
+            });
+        (matches == Some(phandle)).then_some(id)
+    })
+}
+
+fn first_phandle_cell(prop: &[u8]) -> Result<u32, &'static str> {
+    let bytes: [u8; 4] = prop
+        .get(..4)
+        .ok_or("dtb: gpio property too short")?
+        .try_into()
+        .map_err(|_| "dtb: invalid phandle cell width")?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn validate_sd_regulator_gpio_providers(tree: &TargetTree<'_>) -> Result<(), &'static str> {
+    for path in [SOURCE_SD_IO_1V8_REG_PATH, SOURCE_SD_VCC_REG_PATH] {
+        let node_id = tree
+            .find_node_by_path(path)
+            .ok_or("dtb: missing SD regulator node in guest tree")?;
+        let node = tree
+            .node(node_id)
+            .ok_or("dtb: invalid SD regulator node in guest tree")?;
+        let gpio_prop = node
+            .property("gpios")
+            .or_else(|| node.property("gpio"))
+            .ok_or("dtb: SD regulator is missing gpio provider property")?;
+        let phandle = first_phandle_cell(gpio_prop.value.as_slice())?;
+        if find_node_by_phandle_owned(tree, phandle).is_none() {
+            return Err("dtb: SD regulator GPIO provider phandle is unresolved");
+        }
+    }
+    Ok(())
 }
 
 const fn gic_dt_irq_flags_from_sense(sense: IrqSense) -> u32 {
