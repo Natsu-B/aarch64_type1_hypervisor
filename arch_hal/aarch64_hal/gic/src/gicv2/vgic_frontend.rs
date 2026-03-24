@@ -152,15 +152,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     }
 
     #[inline]
-    fn iter_bytes(mut value: u32, bytes: u32, mut f: impl FnMut(u32, u8)) {
-        for i in 0..bytes {
-            let b = (value & 0xff) as u8;
-            f(i, b);
-            value >>= 8;
-        }
-    }
-
-    #[inline]
     fn vcpu_mask_to_u8(mask: &VcpuMask) -> u8 {
         let mut out = 0u8;
         for id in mask.iter() {
@@ -170,6 +161,25 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
         }
         out
+    }
+
+    #[inline]
+    fn implemented_gicv2_target_mask(&self) -> Result<u8, GicError> {
+        let count = self.vgic_model.vcpu_count();
+        if count == 0 {
+            return Err(GicError::InvalidVcpuId);
+        }
+        if count > 8 {
+            return Err(GicError::UnsupportedFeature);
+        }
+        Ok(((1u16 << count) - 1) as u8)
+    }
+
+    #[inline]
+    fn sanitize_gicv2_targets(&self, raw: u8) -> Result<VcpuMask, GicError> {
+        Ok(VcpuMask::from_bits(
+            (raw & self.implemented_gicv2_target_mask()?) as u16,
+        ))
     }
 
     /// Handle a trapped write to the guest vGIC Distributor register.
@@ -378,21 +388,22 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             GICD_ITARGETSR_OFFSET..GICD_ITARGETSR_END => {
                 let byte_offset = offset - GICD_ITARGETSR_OFFSET;
                 let base_intid = 32 + (byte_offset / 4) * 4;
+                let _implemented_target_mask = self.implemented_gicv2_target_mask()?;
                 match size {
                     Gicv2AccessSize::U32 => {
                         let mut update = VgicUpdate::None;
-                        Self::iter_bytes(value, 4, |i, b| {
+                        for i in 0..4u32 {
                             let intid = base_intid + i;
                             if intid < 32 || intid > MAX_VIRTUAL_INTID {
-                                return;
+                                continue;
                             }
-                            if let Ok(u) = self.vgic_model.set_spi_route(
-                                VIntId(intid),
-                                VSpiRouting::Targets(VcpuMask::from_bits(b as u16)),
-                            ) {
-                                update.combine(&u);
-                            }
-                        });
+                            let targets =
+                                self.sanitize_gicv2_targets(((value >> (i * 8)) & 0xff) as u8)?;
+                            let u = self
+                                .vgic_model
+                                .set_spi_route(VIntId(intid), VSpiRouting::Targets(targets))?;
+                            update.combine(&u);
+                        }
                         update
                     }
                     Gicv2AccessSize::U8 => {
@@ -400,10 +411,9 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                         if intid < 32 || intid > MAX_VIRTUAL_INTID {
                             VgicUpdate::None
                         } else {
-                            self.vgic_model.set_spi_route(
-                                VIntId(intid),
-                                VSpiRouting::Targets(VcpuMask::from_bits((value as u8) as u16)),
-                            )?
+                            let targets = self.sanitize_gicv2_targets(value as u8)?;
+                            self.vgic_model
+                                .set_spi_route(VIntId(intid), VSpiRouting::Targets(targets))?
                         }
                     }
                 }
@@ -881,6 +891,7 @@ mod tests {
     struct FakeModel {
         dist_enable: Cell<(bool, bool)>,
         last_sgi: Cell<Option<(VcpuId, VcpuMask, u8)>>,
+        last_spi_route: Cell<Option<(VIntId, VcpuMask)>>,
         vcpu_count: u16,
         vcpu: DummyVcpu,
     }
@@ -890,6 +901,7 @@ mod tests {
             Self {
                 dist_enable: Cell::new((false, false)),
                 last_sgi: Cell::new(None),
+                last_spi_route: Cell::new(None),
                 vcpu_count,
                 vcpu: DummyVcpu,
             }
@@ -1078,9 +1090,12 @@ mod tests {
 
         fn set_spi_route(
             &self,
-            _vintid: VIntId,
-            _targets: VSpiRouting,
+            vintid: VIntId,
+            targets: VSpiRouting,
         ) -> Result<VgicUpdate, GicError> {
+            if let VSpiRouting::Targets(mask) = targets {
+                self.last_spi_route.set(Some((vintid, mask)));
+            }
             Ok(VgicUpdate::None)
         }
 
@@ -1238,5 +1253,41 @@ mod tests {
         assert_eq!(sender, VcpuId(0));
         assert_eq!(targets, VcpuMask::from_bits(0b0010));
         assert_eq!(sgi, 5);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn itargetsr_u8_masks_nonexistent_vcpus() {
+        let model = FakeModel::new(4);
+        let frontend = Gicv2Frontend::new(&model, Gicv2DistIdRegs::ZERO);
+        let offset = offset_of!(GicV2Distributor, itargetsr) as u32 + 1;
+
+        frontend
+            .handle_distributor_write(VcpuId(0), offset, Gicv2AccessSize::U8, 0xfe)
+            .unwrap();
+
+        let (vintid, targets) = model
+            .last_spi_route
+            .get()
+            .expect("SPI route should be recorded");
+        assert_eq!(vintid, VIntId(33));
+        assert_eq!(targets, VcpuMask::from_bits(0x0e));
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn itargetsr_u32_masks_nonexistent_vcpus_in_each_lane() {
+        let model = FakeModel::new(4);
+        let frontend = Gicv2Frontend::new(&model, Gicv2DistIdRegs::ZERO);
+        let offset = offset_of!(GicV2Distributor, itargetsr) as u32;
+
+        frontend
+            .handle_distributor_write(VcpuId(0), offset, Gicv2AccessSize::U32, 0xfefefefe)
+            .unwrap();
+
+        let (vintid, targets) = model
+            .last_spi_route
+            .get()
+            .expect("SPI route should be recorded");
+        assert_eq!(vintid, VIntId(35));
+        assert_eq!(targets, VcpuMask::from_bits(0x0e));
     }
 }
