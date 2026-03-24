@@ -7,9 +7,11 @@ use core::ptr::slice_from_raw_parts_mut;
 use typestate::ReadWrite;
 
 const MIP_SPI_OFFSET: u32 = 128;
-const RP1_MSIX_SPI_START: u32 = MIP_SPI_OFFSET + 32;
+pub const RP1_MSIX_SPI_START: u32 = MIP_SPI_OFFSET + 32;
 const RP1_PCIE_CFG_OFFSET: usize = 0x10_8000 + 0x08;
 const RP1_PCIE_CFG_LEN: usize = 64;
+pub const GUEST_RP1_PASSTHROUGH_MSIX_INDICES: [usize; 6] = [7, 13, 25, 47, 48, 58];
+pub const GUEST_RP1_PASSTHROUGH_SPIS: [u32; 6] = [167, 173, 185, 207, 208, 218];
 pub const RP1_UART0_MSIX_INDEX: usize = 25;
 pub const RP1_UART0_SPI: u32 = RP1_MSIX_SPI_START + RP1_UART0_MSIX_INDEX as u32;
 
@@ -65,8 +67,12 @@ fn rp1_msix_iack(int_id: u32) -> Result<(), PirqHookError> {
     Ok(())
 }
 
+pub fn is_guest_rp1_passthrough_spi(int_id: u32) -> bool {
+    GUEST_RP1_PASSTHROUGH_SPIS.contains(&int_id)
+}
+
 pub fn pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
-    if int_id != RP1_UART0_SPI {
+    if !is_guest_rp1_passthrough_spi(int_id) {
         return Ok(());
     }
 

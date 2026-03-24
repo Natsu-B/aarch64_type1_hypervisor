@@ -13,6 +13,7 @@
 #![feature(sync_unsafe_cell)]
 
 extern crate alloc;
+mod dtb;
 mod handler;
 mod multicore;
 mod pcie;
@@ -22,9 +23,9 @@ mod vgic;
 #[cfg(all(test, target_arch = "aarch64"))]
 aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);
 
+use ::dtb::DtbParser;
+use ::dtb::WalkError;
 use alloc::boxed::Box;
-use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use allocator::define_global_allocator;
 use arch_hal::cpu;
@@ -51,7 +52,6 @@ use arch_hal::tls;
 use core::alloc::Layout;
 use core::arch::global_asm;
 use core::cell::SyncUnsafeCell;
-use core::convert::TryInto;
 use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
@@ -59,18 +59,6 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts_mut;
-use dtb::DeviceTree;
-use dtb::DeviceTreeEditExt;
-use dtb::DeviceTreeQueryExt;
-use dtb::DtbParser;
-use dtb::MemReserve;
-use dtb::NameRef;
-use dtb::NodeEditExt;
-use dtb::NodeId;
-use dtb::NodeQueryExt;
-use dtb::ValueRef;
-use dtb::WalkError;
-use dtb::patch::Pl011Spec;
 use mutex::pod::RawAtomicPod;
 use typestate::Le;
 use typestate::ReadWrite;
@@ -193,8 +181,6 @@ extern "C" fn main() -> ! {
         pintid: bcm2712::pirq_hook::RP1_UART0_SPI,
         sense: arch_hal::gic::IrqSense::Edge,
     };
-    let uart_irq_pintid = uart_irq.pintid;
-    let uart_irq_sense = uart_irq.sense;
 
     let mut systimer = SystemTimer::new();
     systimer.init();
@@ -623,7 +609,7 @@ extern "C" fn main() -> ! {
     // input enable
     gpio_config[15].set_bits(0b100_1000);
 
-    // setup rp1 uart0 interrupt
+    // setup guest RP1 MSI-X interrupts
     // SAFETY: RP1 peripheral MMIO is mapped; the table is sized for the index used below.
     let pcie_config = unsafe {
         &*slice_from_raw_parts_mut(
@@ -631,7 +617,9 @@ extern "C" fn main() -> ! {
             64,
         )
     };
-    pcie_config[bcm2712::pirq_hook::RP1_UART0_MSIX_INDEX].set_bits(0b1001);
+    for msix_index in bcm2712::pirq_hook::GUEST_RP1_PASSTHROUGH_MSIX_INDICES {
+        pcie_config[msix_index].set_bits(0b1001);
+    }
 
     multicore::setup_multicore(stack_top);
 
@@ -657,32 +645,8 @@ extern "C" fn main() -> ! {
     reserved_memory.push((program_start, program_end - program_start));
     reserved_memory.push((DTB_PTR, dtb.get_size()));
 
-    let mut tree = DeviceTree::from_parser(&dtb_modified).unwrap().into_owned();
-    let chosen_id = tree.get_or_create_node_by_path("/chosen").unwrap();
-    let initrd_range = remove_initrd(&mut tree, chosen_id);
-    remove_initrd_memreserve(&mut tree, initrd_range);
-    append_reserved_memory(&mut tree, &reserved_memory);
-    dtb::patch::detach_by_compatible(&mut tree, "brcm,bcm2712-pcie").unwrap();
-    dtb::patch::detach_by_node_name(&mut tree, "rp1").unwrap();
-    dtb::patch::inject_standalone_pl011(
-        &mut tree,
-        Pl011Spec {
-            base: PL011_UART_ADDR.0 as u64,
-            size: 0x1000,
-            uartclk_hz: PL011_UART_ADDR.1 as u32,
-            pintid: uart_irq_pintid,
-            irq_sense: uart_irq_sense,
-        },
-    )
-    .unwrap();
-    configure_uart_console(&mut tree, chosen_id, PL011_UART_ADDR.0).unwrap();
-    if let Some(gicv) = gic_info.gicv {
-        update_gicv2_cpu_interface_reg(&mut tree, gicv).unwrap();
-    } else {
-        panic!("gic: missing GICV region for DT update");
-    }
-
-    let dtb_box = tree.into_dtb_box().unwrap();
+    let dtb_box =
+        dtb::build_guest_dtb(&dtb_modified, &reserved_memory, &gic_info, uart_irq).unwrap();
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
     cpu::clean_dcache_poc(dtb_box.as_ptr() as usize, dtb_box.len());
     core::mem::forget(dtb_box);
@@ -733,14 +697,6 @@ extern "C" fn el1_main() {
     }
 }
 
-fn be_bytes_to_u64(bytes: &[u8]) -> Option<u64> {
-    match bytes.len() {
-        4 => Some(u32::from_be_bytes(bytes.try_into().ok()?) as u64),
-        8 => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
-        _ => None,
-    }
-}
-
 pub(crate) fn apply_guest_timer_policy_for_current_cpu() {
     const CNTHCTL_EL2_EL1PCTEN: u64 = 1 << 0;
     const CNTHCTL_EL2_EL1PCEN: u64 = 1 << 1;
@@ -768,137 +724,6 @@ pub(crate) fn apply_guest_timer_policy_for_current_cpu() {
     cpu::set_mdcr_el2(mdcr_el2);
 
     cpu::isb();
-}
-
-fn remove_initrd(tree: &mut DeviceTree<'_>, chosen: NodeId) -> Option<(u64, u64)> {
-    let start = tree
-        .node(chosen)
-        .and_then(|node| node.property("linux,initrd-start"))
-        .and_then(|p| be_bytes_to_u64(p.value.as_slice()));
-    let end = tree
-        .node(chosen)
-        .and_then(|node| node.property("linux,initrd-end"))
-        .and_then(|p| be_bytes_to_u64(p.value.as_slice()));
-
-    if let Some(node) = tree.node_mut(chosen) {
-        node.remove_property("linux,initrd-start");
-        node.remove_property("linux,initrd-end");
-    }
-
-    if let (Some(start), Some(end)) = (start, end) {
-        if end > start {
-            return Some((start, end - start));
-        }
-    }
-    None
-}
-
-fn remove_initrd_memreserve(tree: &mut DeviceTree<'_>, initrd: Option<(u64, u64)>) {
-    if let Some((addr, size)) = initrd {
-        tree.mem_reserve
-            .retain(|entry| !(entry.address == addr && entry.size == size));
-    }
-}
-
-fn append_reserved_memory(tree: &mut DeviceTree<'_>, reserved_memory: &[(usize, usize)]) {
-    for &(addr, size) in reserved_memory {
-        if size == 0 {
-            continue;
-        }
-        let entry = MemReserve {
-            address: addr as u64,
-            size: size as u64,
-        };
-        if tree
-            .mem_reserve
-            .iter()
-            .any(|r| r.address == entry.address && r.size == entry.size)
-        {
-            continue;
-        }
-        tree.mem_reserve.push(entry);
-    }
-}
-
-fn configure_uart_console(
-    tree: &mut DeviceTree<'_>,
-    chosen: NodeId,
-    pl011_uart_addr: usize,
-) -> Result<(), &'static str> {
-    let alias = pick_uart_alias(tree);
-    let stdout_value = format!("{alias}:115200\0").into_bytes();
-    let node = tree.node_mut(chosen).ok_or("chosen node missing")?;
-    node.set_property(
-        NameRef::Borrowed("stdout-path"),
-        ValueRef::Owned(stdout_value.clone()),
-    );
-    node.set_property(
-        NameRef::Borrowed("linux,stdout-path"),
-        ValueRef::Owned(stdout_value),
-    );
-
-    update_bootargs(tree, chosen, pl011_uart_addr)
-}
-
-fn pick_uart_alias(tree: &DeviceTree<'_>) -> &'static str {
-    if let Some(alias_id) = tree.find_node_by_path("/aliases") {
-        if let Some(node) = tree.node(alias_id) {
-            if node.property("uart0").is_some() {
-                return "uart0";
-            }
-            if node.property("serial0").is_some() {
-                return "serial0";
-            }
-        }
-    }
-    "uart0"
-}
-
-fn update_bootargs(
-    tree: &mut DeviceTree<'_>,
-    chosen: NodeId,
-    pl011_uart_addr: usize,
-) -> Result<(), &'static str> {
-    let mut args = String::new();
-
-    if let Some(existing) = tree
-        .node(chosen)
-        .and_then(|node| node.property("bootargs"))
-        .map(|p| p.value.as_slice())
-    {
-        if let Some(raw) = existing.split(|b| *b == 0).next() {
-            if let Ok(text) = core::str::from_utf8(raw) {
-                for token in text.split_whitespace() {
-                    if token.starts_with("console=") || token.starts_with("earlycon=") {
-                        continue;
-                    }
-                    if !args.is_empty() {
-                        args.push(' ');
-                    }
-                    args.push_str(token);
-                }
-            }
-        }
-    }
-
-    let earlycon = format!("earlycon=pl011,0x{pl011_uart_addr:x}");
-    let console = "console=ttyAMA0,115200";
-    for token in [earlycon.as_str(), console] {
-        if !args.is_empty() {
-            args.push(' ');
-        }
-        args.push_str(token);
-    }
-
-    let mut bytes = args.into_bytes();
-    if !bytes.ends_with(&[0]) {
-        bytes.push(0);
-    }
-
-    tree.node_mut(chosen)
-        .ok_or("chosen node missing")?
-        .set_property(NameRef::Borrowed("bootargs"), ValueRef::Owned(bytes));
-    Ok(())
 }
 
 fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
@@ -980,133 +805,6 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
         }
     }
     found.ok_or("gic: missing GICv2 node")
-}
-
-fn update_gicv2_cpu_interface_reg(
-    tree: &mut DeviceTree<'_>,
-    gicv: MmioRegion,
-) -> Result<(), &'static str> {
-    const COMPATS: [&str; 2] = ["arm,gic-400", "arm,cortex-a15-gic"];
-    let mut gic_node = None;
-    for id in 0..tree.nodes.len() {
-        for compat in COMPATS {
-            if node_compatible_contains(tree, id, compat)? {
-                gic_node = Some(id);
-                break;
-            }
-        }
-        if gic_node.is_some() {
-            break;
-        }
-    }
-    let Some(node_id) = gic_node else {
-        return Ok(());
-    };
-
-    let parent = tree
-        .node(node_id)
-        .and_then(|n| n.parent)
-        .unwrap_or(tree.root);
-    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
-    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
-    let stride = (addr_cells + size_cells) * 4;
-    let Some(node) = tree.node(node_id) else {
-        return Ok(());
-    };
-    let Some(reg) = node.property("reg") else {
-        return Ok(());
-    };
-    let mut bytes = reg.value.as_slice().to_vec();
-    if bytes.len() < stride * 2 {
-        return Err("gic: reg property too short");
-    }
-    let base_off = stride;
-    write_be_u32s(&mut bytes, base_off, addr_cells, gicv.base as u64)?;
-    write_be_u32s(
-        &mut bytes,
-        base_off + addr_cells * 4,
-        size_cells,
-        gicv.size as u64,
-    )?;
-
-    if let Some(node) = tree.node_mut(node_id) {
-        node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
-    }
-    Ok(())
-}
-
-fn node_compatible_contains(
-    tree: &DeviceTree<'_>,
-    node_id: usize,
-    needle: &str,
-) -> Result<bool, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(false);
-    };
-    let Some(prop) = node.property("compatible") else {
-        return Ok(false);
-    };
-    let bytes = prop.value.as_slice();
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| start + p)
-            .unwrap_or(bytes.len());
-        if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
-            if entry == needle {
-                return Ok(true);
-            }
-        }
-        start = end + 1;
-    }
-    Ok(false)
-}
-
-fn property_u32(
-    tree: &DeviceTree<'_>,
-    node_id: usize,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(None);
-    };
-    let Some(prop) = node.property(key) else {
-        return Ok(None);
-    };
-    let bytes = prop.value.as_slice();
-    if bytes.len() != 4 {
-        return Ok(None);
-    }
-    Ok(Some(read_be_u32(bytes, 0)?))
-}
-
-fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
-    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
-    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
-    slice.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for i in 0..cells {
-        let shift = 32 * (cells - 1 - i);
-        let cell = ((value >> shift) & 0xffff_ffff) as u32;
-        write_be_u32(bytes, offset + i * 4, cell)?;
-    }
-    Ok(())
 }
 
 #[cfg(not(all(test, target_arch = "aarch64")))]

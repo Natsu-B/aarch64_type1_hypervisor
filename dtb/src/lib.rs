@@ -6,6 +6,7 @@ pub mod ast;
 pub(crate) mod dtb_parser;
 pub mod overlay;
 pub mod patch;
+pub mod tree_copy;
 
 pub use dtb_parser::DtbGenerator;
 pub use dtb_parser::DtbNodeView;
@@ -35,6 +36,10 @@ pub use ast::NodeId;
 pub use ast::NodeQueryExt;
 pub use ast::Owned;
 pub use ast::ValueRef;
+pub use tree_copy::copy_node_properties;
+pub use tree_copy::copy_node_with_ancestors;
+pub use tree_copy::copy_subtree;
+pub use tree_copy::node_path;
 
 #[cfg(test)]
 mod tests {

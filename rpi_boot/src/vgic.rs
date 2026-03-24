@@ -16,6 +16,7 @@ use arch_hal::gic::vm::PirqHookFn;
 use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
 use arch_hal::println;
+use arch_hal::soc::bcm2712;
 use arch_hal::tls;
 use core::cell::SyncUnsafeCell;
 use core::sync::atomic::AtomicUsize;
@@ -24,12 +25,14 @@ use core::sync::atomic::Ordering;
 use crate::Gicv2Info;
 use crate::handler;
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct UartIrq {
     pub pintid: u32,
     pub sense: IrqSense,
 }
 
 const MIP_SPI_OFFSET: u32 = 128;
+const EXPLICIT_SPI_PASSTHROUGH_SPIS: [u32; 3] = [265, 266, 305];
 const VCPU_COUNT: usize = 4;
 const KICK_SGI_ID: u8 = 15;
 const KICK_INTID: u32 = KICK_SGI_ID as u32;
@@ -159,6 +162,21 @@ fn affinity_for_vcpu(vcpu_id: VcpuId) -> Result<cpu::CoreAffinity, GicError> {
     table[index].ok_or(GicError::InvalidState)
 }
 
+fn is_explicit_spi_passthrough(spi: u32) -> bool {
+    EXPLICIT_SPI_PASSTHROUGH_SPIS.contains(&spi)
+        || bcm2712::pirq_hook::is_guest_rp1_passthrough_spi(spi)
+}
+
+fn bind_spi_passthrough(gic: &Gicv2, spi: u32) -> Result<(), &'static str> {
+    match VGIC.bind_spi_pirq_passthrough(gic, PIntId(spi), VIntId(spi)) {
+        Ok(()) | Err(GicError::InvalidState) => Ok(()),
+        Err(err) => {
+            println!("vgic: map pirq failed: {:?}", err);
+            Err("vgic: map pirq failed")
+        }
+    }
+}
+
 pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<(), &'static str> {
     reset_online_state_for_init();
     reset_vcpu_affinities_for_init();
@@ -182,12 +200,11 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     })?;
     mark_vcpu_online(boot_vcpu_id).map_err(|_| "vgic: mark online")?;
 
-    if let Some(uart_irq) = uart_irq {
-        VGIC.bind_spi_pirq_passthrough(gic, PIntId(uart_irq.pintid), VIntId(uart_irq.pintid))
-            .map_err(|x| {
-                println!("vgic: map uart pirq failed: {:?}", x);
-                "vgic: map uart pirq failed"
-            })?;
+    if let Some(uart_irq) = uart_irq
+        && uart_irq.pintid >= MIP_SPI_OFFSET + 32
+        && !is_explicit_spi_passthrough(uart_irq.pintid)
+    {
+        bind_spi_passthrough(gic, uart_irq.pintid)?;
     }
 
     let max_intid = gic.max_intid();
@@ -204,6 +221,13 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
                 return Err("vgic: map pirq");
             }
         }
+    }
+
+    for spi in EXPLICIT_SPI_PASSTHROUGH_SPIS {
+        bind_spi_passthrough(gic, spi)?;
+    }
+    for spi in bcm2712::pirq_hook::GUEST_RP1_PASSTHROUGH_SPIS {
+        bind_spi_passthrough(gic, spi)?;
     }
 
     // SAFETY: vGIC state is initialized once before guest entry.
