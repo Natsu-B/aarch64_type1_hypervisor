@@ -889,14 +889,22 @@ impl<
                 if irq.is_hw() {
                     match eoi_mode {
                         EoiMode::DropOnly => {
-                            // Keep the LR unless the hardware already marked it inactive.
-                            if irq.state() == IrqState::Inactive {
-                                inner.in_lr[idx] = None;
-                                inner.lr_pintid[idx] = None;
-                                inner.sw_empty_lrs |= bit;
-                            } else {
-                                inner.in_lr[idx] = Some(key);
-                                inner.sw_empty_lrs &= !bit;
+                            // Retire completed HW-backed LRs that still need resample so a
+                            // persistent level source can be requeued through the normal ingress
+                            // path without relying on explicit EL2 deactivate.
+                            match irq.state() {
+                                IrqState::Inactive => {
+                                    inner.in_lr[idx] = None;
+                                    inner.lr_pintid[idx] = None;
+                                    inner.sw_empty_lrs |= bit;
+                                }
+                                IrqState::Pending | IrqState::PendingActive => {
+                                    self.invalidate_lr_entry(hw, idx, &mut inner)?;
+                                }
+                                IrqState::Active => {
+                                    inner.in_lr[idx] = Some(key);
+                                    inner.sw_empty_lrs &= !bit;
+                                }
                             }
                         }
                         EoiMode::DropAndDeactivate => {
@@ -1550,6 +1558,45 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn sync_lr_shadow_clears_stale_consumed_hw_lr() {
+        let vcpu = TestVcpu::with_id(VcpuId(0));
+        let hw = FakeHw::new(1);
+        vcpu.set_resident(cpu::get_current_core_id()).unwrap();
+        let key = LrKey {
+            vintid: VIntId(45),
+            source: None,
+        };
+        {
+            let irq = VirtualInterrupt::Hardware {
+                vintid: 45,
+                pintid: 33,
+                priority: 0x10,
+                group: IrqGroup::Group1,
+                state: IrqState::Pending,
+                source: None,
+            };
+            hw.write_lr(0, irq).unwrap();
+            let mut inner = vcpu.inner.lock_irqsave();
+            inner.in_lr[0] = Some(key);
+            inner.lr_state[0] = IrqState::Pending;
+            inner.lr_pintid[0] = Some(PIntId(33));
+            inner.sw_empty_lrs &= !1;
+        }
+        {
+            let mut st = hw.state.borrow_mut();
+            st.lrs[0] = invalid_irq();
+            st.elrsr |= 1;
+        }
+
+        vcpu.sync_lr_shadow(&hw).unwrap();
+
+        let inner = vcpu.inner.lock_irqsave();
+        assert!(inner.in_lr[0].is_none());
+        assert_eq!(inner.lr_state[0], IrqState::Inactive);
+        assert_eq!(inner.lr_pintid[0], None);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn eoi_maintenance_invalidates_and_calls_callbacks() {
         let vcpu = TestVcpu::with_id(VcpuId(0));
         let hw = FakeHw::new(2);
@@ -1828,6 +1875,72 @@ mod tests {
         assert_eq!(st.lrs[0].state(), IrqState::Active);
         assert!(!st.lrs[0].eoi_maintenance());
         assert_eq!(st.elrsr & 1, 0);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn hw_drop_only_pending_eoi_invalidates_lr_for_resample() {
+        let vcpu = TestVcpu::with_id(VcpuId(0));
+        let hw = FakeHw::new(1);
+        vcpu.set_resident(cpu::get_current_core_id()).unwrap();
+        hw.set_eoi_mode(EoiMode::DropOnly);
+        let key = LrKey {
+            vintid: VIntId(45),
+            source: None,
+        };
+        {
+            let irq = VirtualInterrupt::Hardware {
+                vintid: 45,
+                pintid: 33,
+                priority: 0x10,
+                group: IrqGroup::Group0,
+                state: IrqState::Active,
+                source: None,
+            };
+            hw.write_lr(0, irq).unwrap();
+            let mut inner = vcpu.inner.lock_irqsave();
+            inner.in_lr[0] = Some(key);
+            inner.lr_state[0] = IrqState::Active;
+            inner.lr_pintid[0] = Some(PIntId(33));
+            inner.sw_empty_lrs &= !1;
+        }
+        {
+            let irq = VirtualInterrupt::Hardware {
+                vintid: 45,
+                pintid: 33,
+                priority: 0x10,
+                group: IrqGroup::Group0,
+                state: IrqState::Pending,
+                source: None,
+            };
+            hw.write_lr(0, irq).unwrap();
+            let mut state = hw.state.borrow_mut();
+            state.eisr &= !1;
+            state.misr = MaintenanceReasons(MaintenanceReasons::EOI);
+        }
+
+        let mut eoi = CallbackLog::<4>::new();
+        let mut deactivate = CallbackLog::<4>::new();
+        let mut resample = CallbackLog::<4>::new();
+        let update = vcpu
+            .handle_maintenance(
+                &hw,
+                &mut |id| eoi.push(id.0),
+                &mut |id| deactivate.push(id.0),
+                &mut |id| resample.push(id.0),
+            )
+            .unwrap();
+
+        assert_eq!(eoi.as_slice(), &[33]);
+        assert!(deactivate.as_slice().is_empty());
+        assert_eq!(resample.as_slice(), &[33]);
+        assert!(matches!(update, VgicUpdate::Some { work, .. } if work.refill));
+        {
+            let state = hw.state.borrow();
+            assert_ne!(state.elrsr & 1, 0);
+        }
+        let inner = vcpu.inner.lock_irqsave();
+        assert!(inner.in_lr[0].is_none());
+        assert_eq!(inner.lr_state[0], IrqState::Inactive);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]

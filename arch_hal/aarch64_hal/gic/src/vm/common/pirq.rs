@@ -567,6 +567,7 @@ where
         let mut update = VgicUpdate::None;
         let mut changed = false;
         let mut enqueue_irq: Option<VirtualInterrupt> = None;
+        let mut requeue_if_not_present = false;
 
         // NOTE: `level` semantics for pIRQ ingress:
         // - For level-sensitive pIRQs, `level=true` means the line is asserted, `level=false`
@@ -594,6 +595,7 @@ where
                     IrqGroup::Group1 => regs.dist_enable.1,
                 };
                 if changed && attrs.pending && attrs.enable && dist_enabled {
+                    requeue_if_not_present = false;
                     let shadow_state = if attrs.pending && attrs.active {
                         IrqStateKind::PendingActive
                     } else if attrs.pending {
@@ -621,6 +623,37 @@ where
                             source: None,
                         },
                     });
+                } else if attrs.pending && attrs.enable && dist_enabled {
+                    requeue_if_not_present = matches!(sense, IrqSense::Level);
+                    if requeue_if_not_present {
+                        let shadow_state = if attrs.pending && attrs.active {
+                            IrqStateKind::PendingActive
+                        } else if attrs.pending {
+                            IrqStateKind::Pending
+                        } else if attrs.active {
+                            IrqStateKind::Active
+                        } else {
+                            IrqStateKind::Inactive
+                        };
+                        enqueue_irq = Some(match entry.delivery.cpu_mode() {
+                            CpuDeliveryMode::HardwareLr => VirtualInterrupt::Hardware {
+                                vintid: entry.vintid.0,
+                                pintid: pintid.0,
+                                priority: attrs.priority,
+                                group: attrs.group,
+                                state: shadow_state,
+                                source: None,
+                            },
+                            CpuDeliveryMode::SoftwareLr => VirtualInterrupt::Software {
+                                vintid: entry.vintid.0,
+                                eoi_maintenance: false,
+                                priority: attrs.priority,
+                                group: attrs.group,
+                                state: shadow_state,
+                                source: None,
+                            },
+                        });
+                    }
                 }
             } else if matches!(sense, IrqSense::Level) {
                 changed = regs.irq_state.set_pending(scope, entry.vintid, false)?;
@@ -630,11 +663,21 @@ where
         if let Some(irq) = enqueue_irq {
             match scope {
                 VgicIrqScope::Local(target) => {
-                    update.combine(&self.common.enqueue_to_target(target, irq)?);
+                    if changed
+                        || (requeue_if_not_present
+                            && !self.common.vcpu(target)?.contains_irq(entry.vintid, None))
+                    {
+                        update.combine(&self.common.enqueue_to_target(target, irq)?);
+                    }
                 }
                 VgicIrqScope::Global => {
                     for target in global_targets.iter() {
-                        update.combine(&self.common.enqueue_to_target(target, irq)?);
+                        if changed
+                            || (requeue_if_not_present
+                                && !self.common.vcpu(target)?.contains_irq(entry.vintid, None))
+                        {
+                            update.combine(&self.common.enqueue_to_target(target, irq)?);
+                        }
                     }
                 }
             }

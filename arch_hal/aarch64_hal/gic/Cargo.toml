@@ -59,3 +59,8 @@ harness = false
 name = "vgic_e2e_physical_ppi_rpi_boot"
 path = "tests/vgic_e2e_physical_ppi_rpi_boot.rs"
 harness = false
+
+[[test]]
+name = "vgic_e2e_physical_ppi_rpi_boot_hwlr_drop_only"
+path = "tests/vgic_e2e_physical_ppi_rpi_boot_hwlr_drop_only.rs"
+harness = false

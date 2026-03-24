@@ -87,7 +87,7 @@ impl VgicDelegate for RpiVgicDelegate {
 }
 
 fn map_guest_local_ppis_for_vcpu(gic: &Gicv2, vcpu: VcpuId) -> Result<(), GicError> {
-    VGIC.bind_local_pirq_write_through_software_lr(
+    VGIC.bind_local_pirq_passthrough(
         gic,
         PIntId(GUEST_EL1_VTIMER_PPI_INTID),
         vcpu,

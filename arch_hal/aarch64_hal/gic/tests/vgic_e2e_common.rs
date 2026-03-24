@@ -216,6 +216,7 @@ struct TestVgicDelegate;
 enum TestPpi27Mode {
     DirectVgicSticky,
     RpiBootLikeSticky,
+    RpiBootLikeHwLrDropOnlyNoDeactivate,
 }
 
 static DELEGATE: TestVgicDelegate = TestVgicDelegate;
@@ -301,6 +302,17 @@ pub fn run_el2_rpi_boot_like(
     guest_entry: extern "C" fn(*mut Shared) -> !,
 ) -> ! {
     run_el2_with_ppi27_mode(test_name, guest_entry, TestPpi27Mode::RpiBootLikeSticky)
+}
+
+pub fn run_el2_rpi_boot_like_hwlr_drop_only_no_deactivate(
+    test_name: &'static str,
+    guest_entry: extern "C" fn(*mut Shared) -> !,
+) -> ! {
+    run_el2_with_ppi27_mode(
+        test_name,
+        guest_entry,
+        TestPpi27Mode::RpiBootLikeHwLrDropOnlyNoDeactivate,
+    )
 }
 
 fn run_el2_with_ppi27_mode(
@@ -463,12 +475,18 @@ fn init_gic_and_vgic() -> Result<(), &'static str> {
     gic.init_cpu_interface()
         .map_err(|_| "gic cpu init failed")?;
 
+    let eoi_mode = match current_test_ppi27_mode() {
+        TestPpi27Mode::DirectVgicSticky | TestPpi27Mode::RpiBootLikeSticky => {
+            EoiMode::DropAndDeactivate
+        }
+        TestPpi27Mode::RpiBootLikeHwLrDropOnlyNoDeactivate => EoiMode::DropOnly,
+    };
     let cfg = GicCpuConfig {
         priority_mask: 0xff,
         enable_group0: true,
         enable_group1: true,
         binary_point: BinaryPoint::Common(1),
-        eoi_mode: EoiMode::DropAndDeactivate,
+        eoi_mode,
     };
     GicCpuInterface::configure(&gic, &cfg).map_err(|_| "gic cpu configure failed")?;
 
@@ -638,6 +656,27 @@ fn clear_test_physical_ppi27_or_panic(context: &'static str) {
     set_test_physical_ppi27_or_panic(false, context);
 }
 
+fn observe_asserted_test_physical_ppi27_or_panic(context: &'static str) {
+    match VGIC.handle_physical_irq_asserted(gic_ref(), PIntId(TIMER_TEST_PPI_INTID)) {
+        Ok(()) => {}
+        Err(GicError::UnsupportedIntId) => {
+            record_fail(FAIL_EL2_IRQ_UNSUPPORTED);
+            panic!(
+                "{}: unsupported physical test PPI {}",
+                context, TIMER_TEST_PPI_INTID
+            );
+        }
+        Err(err) => {
+            record_fail(FAIL_EL2_IRQ_HANDLE);
+            println!(
+                "{}: physical asserted-ingress failed (intid={}): {:?}",
+                context, TIMER_TEST_PPI_INTID, err
+            );
+            panic!("{}: physical asserted-ingress failed", context);
+        }
+    }
+}
+
 fn set_test_physical_ppi27_pending(pending: bool) {
     let reg_off = if pending {
         GICD_ISPENDR0_OFF
@@ -666,6 +705,10 @@ fn quiesce_test_physical_ppi27_source_or_panic() {
             clear_test_physical_ppi27_or_panic("test control sticky disable");
             clear_test_physical_ppi27_pending();
         }
+        TestPpi27Mode::RpiBootLikeHwLrDropOnlyNoDeactivate => {
+            clear_test_physical_ppi27_or_panic("test control sticky disable");
+            clear_test_physical_ppi27_pending();
+        }
     }
 }
 
@@ -680,6 +723,7 @@ fn reassert_test_physical_ppi27_source_or_panic() {
             clear_test_physical_ppi27_pending();
             assert_test_physical_ppi27_pending();
         }
+        TestPpi27Mode::RpiBootLikeHwLrDropOnlyNoDeactivate => {}
     }
 }
 
@@ -866,9 +910,14 @@ fn el2_irq_handler(_regs: &mut cpu::Registers) {
             mmio_write32(UART_BASE + UART_ICR_OFF, UART_ICR_ALL);
         }
     } else {
-        let rpi_boot_like = intid == TIMER_TEST_PPI_INTID
-            && current_test_ppi27_mode() == TestPpi27Mode::RpiBootLikeSticky;
-        let result = if rpi_boot_like {
+        let ppi27_mode = current_test_ppi27_mode();
+        let use_asserted_path = intid == TIMER_TEST_PPI_INTID
+            && matches!(
+                ppi27_mode,
+                TestPpi27Mode::RpiBootLikeSticky
+                    | TestPpi27Mode::RpiBootLikeHwLrDropOnlyNoDeactivate
+            );
+        let result = if use_asserted_path {
             VGIC.handle_physical_irq_asserted(gic, PIntId(intid))
         } else {
             VGIC.handle_physical_irq(gic, PIntId(intid), true)
@@ -876,7 +925,8 @@ fn el2_irq_handler(_regs: &mut cpu::Registers) {
 
         match result {
             Ok(()) => {
-                needs_deactivate = rpi_boot_like;
+                needs_deactivate =
+                    intid == TIMER_TEST_PPI_INTID && ppi27_mode == TestPpi27Mode::RpiBootLikeSticky;
             }
             Err(GicError::UnsupportedIntId) => {
                 record_fail(FAIL_EL2_IRQ_UNSUPPORTED);
@@ -932,8 +982,18 @@ fn el2_trapped_wf_handler(_regs: &mut cpu::Registers, info: &TrappedWfInfo) {
         unsafe { *ptr::addr_of!(TEST_PPI27_STICKY_ACTIVE) }
     };
     if sticky_active {
-        reassert_test_physical_ppi27_source_or_panic();
-        return;
+        match current_test_ppi27_mode() {
+            TestPpi27Mode::DirectVgicSticky | TestPpi27Mode::RpiBootLikeSticky => {
+                reassert_test_physical_ppi27_source_or_panic();
+                return;
+            }
+            TestPpi27Mode::RpiBootLikeHwLrDropOnlyNoDeactivate => {
+                observe_asserted_test_physical_ppi27_or_panic(
+                    "trapped wf rpi_boot persistent ppi27",
+                );
+                return;
+            }
+        }
     }
 
     match info.ti {

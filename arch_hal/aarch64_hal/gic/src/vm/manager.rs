@@ -152,6 +152,8 @@ where
     ) -> Result<(), GicError> {
         let vm = self.model()?;
         let source_vcpu = VcpuId(u16::from(cpu_if().ok_or(GicError::UninitCpuId)?));
+        let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, source_vcpu)?;
+        vcpu_model.sync_lr_shadow(hw)?;
         let update = vm.on_physical_irq(source_vcpu, pintid, level)?;
         self.apply_update(hw, update)
     }
@@ -309,8 +311,9 @@ where
             let vcpu_model = <GicVmModelForVcpus<VCPUS> as VgicVmInfo>::vcpu(vm, vcpu)?;
             vcpu_model.handle_maintenance_collect(hw)?
         };
-        vm.dispatch_pirq_notifications(&notifs)?;
-        self.apply_update(hw, update)
+        let mut combined_update = update;
+        combined_update.combine(&vm.dispatch_pirq_notifications(vcpu, &notifs)?);
+        self.apply_update(hw, combined_update)
     }
 
     pub fn refill_vcpu<H: VgicHw>(&self, hw: &H, vcpu: VcpuId) -> Result<bool, GicError> {

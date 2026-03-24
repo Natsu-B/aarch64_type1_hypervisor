@@ -1,6 +1,7 @@
 use self::common::LOCAL_INTID_COUNT;
 use self::common::SGI_COUNT;
 use self::common::VmCommon;
+use self::common::pirq::CpuDeliveryMode;
 use self::common::pirq::DistMirrorMode;
 use self::common::pirq::PirqDelivery;
 use self::v2_ext::V2SgiState;
@@ -263,8 +264,16 @@ where
 
     pub(crate) fn dispatch_pirq_notifications(
         &self,
+        source_vcpu: VcpuId,
         notifs: &crate::PirqNotifications,
-    ) -> Result<(), GicError> {
+    ) -> Result<VgicUpdate, GicError>
+    where
+        V: VgicVcpuQueue,
+        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+        [(); pending_cap_for_vcpus(VCPUS)]:,
+    {
+        let mut update = VgicUpdate::None;
+
         for pintid in notifs.eoi.iter() {
             self.call_pirq_signal_hook(pintid, PirqHookOp::Eoi)?;
         }
@@ -272,9 +281,59 @@ where
             self.call_pirq_signal_hook(pintid, PirqHookOp::Deactivate)?;
         }
         for pintid in notifs.resample.iter() {
-            self.call_pirq_signal_hook(pintid, PirqHookOp::Resample)?;
+            if let Some(resample_update) =
+                self.resample_local_pirq_without_hook(source_vcpu, pintid)?
+            {
+                update.combine(&resample_update);
+            } else {
+                self.call_pirq_signal_hook(pintid, PirqHookOp::Resample)?;
+            }
         }
-        Ok(())
+        Ok(update)
+    }
+
+    fn resample_local_pirq_without_hook(
+        &self,
+        source_vcpu: VcpuId,
+        pintid: PIntId,
+    ) -> Result<Option<VgicUpdate>, GicError>
+    where
+        V: VgicVcpuQueue,
+        [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
+        [(); pending_cap_for_vcpus(VCPUS)]:,
+    {
+        if (pintid.0 as usize) >= LOCAL_INTID_COUNT {
+            return Ok(None);
+        }
+
+        let (_, hook) = self.pirq_hook_snapshot();
+        if hook.is_some() {
+            return Ok(None);
+        }
+
+        let maybe_local = {
+            let routing = self.common.routing_lock.lock_irqsave();
+            routing.pirqs.get_local(source_vcpu, pintid)?
+        };
+        let Some(entry) = maybe_local else {
+            return Ok(None);
+        };
+
+        let PirqDelivery::Local {
+            dist_mode,
+            cpu_mode,
+            ..
+        } = entry.delivery
+        else {
+            return Ok(None);
+        };
+
+        if dist_mode != DistMirrorMode::WriteThrough || cpu_mode != CpuDeliveryMode::HardwareLr {
+            return Ok(None);
+        }
+
+        self.on_physical_irq_inner(source_vcpu, pintid, true)
+            .map(Some)
     }
 
     fn call_pirq_signal_hook(&self, pintid: PIntId, op: PirqHookOp) -> Result<(), GicError> {
@@ -1058,6 +1117,7 @@ mod tests {
     struct RecordingVcpu {
         enqueued: RefCell<EnqueueLog>,
         cancelled: RefCell<CancelLog>,
+        present: RefCell<[Option<(VIntId, Option<VcpuId>)>; 8]>,
     }
 
     impl RecordingVcpu {
@@ -1065,6 +1125,7 @@ mod tests {
             Self {
                 enqueued: RefCell::new(EnqueueLog::new()),
                 cancelled: RefCell::new(CancelLog::new()),
+                present: RefCell::new([None; 8]),
             }
         }
     }
@@ -1088,6 +1149,14 @@ mod tests {
         fn switch_out_sync<H: crate::VgicHw>(&self, _hw: &H) -> Result<(), GicError> {
             Ok(())
         }
+
+        fn contains_irq(&self, vintid: VIntId, source: Option<VcpuId>) -> bool {
+            self.present
+                .borrow()
+                .iter()
+                .flatten()
+                .any(|entry| *entry == (vintid, source))
+        }
     }
 
     impl VgicVcpuQueue for RecordingVcpu {
@@ -1095,6 +1164,14 @@ mod tests {
             let mut log = self.enqueued.borrow_mut();
             log.count += 1;
             log.last = Some(irq);
+
+            let key = (VIntId(irq.vintid()), irq.source());
+            let mut present = self.present.borrow_mut();
+            if !present.iter().flatten().any(|entry| *entry == key)
+                && let Some(slot) = present.iter_mut().find(|entry| entry.is_none())
+            {
+                *slot = Some(key);
+            }
             Ok(VgicWork::REFILL)
         }
 
@@ -1102,6 +1179,14 @@ mod tests {
             let mut log = self.cancelled.borrow_mut();
             log.count += 1;
             log.last = Some((vintid, source));
+
+            let mut present = self.present.borrow_mut();
+            if let Some(slot) = present
+                .iter_mut()
+                .find(|entry| **entry == Some((vintid, source)))
+            {
+                *slot = None;
+            }
             Ok(())
         }
     }
@@ -1515,6 +1600,90 @@ mod tests {
         let log = vm.vcpu(target).unwrap().enqueued.borrow();
         assert_eq!(log.count, 1);
         match log.last.as_ref().expect("expected pending virq") {
+            VirtualInterrupt::Hardware { pintid, state, .. } => {
+                assert_eq!(*pintid, 27);
+                assert_eq!(*state, IrqState::Pending);
+            }
+            _ => panic!("expected hardware virq"),
+        }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn stale_pending_passthrough_ppi_requeues_after_previous_delivery_drains() {
+        let vm = mirrored_vm(1);
+        let target = VcpuId(0);
+        let vintid = VIntId(27);
+        let bit = 1u32 << vintid.0;
+
+        reset_mirror_state();
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
+            .unwrap();
+        vm.write_set_enable_word(VgicIrqScope::Local(target), VIntId(0), bit)
+            .unwrap();
+
+        vm.on_physical_irq(target, PIntId(27), true).unwrap();
+        assert_eq!(vm.vcpu(target).unwrap().enqueued.borrow().count, 1);
+        assert_ne!(
+            vm.read_pending_word(VgicIrqScope::Local(target), VIntId(0))
+                .unwrap()
+                & bit,
+            0
+        );
+
+        vm.vcpu(target).unwrap().cancel_irq(vintid, None).unwrap();
+        assert_eq!(vm.vcpu(target).unwrap().cancelled.borrow().count, 1);
+        assert_ne!(
+            vm.read_pending_word(VgicIrqScope::Local(target), VIntId(0))
+                .unwrap()
+                & bit,
+            0
+        );
+
+        vm.on_physical_irq(target, PIntId(27), true).unwrap();
+        let log = vm.vcpu(target).unwrap().enqueued.borrow();
+        assert_eq!(log.count, 2);
+        match log.last.as_ref().expect("expected requeued virq") {
+            VirtualInterrupt::Hardware { pintid, state, .. } => {
+                assert_eq!(*pintid, 27);
+                assert_eq!(*state, IrqState::Pending);
+            }
+            _ => panic!("expected hardware virq"),
+        }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn resample_without_hook_requeues_local_passthrough_ppi_via_vm_ingress() {
+        let vm = mirrored_vm(1);
+        let target = VcpuId(0);
+        let vintid = VIntId(27);
+        let bit = 1u32 << vintid.0;
+
+        vm.set_dist_enable(true, true).unwrap();
+        vm.bind_local_pirq_passthrough(PIntId(27), target, vintid)
+            .unwrap();
+        vm.write_set_enable_word(VgicIrqScope::Local(target), VIntId(0), bit)
+            .unwrap();
+
+        vm.on_physical_irq(target, PIntId(27), true).unwrap();
+        vm.vcpu(target).unwrap().cancel_irq(vintid, None).unwrap();
+
+        reset_mirror_state();
+        let mut notifications = crate::PirqNotifications::new();
+        notifications.resample.push(PIntId(27)).unwrap();
+        let update = vm
+            .dispatch_pirq_notifications(target, &notifications)
+            .unwrap();
+
+        assert_eq!(recorded_mirror_count(), 0);
+        assert!(matches!(
+            update,
+            VgicUpdate::Some { work, .. } if work.refill
+        ));
+
+        let log = vm.vcpu(target).unwrap().enqueued.borrow();
+        assert_eq!(log.count, 2);
+        match log.last.as_ref().expect("expected requeued virq") {
             VirtualInterrupt::Hardware { pintid, state, .. } => {
                 assert_eq!(*pintid, 27);
                 assert_eq!(*state, IrqState::Pending);
