@@ -156,7 +156,6 @@ pub(crate) fn build_guest_dtb(
     reserved_memory: &[(usize, usize)],
     gic_info: &Gicv2Info,
     uart_irq: vgic::UartIrq,
-    enable_virtio_blk: bool,
 ) -> Result<AlignedSliceBox<u8>, &'static str> {
     let source_tree = DeviceTreeBorrowed::from_parser(source)?;
     let mut target = DeviceTree::with_root(NameRef::Borrowed("/"));
@@ -226,15 +225,6 @@ pub(crate) fn build_guest_dtb(
         "mailbox@7c013880",
         "dtb: missing mailbox node",
     )?;
-    if !enable_virtio_blk {
-        copy_required_soc_child(
-            &source_tree,
-            source,
-            &mut target,
-            "mmc@fff000",
-            "dtb: missing sdio1 node",
-        )?;
-    }
     copy_optional_soc_child(&source_tree, source, &mut target, "pinctrl@7d504100")?;
     copy_required_soc_child(
         &source_tree,
@@ -304,9 +294,7 @@ pub(crate) fn build_guest_dtb(
             uart_irq,
         )?;
     }
-    if enable_virtio_blk {
-        add_virtio_mmio_blk_node(&mut target, gic_phandle)?;
-    }
+    add_virtio_mmio_blk_node(&mut target, gic_phandle)?;
 
     copy_reserved_memory(&source_tree, &mut target)?;
     validate_sd_regulator_gpio_providers(&target)?;
@@ -345,9 +333,9 @@ fn add_virtio_mmio_blk_node(
         NameRef::Borrowed("interrupt-parent"),
         ValueRef::Owned(gic_phandle.to_be_bytes().to_vec()),
     );
-    let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Edge);
+    let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Level);
     let interrupts = encode_gic_spi_interrupts_with_mapper(
-        &[(virtio_blk::VIRTIO_BLK_IRQ, irq_flags)],
+        &[(virtio_blk::VIRTIO_BLK_IRQ_INTID, irq_flags)],
         |intid| Ok(intid),
     )?;
     node.set_property(NameRef::Borrowed("interrupts"), ValueRef::Owned(interrupts));

@@ -632,22 +632,11 @@ extern "C" fn main() -> ! {
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
     println!("set up linux data");
 
-    let enable_virtio_blk = match bcm2712::sdhc::init_from_dtb(&dtb_modified) {
-        Ok(dev) => match virtio_blk::init_with_backend(dev) {
-            Ok(()) => {
-                println!("virtio-blk: enabled with bcm2712 sdhc backend");
-                true
-            }
-            Err(err) => {
-                println!("virtio-blk: backend install failed: {}", err);
-                false
-            }
-        },
-        Err(err) => {
-            println!("virtio-blk: sdhc init failed: {:?}", err);
-            false
-        }
-    };
+    let virtio_blk_backend = bcm2712::sdhc::init_from_dtb(&dtb_modified)
+        .unwrap_or_else(|err| panic!("virtio-blk: sdhc init failed: {:?}", err));
+    virtio_blk::init_with_backend(virtio_blk_backend)
+        .unwrap_or_else(|err| panic!("virtio-blk: backend install failed: {err}"));
+    println!("virtio-blk: enabled with bcm2712 sdhc backend");
 
     let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
     println!("allocator closed");
@@ -659,14 +648,8 @@ extern "C" fn main() -> ! {
     reserved_memory.push((program_start, program_end - program_start));
     reserved_memory.push((DTB_PTR, dtb.get_size()));
 
-    let dtb_box = dtb::build_guest_dtb(
-        &dtb_modified,
-        &reserved_memory,
-        &gic_info,
-        uart_irq,
-        enable_virtio_blk,
-    )
-    .unwrap();
+    let dtb_box =
+        dtb::build_guest_dtb(&dtb_modified, &reserved_memory, &gic_info, uart_irq).unwrap();
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
     cpu::clean_dcache_poc(dtb_box.as_ptr() as usize, dtb_box.len());
     core::mem::forget(dtb_box);

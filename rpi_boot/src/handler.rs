@@ -222,30 +222,20 @@ fn data_abort_handler(
         return;
     }
     if virtio_blk::handles_mmio(address as usize) {
-        let handled = match write_access {
+        match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                match virtio_blk::handle_mmio_read(address as usize, access_bytes) {
-                    Ok(value) => {
-                        write_guest_mmio_dest_reg(regs, reg_num, reg_size, value);
-                        true
-                    }
-                    Err(err) if virtio_blk::is_uninitialized_error(err) => false,
-                    Err(err) => panic!("virtio-blk read failed: {err}"),
-                }
+                let value = virtio_blk::handle_mmio_read(address as usize, access_bytes)
+                    .unwrap_or_else(|err| panic!("virtio-blk read failed: {err}"));
+                write_guest_mmio_dest_reg(regs, reg_num, reg_size, value);
             }
             WriteNotRead::WritingMemoryAbort => {
                 let reg_val = read_guest_mmio_source_reg(regs, reg_num, reg_size);
-                match virtio_blk::handle_mmio_write(address as usize, access_bytes, reg_val) {
-                    Ok(()) => true,
-                    Err(err) if virtio_blk::is_uninitialized_error(err) => false,
-                    Err(err) => panic!("virtio-blk write failed: {err}"),
-                }
+                virtio_blk::handle_mmio_write(address as usize, access_bytes, reg_val)
+                    .unwrap_or_else(|err| panic!("virtio-blk write failed: {err}"));
             }
-        };
-        if handled {
-            cpu::set_elr_el2(cpu::get_elr_el2() + 4);
-            return;
         }
+        cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+        return;
     }
     if vgic::handles_gicc_phys(address as usize) {
         panic!("gicc: physical GICC access denied; guest must use GICV");
@@ -377,23 +367,14 @@ fn handle_virtio_blk_decoded(plan: &MmioDecoded, regs: &mut cpu::Registers) -> b
             }
             if desc.is_store {
                 let value = store_value(desc, regs);
-                match virtio_blk::handle_mmio_write(*ipa as usize, desc.size, value) {
-                    Ok(()) => {}
-                    Err(err) if virtio_blk::is_uninitialized_error(err) => return false,
-                    Err(err) => panic!("virtio-blk write failed: {err}"),
-                }
+                virtio_blk::handle_mmio_write(*ipa as usize, desc.size, value)
+                    .unwrap_or_else(|err| panic!("virtio-blk write failed: {err}"));
             } else if desc.rt == 31 {
-                match virtio_blk::handle_mmio_read(*ipa as usize, desc.size) {
-                    Ok(_) => {}
-                    Err(err) if virtio_blk::is_uninitialized_error(err) => return false,
-                    Err(err) => panic!("virtio-blk read failed: {err}"),
-                }
+                virtio_blk::handle_mmio_read(*ipa as usize, desc.size)
+                    .unwrap_or_else(|err| panic!("virtio-blk read failed: {err}"));
             } else {
-                let value = match virtio_blk::handle_mmio_read(*ipa as usize, desc.size) {
-                    Ok(value) => value,
-                    Err(err) if virtio_blk::is_uninitialized_error(err) => return false,
-                    Err(err) => panic!("virtio-blk read failed: {err}"),
-                };
+                let value = virtio_blk::handle_mmio_read(*ipa as usize, desc.size)
+                    .unwrap_or_else(|err| panic!("virtio-blk read failed: {err}"));
                 if desc.rt >= 32 {
                     panic!("virtio-blk: invalid register {}", desc.rt);
                 }
@@ -497,7 +478,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
         }
     } else {
         if irq.intid == 27 {
-            println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
+            // println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
         }
         let delivery = handle_acknowledged_pirq(irq.intid);
         if let AckedPirqDelivery::Error(err) = delivery {
