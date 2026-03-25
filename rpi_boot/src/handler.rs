@@ -35,6 +35,7 @@ use crate::GICV2_DRIVER;
 use crate::PL011_UART_ADDR;
 use crate::multicore::ap_on;
 use crate::vgic;
+use crate::virtio_blk;
 
 pub(crate) fn setup_handler() {
     exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
@@ -95,7 +96,10 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
 
 fn passthrough_probe(_ctx: *const (), ipa: u64, size: u8, _is_write: bool) -> bool {
     let addr = ipa as usize;
-    matches!(size, 1 | 2 | 4 | 8) && !vgic::handles_gicd(addr) && !vgic::handles_gicc_phys(addr)
+    matches!(size, 1 | 2 | 4 | 8)
+        && !vgic::handles_gicd(addr)
+        && !vgic::handles_gicc_phys(addr)
+        && !virtio_blk::handles_mmio(addr)
 }
 
 fn read_guest_mmio_source_reg(
@@ -144,6 +148,9 @@ fn data_abort_handler(
 ) {
     if let Some(plan) = decoded {
         if handle_gicd_decoded(plan, regs) {
+            return;
+        }
+        if handle_virtio_blk_decoded(plan, regs) {
             return;
         }
         if gicc_access_denied(plan) {
@@ -213,6 +220,32 @@ fn data_abort_handler(
         }
         cpu::set_elr_el2(cpu::get_elr_el2() + 4);
         return;
+    }
+    if virtio_blk::handles_mmio(address as usize) {
+        let handled = match write_access {
+            WriteNotRead::ReadingMemoryAbort => {
+                match virtio_blk::handle_mmio_read(address as usize, access_bytes) {
+                    Ok(value) => {
+                        write_guest_mmio_dest_reg(regs, reg_num, reg_size, value);
+                        true
+                    }
+                    Err(err) if virtio_blk::is_uninitialized_error(err) => false,
+                    Err(err) => panic!("virtio-blk read failed: {err}"),
+                }
+            }
+            WriteNotRead::WritingMemoryAbort => {
+                let reg_val = read_guest_mmio_source_reg(regs, reg_num, reg_size);
+                match virtio_blk::handle_mmio_write(address as usize, access_bytes, reg_val) {
+                    Ok(()) => true,
+                    Err(err) if virtio_blk::is_uninitialized_error(err) => false,
+                    Err(err) => panic!("virtio-blk write failed: {err}"),
+                }
+            }
+        };
+        if handled {
+            cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+            return;
+        }
     }
     if vgic::handles_gicc_phys(address as usize) {
         panic!("gicc: physical GICC access denied; guest must use GICV");
@@ -331,6 +364,52 @@ fn gic_access_size_from_bytes(access_bytes: u8) -> Option<Gicv2AccessSize> {
         1 => Some(Gicv2AccessSize::U8),
         4 => Some(Gicv2AccessSize::U32),
         _ => None,
+    }
+}
+
+fn handle_virtio_blk_decoded(plan: &MmioDecoded, regs: &mut cpu::Registers) -> bool {
+    match plan {
+        MmioDecoded::Single {
+            desc, ipa, split, ..
+        } => {
+            if split.is_some() || !virtio_blk::handles_mmio(*ipa as usize) {
+                return false;
+            }
+            if desc.is_store {
+                let value = store_value(desc, regs);
+                match virtio_blk::handle_mmio_write(*ipa as usize, desc.size, value) {
+                    Ok(()) => {}
+                    Err(err) if virtio_blk::is_uninitialized_error(err) => return false,
+                    Err(err) => panic!("virtio-blk write failed: {err}"),
+                }
+            } else if desc.rt == 31 {
+                match virtio_blk::handle_mmio_read(*ipa as usize, desc.size) {
+                    Ok(_) => {}
+                    Err(err) if virtio_blk::is_uninitialized_error(err) => return false,
+                    Err(err) => panic!("virtio-blk read failed: {err}"),
+                }
+            } else {
+                let value = match virtio_blk::handle_mmio_read(*ipa as usize, desc.size) {
+                    Ok(value) => value,
+                    Err(err) if virtio_blk::is_uninitialized_error(err) => return false,
+                    Err(err) => panic!("virtio-blk read failed: {err}"),
+                };
+                if desc.rt >= 32 {
+                    panic!("virtio-blk: invalid register {}", desc.rt);
+                }
+                write_guest_mmio_dest_reg(regs, desc.rt as usize, desc.rt_size, value);
+            }
+            cpu::set_elr_el2(cpu::get_elr_el2() + 4);
+            true
+        }
+        MmioDecoded::Pair { ipa0, ipa1, .. } => {
+            if virtio_blk::handles_mmio(*ipa0 as usize) || virtio_blk::handles_mmio(*ipa1 as usize)
+            {
+                panic!("virtio-blk: pair access is not supported");
+            }
+            false
+        }
+        MmioDecoded::Prefetch { .. } => false,
     }
 }
 

@@ -335,3 +335,8 @@ pub fn handle_kick_sgi() -> Result<(), GicError> {
     let _kick = VGIC.refill_vcpu(gic, current_vcpu_id()?)?;
     Ok(())
 }
+
+pub fn inject_virtual_spi(intid: u32, level: bool) -> Result<(), GicError> {
+    let gic = handler::gic().ok_or(GicError::InvalidState)?;
+    VGIC.inject_physical_irq_as_pending(gic, intid, level)
+}

@@ -294,6 +294,7 @@ dependencies = [
  "aarch64_unit_test",
  "allocator",
  "arch_hal",
+ "block-device-api",
  "dtb",
  "elf",
  "file",

@@ -35,6 +35,7 @@ use crate::Gicv2Info;
 use crate::PL011_UART_ADDR;
 use crate::RP1_BASE;
 use crate::vgic;
+use crate::virtio_blk;
 
 type SourceTree<'dtb> = DeviceTreeBorrowed<'dtb>;
 type TargetTree<'dtb> = DeviceTree<'dtb, Owned>;
@@ -155,6 +156,7 @@ pub(crate) fn build_guest_dtb(
     reserved_memory: &[(usize, usize)],
     gic_info: &Gicv2Info,
     uart_irq: vgic::UartIrq,
+    enable_virtio_blk: bool,
 ) -> Result<AlignedSliceBox<u8>, &'static str> {
     let source_tree = DeviceTreeBorrowed::from_parser(source)?;
     let mut target = DeviceTree::with_root(NameRef::Borrowed("/"));
@@ -224,13 +226,15 @@ pub(crate) fn build_guest_dtb(
         "mailbox@7c013880",
         "dtb: missing mailbox node",
     )?;
-    copy_required_soc_child(
-        &source_tree,
-        source,
-        &mut target,
-        "mmc@fff000",
-        "dtb: missing sdio1 node",
-    )?;
+    if !enable_virtio_blk {
+        copy_required_soc_child(
+            &source_tree,
+            source,
+            &mut target,
+            "mmc@fff000",
+            "dtb: missing sdio1 node",
+        )?;
+    }
     copy_optional_soc_child(&source_tree, source, &mut target, "pinctrl@7d504100")?;
     copy_required_soc_child(
         &source_tree,
@@ -300,6 +304,9 @@ pub(crate) fn build_guest_dtb(
             uart_irq,
         )?;
     }
+    if enable_virtio_blk {
+        add_virtio_mmio_blk_node(&mut target, gic_phandle)?;
+    }
 
     copy_reserved_memory(&source_tree, &mut target)?;
     validate_sd_regulator_gpio_providers(&target)?;
@@ -313,6 +320,42 @@ pub(crate) fn build_guest_dtb(
     update_gicv2_cpu_interface_reg(&mut target, gicv)?;
 
     target.into_dtb_box()
+}
+
+fn add_virtio_mmio_blk_node(
+    target: &mut TargetTree<'_>,
+    gic_phandle: u32,
+) -> Result<NodeId, &'static str> {
+    let base = soc_bus_address_from_phys(virtio_blk::VIRTIO_BLK_MMIO_BASE as u64)?;
+    let size = virtio_blk::VIRTIO_BLK_MMIO_SIZE as u64;
+    let path = format!("{TARGET_SOC_PATH}/virtio_block@{base:x}");
+    let node_id = target.get_or_create_node_by_path(&path)?;
+    let node = target
+        .node_mut(node_id)
+        .ok_or("dtb: missing virtio-blk target node")?;
+    node.set_property(
+        NameRef::Borrowed("compatible"),
+        ValueRef::Owned(b"virtio,mmio\0".to_vec()),
+    );
+    node.set_property(
+        NameRef::Borrowed("reg"),
+        ValueRef::Owned(encode_reg_entries(&[(base, size)], 2, 1)?),
+    );
+    node.set_property(
+        NameRef::Borrowed("interrupt-parent"),
+        ValueRef::Owned(gic_phandle.to_be_bytes().to_vec()),
+    );
+    let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Edge);
+    let interrupts = encode_gic_spi_interrupts_with_mapper(
+        &[(virtio_blk::VIRTIO_BLK_IRQ, irq_flags)],
+        |intid| Ok(intid),
+    )?;
+    node.set_property(NameRef::Borrowed("interrupts"), ValueRef::Owned(interrupts));
+    node.set_property(
+        NameRef::Borrowed("status"),
+        ValueRef::Owned(b"okay\0".to_vec()),
+    );
+    Ok(node_id)
 }
 
 fn copy_root_properties(

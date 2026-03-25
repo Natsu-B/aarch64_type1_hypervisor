@@ -19,6 +19,7 @@ mod multicore;
 mod pcie;
 mod stack_overflow;
 mod vgic;
+mod virtio_blk;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);
@@ -391,17 +392,13 @@ extern "C" fn main() -> ! {
         trap_window(gic_info.dist.base, gic_info.dist.size, "gicd"),
         trap_window(gic_info.cpu.base, gic_info.cpu.size, "gicc"),
         trap_window(PL011_UART_ADDR.0, 0x1000, "pl011"),
+        trap_window(
+            virtio_blk::VIRTIO_BLK_MMIO_BASE,
+            virtio_blk::VIRTIO_BLK_MMIO_SIZE,
+            "virtio-blk-mmio",
+        ),
     ];
-
-    if trap_windows[0].start > trap_windows[1].start {
-        trap_windows.swap(0, 1);
-    }
-    if trap_windows[1].start > trap_windows[2].start {
-        trap_windows.swap(1, 2);
-    }
-    if trap_windows[0].start > trap_windows[1].start {
-        trap_windows.swap(0, 1);
-    }
+    trap_windows.sort_unstable_by_key(|window| window.start);
 
     let mut cursor = memory_last_addr;
     for window in trap_windows.iter() {
@@ -635,6 +632,8 @@ extern "C" fn main() -> ! {
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
     println!("set up linux data");
 
+    let enable_virtio_blk = false;
+
     let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
     println!("allocator closed");
     let mut allocator_regions = Vec::new();
@@ -645,8 +644,14 @@ extern "C" fn main() -> ! {
     reserved_memory.push((program_start, program_end - program_start));
     reserved_memory.push((DTB_PTR, dtb.get_size()));
 
-    let dtb_box =
-        dtb::build_guest_dtb(&dtb_modified, &reserved_memory, &gic_info, uart_irq).unwrap();
+    let dtb_box = dtb::build_guest_dtb(
+        &dtb_modified,
+        &reserved_memory,
+        &gic_info,
+        uart_irq,
+        enable_virtio_blk,
+    )
+    .unwrap();
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
     cpu::clean_dcache_poc(dtb_box.as_ptr() as usize, dtb_box.len());
     core::mem::forget(dtb_box);
