@@ -632,7 +632,22 @@ extern "C" fn main() -> ! {
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
     println!("set up linux data");
 
-    let enable_virtio_blk = false;
+    let enable_virtio_blk = match bcm2712::sdhc::init_from_dtb(&dtb_modified) {
+        Ok(dev) => match virtio_blk::init_with_backend(dev) {
+            Ok(()) => {
+                println!("virtio-blk: enabled with bcm2712 sdhc backend");
+                true
+            }
+            Err(err) => {
+                println!("virtio-blk: backend install failed: {}", err);
+                false
+            }
+        },
+        Err(err) => {
+            println!("virtio-blk: sdhc init failed: {:?}", err);
+            false
+        }
+    };
 
     let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
     println!("allocator closed");

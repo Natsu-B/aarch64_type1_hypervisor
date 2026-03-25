@@ -7,8 +7,8 @@ use dtb::WalkError;
 use io_api::block_device::BlockDevice;
 use io_api::block_device::IoError;
 use io_api::block_device::Lba;
-use mutex::pod::RawAtomicPod;
 use mutex::SpinLock;
+use mutex::pod::RawAtomicPod;
 use print::println;
 use timer::SystemTimer;
 
