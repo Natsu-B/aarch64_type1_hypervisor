@@ -19,6 +19,7 @@ pub mod brcmstb;
 pub mod mip;
 pub mod pirq_hook;
 pub mod rp1_interrupt;
+pub mod sdhc;
 pub use pirq_hook::pirq_hook;
 
 pub(crate) struct MsiXTablePtr {
