@@ -1,6 +1,7 @@
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use dtb::DtbParser;
 use dtb::WalkError;
@@ -10,7 +11,56 @@ use io_api::block_device::Lba;
 use mutex::SpinLock;
 use mutex::pod::RawAtomicPod;
 use print::println;
+
+#[cfg(target_arch = "aarch64")]
 use timer::SystemTimer;
+#[cfg(target_arch = "aarch64")]
+use timer::read_counter;
+
+#[cfg(not(target_arch = "aarch64"))]
+use self::timer_compat::SystemTimer;
+#[cfg(not(target_arch = "aarch64"))]
+use self::timer_compat::read_counter;
+
+#[cfg(not(target_arch = "aarch64"))]
+mod timer_compat {
+    use core::num::NonZeroU64;
+    use core::sync::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
+    use core::time::Duration;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub struct SystemTimer {
+        counter_frequency: Option<NonZeroU64>,
+    }
+
+    impl SystemTimer {
+        pub const fn new() -> Self {
+            Self {
+                counter_frequency: None,
+            }
+        }
+
+        pub fn init(&mut self) {
+            self.counter_frequency = NonZeroU64::new(1_000_000);
+        }
+
+        pub fn counter_frequency_hz(&self) -> NonZeroU64 {
+            self.counter_frequency
+                .expect("before calling wait function call init")
+        }
+
+        pub fn wait(&self, duration: Duration) {
+            let ticks = duration.as_micros() as u64;
+            COUNTER.fetch_add(ticks.max(1), Ordering::Relaxed);
+        }
+    }
+
+    pub fn read_counter() -> u64 {
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 const DT_COMPAT_BCM2712_SDHCI: &str = "brcm,bcm2712-sdhci";
 const DT_COMPAT_BRCMSTB_SDHCI: &str = "brcm,sdhci-brcmstb";
@@ -23,6 +73,11 @@ const SDHC_DATA_TIMEOUT_US: u64 = 1_000_000;
 const SDHC_CLOCK_TIMEOUT_US: u64 = 20_000;
 const SDHC_RESET_TIMEOUT_US: u64 = 100_000;
 const SDHC_ACMD41_RETRY_MAX: usize = 1000;
+const SDHC_ACMD41_POLL_DELAY_US: u64 = 10;
+const SDHC_MAX_DT_CANDIDATES: usize = 8;
+const SDHC_MAX_REG_ENTRIES: usize = 8;
+const SDHC_MAX_CLOCK_DIVIDER: u16 = 0x03ff;
+const BCM2712_SD_SLOT_HOST_BASE: usize = 0x10_00ff_f000;
 
 const SDHCI_BLOCK_SIZE: usize = 0x04;
 const SDHCI_BLOCK_COUNT: usize = 0x06;
@@ -93,9 +148,46 @@ const SDHCI_INT_ALL_MASK: u32 = u32::MAX;
 const SDIO_CFG_CTRL: usize = 0x00;
 const SDIO_CFG_CTRL_SDCD_N_TEST_EN: u32 = 1 << 31;
 const SDIO_CFG_CTRL_SDCD_N_TEST_LEV: u32 = 1 << 30;
+const SDIO_CFG_CLOCK_REGS_OFFSET: usize = 0x04;
+const SDIO_CFG_MODE: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x00;
+const SDIO_CFG_LOCAL: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x08;
+const SDIO_CFG_USE_LOCAL: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x0c;
+const SDIO_CFG_SD_DELAY: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x10;
+const SDIO_CFG_RX_DELAY: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x14;
+const SDIO_CFG_CS: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x1c;
 const SDIO_CFG_SD_PIN_SEL: usize = 0x44;
 const SDIO_CFG_SD_PIN_SEL_MASK: u32 = 0x3;
 const SDIO_CFG_SD_PIN_SEL_CARD: u32 = 1 << 1;
+const SDIO_CFG_MODE_SRC_SEL_SHIFT: u32 = 16;
+const SDIO_CFG_MODE_SRC_SEL_PLL_SYS_VCO: u32 = 2;
+const SDIO_CFG_MODE_STEPS_SHIFT: u32 = 28;
+const SDIO_CFG_MODE_STEPS_20_CYCLES: u32 = 0;
+const SDIO_CFG_LOCAL_FREQ_SEL_MASK: u32 = 0x03ff;
+const SDIO_CFG_LOCAL_CLK_GEN_SEL: u32 = 1 << 12;
+const SDIO_CFG_LOCAL_CARD_CLK_EN: u32 = 1 << 16;
+const SDIO_CFG_LOCAL_CLK2CARD_ON: u32 = 1 << 18;
+const SDIO_CFG_USE_LOCAL_FREQ_SEL: u32 = 1 << 0;
+const SDIO_CFG_USE_LOCAL_CLK_GEN_SEL: u32 = 1 << 12;
+const SDIO_CFG_USE_LOCAL_CARD_CLK_EN: u32 = 1 << 16;
+const SDIO_CFG_USE_LOCAL_CLK2CARD_ON: u32 = 1 << 18;
+const SDIO_CFG_SD_DELAY_STEP_MASK: u32 = 0x1f;
+const SDIO_CFG_SD_DELAY_STEP_DEFAULT: u32 = 5;
+const SDIO_CFG_RX_DELAY_FIXED_MASK: u32 = 0x1f;
+const SDIO_CFG_RX_DELAY_FIXED_DEFAULT: u32 = 6;
+const SDIO_CFG_RX_DELAY_MAP_SHIFT: u32 = 8;
+const SDIO_CFG_RX_DELAY_MAP_STRETCH: u32 = 2;
+const SDIO_CFG_RX_DELAY_OVERFLOW_SHIFT: u32 = 12;
+const SDIO_CFG_RX_DELAY_OVERFLOW_CLAMP: u32 = 1;
+const SDIO_CFG_CS_RESET: u32 = 1 << 0;
+const SDIO_CFG_CS_TX_CLK_RUNNING: u32 = 1 << 8;
+const SDIO_CFG_CS_SD_CLK_RUNNING: u32 = 1 << 12;
+const SDIO_CFG_CS_RX_CLK_RUNNING: u32 = 1 << 16;
+const SDIO_CFG_CS_CLOCKS_RUNNING: u32 =
+    SDIO_CFG_CS_TX_CLK_RUNNING | SDIO_CFG_CS_SD_CLK_RUNNING | SDIO_CFG_CS_RX_CLK_RUNNING;
+const BCM2712_SDIO1_SRC_CLOCK_HZ: u32 = 1_000_000_000;
+const BCM2712_SDIO1_CORE_CLOCK_HZ: u32 = 50_000_000;
+const BCM2712_SDIO1_INIT_CLOCK_HZ: u32 = 400_000;
+const BCM2712_SDIO1_CLOCK_START_TIMEOUT_US: u64 = 1_000;
 
 const MMC_CMD_GO_IDLE_STATE: u8 = 0;
 const MMC_CMD_ALL_SEND_CID: u8 = 2;
@@ -158,17 +250,91 @@ impl From<SdhcError> for IoError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HostRegion {
     base: usize,
     size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SdhcConfig {
     host: HostRegion,
     cfg: HostRegion,
+    busisol: HostRegion,
+    lcpll: HostRegion,
     max_clock_hz: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NamedRegions {
+    host: Option<HostRegion>,
+    cfg: Option<HostRegion>,
+    busisol: Option<HostRegion>,
+    lcpll: Option<HostRegion>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SdhcRegName {
+    Host,
+    Cfg,
+    BusIsol,
+    LcPll,
+    #[default]
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SdhcDtCandidate {
+    host: Option<HostRegion>,
+    cfg: Option<HostRegion>,
+    busisol: Option<HostRegion>,
+    lcpll: Option<HostRegion>,
+    max_clock_hz: u32,
+    has_brcmstb_compat: bool,
+    status_okay: bool,
+    bus_width: u32,
+    non_removable: bool,
+    has_wifi_child: bool,
+}
+
+impl SdhcDtCandidate {
+    fn is_supported_shape(&self) -> bool {
+        self.has_brcmstb_compat
+            && self.status_okay
+            && self.bus_width == 4
+            && self.host.is_some()
+            && self.cfg.is_some()
+    }
+
+    fn has_full_sd_slot_regions(&self) -> bool {
+        self.host.is_some() && self.cfg.is_some() && self.busisol.is_some() && self.lcpll.is_some()
+    }
+
+    fn host_base(&self) -> Option<usize> {
+        self.host.map(|region| region.base)
+    }
+
+    fn into_config(self) -> Result<SdhcConfig, SdhcError> {
+        let host = self
+            .host
+            .ok_or(SdhcError::DtbInvalid("sdhc: missing host reg"))?;
+        let cfg = self
+            .cfg
+            .ok_or(SdhcError::DtbInvalid("sdhc: missing cfg reg"))?;
+        let busisol = self
+            .busisol
+            .ok_or(SdhcError::DtbInvalid("sdhc: missing busisol reg"))?;
+        let lcpll = self
+            .lcpll
+            .ok_or(SdhcError::DtbInvalid("sdhc: missing lcpll reg"))?;
+        Ok(SdhcConfig {
+            host,
+            cfg,
+            busisol,
+            lcpll,
+            max_clock_hz: self.max_clock_hz,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -221,6 +387,12 @@ impl Bcm2712Sdhc {
         if cfg.cfg.base == 0 || cfg.cfg.size < 0x48 {
             return Err(SdhcError::DtbInvalid("sdhc: invalid cfg region"));
         }
+        if cfg.busisol.base == 0 || cfg.busisol.size == 0 {
+            return Err(SdhcError::DtbInvalid("sdhc: invalid busisol region"));
+        }
+        if cfg.lcpll.base == 0 || cfg.lcpll.size == 0 {
+            return Err(SdhcError::DtbInvalid("sdhc: invalid lcpll region"));
+        }
         if cfg.max_clock_hz == 0 {
             return Err(SdhcError::InvalidClock);
         }
@@ -231,6 +403,7 @@ impl Bcm2712Sdhc {
             min_clock_hz: SDHC_DEFAULT_MIN_CLOCK_HZ,
             card: SpinLock::new(None),
         };
+        instance.configure_bcm2712_sdio1_clock()?;
         instance.reset(SDHCI_RESET_ALL)?;
         instance.configure_card_detect()?;
         instance.power_on()?;
@@ -249,7 +422,7 @@ impl Bcm2712Sdhc {
     }
 
     fn now_ticks() -> u64 {
-        timer::read_counter()
+        read_counter()
     }
 
     fn elapsed_us(timer: &SystemTimer, start: u64) -> u64 {
@@ -316,6 +489,41 @@ impl Bcm2712Sdhc {
         unsafe { core::ptr::write_volatile(self.cfg.wrapping_add(offset) as *mut u32, value) };
     }
 
+    fn configure_bcm2712_sdio1_clock(&self) -> Result<(), SdhcError> {
+        let steps = match BCM2712_SDIO1_SRC_CLOCK_HZ / BCM2712_SDIO1_CORE_CLOCK_HZ {
+            20 => SDIO_CFG_MODE_STEPS_20_CYCLES,
+            _ => return Err(SdhcError::InvalidClock),
+        };
+
+        let local_divider = bcm2712_sdio1_local_divider(BCM2712_SDIO1_INIT_CLOCK_HZ)?;
+        let mode = (SDIO_CFG_MODE_SRC_SEL_PLL_SYS_VCO << SDIO_CFG_MODE_SRC_SEL_SHIFT)
+            | (steps << SDIO_CFG_MODE_STEPS_SHIFT);
+        let rx_delay = (SDIO_CFG_RX_DELAY_FIXED_DEFAULT & SDIO_CFG_RX_DELAY_FIXED_MASK)
+            | (SDIO_CFG_RX_DELAY_MAP_STRETCH << SDIO_CFG_RX_DELAY_MAP_SHIFT)
+            | (SDIO_CFG_RX_DELAY_OVERFLOW_CLAMP << SDIO_CFG_RX_DELAY_OVERFLOW_SHIFT);
+        let sd_delay = SDIO_CFG_SD_DELAY_STEP_DEFAULT & SDIO_CFG_SD_DELAY_STEP_MASK;
+        let use_local = SDIO_CFG_USE_LOCAL_FREQ_SEL
+            | SDIO_CFG_USE_LOCAL_CLK_GEN_SEL
+            | SDIO_CFG_USE_LOCAL_CARD_CLK_EN
+            | SDIO_CFG_USE_LOCAL_CLK2CARD_ON;
+        let local = (local_divider & SDIO_CFG_LOCAL_FREQ_SEL_MASK)
+            | SDIO_CFG_LOCAL_CLK_GEN_SEL
+            | SDIO_CFG_LOCAL_CARD_CLK_EN
+            | SDIO_CFG_LOCAL_CLK2CARD_ON;
+
+        self.cfg_write_u32(SDIO_CFG_CS, SDIO_CFG_CS_RESET);
+        self.cfg_write_u32(SDIO_CFG_MODE, mode);
+        self.cfg_write_u32(SDIO_CFG_RX_DELAY, rx_delay);
+        self.cfg_write_u32(SDIO_CFG_SD_DELAY, sd_delay);
+        self.cfg_write_u32(SDIO_CFG_USE_LOCAL, use_local);
+        self.cfg_write_u32(SDIO_CFG_LOCAL, local);
+        self.cfg_write_u32(SDIO_CFG_CS, 0);
+
+        self.wait_until(BCM2712_SDIO1_CLOCK_START_TIMEOUT_US, |s| {
+            (s.cfg_read_u32(SDIO_CFG_CS) & SDIO_CFG_CS_CLOCKS_RUNNING) == SDIO_CFG_CS_CLOCKS_RUNNING
+        })
+    }
+
     fn reset(&self, mask: u8) -> Result<(), SdhcError> {
         self.reg_write_u8(SDHCI_SOFTWARE_RESET, mask);
         self.wait_until(SDHC_RESET_TIMEOUT_US, |s| {
@@ -324,6 +532,9 @@ impl Bcm2712Sdhc {
     }
 
     fn configure_card_detect(&self) -> Result<(), SdhcError> {
+        // The Raspberry Pi 5 SD-slot path we support here still relies on firmware-prepared
+        // regulator state and does not expose a runtime hotplug controller through the DT we
+        // consume at EL2, so we explicitly force the SD-slot routing instead of guessing.
         let mut ctrl = self.cfg_read_u32(SDIO_CFG_CTRL);
         ctrl &= !SDIO_CFG_CTRL_SDCD_N_TEST_LEV;
         ctrl |= SDIO_CFG_CTRL_SDCD_N_TEST_EN;
@@ -353,22 +564,8 @@ impl Bcm2712Sdhc {
 
         self.reg_write_u16(SDHCI_CLOCK_CONTROL, 0);
 
-        let div = if self.max_clock_hz <= clock_hz {
-            1u16
-        } else {
-            let mut d = 2u16;
-            while d < 2046 {
-                if self.max_clock_hz / (u32::from(d)) <= clock_hz {
-                    break;
-                }
-                d = d.saturating_add(2);
-            }
-            d >> 1
-        };
-
-        let mut clk: u16 = ((div & SDHCI_DIV_MASK) << SDHCI_DIVIDER_SHIFT)
-            | (((div & SDHCI_DIV_HI_MASK) >> 8) << SDHCI_DIVIDER_HI_SHIFT)
-            | SDHCI_CLOCK_INT_EN;
+        let encoded_divider = encode_clock_divider(clock_hz, self.max_clock_hz)?;
+        let mut clk: u16 = pack_clock_control_divider(encoded_divider) | SDHCI_CLOCK_INT_EN;
         self.reg_write_u16(SDHCI_CLOCK_CONTROL, clk);
         self.wait_until(SDHC_CLOCK_TIMEOUT_US, |s| {
             (s.reg_read_u16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE) != 0
@@ -572,6 +769,8 @@ impl Bcm2712Sdhc {
 
         let mut ocr = 0u32;
         let mut ready = false;
+        let mut timer = SystemTimer::new();
+        timer.init();
         for _ in 0..SDHC_ACMD41_RETRY_MAX {
             self.send_command(MMC_CMD_APP_CMD, 0, RespType::R1, None)?;
             let resp =
@@ -581,6 +780,7 @@ impl Bcm2712Sdhc {
                 ready = true;
                 break;
             }
+            timer.wait(Duration::from_micros(SDHC_ACMD41_POLL_DELAY_US));
         }
         if !ready {
             return Err(SdhcError::Timeout);
@@ -591,10 +791,11 @@ impl Bcm2712Sdhc {
         let rca_resp = self.send_command(MMC_CMD_SET_RELATIVE_ADDR, 0, RespType::R6, None)?;
         let rca = (rca_resp[0] >> 16) as u16;
         let csd = self.send_command(MMC_CMD_SEND_CSD, u32::from(rca) << 16, RespType::R2, None)?;
+        let select_card = select_card_command(rca);
         self.send_command(
-            MMC_CMD_SELECT_CARD,
-            u32::from(rca) << 16,
-            RespType::R1,
+            select_card.idx,
+            select_card.arg,
+            select_card.resp_type,
             None,
         )?;
         self.send_command(
@@ -695,6 +896,8 @@ impl Bcm2712Sdhc {
 
 impl BlockDevice for Bcm2712Sdhc {
     fn init(&mut self) -> Result<(), IoError> {
+        self.configure_bcm2712_sdio1_clock()
+            .map_err(IoError::from)?;
         self.reset(SDHCI_RESET_ALL).map_err(IoError::from)?;
         self.configure_card_detect().map_err(IoError::from)?;
         self.power_on().map_err(IoError::from)?;
@@ -773,7 +976,7 @@ pub fn init_from_dtb(dtb: &DtbParser) -> Result<&'static dyn BlockDevice, SdhcEr
     Ok(dev)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RespType {
     None,
     R1,
@@ -789,6 +992,13 @@ struct DataTransfer<'a> {
     blocks: usize,
     block_size: usize,
     buffer: &'a mut [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandSpec {
+    idx: u8,
+    arg: u32,
+    resp_type: RespType,
 }
 
 fn decode_capacity_blocks(csd: &[u32; 4], high_capacity: bool) -> Result<u64, SdhcError> {
@@ -816,50 +1026,337 @@ fn decode_capacity_blocks(csd: &[u32; 4], high_capacity: bool) -> Result<u64, Sd
     Ok(bytes / SDHC_BLOCK_SIZE as u64)
 }
 
-fn parse_from_dtb(dtb: &DtbParser) -> Result<SdhcConfig, SdhcError> {
-    let mut result = None;
-    let walk = dtb.find_nodes_by_compatible_view(DT_COMPAT_BCM2712_SDHCI, &mut |view, _name| {
-        if !view
-            .compatible_contains(DT_COMPAT_BRCMSTB_SDHCI)
-            .map_err(WalkError::Dtb)?
-        {
-            return Ok(core::ops::ControlFlow::Continue(()));
+fn bcm2712_sdio1_local_divider(clock_hz: u32) -> Result<u32, SdhcError> {
+    if clock_hz == 0 || clock_hz > BCM2712_SDIO1_CORE_CLOCK_HZ {
+        return Err(SdhcError::InvalidClock);
+    }
+
+    let divider = BCM2712_SDIO1_CORE_CLOCK_HZ / clock_hz;
+    let freq_sel = divider.checked_sub(1).ok_or(SdhcError::InvalidClock)?;
+    if freq_sel > SDIO_CFG_LOCAL_FREQ_SEL_MASK {
+        return Err(SdhcError::InvalidClock);
+    }
+    Ok(freq_sel)
+}
+
+fn encode_clock_divider(requested_clock_hz: u32, max_clock_hz: u32) -> Result<u16, SdhcError> {
+    if requested_clock_hz == 0 || max_clock_hz == 0 {
+        return Err(SdhcError::InvalidClock);
+    }
+    if requested_clock_hz >= max_clock_hz {
+        return Ok(0);
+    }
+
+    let denominator = u64::from(requested_clock_hz)
+        .checked_mul(2)
+        .ok_or(SdhcError::InvalidClock)?;
+    let mut encoded = u64::from(max_clock_hz).div_ceil(denominator);
+    if encoded == 0 {
+        encoded = 1;
+    }
+    if encoded > u64::from(SDHC_MAX_CLOCK_DIVIDER) {
+        encoded = u64::from(SDHC_MAX_CLOCK_DIVIDER);
+    }
+    u16::try_from(encoded).map_err(|_| SdhcError::InvalidClock)
+}
+
+fn pack_clock_control_divider(encoded_divider: u16) -> u16 {
+    ((encoded_divider & SDHCI_DIV_MASK) << SDHCI_DIVIDER_SHIFT)
+        | (((encoded_divider & SDHCI_DIV_HI_MASK) >> 8) << SDHCI_DIVIDER_HI_SHIFT)
+}
+
+fn select_card_command(rca: u16) -> CommandSpec {
+    CommandSpec {
+        idx: MMC_CMD_SELECT_CARD,
+        arg: u32::from(rca) << 16,
+        resp_type: RespType::R1b,
+    }
+}
+
+fn property_string_matches(
+    view: &dtb::DtbNodeView<'_, '_>,
+    key: &str,
+    expected: &str,
+    invalid_msg: &'static str,
+) -> Result<bool, SdhcError> {
+    let Some(bytes) = view.property_bytes(key).map_err(SdhcError::DtbParse)? else {
+        return Ok(false);
+    };
+    let value = bytes.split(|byte| *byte == 0).next().unwrap_or(bytes);
+    let value = core::str::from_utf8(value).map_err(|_| SdhcError::DtbInvalid(invalid_msg))?;
+    Ok(value == expected)
+}
+
+fn property_u32_or_default(
+    view: &dtb::DtbNodeView<'_, '_>,
+    key: &str,
+    default: u32,
+    invalid_msg: &'static str,
+) -> Result<u32, SdhcError> {
+    match view.property_u32_be(key) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Ok(default),
+        Err(_) => Err(SdhcError::DtbInvalid(invalid_msg)),
+    }
+}
+
+fn decode_reg_name(name: &str) -> SdhcRegName {
+    match name {
+        "host" => SdhcRegName::Host,
+        "cfg" => SdhcRegName::Cfg,
+        "busisol" => SdhcRegName::BusIsol,
+        "lcpll" => SdhcRegName::LcPll,
+        _ => SdhcRegName::Other,
+    }
+}
+
+fn parse_reg_names(
+    bytes: &[u8],
+) -> Result<([SdhcRegName; SDHC_MAX_REG_ENTRIES], usize), SdhcError> {
+    let mut names = [SdhcRegName::Other; SDHC_MAX_REG_ENTRIES];
+    let mut count = 0usize;
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let end =
+            start
+                + bytes[start..].iter().position(|byte| *byte == 0).ok_or(
+                    SdhcError::DtbInvalid("sdhc: reg-names missing NUL terminator"),
+                )?;
+        if count >= names.len() {
+            return Err(SdhcError::DtbInvalid("sdhc: too many reg-names entries"));
         }
+        let name = core::str::from_utf8(&bytes[start..end])
+            .map_err(|_| SdhcError::DtbInvalid("sdhc: reg-names contains invalid UTF-8"))?;
+        names[count] = decode_reg_name(name);
+        count += 1;
+        start = end + 1;
+    }
+    Ok((names, count))
+}
 
-        let mut reg_iter = view.reg_iter().map_err(WalkError::Dtb)?;
-        let host = reg_iter
-            .next()
-            .ok_or(SdhcError::DtbInvalid("sdhc: missing host reg"))
-            .map_err(WalkError::User)?;
-        let host = host.map_err(WalkError::Dtb)?;
-        let cfg = reg_iter
-            .next()
-            .ok_or(SdhcError::DtbInvalid("sdhc: missing cfg reg"))
-            .map_err(WalkError::User)?;
-        let cfg = cfg.map_err(WalkError::Dtb)?;
+fn assign_region(
+    slot: &mut Option<HostRegion>,
+    region: HostRegion,
+    duplicate_msg: &'static str,
+) -> Result<(), SdhcError> {
+    if slot.replace(region).is_some() {
+        return Err(SdhcError::DtbInvalid(duplicate_msg));
+    }
+    Ok(())
+}
 
-        let max_clock_hz = find_clock_frequency(view, dtb).map_err(WalkError::User)?;
-        result = Some(SdhcConfig {
-            host: HostRegion {
-                base: host.0,
-                size: host.1,
-            },
-            cfg: HostRegion {
-                base: cfg.0,
-                size: cfg.1,
-            },
-            max_clock_hz,
-        });
-        Ok(core::ops::ControlFlow::Break(()))
+fn parse_named_regions(view: &dtb::DtbNodeView<'_, '_>) -> Result<NamedRegions, SdhcError> {
+    let Some(reg_names_bytes) = view
+        .property_bytes("reg-names")
+        .map_err(SdhcError::DtbParse)?
+    else {
+        return Ok(NamedRegions::default());
+    };
+    let (reg_names, reg_name_count) = parse_reg_names(reg_names_bytes)?;
+
+    let mut regs = [HostRegion::default(); SDHC_MAX_REG_ENTRIES];
+    let mut reg_count = 0usize;
+    let mut reg_iter = view.reg_iter().map_err(SdhcError::DtbParse)?;
+    while let Some(entry) = reg_iter.next() {
+        if reg_count >= regs.len() {
+            return Err(SdhcError::DtbInvalid("sdhc: too many reg entries"));
+        }
+        let (base, size) = entry.map_err(SdhcError::DtbParse)?;
+        regs[reg_count] = HostRegion { base, size };
+        reg_count += 1;
+    }
+    if reg_count != reg_name_count {
+        return Err(SdhcError::DtbInvalid("sdhc: reg/reg-names length mismatch"));
+    }
+
+    let mut named = NamedRegions::default();
+    for index in 0..reg_count {
+        match reg_names[index] {
+            SdhcRegName::Host => {
+                assign_region(&mut named.host, regs[index], "sdhc: duplicate host reg")?
+            }
+            SdhcRegName::Cfg => {
+                assign_region(&mut named.cfg, regs[index], "sdhc: duplicate cfg reg")?
+            }
+            SdhcRegName::BusIsol => assign_region(
+                &mut named.busisol,
+                regs[index],
+                "sdhc: duplicate busisol reg",
+            )?,
+            SdhcRegName::LcPll => {
+                assign_region(&mut named.lcpll, regs[index], "sdhc: duplicate lcpll reg")?
+            }
+            SdhcRegName::Other => {}
+        }
+    }
+    Ok(named)
+}
+
+fn has_wifi_child(view: &dtb::DtbNodeView<'_, '_>) -> Result<bool, SdhcError> {
+    let mut found = false;
+    let walk = view.for_each_child_view(&mut |child| {
+        if child.name() == "wifi@1" {
+            found = true;
+            return Ok(core::ops::ControlFlow::Break(()));
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    });
+    match walk {
+        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => {
+            Ok(found)
+        }
+        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
+        Err(WalkError::User(err)) => Err(err),
+    }
+}
+
+fn parse_candidate_from_view(
+    view: &dtb::DtbNodeView<'_, '_>,
+    dtb: &DtbParser,
+) -> Result<SdhcDtCandidate, SdhcError> {
+    let named = parse_named_regions(view)?;
+    Ok(SdhcDtCandidate {
+        host: named.host,
+        cfg: named.cfg,
+        busisol: named.busisol,
+        lcpll: named.lcpll,
+        max_clock_hz: find_clock_frequency(view, dtb)?,
+        has_brcmstb_compat: view
+            .compatible_contains(DT_COMPAT_BRCMSTB_SDHCI)
+            .map_err(SdhcError::DtbParse)?,
+        status_okay: property_string_matches(
+            view,
+            "status",
+            "okay",
+            "sdhc: invalid status property",
+        )?,
+        bus_width: property_u32_or_default(
+            view,
+            "bus-width",
+            0,
+            "sdhc: invalid bus-width property",
+        )?,
+        non_removable: view
+            .property_bytes("non-removable")
+            .map_err(SdhcError::DtbParse)?
+            .is_some(),
+        has_wifi_child: has_wifi_child(view)?,
+    })
+}
+
+fn matching_candidate_indices(
+    candidates: &[SdhcDtCandidate],
+    predicate: impl Fn(&SdhcDtCandidate) -> bool,
+) -> ([usize; SDHC_MAX_DT_CANDIDATES], usize) {
+    let mut indices = [usize::MAX; SDHC_MAX_DT_CANDIDATES];
+    let mut count = 0usize;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if predicate(candidate) {
+            indices[count] = index;
+            count += 1;
+        }
+    }
+    (indices, count)
+}
+
+fn retain_candidate_subset(
+    candidates: &[SdhcDtCandidate],
+    indices: &mut [usize; SDHC_MAX_DT_CANDIDATES],
+    len: usize,
+    predicate: impl Fn(&SdhcDtCandidate) -> bool,
+) -> usize {
+    let mut write = 0usize;
+    for position in 0..len {
+        let index = indices[position];
+        if predicate(&candidates[index]) {
+            indices[write] = index;
+            write += 1;
+        }
+    }
+    write
+}
+
+fn prefer_candidate_subset(
+    candidates: &[SdhcDtCandidate],
+    indices: &mut [usize; SDHC_MAX_DT_CANDIDATES],
+    len: usize,
+    predicate: impl Fn(&SdhcDtCandidate) -> bool,
+) -> usize {
+    let mut preferred = [usize::MAX; SDHC_MAX_DT_CANDIDATES];
+    let mut preferred_len = 0usize;
+    for position in 0..len {
+        let index = indices[position];
+        if predicate(&candidates[index]) {
+            preferred[preferred_len] = index;
+            preferred_len += 1;
+        }
+    }
+    if preferred_len == 0 {
+        return len;
+    }
+    indices[..preferred_len].copy_from_slice(&preferred[..preferred_len]);
+    preferred_len
+}
+
+fn select_sd_slot_candidate(candidates: &[SdhcDtCandidate]) -> Result<SdhcConfig, SdhcError> {
+    let (mut indices, mut len) =
+        matching_candidate_indices(candidates, |candidate| candidate.is_supported_shape());
+    if len == 0 {
+        return Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate"));
+    }
+
+    len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
+        candidate.has_full_sd_slot_regions()
+    });
+    len = retain_candidate_subset(candidates, &mut indices, len, |candidate| {
+        !candidate.non_removable
+    });
+    if len == 0 {
+        return Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate"));
+    }
+    len = retain_candidate_subset(candidates, &mut indices, len, |candidate| {
+        !candidate.has_wifi_child
+    });
+    if len == 0 {
+        return Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate"));
+    }
+    len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
+        candidate.host_base() == Some(BCM2712_SD_SLOT_HOST_BASE)
     });
 
+    match len {
+        1 => candidates[indices[0]].into_config(),
+        0 => Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate")),
+        _ => Err(SdhcError::DtbInvalid(
+            "sdhc: ambiguous DT candidate selection",
+        )),
+    }
+}
+
+fn parse_from_dtb(dtb: &DtbParser) -> Result<SdhcConfig, SdhcError> {
+    let mut candidates = [SdhcDtCandidate::default(); SDHC_MAX_DT_CANDIDATES];
+    let mut count = 0usize;
+    let walk =
+        dtb.find_nodes_by_compatible_view(DT_COMPAT_BCM2712_SDHCI, &mut |view, _node_name| {
+            if count >= candidates.len() {
+                return Err(WalkError::User(SdhcError::DtbInvalid(
+                    "sdhc: too many compatible nodes",
+                )));
+            }
+            candidates[count] = parse_candidate_from_view(view, dtb).map_err(WalkError::User)?;
+            count += 1;
+            Ok(core::ops::ControlFlow::Continue(()))
+        });
+
     match walk {
-        Ok(core::ops::ControlFlow::Break(())) => {}
-        Ok(core::ops::ControlFlow::Continue(())) => return Err(SdhcError::DtbNotFound),
+        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => {}
         Err(WalkError::Dtb(err)) => return Err(SdhcError::DtbParse(err)),
         Err(WalkError::User(err)) => return Err(err),
     }
-    result.ok_or(SdhcError::DtbNotFound)
+    if count == 0 {
+        return Err(SdhcError::DtbNotFound);
+    }
+    select_sd_slot_candidate(&candidates[..count])
 }
 
 fn find_clock_frequency(
@@ -885,10 +1382,138 @@ fn find_clock_frequency(
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
+    use alloc::vec::Vec;
+
+    use dtb::DeviceTree;
+    use dtb::DeviceTreeEditExt;
+    use dtb::DtbParser;
+    use dtb::NameRef;
+    use dtb::NodeEditExt;
+    use dtb::ValueRef;
+
+    use super::BCM2712_SD_SLOT_HOST_BASE;
+    use super::DT_COMPAT_BCM2712_SDHCI;
+    use super::DT_COMPAT_BRCMSTB_SDHCI;
+    use super::MMC_CMD_SELECT_CARD;
+    use super::RespType;
     use super::SDHC_BLOCK_SIZE;
     use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
+    use super::SdhcConfig;
+    use super::SdhcDtCandidate;
     use super::SdhcError;
     use super::decode_capacity_blocks;
+    use super::encode_clock_divider;
+    use super::pack_clock_control_divider;
+    use super::parse_from_dtb;
+    use super::select_card_command;
+    use super::select_sd_slot_candidate;
+
+    #[derive(Clone, Copy)]
+    struct TestNodeSpec<'a> {
+        name: &'a str,
+        reg_names: &'a [&'a str],
+        regs: &'a [(u64, u64)],
+        non_removable: bool,
+        wifi_child: bool,
+        status: &'a str,
+        bus_width: u32,
+        has_brcmstb_compat: bool,
+    }
+
+    fn u32_prop(value: u32) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    fn string_prop(value: &str) -> Vec<u8> {
+        let mut bytes = value.as_bytes().to_vec();
+        bytes.push(0);
+        bytes
+    }
+
+    fn string_list(values: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    fn reg_prop(entries: &[(u64, u64)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (addr, size) in entries {
+            bytes.extend_from_slice(&((*addr >> 32) as u32).to_be_bytes());
+            bytes.extend_from_slice(&(*addr as u32).to_be_bytes());
+            bytes.extend_from_slice(&((*size >> 32) as u32).to_be_bytes());
+            bytes.extend_from_slice(&(*size as u32).to_be_bytes());
+        }
+        bytes
+    }
+
+    fn compatible_prop(has_brcmstb_compat: bool) -> Vec<u8> {
+        if has_brcmstb_compat {
+            string_list(&[DT_COMPAT_BCM2712_SDHCI, DT_COMPAT_BRCMSTB_SDHCI])
+        } else {
+            string_list(&[DT_COMPAT_BCM2712_SDHCI])
+        }
+    }
+
+    fn set_property<'dtb>(
+        tree: &mut dtb::DeviceTree<'dtb, dtb::Owned>,
+        node: usize,
+        name: &'dtb str,
+        value: Vec<u8>,
+    ) {
+        tree.node_mut(node)
+            .unwrap()
+            .set_property(NameRef::Borrowed(name), ValueRef::Owned(value));
+    }
+
+    fn build_test_dtb(nodes: &[TestNodeSpec<'_>]) -> impl core::ops::Deref<Target = [u8]> {
+        let mut tree = DeviceTree::with_root(NameRef::Borrowed("/"));
+        tree.header.version = 17;
+        tree.header.last_comp_version = 16;
+
+        let root = tree.root;
+        set_property(&mut tree, root, "#address-cells", u32_prop(2));
+        set_property(&mut tree, root, "#size-cells", u32_prop(2));
+
+        let clocks = tree.add_child(root, NameRef::Borrowed("clocks")).unwrap();
+        set_property(&mut tree, clocks, "phandle", u32_prop(1));
+        set_property(&mut tree, clocks, "clock-frequency", u32_prop(100_000_000));
+
+        for spec in nodes {
+            let node = tree.add_child(root, NameRef::Borrowed(spec.name)).unwrap();
+            set_property(
+                &mut tree,
+                node,
+                "compatible",
+                compatible_prop(spec.has_brcmstb_compat),
+            );
+            set_property(&mut tree, node, "status", string_prop(spec.status));
+            set_property(&mut tree, node, "bus-width", u32_prop(spec.bus_width));
+            set_property(&mut tree, node, "reg", reg_prop(spec.regs));
+            set_property(&mut tree, node, "reg-names", string_list(spec.reg_names));
+            set_property(&mut tree, node, "clocks", u32_prop(1));
+
+            if spec.non_removable {
+                set_property(&mut tree, node, "non-removable", Vec::new());
+            }
+            if spec.wifi_child {
+                let _ = tree.add_child(node, NameRef::Borrowed("wifi@1")).unwrap();
+            }
+        }
+
+        tree.into_dtb_box().unwrap()
+    }
+
+    fn parse_test_config(nodes: &[TestNodeSpec<'_>]) -> Result<SdhcConfig, SdhcError> {
+        let dtb = build_test_dtb(nodes);
+        let parser = DtbParser::init((&*dtb).as_ptr() as usize).unwrap();
+        parse_from_dtb(&parser)
+    }
 
     #[test]
     fn decode_capacity_high_capacity() {
@@ -917,5 +1542,125 @@ mod tests {
     fn invalid_param_maps_to_io_invalid_param() {
         let mapped = io_api::block_device::IoError::from(SdhcError::InvalidParam);
         assert_eq!(mapped, io_api::block_device::IoError::InvalidParam);
+    }
+
+    #[test]
+    fn dt_selector_prefers_sd_slot_when_both_mmc_nodes_exist() {
+        let wifi_regs = &[(0x10_0110_0000, 0x104), (0x10_0110_1000, 0x80)];
+        let slot_regs = &[
+            (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
+            (0x10_00ff_f200, 0x80),
+            (0x10_00ff_f400, 0x4),
+            (0x10_00ff_f800, 0x4),
+        ];
+        let nodes = [
+            TestNodeSpec {
+                name: "mmc@1100000",
+                reg_names: &["host", "cfg"],
+                regs: wifi_regs,
+                non_removable: true,
+                wifi_child: true,
+                status: "okay",
+                bus_width: 4,
+                has_brcmstb_compat: true,
+            },
+            TestNodeSpec {
+                name: "mmc@fff000",
+                reg_names: &["host", "cfg", "busisol", "lcpll"],
+                regs: slot_regs,
+                non_removable: false,
+                wifi_child: false,
+                status: "okay",
+                bus_width: 4,
+                has_brcmstb_compat: true,
+            },
+        ];
+
+        let config = parse_test_config(&nodes).unwrap();
+        assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
+        assert_eq!(config.cfg.base, 0x10_00ff_f200);
+        assert_eq!(config.busisol.base, 0x10_00ff_f400);
+        assert_eq!(config.lcpll.base, 0x10_00ff_f800);
+    }
+
+    #[test]
+    fn non_removable_wifi_candidate_is_rejected() {
+        let candidates = [SdhcDtCandidate {
+            host: Some(super::HostRegion {
+                base: 0x10_0110_0000,
+                size: 0x104,
+            }),
+            cfg: Some(super::HostRegion {
+                base: 0x10_0110_1000,
+                size: 0x80,
+            }),
+            busisol: Some(super::HostRegion {
+                base: 0x10_0110_2000,
+                size: 0x4,
+            }),
+            lcpll: Some(super::HostRegion {
+                base: 0x10_0110_3000,
+                size: 0x4,
+            }),
+            max_clock_hz: 100_000_000,
+            has_brcmstb_compat: true,
+            status_okay: true,
+            bus_width: 4,
+            non_removable: true,
+            has_wifi_child: true,
+        }];
+
+        let err = select_sd_slot_candidate(&candidates).unwrap_err();
+        assert_eq!(
+            err,
+            SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate")
+        );
+    }
+
+    #[test]
+    fn reg_names_mapping_is_independent_of_reg_order() {
+        let regs = &[
+            (0x10_00ff_f200, 0x80),
+            (0x10_00ff_f800, 0x4),
+            (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
+            (0x10_00ff_f400, 0x4),
+        ];
+        let nodes = [TestNodeSpec {
+            name: "mmc@fff000",
+            reg_names: &["cfg", "lcpll", "host", "busisol"],
+            regs,
+            non_removable: false,
+            wifi_child: false,
+            status: "okay",
+            bus_width: 4,
+            has_brcmstb_compat: true,
+        }];
+
+        let config = parse_test_config(&nodes).unwrap();
+        assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
+        assert_eq!(config.cfg.base, 0x10_00ff_f200);
+        assert_eq!(config.busisol.base, 0x10_00ff_f400);
+        assert_eq!(config.lcpll.base, 0x10_00ff_f800);
+    }
+
+    #[test]
+    fn divider_encoding_returns_zero_when_requested_clock_meets_or_exceeds_max() {
+        assert_eq!(encode_clock_divider(100_000_000, 100_000_000).unwrap(), 0);
+        assert_eq!(encode_clock_divider(150_000_000, 100_000_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn divider_packing_uses_low_and_high_bits() {
+        let encoded = encode_clock_divider(100_000, 200_000_000).unwrap();
+        assert_eq!(encoded, 1000);
+        assert_eq!(pack_clock_control_divider(encoded), 0xe8c0);
+    }
+
+    #[test]
+    fn cmd7_select_card_uses_r1b() {
+        let command = select_card_command(0x1234);
+        assert_eq!(command.idx, MMC_CMD_SELECT_CARD);
+        assert_eq!(command.arg, 0x1234_0000);
+        assert_eq!(command.resp_type, RespType::R1b);
     }
 }

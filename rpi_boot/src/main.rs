@@ -589,23 +589,6 @@ extern "C" fn main() -> ! {
 
     debug_assert_eq!(rp1.peripheral_addr.unwrap().0, RP1_BASE as u64);
 
-    let io_config = unsafe {
-        &*slice_from_raw_parts_mut(
-            (rp1.peripheral_addr.unwrap().0 + 0xd_0000) as *mut ReadWrite<u32>,
-            56,
-        )
-    };
-    io_config[29].update_bits(0b1111, 0b100);
-
-    let gpio_config = unsafe {
-        &*slice_from_raw_parts_mut(
-            (rp1.peripheral_addr.unwrap().0 + 0xf_0000 + 0x04) as *mut ReadWrite<u32>,
-            28,
-        )
-    };
-    // input enable
-    gpio_config[15].set_bits(0b100_1000);
-
     // setup guest RP1 MSI-X interrupts
     // SAFETY: RP1 peripheral MMIO is mapped; the table is sized for the index used below.
     let pcie_config = unsafe {

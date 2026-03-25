@@ -9,8 +9,10 @@ typestate_macro = { path = "../../../typestate_macro" }
 pci = { path = "../../../pci" }
 dtb = { path = "../../../dtb" }
 print = { path = "../print" }
-cpu = { path = "../cpu" }
 mutex = { path = "../../../mutex" }
 common = { path = "../common" }
 io-api = { path = "../../../io_api" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+cpu = { path = "../cpu" }
 timer = { path = "../timer" }

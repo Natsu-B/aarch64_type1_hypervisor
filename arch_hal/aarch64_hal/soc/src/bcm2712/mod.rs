@@ -1,47 +1,73 @@
+#[cfg(target_arch = "aarch64")]
 use core::ops::ControlFlow;
+#[cfg(target_arch = "aarch64")]
 use core::ptr::slice_from_raw_parts;
 
+#[cfg(target_arch = "aarch64")]
 use crate::bcm2712::brcmstb::BrcmStb;
+#[cfg(target_arch = "aarch64")]
 use crate::bcm2712::brcmstb::PcieStatus;
+#[cfg(target_arch = "aarch64")]
 use dtb::DtbNodeView;
+#[cfg(target_arch = "aarch64")]
 use dtb::DtbParser;
+#[cfg(target_arch = "aarch64")]
 use dtb::WalkError;
+#[cfg(target_arch = "aarch64")]
 use dtb::WalkResult;
+#[cfg(target_arch = "aarch64")]
 use mutex::RawSpinLock;
+#[cfg(target_arch = "aarch64")]
 use pci::PciBhlc;
+#[cfg(target_arch = "aarch64")]
 use pci::PciHeaderKind;
+#[cfg(target_arch = "aarch64")]
 use pci::PciId;
+#[cfg(target_arch = "aarch64")]
 use pci::msix::PciMsiXTable;
+#[cfg(target_arch = "aarch64")]
 use print::println;
+#[cfg(target_arch = "aarch64")]
 use typestate::Readable;
 
+#[cfg(target_arch = "aarch64")]
 pub mod brcmstb;
+#[cfg(target_arch = "aarch64")]
 pub mod mip;
+#[cfg(target_arch = "aarch64")]
 pub mod pirq_hook;
+#[cfg(target_arch = "aarch64")]
 pub mod rp1_interrupt;
 pub mod sdhc;
+#[cfg(target_arch = "aarch64")]
 pub use pirq_hook::pirq_hook;
 
+#[cfg(target_arch = "aarch64")]
 pub(crate) struct MsiXTablePtr {
     base: *const PciMsiXTable,
     len: usize,
 }
 
+#[cfg(target_arch = "aarch64")]
 unsafe impl Send for MsiXTablePtr {}
 
+#[cfg(target_arch = "aarch64")]
 pub(crate) static MSIX_TABLE: RawSpinLock<Option<MsiXTablePtr>> = RawSpinLock::new(None);
 
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn get_msi_x_table(table: &MsiXTablePtr) -> &'static [PciMsiXTable] {
     // SAFETY: `MsiXTablePtr` is created from a valid, MMIO-mapped MSI-X table during RP1 init
     // and remains valid for the lifetime of the system; `len` is the table entry count.
     unsafe { &*slice_from_raw_parts(table.base, table.len) }
 }
 
+#[cfg(target_arch = "aarch64")]
 pub struct Rp1Config {
     pub peripheral_addr: Option<(u64, u64)>,
     pub shared_sram_addr: Option<(u64, u64)>,
 }
 
+#[cfg(target_arch = "aarch64")]
 pub fn init_rp1(dtb: &DtbParser) -> Result<Rp1Config, Bcm2712Error> {
     println!("init rp1...");
     // currently we assumes that the rp1 is already initialized by the firmware
@@ -61,6 +87,7 @@ pub fn init_rp1(dtb: &DtbParser) -> Result<Rp1Config, Bcm2712Error> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bcm2712Error {
     DtbParseError(&'static str),
@@ -72,6 +99,7 @@ pub enum Bcm2712Error {
     InvalidSettings,
 }
 
+#[cfg(target_arch = "aarch64")]
 fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
     let mut has_rp1 = false;
     view.for_each_child_view(&mut |child| {
@@ -188,6 +216,7 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
     })
 }
 
+#[cfg(target_arch = "aarch64")]
 fn link_up(brcm_stb: &BrcmStb) -> bool {
     let status = brcm_stb.pcie_status.read();
     status.get(PcieStatus::phy_linkup) != 0 && status.get(PcieStatus::dl_active) != 0
