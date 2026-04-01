@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 io-api = { path = "../io_api" }
+
+[lints]
+workspace = true

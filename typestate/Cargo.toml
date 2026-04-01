@@ -7,3 +7,6 @@ edition = "2024"
 
 [dev-dependencies]
 typestate_macro = { path = "../typestate_macro" }
+
+[lints]
+workspace = true

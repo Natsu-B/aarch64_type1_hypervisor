@@ -32,3 +32,6 @@ harness = false
 name = "uefi_packet_size"
 path = "tests/uefi_packet_size.rs"
 harness = false
+
+[lints]
+workspace = true

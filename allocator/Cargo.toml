@@ -3,16 +3,6 @@ name = "allocator"
 version = "0.1.0"
 edition = "2024"
 
-[lints.clippy]
-pedantic = "warn"
-# missing_docs_in_private_items = "warn"
-
-[lints.rust]
-# missing_docs = "warn"
-
-[lints.rustdoc]
-# missing_crate_level_docs = "warn"
-
 [dependencies]
 mutex = { path = "../mutex" }
 intrusive_linked_list = { path = "../intrusive_linked_list" }
@@ -22,3 +12,6 @@ typestate = { path = "../typestate" }
 debug-assertions = []
 no-alloc-error-handler = []
 no-allocator = []
+
+[lints]
+workspace = true

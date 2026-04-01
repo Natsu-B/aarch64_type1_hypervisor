@@ -294,7 +294,10 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     ///
     /// # Errors
     /// Returns `Err` if allocator is not initialized.
-    pub fn for_each_reserved_region<F: FnMut(usize, usize)>(&self, f: F) -> Result<(), &'static str> {
+    pub fn for_each_reserved_region<F: FnMut(usize, usize)>(
+        &self,
+        f: F,
+    ) -> Result<(), &'static str> {
         let guard = self.range_list_allocator.lock();
         let Some(block) = guard.get() else {
             return Err("allocator not initialized");

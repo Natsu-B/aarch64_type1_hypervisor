@@ -20,6 +20,16 @@ members = [
     "xtask",
 ]
 
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_docs_in_private_items = "warn"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.rustdoc]
+missing_crate_level_docs = "warn"
+
 [profile.release]
 panic = 'abort'
 debug = true

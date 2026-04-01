@@ -1,10 +1,22 @@
+//! Intrusive linked list implementation for memory-efficient collections.
+//!
+//! This crate provides a simple intrusive linked list that stores node pointers
+//! as raw `usize` values. It is designed for use in allocators and other
+//! low-level memory management scenarios where nodes embed their own link fields.
+
 #![cfg_attr(not(test), no_std)]
 
 use core::fmt;
 use core::ptr::NonNull;
 
+/// An intrusive linked list node that can be embedded in other structures.
+///
+/// Each node contains an optional pointer to the next node in the list.
+/// The list does not own the nodes; callers are responsible for ensuring
+/// node memory remains valid while in the list.
 #[repr(C)]
 pub struct IntrusiveLinkedList {
+    /// Pointer to the next node in the list, or `None` if this is the tail.
     next: Option<NonNull<IntrusiveLinkedList>>,
 }
 
@@ -12,9 +24,11 @@ impl fmt::Debug for IntrusiveLinkedList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut list = f.debug_list();
         let mut current = self.next;
-        while let Some(intrusive_linked_list) = current {
-            list.entry(&intrusive_linked_list);
-            current = unsafe { intrusive_linked_list.as_ref().next };
+        while let Some(node) = current {
+            list.entry(&node);
+            // SAFETY: We only traverse nodes that were previously added to the list,
+            // so they must be valid.
+            current = unsafe { node.as_ref().next };
         }
         list.finish()
     }
@@ -27,10 +41,14 @@ impl Default for IntrusiveLinkedList {
 }
 
 impl IntrusiveLinkedList {
+    /// Creates a new empty intrusive linked list.
+    #[must_use]
     pub const fn new() -> Self {
         Self { next: None }
     }
 
+    /// Returns `true` if the list contains no elements.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.next.is_none()
     }
@@ -42,7 +60,9 @@ impl IntrusiveLinkedList {
     /// - The memory at `ptr` must remain valid for the lifetime of its membership in the list.
     /// - The caller must ensure no aliasing violations occur.
     pub unsafe fn push(&mut self, ptr: usize) {
+        // SAFETY: Caller guarantees ptr is valid.
         let mut node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
+        // SAFETY: We have exclusive access via &mut self.
         unsafe { node.as_mut() }.next = self.next.take();
         self.next = Some(node);
     }
@@ -54,39 +74,54 @@ impl IntrusiveLinkedList {
     /// - The memory at `ptr` must remain valid for the lifetime of its membership in the list.
     /// - The caller must ensure no aliasing violations occur.
     pub unsafe fn push_back(&mut self, ptr: usize) {
+        // SAFETY: Caller guarantees ptr is valid.
         let mut new_node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
+        // SAFETY: We have exclusive access to the new node.
         unsafe { new_node.as_mut().next = None };
 
         let mut last_node = &mut self.next;
         while let Some(node) = last_node {
+            // SAFETY: All nodes in the list are valid by invariant.
             last_node = unsafe { &mut node.as_mut().next };
         }
         *last_node = Some(new_node);
     }
 
+    /// Removes and returns the first node from the list.
+    ///
+    /// Returns `None` if the list is empty.
+    #[must_use]
     pub fn pop(&mut self) -> Option<usize> {
         self.next.map(|node| {
+            // SAFETY: node was in the list, so it must be valid.
             self.next = unsafe { node.as_ref().next };
             node.as_ptr() as usize
         })
     }
 
+    /// Removes a node with the given address from the list.
+    ///
+    /// Returns `true` if the node was found and removed, `false` otherwise.
     pub fn remove_if(&mut self, ptr: usize) -> bool {
-        if let Some(head) = self.next {
-            if head.as_ptr() as usize == ptr {
-                self.next = unsafe { head.as_ref().next };
-                return true;
-            }
+        if let Some(head) = self.next
+            && head.as_ptr() as usize == ptr
+        {
+            // SAFETY: head is valid as it was in the list.
+            self.next = unsafe { head.as_ref().next };
+            return true;
         }
 
         let mut current = self.next;
         while let Some(mut node) = current {
-            if let Some(next_node) = unsafe { node.as_mut().next } {
-                if next_node.as_ptr() as usize == ptr {
-                    unsafe { node.as_mut() }.next = unsafe { next_node.as_ref().next };
-                    return true;
-                }
+            // SAFETY: node is valid as it is in the list.
+            if let Some(next_node) = unsafe { node.as_mut().next }
+                && next_node.as_ptr() as usize == ptr
+            {
+                // SAFETY: Both nodes are valid.
+                unsafe { node.as_mut() }.next = unsafe { next_node.as_ref().next };
+                return true;
             }
+            // SAFETY: node is valid.
             current = unsafe { node.as_mut().next };
         }
         false
@@ -98,16 +133,23 @@ impl IntrusiveLinkedList {
     /// - `ptr` must point to a valid, properly aligned `IntrusiveLinkedList`.
     /// - The memory at `ptr` must remain valid for the lifetime of its membership in the list.
     /// - The caller must ensure no aliasing violations occur.
+    ///
+    /// # Panics
+    /// Panics if the list is non-empty and the head node is unexpectedly `None`
+    /// after the initial check (should not happen in correct usage).
     pub unsafe fn add_with_sort(&mut self, ptr: usize) {
+        // SAFETY: Caller guarantees ptr is valid.
         let mut new_node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
 
-        if self.next.is_none() || self.next.unwrap().as_ptr() as usize > ptr {
+        if self.next.is_none() || self.next.expect("checked above").as_ptr() as usize > ptr {
+            // SAFETY: new_node is valid.
             unsafe { new_node.as_mut() }.next = self.next.take();
             self.next = Some(new_node);
             return;
         }
 
-        let mut prev = self.next.unwrap();
+        let mut prev = self.next.expect("checked above");
+        // SAFETY: prev is valid as it is in the list.
         while let Some(current) = unsafe { prev.as_ref().next } {
             if current.as_ptr() as usize > ptr {
                 break;
@@ -115,20 +157,26 @@ impl IntrusiveLinkedList {
             prev = current;
         }
 
+        // SAFETY: Both prev and new_node are valid.
         unsafe { new_node.as_mut() }.next = unsafe { prev.as_mut().next.take() };
         unsafe { prev.as_mut() }.next = Some(new_node);
     }
 
+    /// Returns the number of elements in the list.
+    #[must_use]
     pub fn len(&self) -> usize {
         let mut count = 0;
         let mut current = self.next;
         while let Some(node) = current {
+            // SAFETY: All nodes in the list are valid by invariant.
             current = unsafe { node.as_ref().next };
             count += 1;
         }
         count
     }
 
+    /// Returns the next node pointer, if any.
+    #[must_use]
     pub fn next(&self) -> Option<NonNull<IntrusiveLinkedList>> {
         self.next
     }
