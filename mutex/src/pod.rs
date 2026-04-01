@@ -88,7 +88,7 @@ where
 
     #[inline(always)]
     fn atomic_ref(&self) -> &<T::Raw as AtomicRaw>::Atomic {
-        let ptr = self.raw.get() as *mut T::Raw;
+        let ptr = self.raw.get();
         debug_assert!(ptr.cast::<<T::Raw as AtomicRaw>::Atomic>().is_aligned());
         // SAFETY: `raw` is properly aligned by construction (_LAYOUT_OK),
         // and the returned reference is bounded by `&self`.
