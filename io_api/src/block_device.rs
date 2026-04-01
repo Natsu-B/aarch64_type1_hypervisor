@@ -58,8 +58,10 @@ pub trait BlockDevice: Send + Sync {
     /// Writes data starting at `lba` from `buf`.
     ///
     /// Requirements mirror `read_at`:
+    ///
     /// - `buf.len()` must be a multiple of `block_size()`.
     /// - The target range must be in-bounds.
+    ///
     /// Implementations must return `IoError::ReadOnly` if the device is not writable.
     ///
     /// On success, the entire buffer is written. On error, no data is considered transferred.
