@@ -31,17 +31,28 @@ impl IntrusiveLinkedList {
         Self { next: None }
     }
 
-    pub fn is_none(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.next.is_none()
     }
 
+    /// Pushes a node at the front of the list.
+    ///
+    /// # Safety
+    /// - `ptr` must point to a valid, properly aligned `IntrusiveLinkedList`.
+    /// - The memory at `ptr` must remain valid for the lifetime of its membership in the list.
+    /// - The caller must ensure no aliasing violations occur.
     pub unsafe fn push(&mut self, ptr: usize) {
-        let mut intrusive_linked_list =
-            unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
-        unsafe { intrusive_linked_list.as_mut() }.next = self.next.take();
-        self.next = Some(intrusive_linked_list);
+        let mut node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
+        unsafe { node.as_mut() }.next = self.next.take();
+        self.next = Some(node);
     }
 
+    /// Pushes a node at the back of the list.
+    ///
+    /// # Safety
+    /// - `ptr` must point to a valid, properly aligned `IntrusiveLinkedList`.
+    /// - The memory at `ptr` must remain valid for the lifetime of its membership in the list.
+    /// - The caller must ensure no aliasing violations occur.
     pub unsafe fn push_back(&mut self, ptr: usize) {
         let mut new_node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
         unsafe { new_node.as_mut().next = None };
@@ -54,40 +65,45 @@ impl IntrusiveLinkedList {
     }
 
     pub fn pop(&mut self) -> Option<usize> {
-        self.next.map(|intrusive_linked_list| {
-            self.next = unsafe { intrusive_linked_list.as_ref().next };
-            intrusive_linked_list.as_ptr() as usize
+        self.next.map(|node| {
+            self.next = unsafe { node.as_ref().next };
+            node.as_ptr() as usize
         })
     }
 
     pub fn remove_if(&mut self, ptr: usize) -> bool {
-        let mut intrusive_linked_list_ptr = self.next;
-        if let Some(intrusive_linked_list) = intrusive_linked_list_ptr
-            && intrusive_linked_list.as_ptr() as usize == ptr
-        {
-            self.next = unsafe { intrusive_linked_list.as_ref().next };
-            return true;
-        }
-        while let Some(mut intrusive_linked_list) = intrusive_linked_list_ptr {
-            if let Some(intrusive_linked_list_next) = unsafe { intrusive_linked_list.as_mut().next }
-                && intrusive_linked_list_next.as_ptr() as usize == ptr
-            {
-                unsafe { intrusive_linked_list.as_mut() }.next =
-                    unsafe { intrusive_linked_list_next.as_ref().next };
+        if let Some(head) = self.next {
+            if head.as_ptr() as usize == ptr {
+                self.next = unsafe { head.as_ref().next };
                 return true;
             }
-            intrusive_linked_list_ptr = unsafe { intrusive_linked_list.as_mut().next };
+        }
+
+        let mut current = self.next;
+        while let Some(mut node) = current {
+            if let Some(next_node) = unsafe { node.as_mut().next } {
+                if next_node.as_ptr() as usize == ptr {
+                    unsafe { node.as_mut() }.next = unsafe { next_node.as_ref().next };
+                    return true;
+                }
+            }
+            current = unsafe { node.as_mut().next };
         }
         false
     }
 
+    /// Inserts a node in sorted order by address (ascending).
+    ///
+    /// # Safety
+    /// - `ptr` must point to a valid, properly aligned `IntrusiveLinkedList`.
+    /// - The memory at `ptr` must remain valid for the lifetime of its membership in the list.
+    /// - The caller must ensure no aliasing violations occur.
     pub unsafe fn add_with_sort(&mut self, ptr: usize) {
-        let mut new_intrusive_linked_list =
-            unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
+        let mut new_node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
 
         if self.next.is_none() || self.next.unwrap().as_ptr() as usize > ptr {
-            unsafe { new_intrusive_linked_list.as_mut() }.next = self.next.take();
-            self.next = Some(new_intrusive_linked_list);
+            unsafe { new_node.as_mut() }.next = self.next.take();
+            self.next = Some(new_node);
             return;
         }
 
@@ -99,21 +115,21 @@ impl IntrusiveLinkedList {
             prev = current;
         }
 
-        unsafe { new_intrusive_linked_list.as_mut() }.next = unsafe { prev.as_mut().next.take() };
-        unsafe { prev.as_mut() }.next = Some(new_intrusive_linked_list);
+        unsafe { new_node.as_mut() }.next = unsafe { prev.as_mut().next.take() };
+        unsafe { prev.as_mut() }.next = Some(new_node);
     }
 
-    pub fn size(&self) -> usize {
-        let mut counter = 0;
-        let mut intrusive_linked_list = self.next;
-        while let Some(tmp) = intrusive_linked_list {
-            intrusive_linked_list = unsafe { tmp.as_ref().next };
-            counter += 1;
+    pub fn len(&self) -> usize {
+        let mut count = 0;
+        let mut current = self.next;
+        while let Some(node) = current {
+            current = unsafe { node.as_ref().next };
+            count += 1;
         }
-        counter
+        count
     }
 
-    pub fn get_next(&self) -> Option<NonNull<IntrusiveLinkedList>> {
+    pub fn next(&self) -> Option<NonNull<IntrusiveLinkedList>> {
         self.next
     }
 }
@@ -125,47 +141,47 @@ mod tests {
     #[test]
     fn test_push_and_pop() {
         let mut list = IntrusiveLinkedList::new();
-        assert!(list.is_none());
+        assert!(list.is_empty());
         assert_eq!(list.pop(), None);
 
-        let mut intrusive_linked_list1 = IntrusiveLinkedList { next: None };
-        let ptr1 = &mut intrusive_linked_list1 as *mut _ as usize;
+        let mut node1 = IntrusiveLinkedList { next: None };
+        let ptr1 = &mut node1 as *mut _ as usize;
 
-        let mut intrusive_linked_list2 = IntrusiveLinkedList { next: None };
-        let ptr2 = &mut intrusive_linked_list2 as *mut _ as usize;
+        let mut node2 = IntrusiveLinkedList { next: None };
+        let ptr2 = &mut node2 as *mut _ as usize;
 
         unsafe {
             list.push(ptr1);
             list.push(ptr2);
         }
 
-        assert!(!list.is_none());
-        assert_eq!(list.size(), 2);
+        assert!(!list.is_empty());
+        assert_eq!(list.len(), 2);
 
         assert_eq!(list.pop(), Some(ptr2));
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), None);
-        assert!(list.is_none());
+        assert!(list.is_empty());
     }
 
     #[test]
     fn test_push_back() {
         let mut list = IntrusiveLinkedList::new();
 
-        let mut intrusive_linked_list1 = IntrusiveLinkedList { next: None };
-        let ptr1 = &mut intrusive_linked_list1 as *mut _ as usize;
-        let mut intrusive_linked_list2 = IntrusiveLinkedList { next: None };
-        let ptr2 = &mut intrusive_linked_list2 as *mut _ as usize;
-        let mut intrusive_linked_list3 = IntrusiveLinkedList { next: None };
-        let ptr3 = &mut intrusive_linked_list3 as *mut _ as usize;
+        let mut node1 = IntrusiveLinkedList { next: None };
+        let ptr1 = &mut node1 as *mut _ as usize;
+        let mut node2 = IntrusiveLinkedList { next: None };
+        let ptr2 = &mut node2 as *mut _ as usize;
+        let mut node3 = IntrusiveLinkedList { next: None };
+        let ptr3 = &mut node3 as *mut _ as usize;
 
         // Push back to empty list
         unsafe {
             list.push_back(ptr1);
         }
-        assert_eq!(list.size(), 1);
+        assert_eq!(list.len(), 1);
         assert_eq!(list.pop(), Some(ptr1));
-        assert!(list.is_none());
+        assert!(list.is_empty());
 
         // Push back to non-empty list
         unsafe {
@@ -174,24 +190,24 @@ mod tests {
             list.push_back(ptr3);
         }
 
-        assert_eq!(list.size(), 3);
+        assert_eq!(list.len(), 3);
         // The list should be ptr1 -> ptr2 -> ptr3
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), Some(ptr2));
         assert_eq!(list.pop(), Some(ptr3));
-        assert!(list.is_none());
+        assert!(list.is_empty());
     }
 
     #[test]
     fn test_remove_if() {
         let mut list = IntrusiveLinkedList::new();
 
-        let mut intrusive_linked_list1 = IntrusiveLinkedList { next: None };
-        let ptr1 = &mut intrusive_linked_list1 as *mut _ as usize;
-        let mut intrusive_linked_list2 = IntrusiveLinkedList { next: None };
-        let ptr2 = &mut intrusive_linked_list2 as *mut _ as usize;
-        let mut intrusive_linked_list3 = IntrusiveLinkedList { next: None };
-        let ptr3 = &mut intrusive_linked_list3 as *mut _ as usize;
+        let mut node1 = IntrusiveLinkedList { next: None };
+        let ptr1 = &mut node1 as *mut _ as usize;
+        let mut node2 = IntrusiveLinkedList { next: None };
+        let ptr2 = &mut node2 as *mut _ as usize;
+        let mut node3 = IntrusiveLinkedList { next: None };
+        let ptr3 = &mut node3 as *mut _ as usize;
 
         unsafe {
             list.push(ptr3);
@@ -199,10 +215,10 @@ mod tests {
             list.push(ptr1);
         }
 
-        // Remove next
+        // Remove head
         assert!(list.remove_if(ptr1));
 
-        assert_eq!(list.size(), 2);
+        assert_eq!(list.len(), 2);
         assert_eq!(list.pop(), Some(ptr2));
         assert_eq!(list.pop(), Some(ptr3));
 
@@ -216,7 +232,7 @@ mod tests {
         // Remove middle
         assert!(list.remove_if(ptr2));
 
-        assert_eq!(list.size(), 2);
+        assert_eq!(list.len(), 2);
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), Some(ptr3));
 
@@ -230,7 +246,7 @@ mod tests {
         // Remove tail
         assert!(list.remove_if(ptr3));
 
-        assert_eq!(list.size(), 2);
+        assert_eq!(list.len(), 2);
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), Some(ptr2));
 
@@ -242,16 +258,13 @@ mod tests {
     fn test_add_with_sort() {
         let mut list = IntrusiveLinkedList::new();
 
-        let mut intrusive_linked_lists = [
+        let mut nodes = [
             IntrusiveLinkedList { next: None },
             IntrusiveLinkedList { next: None },
             IntrusiveLinkedList { next: None },
             IntrusiveLinkedList { next: None },
         ];
-        let ptrs: Vec<usize> = intrusive_linked_lists
-            .iter_mut()
-            .map(|n| n as *mut _ as usize)
-            .collect();
+        let ptrs: Vec<usize> = nodes.iter_mut().map(|n| n as *mut _ as usize).collect();
 
         // ptrs are sorted by address
         let ptr1 = ptrs[0];
@@ -261,27 +274,27 @@ mod tests {
 
         // Add to empty list
         unsafe { list.add_with_sort(ptr2) };
-        assert_eq!(list.size(), 1);
-        assert_eq!(list.next.unwrap().as_ptr() as usize, ptr2);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.next().unwrap().as_ptr() as usize, ptr2);
 
-        // Add smaller to next
+        // Add smaller to head
         unsafe { list.add_with_sort(ptr1) };
-        assert_eq!(list.size(), 2);
-        assert_eq!(list.next.unwrap().as_ptr() as usize, ptr1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.next().unwrap().as_ptr() as usize, ptr1);
 
         // Add to end
         unsafe { list.add_with_sort(ptr4) };
-        assert_eq!(list.size(), 3);
+        assert_eq!(list.len(), 3);
 
         // Add to middle
         unsafe { list.add_with_sort(ptr3) };
-        assert_eq!(list.size(), 4);
+        assert_eq!(list.len(), 4);
 
         // Check final order
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), Some(ptr2));
         assert_eq!(list.pop(), Some(ptr3));
         assert_eq!(list.pop(), Some(ptr4));
-        assert!(list.is_none());
+        assert!(list.is_empty());
     }
 }
