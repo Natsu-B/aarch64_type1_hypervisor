@@ -252,7 +252,7 @@ pub fn check_aligned_sector_buffer(len: u32) -> Result<(), QueueParseError> {
     if len == 0 {
         return Ok(());
     }
-    if (len as usize) % SECTOR_SIZE != 0 {
+    if !(len as usize).is_multiple_of(SECTOR_SIZE) {
         return Err(QueueParseError::Align);
     }
     Ok(())
@@ -328,7 +328,7 @@ pub fn parse_req_layout(
         }
     }
 
-    if chain_len < 2 || chain_len > 3 {
+    if !(2..=3).contains(&chain_len) {
         return Err(QueueParseError::InvalidLayout);
     }
 
@@ -578,7 +578,7 @@ where
     }
 
     fn validate_range(&self, lba: u64, bytes: usize) -> Result<(), VirtioBlkMmioError> {
-        if bytes % SECTOR_SIZE != 0 {
+        if !bytes.is_multiple_of(SECTOR_SIZE) {
             return Err(VirtioBlkMmioError::Backend(IoError::Align));
         }
         let sectors = (bytes / SECTOR_SIZE) as u64;
@@ -1142,10 +1142,7 @@ struct RequestOutcome {
 }
 
 fn normalize_buffer_io_error(err: VirtioBlkMmioError) -> VirtioBlkMmioError {
-    match err {
-        VirtioBlkMmioError::Backend(io) => VirtioBlkMmioError::Backend(io),
-        other => other,
-    }
+    err
 }
 
 fn map_io_to_outcome(
