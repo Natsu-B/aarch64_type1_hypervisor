@@ -22,17 +22,32 @@ pub enum MmioError {
     Fault,
 }
 
+/// Handler function type for single MMIO read operations.
+pub type MmioReadFn = fn(*const (), u64, u8) -> Result<u64, MmioError>;
+
+/// Handler function type for single MMIO write operations.
+pub type MmioWriteFn = fn(*const (), u64, u8, u64) -> Result<(), MmioError>;
+
+/// Probe function type to check if a sub-access can be handled without side effects.
+pub type MmioProbeFn = fn(*const (), u64, u8, bool) -> bool;
+
+/// Handler function type for paired MMIO read operations (LDP).
+pub type MmioReadPairFn = fn(*const (), u64, u64, u8) -> Result<(u64, u64), MmioError>;
+
+/// Handler function type for paired MMIO write operations (STP).
+pub type MmioWritePairFn = fn(*const (), u64, u64, u8, u64, u64) -> Result<(), MmioError>;
+
 #[derive(Copy, Clone)]
 pub struct MmioHandler {
     pub ctx: *const (),
-    pub read: fn(*const (), u64, u8) -> Result<u64, MmioError>,
-    pub write: fn(*const (), u64, u8, u64) -> Result<(), MmioError>,
+    pub read: MmioReadFn,
+    pub write: MmioWriteFn,
     /// Optional capability probe to check whether a sub-access can be handled
     /// without side effects.
-    pub probe: Option<fn(*const (), u64, u8, bool) -> bool>,
+    pub probe: Option<MmioProbeFn>,
     /// Optional pair access hooks to avoid partial side effects on LDP/STP.
-    pub read_pair: Option<fn(*const (), u64, u64, u8) -> Result<(u64, u64), MmioError>>,
-    pub write_pair: Option<fn(*const (), u64, u64, u8, u64, u64) -> Result<(), MmioError>>,
+    pub read_pair: Option<MmioReadPairFn>,
+    pub write_pair: Option<MmioWritePairFn>,
     /// Whether this handler models normal RAM semantics or device/MMIO semantics.
     pub access_class: AccessClass,
     /// Policy for allowing split emulation of an access.
