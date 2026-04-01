@@ -267,6 +267,12 @@ pub struct GdbServer<const MAX_PKT: usize, const TX_CAP: usize> {
     last_stop: LastStop,
 }
 
+impl<const MAX_PKT: usize, const TX_CAP: usize> Default for GdbServer<MAX_PKT, TX_CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
     /// Create a new server with the default advertised packet size.
     pub fn new() -> Self {
