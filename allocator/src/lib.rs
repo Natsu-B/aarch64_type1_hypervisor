@@ -83,6 +83,10 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         }
     }
 
+    /// Initializes the allocator.
+    ///
+    /// # Panics
+    /// Panics if initialization fails unexpectedly (should not happen with correct usage).
     pub fn init(&'static self) {
         // Initialize the range list allocator.
         let range_list_allocator_guard = self.range_list_allocator.lock();
@@ -157,7 +161,9 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     MemoryAllocator<MAX_ALLOCATABLE_BYTES, LEVELS>
 {
     /// Add an available memory region before finalization.
-    /// Returns Err if called after finalization.
+    ///
+    /// # Errors
+    /// Returns `Err` if called after finalization or if allocator is not initialized.
     pub fn add_available_region(&self, address: usize, size: usize) -> Result<(), &'static str> {
         let mut guard = self.range_list_allocator.lock();
         if let Some(block) = guard.get_mut() {
@@ -171,7 +177,9 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     }
 
     /// Add a reserved memory region before finalization.
-    /// Returns Err if called after finalization.
+    ///
+    /// # Errors
+    /// Returns `Err` if called after finalization or if allocator is not initialized.
     pub fn add_reserved_region(&self, address: usize, size: usize) -> Result<(), &'static str> {
         let mut guard = self.range_list_allocator.lock();
         if let Some(block) = guard.get_mut() {
@@ -184,6 +192,10 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         }
     }
 
+    /// Allocates a reserved region dynamically.
+    ///
+    /// # Errors
+    /// Returns `Err` if the allocator is not initialized.
     pub fn allocate_dynamic_reserved_region(
         &self,
         size: usize,
@@ -199,6 +211,9 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     }
 
     /// Finalize the allocator by subtracting reserved regions and enabling allocation.
+    ///
+    /// # Errors
+    /// Returns `Err` if allocator is not initialized.
     /// Safe to call multiple times; after the first success, it’s a no-op.
     pub fn finalize(&self) -> Result<(), &'static str> {
         let mut guard = self.range_list_allocator.lock();
@@ -213,6 +228,10 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         }
     }
 
+    /// Allocates memory with specified size and alignment.
+    ///
+    /// # Errors
+    /// Returns `Err` if allocator is not initialized, not finalized, or allocation fails.
     pub fn allocate_with_size_and_align(
         &self,
         size: usize,
@@ -245,6 +264,8 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// - Only valid before `enable_raw_atomics()` when `RawSpinLock::lock()` is a
     ///   no-op and during single-threaded bring-up; after atomic locking is
     ///   enabled this path can deadlock or spin indefinitely.
+    /// # Errors
+    /// Returns `Err` if allocator is not initialized or not finalized.
     pub fn trim_for_boot(&self, reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
         let mut guard = self.range_list_allocator.lock();
         let Some(block) = guard.get_mut() else {
@@ -256,11 +277,11 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         block.trim_for_boot(reserve_bytes)
     }
 
-    #[allow(unused)]
-    pub fn for_each_free_region<F: FnMut(usize, usize)>(
-        &self,
-        mut f: F,
-    ) -> Result<(), &'static str> {
+    /// Iterates over each free memory region.
+    ///
+    /// # Errors
+    /// Returns `Err` if allocator is not initialized.
+    pub fn for_each_free_region<F: FnMut(usize, usize)>(&self, f: F) -> Result<(), &'static str> {
         let guard = self.range_list_allocator.lock();
         let Some(block) = guard.get() else {
             return Err("allocator not initialized");
@@ -269,11 +290,11 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         Ok(())
     }
 
-    #[allow(unused)]
-    pub fn for_each_reserved_region<F: FnMut(usize, usize)>(
-        &self,
-        mut f: F,
-    ) -> Result<(), &'static str> {
+    /// Iterates over each reserved memory region.
+    ///
+    /// # Errors
+    /// Returns `Err` if allocator is not initialized.
+    pub fn for_each_reserved_region<F: FnMut(usize, usize)>(&self, f: F) -> Result<(), &'static str> {
         let guard = self.range_list_allocator.lock();
         let Some(block) = guard.get() else {
             return Err("allocator not initialized");
@@ -285,8 +306,8 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
 
 #[cfg(all(not(test), not(feature = "no-alloc-error-handler")))]
 #[alloc_error_handler]
-fn panic(layout: Layout) -> ! {
-    pr_debug!("allocator panicked!!: {:?}", layout);
+fn panic(_layout: Layout) -> ! {
+    pr_debug!("allocator panicked!!: {:?}", _layout);
     loop {}
 }
 

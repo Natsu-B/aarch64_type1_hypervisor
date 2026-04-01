@@ -85,7 +85,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         let level = Self::size2level_next_power(required_size);
 
         let mut free_level = level;
-        while free_level < LEVELS && self.free_list[free_level].is_none() {
+        while free_level < LEVELS && self.free_list[free_level].is_empty() {
             free_level += 1;
         }
 
@@ -172,7 +172,7 @@ mod tests {
     fn test_new() {
         let allocator = TestAlloc::<MAX_ALLOC>::new();
         for i in 0..levels!(MAX_ALLOC) {
-            assert!(allocator.free_list[i].is_none());
+            assert!(allocator.free_list[i].is_empty());
         }
         assert_eq!(allocator.total_size, 0);
         assert_eq!(allocator.allocated, 0);
@@ -190,14 +190,14 @@ mod tests {
         allocator.set_memory(heap_addr, HEAP_SIZE);
         let top_level = levels!(MAX_ALLOC) - 1;
         for i in 0..top_level {
-            assert_eq!(allocator.free_list[i].size(), 0);
+            assert_eq!(allocator.free_list[i].len(), 0);
         }
-        assert_eq!(allocator.free_list[top_level].size(), HEAP_SIZE / MAX_ALLOC);
-        let mut current = allocator.free_list[top_level].get_next();
+        assert_eq!(allocator.free_list[top_level].len(), HEAP_SIZE / MAX_ALLOC);
+        let mut current = allocator.free_list[top_level].next();
         for i in 0..(HEAP_SIZE / MAX_ALLOC) {
             let node = current.expect("Node should exist");
             assert_eq!(node.as_ptr() as usize, heap_addr + i * MAX_ALLOC);
-            current = unsafe { node.as_ref().get_next() };
+            current = unsafe { node.as_ref().next() };
         }
     }
 
@@ -254,10 +254,10 @@ mod tests {
         assert_eq!(allocator.allocated, 0);
         let top_level = levels!(MAX_SMALL_ALLOC) - 1;
         let mut count = 0;
-        let mut current = allocator.free_list[top_level].get_next();
+        let mut current = allocator.free_list[top_level].next();
         while let Some(node) = current {
             count += 1;
-            current = unsafe { node.as_ref().get_next() };
+            current = unsafe { node.as_ref().next() };
         }
         assert_eq!(count, 2);
     }
@@ -278,7 +278,7 @@ mod tests {
         let level_64 = top_level - 1;
         let level_32 = top_level - 2;
 
-        assert_eq!(allocator.free_list[top_level].size(), 2);
+        assert_eq!(allocator.free_list[top_level].len(), 2);
 
         let layout32 = Layout::from_size_align(32, 32).unwrap();
         let layout64 = Layout::from_size_align(64, 64).unwrap();
@@ -294,7 +294,7 @@ mod tests {
         allocator.dealloc(ptr1, layout32);
         allocator.dealloc(ptr2, layout32);
         assert_eq!(
-            allocator.free_list[level_64].size(),
+            allocator.free_list[level_64].len(),
             1,
             "After merging 2x32, a 64 block should exist"
         );
@@ -302,13 +302,13 @@ mod tests {
         allocator.dealloc(ptr3, layout64);
 
         assert_eq!(allocator.allocated, 0);
-        assert_eq!(allocator.free_list[level_32].size(), 0);
+        assert_eq!(allocator.free_list[level_32].len(), 0);
         assert_eq!(
-            allocator.free_list[level_64].size(),
+            allocator.free_list[level_64].len(),
             0,
             "After final merge, level 64 should be empty"
         );
-        assert_eq!(allocator.free_list[top_level].size(), 2);
+        assert_eq!(allocator.free_list[top_level].len(), 2);
     }
 
     #[test]
@@ -333,20 +333,20 @@ mod tests {
 
         assert_eq!(ptr, heap_addr);
         assert_eq!(allocator.allocated, 512);
-        assert_eq!(allocator.free_list[top_level].size(), 0);
-        assert_eq!(allocator.free_list[level_2048].size(), 1);
-        assert_eq!(allocator.free_list[level_1024].size(), 1);
-        assert_eq!(allocator.free_list[level_512].size(), 1);
+        assert_eq!(allocator.free_list[top_level].len(), 0);
+        assert_eq!(allocator.free_list[level_2048].len(), 1);
+        assert_eq!(allocator.free_list[level_1024].len(), 1);
+        assert_eq!(allocator.free_list[level_512].len(), 1);
 
         allocator.dealloc(ptr, layout);
 
         assert_eq!(allocator.allocated, 0);
-        assert_eq!(allocator.free_list[level_512].size(), 0);
-        assert_eq!(allocator.free_list[level_1024].size(), 0);
-        assert_eq!(allocator.free_list[level_2048].size(), 0);
-        assert_eq!(allocator.free_list[top_level].size(), 1);
+        assert_eq!(allocator.free_list[level_512].len(), 0);
+        assert_eq!(allocator.free_list[level_1024].len(), 0);
+        assert_eq!(allocator.free_list[level_2048].len(), 0);
+        assert_eq!(allocator.free_list[top_level].len(), 1);
         for i in 0..top_level {
-            assert_eq!(allocator.free_list[i].size(), 0);
+            assert_eq!(allocator.free_list[i].len(), 0);
         }
     }
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(allocator.allocated, 0);
         let top_level = levels!(MAX_ALLOC) - 1;
         assert_eq!(
-            allocator.free_list[top_level].size(),
+            allocator.free_list[top_level].len(),
             HEAP_SIZE / MAX_ALLOC,
             "all blocks should return to the top-level free list"
         );

@@ -22,6 +22,13 @@ pub struct AlignedSliceBox<T> {
 }
 
 impl<T> AlignedSliceBox<T> {
+    /// Creates a new uninitialized aligned slice box.
+    ///
+    /// # Errors
+    /// Returns `Err` if size overflows or if alignment is invalid.
+    ///
+    /// # Panics
+    /// Panics if memory allocation fails.
     pub fn new_uninit_with_align(
         len: usize,
         align: usize,
@@ -82,6 +89,10 @@ impl<T> AlignedSliceBox<T> {
 }
 
 impl<T> AlignedSliceBox<MaybeUninit<T>> {
+    /// Converts the uninitialized box into an initialized one.
+    ///
+    /// # Safety
+    /// Caller must ensure all elements have been fully initialized.
     #[must_use]
     pub unsafe fn assume_init(self) -> AlignedSliceBox<T> {
         let (ptr, len, align) = AlignedSliceBox::<MaybeUninit<T>>::into_raw_parts(self);
