@@ -48,6 +48,11 @@ pub use read_write::Writable;
 pub use read_write::WriteOnly;
 pub use unaligned::Unaligned;
 
+/// # Safety
+/// Implementors must ensure:
+/// - `to_raw()` and `from_raw()` perform lossless round-trip conversions.
+/// - The type is `Copy` and supports bitwise operations safely.
+/// - Endianness conversions are correct for the underlying type.
 pub unsafe trait RawReg:
     Copy + core::ops::BitOr + core::ops::BitAnd + core::ops::Not + core::ops::BitXor
 {
@@ -60,6 +65,8 @@ pub unsafe trait RawReg:
     fn from_be(self) -> Self;
 }
 
+/// # Safety
+/// Implementors must ensure all bit patterns are valid for the type.
 pub unsafe trait BytePod: Copy + 'static {}
 
 /// A POD-like value that can be represented in an atomic raw storage slot.
@@ -82,9 +89,17 @@ pub unsafe trait AtomicPod: Copy + 'static {
     }
 }
 
+/// # Safety
+/// Implementors must be 8-bit atomic-compatible types.
 pub unsafe trait U8: AtomicPod<Raw = u8> {}
+/// # Safety
+/// Implementors must be 16-bit atomic-compatible types.
 pub unsafe trait U16: AtomicPod<Raw = u16> {}
+/// # Safety
+/// Implementors must be 32-bit atomic-compatible types.
 pub unsafe trait U32: AtomicPod<Raw = u32> {}
+/// # Safety
+/// Implementors must be 64-bit atomic-compatible types.
 pub unsafe trait U64: AtomicPod<Raw = u64> {}
 
 macro_rules! impl_raw { ($($t:ty),* $(,)?) => {$(

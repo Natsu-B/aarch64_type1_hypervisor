@@ -75,12 +75,20 @@ macro_rules! unalign_write {
 
 impl<T: Copy + RawReg> Unaligned<T> {
     /// Reads from an unaligned location using unaligned-safe load.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
+    /// - The memory need not be aligned for `T`.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { read_unaligned(ptr) }.0
     }
 
     /// Writes to an unaligned location using unaligned-safe store.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
+    /// - The memory need not be aligned for `T`.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe { write_unaligned(ptr, Unaligned(val)) };
@@ -89,12 +97,18 @@ impl<T: Copy + RawReg> Unaligned<T> {
 
 impl<T: Copy + RawReg> Le<Unaligned<T>> {
     /// Reads a little-endian value from an unaligned location.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { read_unaligned(ptr) }.0.0.from_le()
     }
 
     /// Writes a little-endian value to an unaligned location.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -135,12 +149,18 @@ mod volatile {
 
 impl<T: Copy + RawReg> Be<Unaligned<T>> {
     /// Reads a big-endian value from an unaligned location.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { read_unaligned(ptr) }.0.0.from_be()
     }
 
     /// Writes a big-endian value to an unaligned location.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -150,6 +170,8 @@ impl<T: Copy + RawReg> Be<Unaligned<T>> {
 }
 
 impl<T: Copy + RawReg> ReadOnly<Le<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
@@ -158,6 +180,8 @@ impl<T: Copy + RawReg> ReadOnly<Le<Unaligned<T>>> {
 }
 
 impl<T: Copy + RawReg> ReadPure<Le<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
@@ -166,6 +190,8 @@ impl<T: Copy + RawReg> ReadPure<Le<Unaligned<T>>> {
 }
 
 impl<T: Copy + RawReg> ReadWrite<Le<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
@@ -174,6 +200,8 @@ impl<T: Copy + RawReg> ReadWrite<Le<Unaligned<T>>> {
 }
 
 impl<T: RawReg> WriteOnly<Le<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid, writable MMIO memory.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -186,6 +214,8 @@ impl<T: RawReg> WriteOnly<Le<Unaligned<T>>> {
 }
 
 impl<T: RawReg> ReadWrite<Le<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid, writable MMIO memory.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -198,6 +228,8 @@ impl<T: RawReg> ReadWrite<Le<Unaligned<T>>> {
 }
 
 impl<T: Copy + RawReg> ReadOnly<Be<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
@@ -206,6 +238,8 @@ impl<T: Copy + RawReg> ReadOnly<Be<Unaligned<T>>> {
 }
 
 impl<T: Copy + RawReg> ReadPure<Be<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
@@ -214,6 +248,8 @@ impl<T: Copy + RawReg> ReadPure<Be<Unaligned<T>>> {
 }
 
 impl<T: Copy + RawReg> ReadWrite<Be<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
@@ -222,6 +258,8 @@ impl<T: Copy + RawReg> ReadWrite<Be<Unaligned<T>>> {
 }
 
 impl<T: RawReg> WriteOnly<Be<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid, writable MMIO memory.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -234,6 +272,8 @@ impl<T: RawReg> WriteOnly<Be<Unaligned<T>>> {
 }
 
 impl<T: RawReg> ReadWrite<Be<Unaligned<T>>> {
+    /// # Safety
+    /// `ptr` must point to valid, writable MMIO memory.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -246,6 +286,8 @@ impl<T: RawReg> ReadWrite<Be<Unaligned<T>>> {
 }
 
 impl<T: Copy + RawReg> ReadOnly<Unaligned<T>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0)) }
@@ -253,6 +295,8 @@ impl<T: Copy + RawReg> ReadOnly<Unaligned<T>> {
 }
 
 impl<T: Copy + RawReg> ReadPure<Unaligned<T>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0)) }
@@ -260,6 +304,8 @@ impl<T: Copy + RawReg> ReadPure<Unaligned<T>> {
 }
 
 impl<T: Copy + RawReg> ReadWrite<Unaligned<T>> {
+    /// # Safety
+    /// `ptr` must point to valid MMIO memory.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0)) }
@@ -267,6 +313,8 @@ impl<T: Copy + RawReg> ReadWrite<Unaligned<T>> {
 }
 
 impl<T: RawReg> WriteOnly<Unaligned<T>> {
+    /// # Safety
+    /// `ptr` must point to valid, writable MMIO memory.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
@@ -279,6 +327,8 @@ impl<T: RawReg> WriteOnly<Unaligned<T>> {
 }
 
 impl<T: RawReg> ReadWrite<Unaligned<T>> {
+    /// # Safety
+    /// `ptr` must point to valid, writable MMIO memory.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe {
