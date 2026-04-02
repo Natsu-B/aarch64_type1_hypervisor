@@ -1,3 +1,7 @@
+//! Procedural macros for the typestate crate.
+//!
+//! Provides derive macros for `BytePod`, `RawReg`, and atomic width traits (`U8`, `U16`, `U32`, `U64`).
+
 use proc_macro::TokenStream;
 use quote::format_ident;
 use quote::quote;
@@ -330,6 +334,7 @@ fn derive_width(
     expanded.into()
 }
 
+/// Derives [`typestate::BytePod`] for transparent tuple structs.
 #[proc_macro_derive(BytePod)]
 pub fn derive_bytepod(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -352,6 +357,7 @@ pub fn derive_bytepod(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Derives [`typestate::RawReg`] for transparent tuple structs.
 #[proc_macro_derive(RawReg)]
 pub fn derive_rawreg(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -472,21 +478,25 @@ pub fn derive_rawreg(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Derives [`typestate::U8`] for 8-bit atomic-compatible types.
 #[proc_macro_derive(U8, attributes(atomic_pod))]
 pub fn derive_u8(input: TokenStream) -> TokenStream {
     derive_width(input, "U8", "u8", "U8")
 }
 
+/// Derives [`typestate::U16`] for 16-bit atomic-compatible types.
 #[proc_macro_derive(U16, attributes(atomic_pod))]
 pub fn derive_u16(input: TokenStream) -> TokenStream {
     derive_width(input, "U16", "u16", "U16")
 }
 
+/// Derives [`typestate::U32`] for 32-bit atomic-compatible types.
 #[proc_macro_derive(U32, attributes(atomic_pod))]
 pub fn derive_u32(input: TokenStream) -> TokenStream {
     derive_width(input, "U32", "u32", "U32")
 }
 
+/// Derives [`typestate::U64`] for 64-bit atomic-compatible types.
 #[proc_macro_derive(U64, attributes(atomic_pod))]
 pub fn derive_u64(input: TokenStream) -> TokenStream {
     derive_width(input, "U64", "u64", "U64")

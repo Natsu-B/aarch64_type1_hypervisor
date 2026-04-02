@@ -1,15 +1,22 @@
+//! Target abstraction for debuggable systems.
+
 /// Actions requested by the debugger when resuming execution.
 #[derive(Debug)]
 pub enum ResumeAction {
-    Continue(Option<u64>), // optional new program counter
-    Step(Option<u64>),     // optional new program counter
+    /// Continue execution, optionally at a new address.
+    Continue(Option<u64>),
+    /// Single-step, optionally at a new address.
+    Step(Option<u64>),
 }
 
 /// Target-specific error handling for debugger requests.
 #[derive(Debug)]
 pub enum TargetError<R, U> {
+    /// Operation not supported by this target.
     NotSupported,
+    /// Recoverable error (can continue debugging).
     Recoverable(R),
+    /// Unrecoverable error (must abort debugging session).
     Unrecoverable(U),
 }
 
@@ -18,20 +25,31 @@ pub enum TargetError<R, U> {
 pub struct TargetCapabilities(u32);
 
 impl TargetCapabilities {
+    /// No capabilities.
     pub const NONE: Self = Self(0);
+    /// Software breakpoints.
     pub const SW_BREAK: Self = Self(1 << 0);
+    /// Hardware breakpoints.
     pub const HW_BREAK: Self = Self(1 << 1);
+    /// Write watchpoints.
     pub const WATCH_W: Self = Self(1 << 2);
+    /// Read watchpoints.
     pub const WATCH_R: Self = Self(1 << 3);
+    /// Access (read/write) watchpoints.
     pub const WATCH_A: Self = Self(1 << 4);
+    /// vCont packet support.
     pub const VCONT: Self = Self(1 << 5);
+    /// Feature XML transfer.
     pub const XFER_FEATURES: Self = Self(1 << 6);
+    /// Memory map XML transfer.
     pub const XFER_MEMORY_MAP: Self = Self(1 << 7);
 
+    /// Returns an empty capability set.
     pub const fn empty() -> Self {
         Self::NONE
     }
 
+    /// Returns true if all bits in `other` are set.
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
@@ -57,26 +75,35 @@ impl core::ops::BitOrAssign for TargetCapabilities {
     }
 }
 
+/// Watchpoint type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchpointKind {
+    /// Write watchpoint.
     Write,
+    /// Read watchpoint.
     Read,
+    /// Access (read or write) watchpoint.
     Access,
 }
 
 /// Abstraction over an architecture-specific debug target.
 pub trait Target {
+    /// Recoverable error type (e.g., memory access failure).
     type RecoverableError;
+    /// Unrecoverable error type (e.g., target disconnected).
     type UnrecoverableError;
 
+    /// Returns the target's capabilities.
     fn capabilities(&self) -> TargetCapabilities {
         TargetCapabilities::default()
     }
 
+    /// Returns an error code for a recoverable error.
     fn recoverable_error_code(&self, _e: &Self::RecoverableError) -> u8 {
         1
     }
 
+    /// Returns target description XML for the given annex.
     fn xfer_features(
         &mut self,
         _annex: &str,
@@ -84,6 +111,7 @@ pub trait Target {
         Ok(None)
     }
 
+    /// Returns memory map XML.
     fn xfer_memory_map(
         &mut self,
     ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {

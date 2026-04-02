@@ -36,6 +36,7 @@ pub struct ReadWrite<T>(pub(crate) UnsafeCell<T>);
 /// Consider constraining `T` further (e.g. a `Pod`-like bound) if you need
 /// "all bit patterns are valid".
 pub trait Readable {
+    /// The value type read from the register.
     type T: Copy;
 
     /// Returns a pointer to the underlying storage.
@@ -55,6 +56,7 @@ pub trait Readable {
 ///
 /// No `Copy` bound is required: values are moved into the register.
 pub trait Writable {
+    /// The value type written to the register.
     type T;
 
     /// Returns a mutable pointer to the underlying storage.

@@ -1,14 +1,22 @@
+//! Bitfield register definition macros and helpers.
+
 use core::marker::PhantomData;
 
+/// Specifies the bit offset and size of a register field.
 pub trait FieldSpec<Reg> {
+    /// Bit offset from LSB.
     const OFF: u32;
+    /// Field width in bits.
     const SZ: u32;
 }
 
+/// Marker trait for fields that can be read.
 pub trait FieldReadable<Reg>: FieldSpec<Reg> {}
 
+/// Marker trait for fields that can be written.
 pub trait FieldWritable<Reg>: FieldSpec<Reg> {}
 
+/// A compile-time field descriptor with offset and size as const generics.
 pub struct Field<Reg, const OFF: u32, const SZ: u32>(pub PhantomData<Reg>);
 
 impl<Reg, const OFF: u32, const SZ: u32> FieldSpec<Reg> for Field<Reg, OFF, SZ> {
@@ -23,6 +31,7 @@ impl<Reg, const OFF: u32, const SZ: u32> Default for Field<Reg, OFF, SZ> {
 }
 
 impl<Reg, const OFF: u32, const SZ: u32> Field<Reg, OFF, SZ> {
+    /// Creates a new field descriptor.
     #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)

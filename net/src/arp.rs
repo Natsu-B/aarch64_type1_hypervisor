@@ -1,3 +1,5 @@
+//! ARP protocol parsing and encoding.
+
 use io_api::ethernet::MacAddr;
 
 use super::EncodeError;
@@ -7,6 +9,7 @@ use super::eth;
 use super::read_be_u16;
 use super::write_be_u16;
 
+/// ARP payload size for Ethernet/IPv4.
 pub const ARP_PAYLOAD_LEN: usize = 28;
 const ARP_HWTYPE_ETHERNET: u16 = 1;
 const ARP_OPERATION_REQUEST: u16 = 1;
@@ -14,13 +17,20 @@ const ARP_OPERATION_REPLY: u16 = 2;
 const ARP_HLEN_ETHERNET: u8 = 6;
 const ARP_PLEN_IPV4: u8 = 4;
 
+/// A parsed ARP request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpRequestView {
+    /// Source MAC from Ethernet header.
     pub src_mac: MacAddr,
+    /// Destination MAC from Ethernet header.
     pub dst_mac: MacAddr,
+    /// Sender hardware address.
     pub sender_mac: MacAddr,
+    /// Sender protocol address.
     pub sender_ip: Ipv4Addr,
+    /// Target hardware address.
     pub target_mac: MacAddr,
+    /// Target protocol address.
     pub target_ip: Ipv4Addr,
 }
 

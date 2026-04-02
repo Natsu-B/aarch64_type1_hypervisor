@@ -1,47 +1,83 @@
+//! Network protocol implementations.
+//!
+//! Provides Ethernet, ARP, IPv4, and UDP protocol handling.
+
 #![no_std]
 
 use io_api::ethernet::MacAddr;
 
+/// ARP protocol.
 pub mod arp;
+/// IP checksum calculation.
 pub mod checksum;
+/// Ethernet frame handling.
 pub mod eth;
+/// IPv4 protocol.
 pub mod ipv4;
+/// UDP protocol.
 pub mod udp;
 
+/// An IPv4 address as a 4-byte array.
 pub type Ipv4Addr = [u8; 4];
 
+/// Errors that can occur when parsing network frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseError {
+    /// Frame is too short to contain valid headers.
     FrameTooShort,
+    /// Not an Ethernet II frame.
     NonEthernetII,
+    /// Ethertype is not supported.
     UnsupportedEthertype,
+    /// IPv4 header is too short.
     Ipv4HeaderTooShort,
+    /// IPv4 IHL field is invalid.
     Ipv4IhlInvalid,
+    /// IPv4 total length is invalid.
     Ipv4TotalLenInvalid,
+    /// IPv4 checksum mismatch.
     Ipv4ChecksumMismatch,
+    /// IPv4 packet is fragmented.
     Ipv4Fragmented,
+    /// Protocol is not UDP.
     NotUdp,
+    /// UDP header is too short.
     UdpHeaderTooShort,
+    /// UDP length field is invalid.
     UdpLenInvalid,
+    /// ARP packet is too short.
     ArpPacketTooShort,
+    /// ARP format is not supported.
     ArpUnsupportedFormat,
+    /// ARP operation is not a request.
     ArpNotRequest,
 }
 
+/// Errors that can occur when encoding network frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncodeError {
+    /// Output buffer is too short.
     BufferTooShort,
+    /// Payload exceeds maximum length.
     PayloadTooLong,
 }
 
+/// A parsed UDP-over-IPv4 datagram.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdpIpv4DatagramView<'a> {
+    /// Source MAC address.
     pub src_mac: MacAddr,
+    /// Destination MAC address.
     pub dst_mac: MacAddr,
+    /// Source IPv4 address.
     pub src_ip: Ipv4Addr,
+    /// Destination IPv4 address.
     pub dst_ip: Ipv4Addr,
+    /// Source UDP port.
     pub src_port: u16,
+    /// Destination UDP port.
     pub dst_port: u16,
+    /// UDP payload data.
     pub payload: &'a [u8],
 }
 

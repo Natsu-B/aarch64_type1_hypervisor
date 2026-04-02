@@ -1,9 +1,17 @@
+//! RSP frame parsing and assembly.
+
+/// Events produced while parsing RSP frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RspFrameEvent {
+    /// Byte should be ignored.
     Ignore,
+    /// More bytes needed to complete the frame.
     NeedMore,
+    /// Frame boundary detected; resync in progress.
     Resync,
+    /// Ctrl-C interrupt received.
     CtrlC,
+    /// Frame is complete and ready for processing.
     FrameComplete,
 }
 
@@ -21,21 +29,25 @@ enum RspFrameState {
     Checksum(u8),
 }
 
+/// RSP frame assembler state machine.
 pub struct RspFrameAssembler {
     state: RspFrameState,
 }
 
 impl RspFrameAssembler {
+    /// Creates a new frame assembler.
     pub const fn new() -> Self {
         Self {
             state: RspFrameState::Idle,
         }
     }
 
+    /// Resets the assembler to idle state.
     pub fn reset(&mut self) {
         self.state = RspFrameState::Idle;
     }
 
+    /// Pushes a byte and returns the resulting event.
     pub fn push(&mut self, byte: u8) -> RspFrameEvent {
         self.push_with_kind(byte).0
     }

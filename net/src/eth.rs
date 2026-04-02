@@ -1,3 +1,5 @@
+//! Ethernet frame parsing and encoding.
+
 use io_api::ethernet::MacAddr;
 
 use super::EncodeError;
@@ -5,15 +7,22 @@ use super::ParseError;
 use super::read_be_u16;
 use super::write_be_u16;
 
+/// Ethernet II header size in bytes.
 pub const HEADER_LEN: usize = 14;
+/// Ethertype for IPv4.
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
+/// Ethertype for ARP.
 pub const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_MIN_ETHERNET_II: u16 = 0x0600;
 
+/// Parsed Ethernet II header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EthernetHeader {
+    /// Destination MAC address.
     pub dst_mac: MacAddr,
+    /// Source MAC address.
     pub src_mac: MacAddr,
+    /// Ethertype field.
     pub ethertype: u16,
 }
 

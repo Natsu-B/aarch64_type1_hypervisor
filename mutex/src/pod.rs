@@ -1,3 +1,5 @@
+//! POD-backed atomic cells for bring-up friendly atomic operations.
+
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::align_of;
@@ -57,6 +59,7 @@ where
         assert!(align_of::<T::Raw>() >= align_of::<<T::Raw as AtomicRaw>::Atomic>());
     };
 
+    /// Creates a new cell from a raw value, canonicalizing it first.
     #[inline]
     pub fn new_raw(init: T::Raw) -> Self {
         let () = Self::_LAYOUT_OK;
@@ -66,9 +69,11 @@ where
         }
     }
 
-    #[inline]
+    /// Creates a new cell from a raw value without canonicalization.
+    ///
     /// # Safety
     /// Caller must ensure `init` is already canonical for `T`.
+    #[inline]
     pub const unsafe fn new_raw_unchecked(init: T::Raw) -> Self {
         let () = Self::_LAYOUT_OK;
         Self {
@@ -77,6 +82,7 @@ where
         }
     }
 
+    /// Creates a new cell from a typed value.
     #[inline]
     pub fn new(init: T) -> Self {
         let () = Self::_LAYOUT_OK;
@@ -86,6 +92,7 @@ where
         }
     }
 
+    /// Returns a reference to the underlying atomic.
     #[inline(always)]
     fn atomic_ref(&self) -> &<T::Raw as AtomicRaw>::Atomic {
         let ptr = self.raw.get();
@@ -95,6 +102,7 @@ where
         unsafe { <T::Raw as AtomicRaw>::from_ptr(ptr) }
     }
 
+    /// Loads the value with the specified ordering.
     #[inline]
     pub fn load(&self, order: Ordering) -> T {
         if crate::raw_atomics_enabled() {
@@ -106,6 +114,7 @@ where
         }
     }
 
+    /// Stores the value with the specified ordering.
     #[inline]
     pub fn store(&self, val: T, order: Ordering) {
         let val_raw = T::canonicalize_raw(val.to_raw());
@@ -118,6 +127,7 @@ where
         }
     }
 
+    /// Atomically swaps the value, returning the previous value.
     #[inline]
     pub fn swap(&self, val: T, order: Ordering) -> T {
         let val_raw = T::canonicalize_raw(val.to_raw());
@@ -135,6 +145,7 @@ where
         }
     }
 
+    /// Returns a mutable reference to the raw storage.
     #[inline]
     pub fn get_mut_raw(&mut self) -> &mut T::Raw {
         // This is always safe because &mut self guarantees exclusivity.
@@ -149,6 +160,7 @@ impl<T: RawReg + 'static> RawAtomicPod<T>
 where
     T::Raw: AtomicRaw,
 {
+    /// Atomically performs bitwise OR and returns the previous value.
     #[inline]
     pub fn fetch_or(&self, val: T, order: Ordering) -> T
     where
@@ -167,6 +179,7 @@ where
         }
     }
 
+    /// Atomically performs bitwise AND and returns the previous value.
     #[inline]
     pub fn fetch_and(&self, val: T, order: Ordering) -> T
     where
@@ -185,6 +198,7 @@ where
         }
     }
 
+    /// Atomically performs bitwise XOR and returns the previous value.
     #[inline]
     pub fn fetch_xor(&self, val: T, order: Ordering) -> T
     where
@@ -208,6 +222,7 @@ impl<T: RawReg + 'static> RawAtomicPod<T>
 where
     T::Raw: AtomicRawInt,
 {
+    /// Atomically adds to the current value, returning the previous value.
     #[inline]
     pub fn fetch_add(&self, val: T, order: Ordering) -> T
     where
@@ -227,6 +242,7 @@ where
         }
     }
 
+    /// Atomically subtracts from the current value, returning the previous value.
     #[inline]
     pub fn fetch_sub(&self, val: T, order: Ordering) -> T
     where
@@ -246,6 +262,7 @@ where
         }
     }
 
+    /// Atomically multiplies the current value, returning the previous value.
     #[inline]
     pub fn fetch_mul(&self, val: T, order: Ordering) -> T
     where
@@ -278,6 +295,7 @@ where
         }
     }
 
+    /// Atomically computes the minimum, returning the previous value.
     #[inline]
     pub fn fetch_min(&self, val: T, order: Ordering) -> T
     where
@@ -297,6 +315,7 @@ where
         }
     }
 
+    /// Atomically computes the maximum, returning the previous value.
     #[inline]
     pub fn fetch_max(&self, val: T, order: Ordering) -> T
     where
@@ -316,6 +335,7 @@ where
         }
     }
 
+    /// Atomically performs bitwise NAND, returning the previous value.
     #[inline]
     pub fn fetch_nand(&self, val: T, order: Ordering) -> T
     where
@@ -340,6 +360,7 @@ impl<T: AtomicPod> RawAtomicPod<T>
 where
     T::Raw: AtomicRaw + PartialEq,
 {
+    /// Performs a compare-and-exchange operation.
     #[inline]
     pub fn compare_exchange(
         &self,

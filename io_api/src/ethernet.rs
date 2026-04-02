@@ -1,6 +1,10 @@
+//! Ethernet interface traits.
+
+/// MAC address (6 bytes).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct MacAddr(pub [u8; 6]);
 
+/// Ethernet frame I/O interface.
 pub trait EthernetFrameIo {
     /// Returns the maximum frame size supported by this backend.
     fn max_frame_len(&self) -> usize;

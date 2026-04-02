@@ -1,3 +1,5 @@
+//! Internet checksum (RFC 1071) calculation utilities.
+
 /// Computes the raw one's-complement sum over a byte slice.
 ///
 /// For odd lengths, the final byte is treated as the high byte of a 16-bit word.

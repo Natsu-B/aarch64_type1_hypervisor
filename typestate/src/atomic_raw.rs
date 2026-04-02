@@ -1,6 +1,12 @@
+//! Atomic operations on raw integer types.
 use core::sync::atomic::Ordering;
 
+/// A primitive type that has a corresponding atomic type.
+///
+/// This trait abstracts over atomic operations on raw integer types (u8, u16, etc.),
+/// allowing generic code to perform atomic loads, stores, and RMW operations.
 pub trait AtomicRaw: Copy + 'static {
+    /// The atomic wrapper type for this raw type.
     type Atomic;
 
     /// # Safety
@@ -9,12 +15,16 @@ pub trait AtomicRaw: Copy + 'static {
     /// - Do not mix conflicting atomic and non-atomic accesses without synchronization.
     unsafe fn from_ptr<'a>(ptr: *mut Self) -> &'a Self::Atomic;
 
+    /// Atomically loads a value from the atomic cell.
     fn load(a: &Self::Atomic, order: Ordering) -> Self;
 
+    /// Atomically stores a value into the atomic cell.
     fn store(a: &Self::Atomic, v: Self, order: Ordering);
 
+    /// Atomically swaps the value, returning the previous value.
     fn swap(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Performs a compare-and-exchange operation.
     fn compare_exchange(
         a: &Self::Atomic,
         current: Self,
@@ -23,6 +33,7 @@ pub trait AtomicRaw: Copy + 'static {
         failure: Ordering,
     ) -> Result<Self, Self>;
 
+    /// Performs a weak compare-and-exchange operation.
     fn compare_exchange_weak(
         a: &Self::Atomic,
         current: Self,
@@ -31,22 +42,31 @@ pub trait AtomicRaw: Copy + 'static {
         failure: Ordering,
     ) -> Result<Self, Self>;
 
+    /// Atomically performs bitwise OR and returns the previous value.
     fn fetch_or(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Atomically performs bitwise AND and returns the previous value.
     fn fetch_and(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Atomically performs bitwise XOR and returns the previous value.
     fn fetch_xor(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 }
 
+/// Atomic operations for integer types with arithmetic operations.
 pub trait AtomicRawInt: AtomicRaw {
+    /// Atomically adds to the current value, returning the previous value.
     fn fetch_add(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Atomically subtracts from the current value, returning the previous value.
     fn fetch_sub(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Atomically computes the minimum, returning the previous value.
     fn fetch_min(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Atomically computes the maximum, returning the previous value.
     fn fetch_max(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 
+    /// Atomically performs bitwise NAND, returning the previous value.
     fn fetch_nand(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 }
 

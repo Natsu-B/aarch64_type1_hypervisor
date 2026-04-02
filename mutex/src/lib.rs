@@ -1,5 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(sync_unsafe_cell)]
+//! Synchronization primitives for bare-metal and no_std environments.
+//!
+//! This crate provides spin-based locks and reader-writer locks that work in
+//! environments without an operating system. A key feature is the "raw atomics"
+//! mode that allows locks to operate as no-ops during early single-core bring-up,
+//! then switch to actual atomic operations once [`enable_raw_atomics`] is called.
 
 use core::cell::SyncUnsafeCell;
 use core::cell::UnsafeCell;
@@ -10,6 +16,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 
+/// POD-backed atomic cells for bring-up friendly atomic operations.
 pub mod pod;
 
 #[cfg(test)]
@@ -62,11 +69,13 @@ pub(crate) fn with_raw_atomics_mode(enabled: bool, f: impl FnOnce()) {
     drop(guard);
 }
 
+/// A simple spin-based mutual exclusion lock.
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
 }
 
+/// RAII guard for [`SpinLock`].
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
@@ -75,6 +84,7 @@ unsafe impl<T: ?Sized + Send> Send for SpinLock<T> {}
 unsafe impl<T: ?Sized + Send> Sync for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
+    /// Creates a new spin lock with the given initial value.
     pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
@@ -82,6 +92,7 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Acquires the lock, blocking until it becomes available.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self
             .locked
@@ -93,6 +104,7 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
+    /// Attempts to acquire the lock without blocking.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         if self
             .locked
@@ -139,6 +151,7 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     }
 }
 
+/// Acquires an atomic spin lock.
 #[inline(always)]
 fn lock_atomic(locked: &AtomicBool) {
     while locked
@@ -149,13 +162,16 @@ fn lock_atomic(locked: &AtomicBool) {
     }
 }
 
+/// Releases an atomic spin lock.
 #[inline(always)]
 fn unlock_atomic(locked: &AtomicBool) {
     locked.store(false, Ordering::Release);
 }
 
+/// Write lock flag (MSB of the state word).
 const WRITE_FLAG: usize = 1 << (usize::BITS - 1);
 
+/// Acquires a read lock atomically.
 #[inline(always)]
 fn rw_read_lock_atomic(state: &AtomicUsize) {
     loop {
@@ -193,11 +209,13 @@ fn rw_read_lock_atomic(state: &AtomicUsize) {
     }
 }
 
+/// Releases a read lock atomically.
 #[inline(always)]
 fn rw_read_unlock_atomic(state: &AtomicUsize) {
     state.fetch_sub(1, Ordering::Release);
 }
 
+/// Acquires a write lock atomically.
 #[inline(always)]
 fn rw_write_lock_atomic(state: &AtomicUsize) {
     loop {
@@ -225,16 +243,21 @@ fn rw_write_lock_atomic(state: &AtomicUsize) {
     }
 }
 
+/// Releases a write lock atomically.
 #[inline(always)]
 fn rw_write_unlock_atomic(state: &AtomicUsize) {
     state.fetch_and(!WRITE_FLAG, Ordering::Release);
 }
 
+/// A "raw" spin lock that starts as a no-op until raw atomics are enabled.
+///
+/// See [`enable_raw_atomics`] for details on bring-up sequencing.
 pub struct RawSpinLock<T: ?Sized> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
 }
 
+/// RAII guard for [`RawSpinLock`].
 pub struct RawSpinLockGuard<'a, T> {
     lock: &'a RawSpinLock<T>,
     unlock_on_drop: bool,
@@ -244,6 +267,7 @@ unsafe impl<T: ?Sized + Send> Send for RawSpinLock<T> {}
 unsafe impl<T: ?Sized + Send> Sync for RawSpinLock<T> {}
 
 impl<T> RawSpinLock<T> {
+    /// Creates a new raw spin lock with the given initial value.
     pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
@@ -251,6 +275,7 @@ impl<T> RawSpinLock<T> {
         }
     }
 
+    /// Acquires the lock, blocking if raw atomics are enabled.
     pub fn lock(&self) -> RawSpinLockGuard<'_, T> {
         let unlock_on_drop = raw_atomics_enabled();
         if unlock_on_drop {
@@ -317,11 +342,13 @@ pub struct RawRwLock<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
+/// RAII read guard for [`RawRwLock`].
 pub struct RawRwLockReadGuard<'a, T: ?Sized> {
     lock: &'a RawRwLock<T>,
     unlock_on_drop: bool,
 }
 
+/// RAII write guard for [`RawRwLock`].
 pub struct RawRwLockWriteGuard<'a, T: ?Sized> {
     lock: &'a RawRwLock<T>,
     unlock_on_drop: bool,
@@ -331,6 +358,7 @@ unsafe impl<T: ?Sized + Send + Sync> Sync for RawRwLock<T> {}
 unsafe impl<T: ?Sized + Send> Send for RawRwLock<T> {}
 
 impl<T> RawRwLock<T> {
+    /// Creates a new raw reader-writer lock with the given initial value.
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
@@ -338,6 +366,7 @@ impl<T> RawRwLock<T> {
         }
     }
 
+    /// Acquires a read lock, blocking if raw atomics are enabled.
     pub fn read(&self) -> RawRwLockReadGuard<'_, T> {
         let unlock_on_drop = raw_atomics_enabled();
         if unlock_on_drop {
@@ -349,6 +378,7 @@ impl<T> RawRwLock<T> {
         }
     }
 
+    /// Acquires a write lock, blocking if raw atomics are enabled.
     pub fn write(&self) -> RawRwLockWriteGuard<'_, T> {
         let unlock_on_drop = raw_atomics_enabled();
         if unlock_on_drop {
@@ -414,6 +444,7 @@ impl<T: ?Sized> DerefMut for RawRwLockWriteGuard<'_, T> {
     }
 }
 
+/// A spin-based reader-writer lock.
 pub struct RwLock<T> {
     /// The most significant bit is the write lock flag.
     /// The other bits are the read count.
@@ -421,10 +452,12 @@ pub struct RwLock<T> {
     data: UnsafeCell<T>,
 }
 
+/// RAII read guard for [`RwLock`].
 pub struct RwLockReadGuard<'a, T> {
     lock: &'a RwLock<T>,
 }
 
+/// RAII write guard for [`RwLock`].
 pub struct RwLockWriteGuard<'a, T> {
     lock: &'a RwLock<T>,
 }
@@ -434,6 +467,8 @@ unsafe impl<T: Send> Send for RwLock<T> {}
 
 impl<T> RwLock<T> {
     const WRITE_FLAG: usize = 1 << (usize::BITS - 1);
+
+    /// Creates a new reader-writer lock with the given initial value.
     pub const fn new(data: T) -> Self {
         Self {
             read_count_write_lock_flag: AtomicUsize::new(0),
@@ -441,6 +476,7 @@ impl<T> RwLock<T> {
         }
     }
 
+    /// Acquires a read lock, blocking until it becomes available.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         loop {
             let current_state = self.read_count_write_lock_flag.load(Ordering::Relaxed);
@@ -462,6 +498,7 @@ impl<T> RwLock<T> {
         }
     }
 
+    /// Acquires a write lock, blocking until it becomes available.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         loop {
             let current_state = self.read_count_write_lock_flag.load(Ordering::Relaxed);

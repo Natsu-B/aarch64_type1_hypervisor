@@ -1,3 +1,5 @@
+//! VirtIO MMIO transport implementation.
+
 use core::mem::size_of;
 
 use typestate::ReadPure;
@@ -15,6 +17,7 @@ use crate::device_type::VirtIoDeviceTypes;
 #[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<MmioDeviceRegister>() == 0x100);
 
+/// VirtIO MMIO device registers layout.
 #[repr(C)]
 struct MmioDeviceRegister {
     magic: ReadPure<u32>,
@@ -59,8 +62,11 @@ struct MmioDeviceRegister {
     config_generation: ReadPure<u32>,
 }
 
+/// VirtIO MMIO transport.
 pub struct VirtIoMmio {
+    /// Pointer to memory-mapped registers.
     registers: &'static MmioDeviceRegister,
+    /// Detected device type.
     device: VirtIoDeviceTypes,
 }
 

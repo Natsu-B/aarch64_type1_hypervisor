@@ -8,7 +8,11 @@
 
 #![no_std]
 
+/// Block device I/O traits.
 pub mod block_device;
+/// Ethernet interface traits.
 pub mod ethernet;
+/// Serial I/O traits.
 pub mod serial;
+/// Generic byte stream traits.
 pub mod stream;

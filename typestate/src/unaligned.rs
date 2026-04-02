@@ -40,6 +40,9 @@ use crate::WriteOnly;
 #[derive(Debug, Copy, Clone)]
 pub struct Unaligned<T>(T);
 
+/// Internal macro for unaligned volatile reads.
+///
+/// Reads a value from an unaligned memory location using byte-wise I/O.
 #[macro_export]
 macro_rules! unalign_read {
     ($v:expr => $ty:ty) => {
@@ -51,6 +54,9 @@ macro_rules! unalign_read {
     };
 }
 
+/// Internal macro for unaligned volatile writes.
+///
+/// Writes a value to an unaligned memory location using byte-wise I/O.
 #[macro_export]
 macro_rules! unalign_write {
     ($v:expr => WriteOnly<Unaligned<$t:ty>>, $val:expr) => {{

@@ -1,5 +1,8 @@
+//! VirtIO device type definitions.
+
 use crate::VirtioErr;
 
+/// VirtIO device types as defined in the VirtIO specification.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtIoDeviceTypes {

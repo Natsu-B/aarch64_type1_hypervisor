@@ -1,3 +1,7 @@
+//! GDB Remote Serial Protocol (RSP) implementation.
+//!
+//! Provides a GDB stub for debugging bare-metal targets.
+
 #![no_std]
 
 #[repr(u8)]
@@ -65,6 +69,7 @@ use io_api::stream::PollByteStream;
 #[cfg(any(feature = "gdb_monitor_debug", test))]
 use core::fmt::Write;
 
+/// Debug print macro for GDB monitor commands.
 #[macro_export]
 macro_rules! gdb_debug {
     ($server:expr, $($arg:tt)*) => {
@@ -72,7 +77,9 @@ macro_rules! gdb_debug {
     };
 }
 
+/// RSP frame parsing.
 mod rsp_framing;
+/// Target abstraction for debuggable systems.
 mod target;
 
 use rsp_framing::RspFrameByteKind;
@@ -106,8 +113,11 @@ pub enum ProcessResult {
     Resume(ResumeAction),
     /// File-I/O reply packet from GDB.
     FileIoReply {
+        /// Return code from the file operation.
         retcode: i64,
+        /// Error number (0 on success).
         errno: i32,
+        /// True if Ctrl-C was pressed.
         ctrl_c: bool,
     },
     /// Special-case monitor-exit used by the UEFI test harness.
@@ -140,6 +150,7 @@ static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     noop_waker_drop,
 );
 
+/// Creates a no-op waker for polling.
 fn noop_waker() -> Waker {
     // SAFETY: vtable functions are no-ops and the data pointer is never dereferenced.
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
@@ -147,12 +158,15 @@ fn noop_waker() -> Waker {
 
 /// IRQ-facing transport-agnostic interface for the RSP engine.
 pub trait RspIrqEndpoint<T: Target> {
+    /// Processes a received byte from the transport layer.
     fn on_rx_byte_irq(
         &mut self,
         target: &mut T,
         byte: u8,
     ) -> Result<ProcessResult, GdbServerError<T>>;
+    /// Pops a byte from the transmit queue.
     fn pop_tx_byte_irq(&mut self) -> Option<u8>;
+    /// Returns true if there are bytes pending transmission.
     fn has_tx_pending(&self) -> bool;
 }
 
@@ -313,6 +327,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::init_in_place_with_packet_size(dst, MAX_PKT);
     }
 
+    /// Initialize an uninitialized slot in-place with custom packet size.
     pub fn init_in_place_with_packet_size(
         dst: &mut core::mem::MaybeUninit<Self>,
         packet_size: usize,
@@ -370,6 +385,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
     }
 
     #[cfg(all(not(feature = "gdb_monitor_debug"), not(test)))]
+    /// Writes a formatted message to the debug console (no-op when disabled).
     pub fn debug_console_fmt(&mut self, _args: fmt::Arguments<'_>) {
         let _ = _args;
     }
@@ -391,6 +407,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         self.reset_rx_full();
     }
 
+    /// Returns and clears the file-I/O parse error flag.
     pub fn take_fileio_parse_error(&mut self) -> bool {
         let had_error = self.fileio_parse_error;
         self.fileio_parse_error = false;
@@ -458,6 +475,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
     }
 
+    /// Queues a raw packet payload for transmission.
     pub fn queue_packet_payload(
         &mut self,
         payload: &[u8],
@@ -468,6 +486,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, payload).map_err(|_| GdbError::TxOverflow)
     }
 
+    /// Sends a stop notification with a given signal number.
     pub fn notify_stop_signal(
         &mut self,
         signal: u8,
@@ -485,10 +504,12 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, &payload).map_err(|_| GdbError::TxOverflow)
     }
 
+    /// Sends a stop notification for SIGTRAP (signal 5).
     pub fn notify_stop_sigtrap(&mut self) -> Result<(), GdbError<Infallible, Infallible>> {
         self.notify_stop_signal(5)
     }
 
+    /// Sends a stop notification for a watchpoint hit.
     pub fn notify_stop_watch(
         &mut self,
         kind: WatchpointKind,
@@ -525,6 +546,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         Self::queue_packet(&mut self.tx, &payload[..idx]).map_err(|_| GdbError::TxOverflow)
     }
 
+    /// Drops pending console output packets from the transmit queue.
     pub fn drop_console_output(&mut self) {
         // Drop pending console packets to make room for stop replies.
         loop {
@@ -555,14 +577,17 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
     }
 
+    /// Records a stop signal without sending a notification.
     pub fn set_last_stop_signal(&mut self, signal: u8) {
         self.last_stop = LastStop::signal(signal);
     }
 
+    /// Records SIGTRAP as the last stop reason.
     pub fn set_last_stop_sigtrap(&mut self) {
         self.set_last_stop_signal(5);
     }
 
+    /// Records a watchpoint hit as the last stop reason.
     pub fn set_last_stop_watch(&mut self, kind: WatchpointKind, addr: u64) {
         self.last_stop = LastStop {
             kind: LastStopKind::from_watch(kind),
@@ -864,10 +889,12 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         self.tx.pop()
     }
 
+    /// Returns true if there are pending bytes to transmit.
     pub fn has_tx_pending(&self) -> bool {
         !self.tx.is_empty()
     }
 
+    /// Runs the GDB stub until a monitor-exit is requested.
     pub fn run_until_monitor_exit<S: PollByteStream<Error = Infallible>, T: Target>(
         &mut self,
         stream: &mut S,

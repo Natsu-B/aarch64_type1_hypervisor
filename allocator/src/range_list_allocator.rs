@@ -928,6 +928,7 @@ impl MemoryRegions {
     }
 }
 
+/// Debug assertion macro (evaluates in test builds only).
 #[cfg(test)]
 #[macro_export]
 macro_rules! debug_assert {
@@ -936,6 +937,7 @@ macro_rules! debug_assert {
     )
 }
 
+/// Debug assertion macro (no-op in release builds).
 #[cfg(not(test))]
 #[macro_export]
 macro_rules! debug_assert {

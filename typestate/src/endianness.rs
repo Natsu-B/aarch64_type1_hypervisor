@@ -206,12 +206,14 @@ impl<T: RawReg> Writable for ReadWrite<Be<T>> {
 }
 
 impl<T: RawReg> Le<T> {
+    /// Creates a new little-endian wrapper from a host-endian value.
     pub fn new(t: T) -> Self {
         Self(t.from_le())
     }
 }
 
 impl<T: RawReg> Be<T> {
+    /// Creates a new big-endian wrapper from a host-endian value.
     pub fn new(t: T) -> Self {
         Self(t.from_be())
     }

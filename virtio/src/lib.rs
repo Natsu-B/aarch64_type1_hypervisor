@@ -1,10 +1,17 @@
+//! VirtIO device driver framework.
+//!
+//! Provides support for VirtIO MMIO devices including virtqueues and device configuration.
+
 #![no_std]
 #![allow(dead_code)]
 
 extern crate alloc;
 
+/// VirtIO device type definitions.
 pub mod device_type;
+/// MMIO transport layer.
 pub mod mmio;
+/// Virtqueue implementation.
 pub mod queue;
 use alloc::alloc::alloc_zeroed;
 use alloc::boxed::Box;
@@ -18,37 +25,54 @@ use crate::queue::VirtqDesc;
 
 const VIRTIO_FEATURE_SEL_SIZE: usize = 4;
 
+/// Transport-agnostic VirtIO device interface.
 pub trait VirtioTransport {
+    /// Returns the device type.
     fn get_device(&self) -> VirtIoDeviceTypes;
+    /// Returns the device configuration space address.
     fn get_configuration_addr(&self) -> usize;
+    /// Returns the device version.
     fn get_device_version(&self) -> u32;
 
-    // features
+    /// Sets the device status.
     fn set_status(&self, features: DeviceStatus);
+    /// Sets status bits without clearing others.
     fn bitmask_set_status(&self, features: DeviceStatus);
+    /// Returns the current device status.
     fn get_status(&self) -> DeviceStatus;
+    /// Returns device features for the given selector.
     fn get_device_features(&self, select: u32) -> VirtioFeatures;
+    /// Sets driver features for the given selector.
     fn set_driver_features(&self, select: u32, val: VirtioFeatures);
 
-    //queue
+    /// Selects a virtqueue by index.
     fn select_queue(&self, index: u16);
+    /// Returns true if the queue is not ready.
     fn is_queue_ready_equal_0(&self) -> bool;
+    /// Marks the queue as ready.
     fn enable_queue_ready(&self);
+    /// Returns the maximum queue size.
     fn get_max_queue_size(&self) -> u32;
+    /// Sets the queue size.
     fn set_queue_size(&self, size: u32);
+    /// Sets the descriptor table address.
     fn queue_set_descriptor(&self, paddr: usize);
+    /// Sets the available ring address.
     fn queue_set_available(&self, paddr: usize);
+    /// Sets the used ring address.
     fn queue_set_used(&self, paddr: usize);
 
+    /// Notifies the device about queue activity.
     fn queue_notify(&self, index: u16);
 }
 
+/// VirtIO feature flags.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, RawReg, PartialEq)]
 pub struct VirtioFeatures(pub u32);
 
 impl VirtioFeatures {
-    #![allow(unused)]
+    #![allow(unused, missing_docs)]
     // --- lower 32 bits (select = 0) ---
     pub const F_INDIRECT_DESC: Self = Self(1u32 << 28);
     pub const F_EVENT_IDX: Self = Self(1u32 << 29);
@@ -75,16 +99,19 @@ impl VirtioFeatures {
     }
 }
 
+/// Trait for device-specific VirtIO implementations.
 pub trait VirtIoDevice {
-    // should return only driver features (not including device-independent features)
+    /// Returns driver-negotiated features for the given selector.
     fn driver_features(
         &self,
         select: u32,
         device_feature: VirtioFeatures,
     ) -> Result<VirtioFeatures, VirtioErr>;
+    /// Returns the number of virtqueues this device uses.
     fn num_of_queue(&self) -> Result<u32, VirtioErr>;
 }
 
+/// VirtIO device status register.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, RawReg)]
 pub struct DeviceStatus(u32);
@@ -99,12 +126,16 @@ impl DeviceStatus {
     const DEVICE_NEEDS_RESET: DeviceStatus = DeviceStatus(64);
 }
 
+/// Core VirtIO device state with transport and queues.
 pub struct VirtIoCore<T: VirtioTransport> {
+    /// The underlying transport (e.g., MMIO).
     pub transport: T,
+    /// Allocated virtqueues.
     pub queues: Option<Box<[VirtQueue]>>,
 }
 
 impl VirtIoCore<VirtIoMmio> {
+    /// Creates a new MMIO-based VirtIO device at the given physical address.
     pub fn new_mmio(paddr: usize) -> Result<Self, VirtioErr> {
         Ok(Self {
             transport: VirtIoMmio::new_mmio(paddr)?,
@@ -114,11 +145,13 @@ impl VirtIoCore<VirtIoMmio> {
 }
 
 impl<T: VirtioTransport> VirtIoCore<T> {
+    /// Returns the device type.
     #[inline]
     pub fn get_device(&self) -> VirtIoDeviceTypes {
         self.transport.get_device()
     }
 
+    /// Returns the configuration space address.
     #[inline]
     pub fn get_configuration_addr(&self) -> usize {
         self.transport.get_configuration_addr()
@@ -142,6 +175,7 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         }
     }
 
+    /// Initializes the VirtIO device with the given device-specific configuration.
     pub fn init<D>(&mut self, virtio_device: &D) -> Result<(), VirtioErr>
     where
         D: VirtIoDevice,
@@ -261,6 +295,7 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         result
     }
 
+    /// Allocates a descriptor from the specified queue.
     pub fn allocate_descriptor(
         &self,
         queue_idx: u16,
@@ -271,6 +306,7 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         queue[queue_idx as usize].allocate_descriptor()
     }
 
+    /// Adds a descriptor to the available ring and notifies the device.
     pub fn set_and_notify(&self, queue_idx: u16, desc_idx: u16) -> Result<(), VirtioErr> {
         let Some(queue) = &self.queues else {
             return Err(VirtioErr::DeviceUninitialized);
@@ -283,6 +319,7 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         Ok(())
     }
 
+    /// Pops a completed entry from the used ring.
     pub fn pop_used(&self, queue_idx: u16) -> Result<Option<(u16, u32)>, VirtioErr> {
         let Some(queue) = &self.queues else {
             return Err(VirtioErr::DeviceUninitialized);
@@ -290,6 +327,7 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         queue[queue_idx as usize].pop_used()
     }
 
+    /// Releases a used descriptor back to the free pool.
     pub fn dequeue_used(&self, queue_idx: u16, desc_idx: u16) -> Result<(), VirtioErr> {
         let Some(queue) = &self.queues else {
             return Err(VirtioErr::DeviceUninitialized);
@@ -297,22 +335,34 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         queue[queue_idx as usize].dequeue_used(desc_idx)
     }
 
+    /// Resets the device.
     pub fn reset(&self) {
         // reset virtio
         self.transport.set_status(DeviceStatus::RESET);
     }
 }
 
+/// VirtIO error types.
 #[derive(Debug)]
 pub enum VirtioErr {
+    /// Invalid magic number.
     BadMagic(u32),
+    /// Unsupported VirtIO version.
     UnsupportedVersion(u32),
+    /// Unknown device type.
     UnknownVirtioDevice(u32),
+    /// Device features not supported.
     UnsupportedDeviceFeature([VirtioFeatures; VIRTIO_FEATURE_SEL_SIZE]),
+    /// Driver features not supported.
     UnsupportedDriverFeature([VirtioFeatures; VIRTIO_FEATURE_SEL_SIZE]),
+    /// Generic invalid state.
     Invalid,
+    /// Device requires a reset.
     DeviceNeedsReset,
+    /// Device not yet initialized.
     DeviceUninitialized,
+    /// No free descriptors available.
     OutOfAvailableDesc,
+    /// Queue data corrupted.
     QueueCorrupted,
 }

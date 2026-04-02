@@ -1,3 +1,5 @@
+//! IPv4 packet parsing and encoding.
+
 use super::EncodeError;
 use super::Ipv4Addr;
 use super::ParseError;
@@ -6,18 +8,26 @@ use super::checksum::ipv4_header_checksum_is_valid;
 use super::read_be_u16;
 use super::write_be_u16;
 
+/// IPv4 header size without options.
 pub const HEADER_LEN_NO_OPTIONS: usize = 20;
+/// IP protocol number for UDP.
 pub const IPV4_PROTOCOL_UDP: u8 = 17;
 const VERSION: u8 = 4;
 const MIN_IHL_WORDS: usize = 5;
 const TTL_DEFAULT: u8 = 64;
 
+/// Parsed IPv4 header and payload reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4HeaderView<'a> {
+    /// Source IPv4 address.
     pub src_ip: Ipv4Addr,
+    /// Destination IPv4 address.
     pub dst_ip: Ipv4Addr,
+    /// IP protocol field.
     pub protocol: u8,
+    /// Payload data.
     pub payload: &'a [u8],
+    /// Header length in bytes.
     pub header_len: usize,
 }
 

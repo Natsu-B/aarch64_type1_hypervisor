@@ -1,3 +1,5 @@
+//! VirtIO virtqueue implementation.
+
 use core::mem::size_of;
 use core::sync::atomic::Ordering;
 
@@ -15,40 +17,56 @@ use crate::VirtioErr;
 use cpu::clean_dcache_range;
 use cpu::invalidate_dcache_range;
 
+/// A single virtqueue with descriptor, available, and used rings.
 #[derive(Debug)]
 pub struct VirtQueue {
+    /// Number of descriptors in this queue.
     size: u32,
+    /// Physical address of the descriptor table.
     descriptor_paddr: u64,
+    /// Physical address of the available ring.
     avail_paddr: u64,
+    /// Physical address of the used ring.
     used_paddr: u64,
+    /// Internal state protected by a spin lock.
     idx: SpinLock<VirtQueueIdx>,
 }
 
+/// Internal index tracking for a virtqueue.
 #[derive(Debug)]
 struct VirtQueueIdx {
+    /// Free descriptor list.
     free_list: IntrusiveLinkedList,
+    /// Next available ring index.
     avail_idx: u16,
+    /// Last consumed used ring index.
     used_idx: u16,
 }
 
+/// A virtqueue descriptor entry.
 #[repr(C)]
 pub struct VirtqDesc {
+    /// Physical address of the buffer.
     pub addr: Le<u64>,
+    /// Length of the buffer in bytes.
     pub len: Le<u32>,
+    /// Descriptor flags.
     pub flags: Le<VirtqDescFlags>,
+    /// Index of the next descriptor in a chain.
     pub next: Le<u16>,
 }
 
+/// Virtqueue descriptor flags.
 #[repr(transparent)]
 #[derive(Clone, Copy, RawReg)]
 pub struct VirtqDescFlags(u16);
 
 impl VirtqDescFlags {
-    // This marks a buffer as continuing via the next field
+    /// Buffer continues via the next field.
     pub const VIRTQ_DESC_F_NEXT: VirtqDescFlags = Self(1);
-    // This marks a buffer as device write-only (otherwise device read-only)
+    /// Buffer is device write-only (otherwise read-only).
     pub const VIRTQ_DESC_F_WRITE: VirtqDescFlags = Self(2);
-    //  This means the buffer contains a list of buffer descriptors
+    /// Buffer contains indirect descriptors.
     pub const VIRTQ_DESC_F_INDIRECT: VirtqDescFlags = Self(4);
 }
 

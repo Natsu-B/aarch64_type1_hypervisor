@@ -32,7 +32,9 @@
 #[cfg(test)]
 extern crate self as typestate;
 
+/// Atomic operations on raw integer types.
 pub mod atomic_raw;
+/// Bitfield register definition macros.
 pub mod bitflags;
 mod endianness;
 mod read_write;
@@ -56,12 +58,19 @@ pub use unaligned::Unaligned;
 pub unsafe trait RawReg:
     Copy + core::ops::BitOr + core::ops::BitAnd + core::ops::Not + core::ops::BitXor
 {
+    /// The underlying raw representation type.
     type Raw;
+    /// Converts `self` to the raw representation.
     fn to_raw(self) -> Self::Raw;
+    /// Constructs `Self` from its raw representation.
     fn from_raw(raw: Self::Raw) -> Self;
+    /// Converts `self` to little-endian byte order.
     fn to_le(self) -> Self;
+    /// Interprets `self` as little-endian and converts to native byte order.
     fn from_le(self) -> Self;
+    /// Converts `self` to big-endian byte order.
     fn to_be(self) -> Self;
+    /// Interprets `self` as big-endian and converts to native byte order.
     fn from_be(self) -> Self;
 }
 
@@ -78,11 +87,15 @@ pub unsafe trait BytePod: Copy + 'static {}
 /// - `from_raw(Self::canonicalize_raw(raw))` is always safe for any `raw`.
 /// - `to_raw()` produces a representation suitable for atomic storage in `Self::Raw`.
 pub unsafe trait AtomicPod: Copy + 'static {
+    /// The underlying atomic-compatible raw type.
     type Raw: crate::atomic_raw::AtomicRaw;
 
+    /// Converts `self` to the raw representation for atomic storage.
     fn to_raw(self) -> Self::Raw;
+    /// Constructs `Self` from its raw atomic representation.
     fn from_raw(raw: Self::Raw) -> Self;
 
+    /// Clears invalid/unused bits, returning a canonical representation.
     #[inline]
     fn canonicalize_raw(raw: Self::Raw) -> Self::Raw {
         raw

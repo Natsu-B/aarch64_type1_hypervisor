@@ -1,3 +1,8 @@
+//! Memory allocator for bare-metal environments.
+//!
+//! This crate provides a two-tier allocator: a buddy allocator for small allocations
+//! and a range-list allocator for large/aligned allocations.
+
 #![cfg_attr(not(any(test, doctest)), no_std)]
 #![feature(generic_const_exprs)]
 #![cfg_attr(not(test), feature(alloc_error_handler))]
@@ -20,6 +25,7 @@ use crate::buddy_allocator::BuddyAllocator;
 use crate::range_list_allocator::MemoryBlock;
 use crate::range_list_allocator::MemoryRegions;
 
+/// Debug print macro (no-op in release builds).
 #[cfg(all(not(feature = "debug-assertions"), not(test)))]
 #[macro_export]
 macro_rules! pr_debug {
@@ -38,13 +44,16 @@ macro_rules! pr_debug {
     ($($arg:tt)*) => {};
 }
 
+/// Minimum allocatable block size in bytes.
 pub const MINIMUM_ALLOCATABLE_BYTES: usize = range_list_allocator::MINIMUM_ALLOCATABLE_BYTES;
 
+/// Computes the number of buddy levels needed for the given maximum block size.
 #[must_use]
 pub const fn levels_value(max: usize) -> usize {
     max.trailing_zeros() as usize - MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize + 1
 }
 
+/// Macro to compute buddy levels at compile time.
 #[macro_export]
 macro_rules! levels {
     ($max:expr) => {
@@ -52,8 +61,10 @@ macro_rules! levels {
     };
 }
 
+/// Default allocator with 4096-byte maximum block size.
 pub type DefaultAllocator = MemoryAllocator<4096, { levels!(4096) }>;
 
+/// A two-tier memory allocator combining buddy and range-list algorithms.
 pub struct MemoryAllocator<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> {
     range_list_allocator: RawSpinLock<OnceCell<MemoryBlock>>,
     buddy_allocator: RawSpinLock<OnceCell<BuddyAllocator<MAX_ALLOCATABLE_BYTES, LEVELS>>>,
@@ -75,6 +86,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> Default
 impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     MemoryAllocator<MAX_ALLOCATABLE_BYTES, LEVELS>
 {
+    /// Creates a new uninitialized allocator.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -106,6 +118,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         }
     }
 
+    /// Allocates a block for the buddy allocator from the range-list allocator.
     pub fn alloc_for_buddy_allocator(&self) -> Option<usize> {
         let mut range_list_allocator_guard = self.range_list_allocator.lock();
         if let Some(range_list_allocator) = range_list_allocator_guard.get_mut() {
@@ -314,6 +327,7 @@ fn panic(_layout: Layout) -> ! {
     loop {}
 }
 
+/// Macro to define a global allocator with the specified page size.
 #[macro_export]
 macro_rules! define_global_allocator {
     ($name:ident, $page_size:expr) => {

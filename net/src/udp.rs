@@ -1,3 +1,5 @@
+//! UDP datagram parsing and encoding.
+
 use super::EncodeError;
 use super::Ipv4Addr;
 use super::ParseError;
@@ -5,12 +7,17 @@ use super::checksum;
 use super::read_be_u16;
 use super::write_be_u16;
 
+/// UDP header size in bytes.
 pub const HEADER_LEN: usize = 8;
 
+/// Parsed UDP header and payload reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdpHeaderView<'a> {
+    /// Source port.
     pub src_port: u16,
+    /// Destination port.
     pub dst_port: u16,
+    /// Payload data.
     pub payload: &'a [u8],
 }
 

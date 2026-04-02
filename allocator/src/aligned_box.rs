@@ -1,3 +1,5 @@
+//! Aligned slice box for memory regions with custom alignment.
+
 use alloc::alloc::alloc;
 use alloc::alloc::dealloc;
 use alloc::alloc::handle_alloc_error;
@@ -14,6 +16,7 @@ use core::ptr::NonNull;
 use core::ptr::{self};
 use typestate::BytePod;
 
+/// An owning pointer to a heap-allocated slice with custom alignment.
 pub struct AlignedSliceBox<T> {
     ptr: NonNull<T>,
     len: usize,
@@ -63,6 +66,7 @@ impl<T> AlignedSliceBox<T> {
         })
     }
 
+    /// Consumes the box and returns its raw parts (pointer, length, alignment).
     #[must_use]
     pub fn into_raw_parts(this: Self) -> (*mut T, usize, NonZeroUsize) {
         let ptr = this.ptr.as_ptr();
@@ -72,16 +76,19 @@ impl<T> AlignedSliceBox<T> {
         (ptr, len, align)
     }
 
+    /// Returns the number of elements in the slice.
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` if the slice is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Returns the alignment of the slice.
     #[must_use]
     pub fn align(&self) -> NonZeroUsize {
         self.align
@@ -107,6 +114,7 @@ impl<T> AlignedSliceBox<MaybeUninit<T>> {
 }
 
 impl<T: BytePod> AlignedSliceBox<MaybeUninit<T>> {
+    /// Returns the uninitialized slice as a mutable byte slice.
     pub fn deref_uninit_u8_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         let byte_len = self.len * size_of::<T>();
         let p = self.ptr.as_ptr().cast::<MaybeUninit<u8>>();

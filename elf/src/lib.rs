@@ -1,3 +1,7 @@
+//! ELF file parser for loading executables.
+//!
+//! Provides utilities for parsing ELF64 headers and loading program segments.
+
 #![no_std]
 #![allow(unused)]
 
@@ -87,6 +91,7 @@ enum ElfEndian {
     Little,
 }
 
+/// Program header data extracted from an ELF file.
 #[derive(Clone, Copy, Debug)]
 pub struct ProgramHeaderData {
     /// Segment permissions derived from `p_flags`.
@@ -116,17 +121,22 @@ pub struct ProgramHeaderData {
     align: u64,
 }
 
+/// ELF segment permission flags.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, RawReg)]
 pub struct ElfPermissions(u8);
 
 impl ElfPermissions {
+    /// Executable permission flag.
     pub const EXECUTABLE: Self = Self(0x1);
+    /// Writable permission flag.
     pub const WRITABLE: Self = Self(0x2);
+    /// Readable permission flag.
     pub const READABLE: Self = Self(0x4);
     const MASK: Self = Self(0b111);
 }
 
+/// Parsed ELF64 file.
 #[derive(Debug)]
 pub struct Elf64<'a> {
     data: &'a [u8],
@@ -134,11 +144,12 @@ pub struct Elf64<'a> {
 }
 
 impl<'a> Elf64<'a> {
-    /// return size and require alignment
+    /// Returns size and required alignment for the ELF header.
     pub const fn elf_header_size() -> (usize /* size */, usize /* alignment */) {
         (size_of::<Elf64Header>(), align_of::<Elf64Header>())
     }
 
+    /// Returns actual header size and alignment for this ELF file.
     pub fn elf_real_header_size(&self) -> (usize /* size */, usize /* alignment */) {
         let header = unsafe { &*(self.data.as_ptr() as *const Elf64Header) };
         (
@@ -196,6 +207,7 @@ impl<'a> Elf64<'a> {
         Ok(Self { data: elf, endian })
     }
 
+    /// Iterates over loadable program headers, invoking `f` for each.
     pub fn iterate_program_header<F>(&self, mut f: F) -> Result<(), ElfErr>
     where
         F: FnMut(&ProgramHeaderData),
@@ -256,10 +268,15 @@ fn read<T: RawReg>(data: T, endian: ElfEndian) -> T {
     }
 }
 
+/// ELF parsing error types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ElfErr {
+    /// Input data is too short to contain a valid ELF header.
     TooShort,
+    /// ELF magic number is invalid.
     InvalidMagic,
+    /// ELF format is not supported (e.g., wrong architecture).
     Unsupported,
+    /// ELF structure is malformed.
     Invalid,
 }
