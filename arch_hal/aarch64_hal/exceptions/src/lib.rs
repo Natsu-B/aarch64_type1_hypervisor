@@ -1,3 +1,5 @@
+//! AArch64 exception vector setup and EL2 exception handling support.
+
 #![no_std]
 #![feature(naked_functions_rustic_abi)]
 #![feature(sync_unsafe_cell)]

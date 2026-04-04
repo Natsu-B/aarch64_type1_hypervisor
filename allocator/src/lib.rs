@@ -263,10 +263,11 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
             .ok_or("failed to allocate")
     }
 
-    /// Finalizes the global allocator before handing off control.
+    /// Trims an already-finalized allocator before boot handoff.
     ///
     /// This function should be called right before transferring execution
-    /// to another kernel or ELF payload (e.g., Linux).
+    /// to another kernel or ELF payload (e.g., Linux), after `finalize()`
+    /// has succeeded.
     ///
     /// # Safety
     /// - Do not call this after `enable_raw_atomics` has been invoked.

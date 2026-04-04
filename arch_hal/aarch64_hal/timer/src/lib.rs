@@ -1,3 +1,5 @@
+//! AArch64 timer abstractions and hardware timer backends.
+
 #![no_std]
 
 pub mod systimer;

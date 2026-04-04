@@ -1,3 +1,5 @@
+//! PSCI dispatch, forwarding, and handler registration for EL2.
+
 #![no_std]
 #![feature(sync_unsafe_cell)]
 

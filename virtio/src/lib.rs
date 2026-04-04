@@ -72,21 +72,33 @@ pub trait VirtioTransport {
 pub struct VirtioFeatures(pub u32);
 
 impl VirtioFeatures {
-    #![allow(unused, missing_docs)]
+    #![allow(unused)]
     // --- lower 32 bits (select = 0) ---
+    /// Device supports descriptor-table entries that reference indirect descriptor tables.
     pub const F_INDIRECT_DESC: Self = Self(1u32 << 28);
+    /// Device supports the `used_event`/`avail_event` event index fields in split virtqueues.
     pub const F_EVENT_IDX: Self = Self(1u32 << 29);
 
     // --- upper 32 bits (select = 1) ---
+    /// Device follows VirtIO 1.0+ semantics.
     pub const F_VERSION_1: Self = Self(1u32 << (32 - 32)); // bit 0 of high
+    /// Device requires platform/IOMMU access translation for queue memory.
     pub const F_ACCESS_PLATFORM: Self = Self(1u32 << (33 - 32));
+    /// Device supports packed virtqueue ring layout.
     pub const F_RING_PACKED: Self = Self(1u32 << (34 - 32));
+    /// Device processes descriptors in the order they are made available.
     pub const F_IN_ORDER: Self = Self(1u32 << (35 - 32));
+    /// Device observes stronger platform ordering requirements for memory accesses.
     pub const F_ORDER_PLATFORM: Self = Self(1u32 << (36 - 32));
+    /// Device supports SR-IOV related capabilities.
     pub const F_SR_IOV: Self = Self(1u32 << (37 - 32));
+    /// Driver provides extra notification data with queue notifications.
     pub const F_NOTIFICATION_DATA: Self = Self(1u32 << (38 - 32));
+    /// Device-specific notification configuration data is available.
     pub const F_NOTIF_CONFIG_DATA: Self = Self(1u32 << (39 - 32));
+    /// Device supports resetting individual virtqueues.
     pub const F_RING_RESET: Self = Self(1u32 << (40 - 32));
+    /// Device supports an administrative virtqueue.
     pub const F_ADMIN_VQ: Self = Self(1u32 << (41 - 32));
 
     fn get_features_mask(select: usize) -> VirtioFeatures {

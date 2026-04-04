@@ -1,3 +1,5 @@
+//! Bare-metal AArch64 unit-test harness and shared test runtime helpers.
+
 #![no_std]
 #![feature(alloc_error_handler)]
 

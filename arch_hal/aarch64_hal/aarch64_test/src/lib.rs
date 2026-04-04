@@ -1,3 +1,5 @@
+//! Minimal AArch64 semihosting helpers used by bare-metal tests.
+
 #![no_std]
 
 #[cfg(feature = "bump-allocator")]

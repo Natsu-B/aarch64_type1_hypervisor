@@ -1,3 +1,5 @@
+//! AArch64 stage-1 and stage-2 paging types and translation helpers.
+
 #![no_std]
 #![recursion_limit = "1024"]
 #![feature(generic_const_exprs)]

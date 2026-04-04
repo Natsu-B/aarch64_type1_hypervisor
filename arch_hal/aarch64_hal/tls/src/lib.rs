@@ -1,3 +1,5 @@
+//! EL2 per-CPU TLS primitives backed by linker-provided templates.
+
 #![no_std]
 
 use core::cell::Cell;

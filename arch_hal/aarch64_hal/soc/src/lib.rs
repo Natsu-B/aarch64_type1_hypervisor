@@ -1,3 +1,5 @@
+//! SoC-specific drivers and integration points for supported boards.
+
 #![feature(sync_unsafe_cell)]
 #![no_std]
 

@@ -1,3 +1,5 @@
+//! Standalone GENET local-loopback self-test example for BCM2711.
+
 #![no_std]
 #![no_main]
 

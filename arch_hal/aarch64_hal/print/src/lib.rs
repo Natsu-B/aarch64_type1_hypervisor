@@ -1,3 +1,5 @@
+//! Debug UART and formatted output primitives for early bring-up.
+
 #![no_std]
 
 pub mod pl011;

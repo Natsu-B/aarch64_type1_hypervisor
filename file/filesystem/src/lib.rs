@@ -1,3 +1,5 @@
+//! Filesystem mounting and shared filesystem error types.
+
 #![no_std]
 #![feature(maybe_uninit_array_assume_init)]
 #![feature(maybe_uninit_as_bytes)]

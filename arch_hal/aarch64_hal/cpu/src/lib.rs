@@ -1,3 +1,5 @@
+//! AArch64 CPU register and control helpers.
+
 #![no_std]
 
 use core::arch::asm;

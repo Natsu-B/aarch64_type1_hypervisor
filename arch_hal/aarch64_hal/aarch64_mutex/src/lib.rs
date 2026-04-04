@@ -1,3 +1,5 @@
+//! IRQ-save lock wrappers built on raw mutex primitives.
+
 #![no_std]
 #![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
 #![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]

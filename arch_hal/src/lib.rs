@@ -1,3 +1,5 @@
+//! Architecture-selected HAL re-exports.
+
 #![no_std]
 
 #[cfg(target_arch = "aarch64")]

@@ -1,3 +1,5 @@
+//! AArch64 GDB remote-target glue and debugger state management.
+
 #![no_std]
 
 use aarch64_mutex::RawSpinLockIrqSave;

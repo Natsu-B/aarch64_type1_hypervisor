@@ -1,3 +1,5 @@
+//! High-level storage facade combining block devices and filesystem access.
+
 #![no_std]
 
 extern crate alloc;

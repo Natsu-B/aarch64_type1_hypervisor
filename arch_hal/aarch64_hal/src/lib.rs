@@ -1,3 +1,5 @@
+//! Top-level AArch64 HAL crate that re-exports architecture subsystems.
+
 #![no_std]
 
 #[cfg(feature = "uefi-test")]

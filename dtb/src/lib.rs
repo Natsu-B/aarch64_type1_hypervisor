@@ -1,3 +1,5 @@
+//! Device-tree parsing, querying, editing, and DTB generation utilities.
+
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;

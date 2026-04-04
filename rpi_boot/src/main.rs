@@ -1,3 +1,5 @@
+//! Raspberry Pi EL2 boot binary that prepares Linux handoff and virtualization state.
+
 #![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
 #![cfg_attr(
     all(test, target_arch = "aarch64"),

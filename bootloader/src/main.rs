@@ -1,3 +1,5 @@
+//! Hypervisor bootloader binary entrypoint and platform bring-up flow.
+
 #![feature(once_cell_get_mut)]
 #![feature(sync_unsafe_cell)]
 #![feature(generic_const_exprs)]

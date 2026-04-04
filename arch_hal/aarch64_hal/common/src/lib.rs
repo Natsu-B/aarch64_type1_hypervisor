@@ -1,3 +1,5 @@
+//! Common architecture-neutral primitives shared across AArch64 HAL crates.
+
 #![no_std]
 
 #[cfg(test)]

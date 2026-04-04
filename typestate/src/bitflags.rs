@@ -444,9 +444,15 @@ macro_rules! bitregs {
     (@field_emit_enum $Name:ident : $ty:ty ;
         $fvis:vis $Field:ident ; $E:ident ; $off:expr ; $sz:expr ; { $($V:ident = $val:expr),+ }
     ) => {
+        #[doc = concat!("Enumeration type for the `", stringify!($Field), "` field.")]
         #[repr(u128)]
         #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-        $fvis enum $E { $( $V = $val ),+ }
+        $fvis enum $E {
+            $(
+                #[doc = concat!("Encoded value for `", stringify!($V), "`.")]
+                $V = $val
+            ),+
+        }
         impl From<$E> for $ty { fn from(e: $E) -> $ty { e as u128 as $ty } }
         impl ::core::convert::TryFrom<$ty> for $E {
             type Error = ();

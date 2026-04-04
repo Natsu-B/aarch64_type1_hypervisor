@@ -1,3 +1,5 @@
+//! Workspace helper binary for build, run, and test workflows.
+
 #![crate_type = "bin"]
 // xtask/src/main.rs
 

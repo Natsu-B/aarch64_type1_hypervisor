@@ -1,8 +1,8 @@
 //! Intrusive linked list implementation for memory-efficient collections.
 //!
-//! This crate provides a simple intrusive linked list that stores node pointers
-//! as raw `usize` values. It is designed for use in allocators and other
-//! low-level memory management scenarios where nodes embed their own link fields.
+//! This crate provides a simple intrusive linked list. APIs that insert/remove
+//! nodes use node addresses as `usize`, while link fields are stored internally
+//! as `Option<NonNull<IntrusiveLinkedList>>`.
 
 #![cfg_attr(not(test), no_std)]
 
