@@ -657,6 +657,8 @@ extern "C" fn main() -> ! {
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
         el1_main, stack_addr
     );
+    // SAFETY: The EL2 boot path is about to transfer control to the prepared EL1 entry point
+    // with a freshly allocated EL1 stack and the expected saved program state.
     unsafe {
         core::arch::asm!("msr spsr_el2, {}", in(reg) SPSR_EL2_M_EL1H);
         core::arch::asm!("msr elr_el2, {}", in(reg) el1_main);
@@ -822,5 +824,6 @@ fn panic(info: &PanicInfo) -> ! {
     }
     debug_uart.write("panicked!!!\r\n");
     let _ = debug_uart.write_fmt(format_args!("PANIC: {}", info));
+    debug_uart.write("\r\n=================================\r\n");
     loop {}
 }

@@ -8,19 +8,22 @@ use dtb::WalkError;
 use io_api::block_device::BlockDevice;
 use io_api::block_device::IoError;
 use io_api::block_device::Lba;
-use mutex::SpinLock;
 use mutex::pod::RawAtomicPod;
+use mutex::SpinLock;
 use print::println;
 
-#[cfg(target_arch = "aarch64")]
-use timer::SystemTimer;
+#[cfg(test)]
+extern crate std;
+
 #[cfg(target_arch = "aarch64")]
 use timer::read_counter;
+#[cfg(target_arch = "aarch64")]
+use timer::SystemTimer;
 
 #[cfg(not(target_arch = "aarch64"))]
-use self::timer_compat::SystemTimer;
-#[cfg(not(target_arch = "aarch64"))]
 use self::timer_compat::read_counter;
+#[cfg(not(target_arch = "aarch64"))]
+use self::timer_compat::SystemTimer;
 
 #[cfg(not(target_arch = "aarch64"))]
 mod timer_compat {
@@ -260,8 +263,6 @@ struct HostRegion {
 struct SdhcConfig {
     host: HostRegion,
     cfg: HostRegion,
-    busisol: HostRegion,
-    lcpll: HostRegion,
     max_clock_hz: u32,
 }
 
@@ -299,19 +300,16 @@ struct SdhcDtCandidate {
 
 impl SdhcDtCandidate {
     fn is_supported_shape(&self) -> bool {
-        self.has_brcmstb_compat
-            && self.status_okay
-            && self.bus_width == 4
-            && self.host.is_some()
-            && self.cfg.is_some()
-    }
-
-    fn has_full_sd_slot_regions(&self) -> bool {
-        self.host.is_some() && self.cfg.is_some() && self.busisol.is_some() && self.lcpll.is_some()
+        self.status_okay && self.host.is_some() && self.cfg.is_some()
     }
 
     fn host_base(&self) -> Option<usize> {
         self.host.map(|region| region.base)
+    }
+
+    fn is_viable_sd_slot(&self) -> bool {
+        self.host_base() == Some(BCM2712_SD_SLOT_HOST_BASE)
+            || (!self.non_removable && !self.has_wifi_child)
     }
 
     fn into_config(self) -> Result<SdhcConfig, SdhcError> {
@@ -321,17 +319,9 @@ impl SdhcDtCandidate {
         let cfg = self
             .cfg
             .ok_or(SdhcError::DtbInvalid("sdhc: missing cfg reg"))?;
-        let busisol = self
-            .busisol
-            .ok_or(SdhcError::DtbInvalid("sdhc: missing busisol reg"))?;
-        let lcpll = self
-            .lcpll
-            .ok_or(SdhcError::DtbInvalid("sdhc: missing lcpll reg"))?;
         Ok(SdhcConfig {
             host,
             cfg,
-            busisol,
-            lcpll,
             max_clock_hz: self.max_clock_hz,
         })
     }
@@ -386,12 +376,6 @@ impl Bcm2712Sdhc {
         }
         if cfg.cfg.base == 0 || cfg.cfg.size < 0x48 {
             return Err(SdhcError::DtbInvalid("sdhc: invalid cfg region"));
-        }
-        if cfg.busisol.base == 0 || cfg.busisol.size == 0 {
-            return Err(SdhcError::DtbInvalid("sdhc: invalid busisol region"));
-        }
-        if cfg.lcpll.base == 0 || cfg.lcpll.size == 0 {
-            return Err(SdhcError::DtbInvalid("sdhc: invalid lcpll region"));
         }
         if cfg.max_clock_hz == 0 {
             return Err(SdhcError::InvalidClock);
@@ -1259,23 +1243,6 @@ fn matching_candidate_indices(
     (indices, count)
 }
 
-fn retain_candidate_subset(
-    candidates: &[SdhcDtCandidate],
-    indices: &mut [usize; SDHC_MAX_DT_CANDIDATES],
-    len: usize,
-    predicate: impl Fn(&SdhcDtCandidate) -> bool,
-) -> usize {
-    let mut write = 0usize;
-    for position in 0..len {
-        let index = indices[position];
-        if predicate(&candidates[index]) {
-            indices[write] = index;
-            write += 1;
-        }
-    }
-    write
-}
-
 fn prefer_candidate_subset(
     candidates: &[SdhcDtCandidate],
     indices: &mut [usize; SDHC_MAX_DT_CANDIDATES],
@@ -1298,6 +1265,41 @@ fn prefer_candidate_subset(
     preferred_len
 }
 
+#[cfg(test)]
+fn log_dt_candidates(candidates: &[SdhcDtCandidate]) {
+    for (index, candidate) in candidates.iter().enumerate() {
+        std::println!(
+            "sdhc: dt candidate[{}] host={:?} cfg={:?} bus_width={} non_removable={} has_wifi_child={} has_brcmstb_compat={}",
+            index,
+            candidate.host,
+            candidate.cfg,
+            candidate.bus_width,
+            candidate.non_removable,
+            candidate.has_wifi_child,
+            candidate.has_brcmstb_compat
+        );
+    }
+}
+
+#[cfg(all(not(test), debug_assertions))]
+fn log_dt_candidates(candidates: &[SdhcDtCandidate]) {
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!(
+            "sdhc: dt candidate[{}] host={:?} cfg={:?} bus_width={} non_removable={} has_wifi_child={} has_brcmstb_compat={}",
+            index,
+            candidate.host,
+            candidate.cfg,
+            candidate.bus_width,
+            candidate.non_removable,
+            candidate.has_wifi_child,
+            candidate.has_brcmstb_compat
+        );
+    }
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn log_dt_candidates(_candidates: &[SdhcDtCandidate]) {}
+
 fn select_sd_slot_candidate(candidates: &[SdhcDtCandidate]) -> Result<SdhcConfig, SdhcError> {
     let (mut indices, mut len) =
         matching_candidate_indices(candidates, |candidate| candidate.is_supported_shape());
@@ -1306,26 +1308,32 @@ fn select_sd_slot_candidate(candidates: &[SdhcDtCandidate]) -> Result<SdhcConfig
     }
 
     len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
-        candidate.has_full_sd_slot_regions()
-    });
-    len = retain_candidate_subset(candidates, &mut indices, len, |candidate| {
-        !candidate.non_removable
-    });
-    if len == 0 {
-        return Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate"));
-    }
-    len = retain_candidate_subset(candidates, &mut indices, len, |candidate| {
-        !candidate.has_wifi_child
-    });
-    if len == 0 {
-        return Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate"));
-    }
-    len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
         candidate.host_base() == Some(BCM2712_SD_SLOT_HOST_BASE)
     });
+    if len > 1 {
+        len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
+            !candidate.non_removable
+        });
+    }
+    if len > 1 {
+        len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
+            !candidate.has_wifi_child
+        });
+    }
+    if len > 1 {
+        len = prefer_candidate_subset(candidates, &mut indices, len, |candidate| {
+            candidate.has_brcmstb_compat
+        });
+    }
 
     match len {
-        1 => candidates[indices[0]].into_config(),
+        1 => {
+            let candidate = candidates[indices[0]];
+            if !candidate.is_viable_sd_slot() {
+                return Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate"));
+            }
+            candidate.into_config()
+        }
         0 => Err(SdhcError::DtbInvalid("sdhc: no valid SD-slot candidate")),
         _ => Err(SdhcError::DtbInvalid(
             "sdhc: ambiguous DT candidate selection",
@@ -1356,6 +1364,7 @@ fn parse_from_dtb(dtb: &DtbParser) -> Result<SdhcConfig, SdhcError> {
     if count == 0 {
         return Err(SdhcError::DtbNotFound);
     }
+    log_dt_candidates(&candidates[..count]);
     select_sd_slot_candidate(&candidates[..count])
 }
 
@@ -1393,22 +1402,22 @@ mod tests {
     use dtb::NodeEditExt;
     use dtb::ValueRef;
 
-    use super::BCM2712_SD_SLOT_HOST_BASE;
-    use super::DT_COMPAT_BCM2712_SDHCI;
-    use super::DT_COMPAT_BRCMSTB_SDHCI;
-    use super::MMC_CMD_SELECT_CARD;
-    use super::RespType;
-    use super::SDHC_BLOCK_SIZE;
-    use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
-    use super::SdhcConfig;
-    use super::SdhcDtCandidate;
-    use super::SdhcError;
     use super::decode_capacity_blocks;
     use super::encode_clock_divider;
     use super::pack_clock_control_divider;
     use super::parse_from_dtb;
     use super::select_card_command;
     use super::select_sd_slot_candidate;
+    use super::RespType;
+    use super::SdhcConfig;
+    use super::SdhcDtCandidate;
+    use super::SdhcError;
+    use super::BCM2712_SD_SLOT_HOST_BASE;
+    use super::DT_COMPAT_BCM2712_SDHCI;
+    use super::DT_COMPAT_BRCMSTB_SDHCI;
+    use super::MMC_CMD_SELECT_CARD;
+    use super::SDHC_BLOCK_SIZE;
+    use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
 
     #[derive(Clone, Copy)]
     struct TestNodeSpec<'a> {
@@ -1550,8 +1559,6 @@ mod tests {
         let slot_regs = &[
             (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
             (0x10_00ff_f200, 0x80),
-            (0x10_00ff_f400, 0x4),
-            (0x10_00ff_f800, 0x4),
         ];
         let nodes = [
             TestNodeSpec {
@@ -1566,7 +1573,7 @@ mod tests {
             },
             TestNodeSpec {
                 name: "mmc@fff000",
-                reg_names: &["host", "cfg", "busisol", "lcpll"],
+                reg_names: &["host", "cfg"],
                 regs: slot_regs,
                 non_removable: false,
                 wifi_child: false,
@@ -1579,12 +1586,10 @@ mod tests {
         let config = parse_test_config(&nodes).unwrap();
         assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
         assert_eq!(config.cfg.base, 0x10_00ff_f200);
-        assert_eq!(config.busisol.base, 0x10_00ff_f400);
-        assert_eq!(config.lcpll.base, 0x10_00ff_f800);
     }
 
     #[test]
-    fn non_removable_wifi_candidate_is_rejected() {
+    fn wifi_candidate_without_slot_host_base_is_rejected() {
         let candidates = [SdhcDtCandidate {
             host: Some(super::HostRegion {
                 base: 0x10_0110_0000,
@@ -1594,14 +1599,8 @@ mod tests {
                 base: 0x10_0110_1000,
                 size: 0x80,
             }),
-            busisol: Some(super::HostRegion {
-                base: 0x10_0110_2000,
-                size: 0x4,
-            }),
-            lcpll: Some(super::HostRegion {
-                base: 0x10_0110_3000,
-                size: 0x4,
-            }),
+            busisol: None,
+            lcpll: None,
             max_clock_hz: 100_000_000,
             has_brcmstb_compat: true,
             status_okay: true,
@@ -1618,16 +1617,36 @@ mod tests {
     }
 
     #[test]
-    fn reg_names_mapping_is_independent_of_reg_order() {
+    fn sd_slot_host_base_accepts_bus_width_eight_without_optional_regions() {
         let regs = &[
-            (0x10_00ff_f200, 0x80),
-            (0x10_00ff_f800, 0x4),
             (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
-            (0x10_00ff_f400, 0x4),
+            (0x10_00ff_f200, 0x80),
         ];
         let nodes = [TestNodeSpec {
             name: "mmc@fff000",
-            reg_names: &["cfg", "lcpll", "host", "busisol"],
+            reg_names: &["host", "cfg"],
+            regs,
+            non_removable: false,
+            wifi_child: false,
+            status: "okay",
+            bus_width: 8,
+            has_brcmstb_compat: false,
+        }];
+
+        let config = parse_test_config(&nodes).unwrap();
+        assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
+        assert_eq!(config.cfg.base, 0x10_00ff_f200);
+    }
+
+    #[test]
+    fn reg_names_mapping_is_independent_of_reg_order() {
+        let regs = &[
+            (0x10_00ff_f200, 0x80),
+            (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
+        ];
+        let nodes = [TestNodeSpec {
+            name: "mmc@fff000",
+            reg_names: &["cfg", "host"],
             regs,
             non_removable: false,
             wifi_child: false,
@@ -1639,8 +1658,54 @@ mod tests {
         let config = parse_test_config(&nodes).unwrap();
         assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
         assert_eq!(config.cfg.base, 0x10_00ff_f200);
-        assert_eq!(config.busisol.base, 0x10_00ff_f400);
-        assert_eq!(config.lcpll.base, 0x10_00ff_f800);
+    }
+
+    #[test]
+    fn ambiguous_structurally_valid_candidates_fail() {
+        let candidates = [
+            SdhcDtCandidate {
+                host: Some(super::HostRegion {
+                    base: 0x10_0200_0000,
+                    size: 0x104,
+                }),
+                cfg: Some(super::HostRegion {
+                    base: 0x10_0200_1000,
+                    size: 0x80,
+                }),
+                busisol: None,
+                lcpll: None,
+                max_clock_hz: 100_000_000,
+                has_brcmstb_compat: true,
+                status_okay: true,
+                bus_width: 4,
+                non_removable: false,
+                has_wifi_child: false,
+            },
+            SdhcDtCandidate {
+                host: Some(super::HostRegion {
+                    base: 0x10_0300_0000,
+                    size: 0x104,
+                }),
+                cfg: Some(super::HostRegion {
+                    base: 0x10_0300_1000,
+                    size: 0x80,
+                }),
+                busisol: None,
+                lcpll: None,
+                max_clock_hz: 100_000_000,
+                has_brcmstb_compat: true,
+                status_okay: true,
+                bus_width: 8,
+                non_removable: false,
+                has_wifi_child: false,
+            },
+        ];
+
+        let err = select_sd_slot_candidate(&candidates).unwrap_err();
+        assert_eq!(
+            err,
+            SdhcError::DtbInvalid("sdhc: ambiguous DT candidate selection")
+        );
     }
 
     #[test]
