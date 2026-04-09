@@ -1103,30 +1103,38 @@ fn update_bootargs(
     chosen: NodeId,
     pl011_uart_addr: usize,
 ) -> Result<(), &'static str> {
-    let mut args = String::new();
-    let mut saw_rootwait = false;
-    let mut saw_virtio_mmio_device = false;
-
-    if let Some(existing) = tree
+    let existing = tree
         .node(chosen)
         .and_then(|node| node.property("bootargs"))
         .map(|prop| prop.value.as_slice())
-        && let Some(raw) = existing.split(|byte| *byte == 0).next()
-        && let Ok(text) = core::str::from_utf8(raw)
-    {
-        for token in text.split_whitespace() {
-            if token.starts_with("console=") || token.starts_with("earlycon=") {
-                continue;
-            }
-            if token.starts_with("root=") {
+        .and_then(|bytes| bytes.split(|byte| *byte == 0).next())
+        .and_then(|raw| core::str::from_utf8(raw).ok());
+    let mut bytes = rewrite_bootargs(existing, pl011_uart_addr).into_bytes();
+    if !bytes.ends_with(&[0]) {
+        bytes.push(0);
+    }
+
+    tree.node_mut(chosen)
+        .ok_or("chosen node missing")?
+        .set_property(NameRef::Borrowed("bootargs"), ValueRef::Owned(bytes));
+    Ok(())
+}
+
+fn rewrite_bootargs(existing: Option<&str>, pl011_uart_addr: usize) -> String {
+    let mut args = String::new();
+    let mut saw_rootwait = false;
+
+    if let Some(existing) = existing {
+        for token in existing.split_whitespace() {
+            if token.starts_with("console=")
+                || token.starts_with("earlycon=")
+                || token.starts_with("root=")
+                || token.starts_with("virtio_mmio.device=")
+            {
                 continue;
             }
             if token == "rootwait" {
                 saw_rootwait = true;
-            }
-            if token.starts_with("virtio_mmio.device=") {
-                saw_virtio_mmio_device = true;
-                continue;
             }
             if !args.is_empty() {
                 args.push(' ');
@@ -1136,23 +1144,11 @@ fn update_bootargs(
     }
 
     let earlycon = format!("earlycon=pl011,0x{pl011_uart_addr:x}");
-    let console = "console=ttyAMA0,115200";
-    let virtio_mmio_device = format!(
-        "virtio_mmio.device={}@0x{:x}:{}",
-        virtio_blk::VIRTIO_BLK_MMIO_SIZE,
-        virtio_blk::VIRTIO_BLK_MMIO_BASE,
-        virtio_blk::VIRTIO_BLK_IRQ_INTID,
-    );
     for token in [
         GUEST_ROOT_TOKEN,
         if saw_rootwait { "" } else { "rootwait" },
-        if saw_virtio_mmio_device {
-            ""
-        } else {
-            virtio_mmio_device.as_str()
-        },
         earlycon.as_str(),
-        console,
+        "console=ttyAMA0,115200",
     ] {
         if token.is_empty() {
             continue;
@@ -1163,15 +1159,7 @@ fn update_bootargs(
         args.push_str(token);
     }
 
-    let mut bytes = args.into_bytes();
-    if !bytes.ends_with(&[0]) {
-        bytes.push(0);
-    }
-
-    tree.node_mut(chosen)
-        .ok_or("chosen node missing")?
-        .set_property(NameRef::Borrowed("bootargs"), ValueRef::Owned(bytes));
-    Ok(())
+    args
 }
 
 fn update_gicv2_cpu_interface_reg(
@@ -1343,4 +1331,61 @@ fn write_be_u32s(
         write_be_u32(bytes, offset + index * 4, cell)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GUEST_ROOT_TOKEN;
+    use super::rewrite_bootargs;
+
+    const TEST_UART_ADDR: usize = 0x1c00_030000;
+
+    fn token_count(text: &str, needle: &str) -> usize {
+        text.split_whitespace()
+            .filter(|token| *token == needle)
+            .count()
+    }
+
+    #[test]
+    fn rewrite_bootargs_replaces_root_console_and_earlycon() {
+        let rewritten = rewrite_bootargs(
+            Some(
+                "root=/dev/mmcblk0p2 ro console=ttyS0,115200 earlycon=uart8250,mmio32,0xfe201000 quiet",
+            ),
+            TEST_UART_ADDR,
+        );
+
+        assert!(rewritten.contains("quiet"));
+        assert!(rewritten.contains(GUEST_ROOT_TOKEN));
+        assert!(rewritten.contains("rootwait"));
+        assert!(rewritten.contains("console=ttyAMA0,115200"));
+        assert!(rewritten.contains("earlycon=pl011,0x1c00030000"));
+        assert!(!rewritten.contains("root=/dev/mmcblk0p2"));
+        assert!(!rewritten.contains("console=ttyS0,115200"));
+        assert!(!rewritten.contains("earlycon=uart8250"));
+    }
+
+    #[test]
+    fn rewrite_bootargs_preserves_single_rootwait_and_drops_virtio_mmio_device() {
+        let rewritten = rewrite_bootargs(
+            Some("rootwait root=/dev/vda1 virtio_mmio.device=0x200@0x1000:3 splash rootwait"),
+            TEST_UART_ADDR,
+        );
+
+        assert_eq!(token_count(&rewritten, "rootwait"), 1);
+        assert_eq!(token_count(&rewritten, GUEST_ROOT_TOKEN), 1);
+        assert!(!rewritten.contains("virtio_mmio.device="));
+        assert!(rewritten.contains("splash"));
+    }
+
+    #[test]
+    fn rewrite_bootargs_inserts_required_tokens_when_missing() {
+        let rewritten = rewrite_bootargs(None, TEST_UART_ADDR);
+
+        assert!(rewritten.contains(GUEST_ROOT_TOKEN));
+        assert_eq!(token_count(&rewritten, "rootwait"), 1);
+        assert!(rewritten.contains("console=ttyAMA0,115200"));
+        assert!(rewritten.contains("earlycon=pl011,0x1c00030000"));
+        assert!(!rewritten.contains("virtio_mmio.device="));
+    }
 }

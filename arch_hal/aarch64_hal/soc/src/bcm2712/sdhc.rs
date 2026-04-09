@@ -259,12 +259,11 @@ const MMC_CMD_SET_RELATIVE_ADDR: u8 = 3;
 const MMC_CMD_SELECT_CARD: u8 = 7;
 const MMC_CMD_SEND_IF_COND: u8 = 8;
 const MMC_CMD_SEND_CSD: u8 = 9;
+const MMC_CMD_SEND_STATUS: u8 = 13;
 const MMC_CMD_STOP_TRANSMISSION: u8 = 12;
 const MMC_CMD_SET_BLOCKLEN: u8 = 16;
 const MMC_CMD_READ_SINGLE_BLOCK: u8 = 17;
-const MMC_CMD_READ_MULTIPLE_BLOCK: u8 = 18;
 const MMC_CMD_WRITE_SINGLE_BLOCK: u8 = 24;
-const MMC_CMD_WRITE_MULTIPLE_BLOCK: u8 = 25;
 const MMC_CMD_APP_CMD: u8 = 55;
 const SD_CMD_APP_SEND_OP_COND: u8 = 41;
 
@@ -274,6 +273,12 @@ const OCR_3V2_3V4: u32 = 0x0030_0000;
 const OCR_3V3_3V4: u32 = 0x0020_0000;
 const OCR_3V2_3V3: u32 = 0x0010_0000;
 const OCR_REQUEST: u32 = OCR_HCS | OCR_3V2_3V4 | OCR_3V3_3V4 | OCR_3V2_3V3;
+const SD_STATUS_READY_FOR_DATA: u32 = 1 << 8;
+const SD_STATUS_CURRENT_STATE_SHIFT: u32 = 9;
+const SD_STATUS_CURRENT_STATE_MASK: u32 = 0x0f << SD_STATUS_CURRENT_STATE_SHIFT;
+const SD_STATUS_TRANSFER_STATE: u8 = 4;
+const SDHC_CARD_STATUS_TIMEOUT_US: u64 = 1_000_000;
+const SDHC_CARD_STATUS_POLL_DELAY_US: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SdhcError {
@@ -437,12 +442,14 @@ static TAKEN: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(fals
 static READY: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 static STATE: SyncUnsafeCell<MaybeUninit<Bcm2712Sdhc>> = SyncUnsafeCell::new(MaybeUninit::uninit());
 
+#[cfg(target_arch = "aarch64")]
 fn mmio_read_u32(base: *mut u8, offset: usize) -> u32 {
     // SAFETY: The caller provides a valid MMIO base, and `offset` targets a 32-bit register in
     // that mapped window.
     unsafe { core::ptr::read_volatile(base.wrapping_add(offset) as *const u32) }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn mmio_write_u32(base: *mut u8, offset: usize, value: u32) {
     // SAFETY: The caller provides a valid MMIO base, and `offset` targets a 32-bit register in
     // that mapped window.
@@ -800,8 +807,77 @@ impl Bcm2712Sdhc {
         (self.reg_read_u32(SDHCI_PRESENT_STATE) & SDHCI_WRITE_PROTECT) != 0
     }
 
-    fn io_chunk_blocks(&self) -> usize {
-        SDHC_MAX_TRANSFER_BLOCKS_PER_CMD
+    fn controller_snapshot(&self) -> ControllerSnapshot {
+        ControllerSnapshot {
+            int_status: self.reg_read_u32(SDHCI_INT_STATUS),
+            present_state: self.reg_read_u32(SDHCI_PRESENT_STATE),
+            block_count: self.reg_read_u16(SDHCI_BLOCK_COUNT),
+            transfer_mode: self.reg_read_u16(SDHCI_TRANSFER_MODE),
+            command: self.reg_read_u16(SDHCI_COMMAND),
+            argument: self.reg_read_u32(SDHCI_ARGUMENT),
+            clock_control: self.reg_read_u16(SDHCI_CLOCK_CONTROL),
+            power_control: self.reg_read_u8(SDHCI_POWER_CONTROL),
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn log_controller_failure(&self, site: &str, ctx: CommandFailureContext, err: SdhcError) {
+        let snapshot = self.controller_snapshot();
+        println!(
+            "sdhc: {} failed op={} lba={} blocks={} cmd_idx={} arg=0x{:08x} data_phase={} err={:?} int_status=0x{:08x} present_state=0x{:08x} block_count=0x{:04x} transfer_mode=0x{:04x} command=0x{:04x} argument=0x{:08x} clock_control=0x{:04x} power_control=0x{:02x}",
+            site,
+            ctx.op.as_str(),
+            ctx.lba,
+            ctx.block_count,
+            ctx.cmd_idx,
+            ctx.arg,
+            ctx.data_phase,
+            err,
+            snapshot.int_status,
+            snapshot.present_state,
+            snapshot.block_count,
+            snapshot.transfer_mode,
+            snapshot.command,
+            snapshot.argument,
+            snapshot.clock_control,
+            snapshot.power_control,
+        );
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn log_controller_failure(&self, _site: &str, _ctx: CommandFailureContext, _err: SdhcError) {}
+
+    #[cfg(any(test, debug_assertions))]
+    fn log_run_rw_failure(
+        &self,
+        op: IoOperation,
+        request_lba: u64,
+        request_blocks: usize,
+        current_lba: u64,
+        current_block_index: usize,
+        err: SdhcError,
+    ) {
+        println!(
+            "sdhc: run_rw failed op={} request_lba={} request_blocks={} current_lba={} current_block_index={} err={:?}",
+            op.as_str(),
+            request_lba,
+            request_blocks,
+            current_lba,
+            current_block_index,
+            err,
+        );
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn log_run_rw_failure(
+        &self,
+        _op: IoOperation,
+        _request_lba: u64,
+        _request_blocks: usize,
+        _current_lba: u64,
+        _current_block_index: usize,
+        _err: SdhcError,
+    ) {
     }
 
     fn cmd_flags(resp_type: RespType, data: bool) -> u16 {
@@ -826,19 +902,26 @@ impl Bcm2712Sdhc {
         arg: u32,
         resp_type: RespType,
         mut data: Option<DataTransfer<'_>>,
+        io: Option<IoTraceContext>,
     ) -> Result<[u32; 4], SdhcError> {
         let mask = if cmd_idx == MMC_CMD_STOP_TRANSMISSION {
             SDHCI_CMD_INHIBIT
         } else {
             SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT
         };
+        let has_data = data.is_some();
+        let transfer_blocks = data.as_ref().map_or(0, |transfer| transfer.blocks);
+        let log_ctx = CommandFailureContext::from_io(io, cmd_idx, arg, has_data, transfer_blocks);
+
         self.wait_until(SDHC_CMD_TIMEOUT_US, |s| {
             (s.reg_read_u32(SDHCI_PRESENT_STATE) & mask) == 0
+        })
+        .inspect_err(|&err| {
+            self.log_controller_failure("waiting for inhibit clear", log_ctx, err);
         })?;
 
         self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
 
-        let has_data = data.is_some();
         let mut interrupt_mask = SDHCI_INT_RESPONSE;
         if matches!(resp_type, RespType::R1b) {
             interrupt_mask |= SDHCI_INT_DATA_END;
@@ -868,17 +951,23 @@ impl Bcm2712Sdhc {
         self.wait_until(SDHC_CMD_TIMEOUT_US, |s| {
             let stat = s.reg_read_u32(SDHCI_INT_STATUS);
             (stat & SDHCI_INT_ERROR) != 0 || (stat & interrupt_mask) == interrupt_mask
+        })
+        .inspect_err(|&err| {
+            self.log_controller_failure("waiting for response completion", log_ctx, err);
         })?;
 
         let status = self.reg_read_u32(SDHCI_INT_STATUS);
         if (status & SDHCI_INT_ERROR) != 0 {
+            let err = if (status & SDHCI_INT_TIMEOUT) != 0 {
+                SdhcError::Timeout
+            } else {
+                SdhcError::Io
+            };
+            self.log_controller_failure("response completion", log_ctx, err);
             self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
             self.reset(SDHCI_RESET_CMD)?;
             self.reset(SDHCI_RESET_DATA)?;
-            if (status & SDHCI_INT_TIMEOUT) != 0 {
-                return Err(SdhcError::Timeout);
-            }
-            return Err(SdhcError::Io);
+            return Err(err);
         }
 
         let resp = if matches!(resp_type, RespType::R2) {
@@ -895,13 +984,17 @@ impl Bcm2712Sdhc {
             [self.reg_read_u32(SDHCI_RESPONSE), 0, 0, 0]
         };
         if let Some(transfer) = data.take() {
-            self.transfer_data_pio(transfer)?;
+            self.transfer_data_pio(transfer, log_ctx)?;
             self.wait_until(SDHC_DATA_TIMEOUT_US, |s| {
                 let stat = s.reg_read_u32(SDHCI_INT_STATUS);
                 (stat & SDHCI_INT_ERROR) != 0 || (stat & SDHCI_INT_DATA_END) != 0
+            })
+            .inspect_err(|&err| {
+                self.log_controller_failure("waiting for data-end", log_ctx, err);
             })?;
             let stat = self.reg_read_u32(SDHCI_INT_STATUS);
             if (stat & SDHCI_INT_ERROR) != 0 {
+                self.log_controller_failure("data-end", log_ctx, SdhcError::Io);
                 self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
                 self.reset(SDHCI_RESET_CMD)?;
                 self.reset(SDHCI_RESET_DATA)?;
@@ -912,10 +1005,19 @@ impl Bcm2712Sdhc {
         Ok(resp)
     }
 
-    fn transfer_data_pio(&self, transfer: DataTransfer<'_>) -> Result<(), SdhcError> {
+    fn transfer_data_pio(
+        &self,
+        transfer: DataTransfer<'_>,
+        log_ctx: CommandFailureContext,
+    ) -> Result<(), SdhcError> {
         let mut remaining_blocks = transfer.blocks;
         let mut offset = 0usize;
         while remaining_blocks > 0 {
+            let wait_site = if transfer.read {
+                "waiting for data-ready"
+            } else {
+                "waiting for data-space"
+            };
             self.wait_until(SDHC_DATA_TIMEOUT_US, |s| {
                 let stat = s.reg_read_u32(SDHCI_INT_STATUS);
                 if (stat & SDHCI_INT_ERROR) != 0 {
@@ -926,10 +1028,14 @@ impl Bcm2712Sdhc {
                 } else {
                     (s.reg_read_u32(SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE) != 0
                 }
+            })
+            .inspect_err(|&err| {
+                self.log_controller_failure(wait_site, log_ctx, err);
             })?;
 
             let stat = self.reg_read_u32(SDHCI_INT_STATUS);
             if (stat & SDHCI_INT_ERROR) != 0 {
+                self.log_controller_failure(wait_site, log_ctx, SdhcError::Io);
                 return Err(SdhcError::Io);
             }
 
@@ -969,22 +1075,57 @@ impl Bcm2712Sdhc {
         Ok(())
     }
 
+    fn wait_for_transfer_state(&self, rca: u16) -> Result<(), SdhcError> {
+        let arg = u32::from(rca) << 16;
+        let mut timer = SystemTimer::new();
+        timer.init();
+        let start = Self::now_ticks();
+
+        let last_status = loop {
+            let status = self
+                .send_command(MMC_CMD_SEND_STATUS, arg, RespType::R1, None, None)
+                .map(|resp| resp[0])?;
+            if card_status_is_transfer_state(status) {
+                return Ok(());
+            }
+            if Self::elapsed_us(&timer, start) >= SDHC_CARD_STATUS_TIMEOUT_US {
+                break status;
+            }
+            timer.wait(Duration::from_micros(SDHC_CARD_STATUS_POLL_DELAY_US));
+        };
+
+        #[cfg(any(test, debug_assertions))]
+        println!(
+            "sdhc: card did not reach TRANSFER state rca=0x{:x} status=0x{:08x} state={} ready_for_data={}",
+            rca,
+            last_status,
+            card_status_current_state(last_status),
+            (last_status & SD_STATUS_READY_FOR_DATA) != 0,
+        );
+        Err(SdhcError::Timeout)
+    }
+
     fn card_init_sequence(&self) -> Result<(), SdhcError> {
         if !self.card_present() {
             return Err(SdhcError::NoCard);
         }
 
-        self.send_command(MMC_CMD_GO_IDLE_STATE, 0, RespType::None, None)?;
-        self.send_command(MMC_CMD_SEND_IF_COND, 0x1aa, RespType::R7, None)?;
+        self.send_command(MMC_CMD_GO_IDLE_STATE, 0, RespType::None, None, None)?;
+        self.send_command(MMC_CMD_SEND_IF_COND, 0x1aa, RespType::R7, None, None)?;
 
         let mut ocr = 0u32;
         let mut ready = false;
         let mut timer = SystemTimer::new();
         timer.init();
         for _ in 0..SDHC_ACMD41_RETRY_MAX {
-            self.send_command(MMC_CMD_APP_CMD, 0, RespType::R1, None)?;
-            let resp =
-                self.send_command(SD_CMD_APP_SEND_OP_COND, OCR_REQUEST, RespType::R3, None)?;
+            self.send_command(MMC_CMD_APP_CMD, 0, RespType::R1, None, None)?;
+            let resp = self.send_command(
+                SD_CMD_APP_SEND_OP_COND,
+                OCR_REQUEST,
+                RespType::R3,
+                None,
+                None,
+            )?;
             ocr = resp[0];
             if (ocr & OCR_BUSY) != 0 {
                 ready = true;
@@ -997,15 +1138,22 @@ impl Bcm2712Sdhc {
         }
         let high_capacity = (ocr & OCR_HCS) != 0;
 
-        let _cid = self.send_command(MMC_CMD_ALL_SEND_CID, 0, RespType::R2, None)?;
-        let rca_resp = self.send_command(MMC_CMD_SET_RELATIVE_ADDR, 0, RespType::R6, None)?;
+        let _cid = self.send_command(MMC_CMD_ALL_SEND_CID, 0, RespType::R2, None, None)?;
+        let rca_resp = self.send_command(MMC_CMD_SET_RELATIVE_ADDR, 0, RespType::R6, None, None)?;
         let rca = (rca_resp[0] >> 16) as u16;
-        let csd = self.send_command(MMC_CMD_SEND_CSD, u32::from(rca) << 16, RespType::R2, None)?;
+        let csd = self.send_command(
+            MMC_CMD_SEND_CSD,
+            u32::from(rca) << 16,
+            RespType::R2,
+            None,
+            None,
+        )?;
         let select_card = select_card_command(rca);
         self.send_command(
             select_card.idx,
             select_card.arg,
             select_card.resp_type,
+            None,
             None,
         )?;
         self.send_command(
@@ -1013,7 +1161,9 @@ impl Bcm2712Sdhc {
             SDHC_BLOCK_SIZE as u32,
             RespType::R1,
             None,
+            None,
         )?;
+        self.wait_for_transfer_state(rca)?;
         self.set_clock(25_000_000)?;
 
         let capacity_blocks = decode_capacity_blocks(&csd, high_capacity)?;
@@ -1056,43 +1206,51 @@ impl Bcm2712Sdhc {
         if write && card.read_only {
             return Err(SdhcError::ReadOnly);
         }
+        let op = if write {
+            IoOperation::Write
+        } else {
+            IoOperation::Read
+        };
         let mut current_lba = lba;
         let mut offset = 0usize;
         let total_blocks = usize::try_from(blocks).map_err(|_| SdhcError::OutOfRange)?;
-        let max_blocks = self.io_chunk_blocks();
         while offset < buf.len() {
             let remaining_blocks = (buf.len() - offset) / SDHC_BLOCK_SIZE;
-            let chunk_blocks = remaining_blocks.min(max_blocks);
+            let plan = plan_data_command(current_lba, remaining_blocks, write, card.high_capacity)?;
+            let chunk_blocks = plan.block_count;
             let chunk_end = offset
                 .checked_add(chunk_blocks * SDHC_BLOCK_SIZE)
                 .ok_or(SdhcError::OutOfRange)?;
             let chunk = buf
                 .get_mut(offset..chunk_end)
                 .ok_or(SdhcError::OutOfRange)?;
-            let multi = chunk_blocks > 1;
-            let cmd = match (write, multi) {
-                (false, false) => MMC_CMD_READ_SINGLE_BLOCK,
-                (false, true) => MMC_CMD_READ_MULTIPLE_BLOCK,
-                (true, false) => MMC_CMD_WRITE_SINGLE_BLOCK,
-                (true, true) => MMC_CMD_WRITE_MULTIPLE_BLOCK,
-            };
-            let arg = if card.high_capacity {
-                u32::try_from(current_lba).map_err(|_| SdhcError::OutOfRange)?
-            } else {
-                let byte_addr = current_lba
-                    .checked_mul(SDHC_BLOCK_SIZE as u64)
-                    .ok_or(SdhcError::OutOfRange)?;
-                u32::try_from(byte_addr).map_err(|_| SdhcError::OutOfRange)?
-            };
             let transfer = DataTransfer {
                 read: !write,
                 blocks: chunk_blocks,
                 block_size: SDHC_BLOCK_SIZE,
                 buffer: chunk,
             };
-            self.send_command(cmd, arg, RespType::R1, Some(transfer))?;
-            if multi {
-                self.send_command(MMC_CMD_STOP_TRANSMISSION, 0, RespType::R1b, None)?;
+            let io = IoTraceContext {
+                op,
+                lba: current_lba,
+                block_count: chunk_blocks,
+            };
+            if let Err(err) = self.send_command(
+                plan.cmd_idx,
+                plan.arg,
+                RespType::R1,
+                Some(transfer),
+                Some(io),
+            ) {
+                self.log_run_rw_failure(
+                    op,
+                    lba,
+                    total_blocks,
+                    current_lba,
+                    offset / SDHC_BLOCK_SIZE,
+                    err,
+                );
+                return Err(err);
             }
             current_lba = current_lba
                 .checked_add(u64::try_from(chunk_blocks).map_err(|_| SdhcError::OutOfRange)?)
@@ -1209,6 +1367,129 @@ struct CommandSpec {
     idx: u8,
     arg: u32,
     resp_type: RespType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoOperation {
+    Control,
+    Read,
+    Write,
+}
+
+impl IoOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IoTraceContext {
+    op: IoOperation,
+    lba: u64,
+    block_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandFailureContext {
+    op: IoOperation,
+    lba: u64,
+    block_count: usize,
+    cmd_idx: u8,
+    arg: u32,
+    data_phase: bool,
+}
+
+impl CommandFailureContext {
+    fn from_io(
+        io: Option<IoTraceContext>,
+        cmd_idx: u8,
+        arg: u32,
+        data_phase: bool,
+        transfer_blocks: usize,
+    ) -> Self {
+        let io = io.unwrap_or(IoTraceContext {
+            op: IoOperation::Control,
+            lba: 0,
+            block_count: transfer_blocks,
+        });
+        Self {
+            op: io.op,
+            lba: io.lba,
+            block_count: io.block_count,
+            cmd_idx,
+            arg,
+            data_phase,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControllerSnapshot {
+    int_status: u32,
+    present_state: u32,
+    block_count: u16,
+    transfer_mode: u16,
+    command: u16,
+    argument: u32,
+    clock_control: u16,
+    power_control: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlannedDataCommand {
+    cmd_idx: u8,
+    arg: u32,
+    block_count: usize,
+}
+
+fn block_command_arg(lba: u64, high_capacity: bool) -> Result<u32, SdhcError> {
+    if high_capacity {
+        return u32::try_from(lba).map_err(|_| SdhcError::OutOfRange);
+    }
+
+    let byte_addr = lba
+        .checked_mul(SDHC_BLOCK_SIZE as u64)
+        .ok_or(SdhcError::OutOfRange)?;
+    u32::try_from(byte_addr).map_err(|_| SdhcError::OutOfRange)
+}
+
+fn conservative_chunk_blocks(remaining_blocks: usize) -> Result<usize, SdhcError> {
+    if remaining_blocks == 0 {
+        return Err(SdhcError::InvalidParam);
+    }
+    Ok(remaining_blocks
+        .min(1)
+        .min(SDHC_MAX_TRANSFER_BLOCKS_PER_CMD))
+}
+
+fn plan_data_command(
+    lba: u64,
+    remaining_blocks: usize,
+    write: bool,
+    high_capacity: bool,
+) -> Result<PlannedDataCommand, SdhcError> {
+    let block_count = conservative_chunk_blocks(remaining_blocks)?;
+    Ok(PlannedDataCommand {
+        cmd_idx: if write {
+            MMC_CMD_WRITE_SINGLE_BLOCK
+        } else {
+            MMC_CMD_READ_SINGLE_BLOCK
+        },
+        arg: block_command_arg(lba, high_capacity)?,
+        block_count,
+    })
+}
+
+fn card_status_current_state(status: u32) -> u8 {
+    ((status & SD_STATUS_CURRENT_STATE_MASK) >> SD_STATUS_CURRENT_STATE_SHIFT) as u8
+}
+
+fn card_status_is_transfer_state(status: u32) -> bool {
+    card_status_current_state(status) == SD_STATUS_TRANSFER_STATE
 }
 
 fn decode_capacity_blocks(csd: &[u32; 4], high_capacity: bool) -> Result<u64, SdhcError> {
@@ -1842,6 +2123,7 @@ fn find_clock_frequency(
 mod tests {
     extern crate alloc;
 
+    use alloc::vec;
     use alloc::vec::Vec;
 
     use dtb::DeviceTree;
@@ -1854,17 +2136,26 @@ mod tests {
     use super::BCM2712_SD_SLOT_HOST_BASE;
     use super::DT_COMPAT_BCM2712_SDHCI;
     use super::DT_COMPAT_BRCMSTB_SDHCI;
+    use super::MMC_CMD_READ_SINGLE_BLOCK;
     use super::MMC_CMD_SELECT_CARD;
+    use super::MMC_CMD_WRITE_SINGLE_BLOCK;
     use super::RespType;
+    use super::SD_STATUS_READY_FOR_DATA;
+    use super::SD_STATUS_TRANSFER_STATE;
     use super::SDHC_BLOCK_SIZE;
     use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
     use super::SdhcConfig;
     use super::SdhcDtCandidate;
     use super::SdhcError;
+    use super::block_command_arg;
+    use super::card_status_current_state;
+    use super::card_status_is_transfer_state;
+    use super::conservative_chunk_blocks;
     use super::decode_capacity_blocks;
     use super::encode_clock_divider;
     use super::pack_clock_control_divider;
     use super::parse_from_dtb;
+    use super::plan_data_command;
     use super::rp1_sdio1_pad_value;
     use super::rp1_sdio1_pin_prep;
     use super::select_card_command;
@@ -2279,5 +2570,76 @@ mod tests {
         assert_eq!(command.idx, MMC_CMD_SELECT_CARD);
         assert_eq!(command.arg, 0x1234_0000);
         assert_eq!(command.resp_type, RespType::R1b);
+    }
+
+    #[test]
+    fn conservative_chunk_policy_is_single_block() {
+        assert_eq!(conservative_chunk_blocks(1).unwrap(), 1);
+        assert_eq!(conservative_chunk_blocks(8).unwrap(), 1);
+    }
+
+    #[test]
+    fn high_capacity_argument_uses_lba() {
+        assert_eq!(block_command_arg(7, true).unwrap(), 7);
+    }
+
+    #[test]
+    fn standard_capacity_argument_uses_byte_address() {
+        assert_eq!(
+            block_command_arg(7, false).unwrap(),
+            7 * SDHC_BLOCK_SIZE as u32
+        );
+    }
+
+    #[test]
+    fn multi_sector_reads_are_planned_as_repeated_single_block_commands() {
+        let mut lba = 0x40;
+        let mut remaining_blocks = 3usize;
+        let mut args = Vec::new();
+
+        while remaining_blocks > 0 {
+            let plan = plan_data_command(lba, remaining_blocks, false, true).unwrap();
+            assert_eq!(plan.cmd_idx, MMC_CMD_READ_SINGLE_BLOCK);
+            assert_eq!(plan.block_count, 1);
+            args.push(plan.arg);
+            lba += plan.block_count as u64;
+            remaining_blocks -= plan.block_count;
+        }
+
+        assert_eq!(args, vec![0x40, 0x41, 0x42]);
+    }
+
+    #[test]
+    fn multi_sector_writes_are_planned_as_repeated_single_block_commands() {
+        let mut lba = 2u64;
+        let mut remaining_blocks = 3usize;
+        let mut args = Vec::new();
+
+        while remaining_blocks > 0 {
+            let plan = plan_data_command(lba, remaining_blocks, true, false).unwrap();
+            assert_eq!(plan.cmd_idx, MMC_CMD_WRITE_SINGLE_BLOCK);
+            assert_eq!(plan.block_count, 1);
+            args.push(plan.arg);
+            lba += plan.block_count as u64;
+            remaining_blocks -= plan.block_count;
+        }
+
+        assert_eq!(
+            args,
+            vec![
+                2 * SDHC_BLOCK_SIZE as u32,
+                3 * SDHC_BLOCK_SIZE as u32,
+                4 * SDHC_BLOCK_SIZE as u32
+            ]
+        );
+    }
+
+    #[test]
+    fn transfer_state_helper_decodes_cmd13_state() {
+        let status = SD_STATUS_READY_FOR_DATA | (u32::from(SD_STATUS_TRANSFER_STATE) << 9);
+
+        assert_eq!(card_status_current_state(status), SD_STATUS_TRANSFER_STATE);
+        assert!(card_status_is_transfer_state(status));
+        assert!(!card_status_is_transfer_state(0));
     }
 }
