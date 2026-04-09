@@ -1,3 +1,4 @@
+use arch_hal::println;
 use block_device_api::BlockDevice;
 use block_device_api::IoError;
 use block_device_api::virtio_blk_mmio::VirtioBlkMmioDevice;
@@ -6,6 +7,9 @@ use block_device_api::virtio_blk_mmio::VirtioBlkMmioGuestMemory;
 use block_device_api::virtio_blk_mmio::VirtioBlkMmioInterrupt;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 use mutex::SpinLock;
 
 use crate::vgic;
@@ -15,6 +19,18 @@ pub(crate) const VIRTIO_BLK_MMIO_SIZE: usize = 0x1000;
 pub(crate) const VIRTIO_BLK_IRQ_INTID: u32 = 275;
 
 const ERR_UNINITIALIZED: &str = "virtio-blk: uninitialized";
+const REG_INTERRUPT_ACK: usize = 0x064;
+const REG_STATUS: usize = 0x070;
+const REG_QUEUE_READY: usize = 0x044;
+const REG_QUEUE_NOTIFY: usize = 0x050;
+const LOG_MMIO_ONCE: u32 = 1 << 0;
+const LOG_STATUS_ONCE: u32 = 1 << 1;
+const LOG_QUEUE_READY_ONCE: u32 = 1 << 2;
+
+static VIRTIO_BLK_LOG_ONCE: AtomicU32 = AtomicU32::new(0);
+static VIRTIO_BLK_NOTIFY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VIRTIO_BLK_ACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VIRTIO_BLK_IRQ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 type RpiVirtioBlkDevice =
     VirtioBlkMmioDevice<'static, dyn BlockDevice, GuestMemoryIdentity, VgicInterruptSink>;
@@ -23,6 +39,61 @@ static VIRTIO_BLK: SpinLock<Option<RpiVirtioBlkDevice>> = SpinLock::new(None);
 
 struct GuestMemoryIdentity;
 struct VgicInterruptSink;
+
+fn log_once(mask: u32, msg: impl FnOnce()) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let old = VIRTIO_BLK_LOG_ONCE.fetch_or(mask, Ordering::Relaxed);
+    if (old & mask) == 0 {
+        msg();
+    }
+}
+
+fn log_first_n(counter: &AtomicUsize, limit: usize, msg: impl FnOnce(usize)) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let index = counter.fetch_add(1, Ordering::Relaxed);
+    if index < limit {
+        msg(index);
+    }
+}
+
+fn log_mmio_access(kind: &str, offset: usize, size: u8, value: Option<u64>) {
+    match offset {
+        REG_STATUS => log_once(LOG_STATUS_ONCE, || {
+            println!(
+                "virtio-blk: guest touched STATUS via {} size={} value={:?}",
+                kind, size, value
+            );
+        }),
+        REG_QUEUE_READY => log_once(LOG_QUEUE_READY_ONCE, || {
+            println!(
+                "virtio-blk: guest touched QUEUE_READY via {} size={} value={:?}",
+                kind, size, value
+            );
+        }),
+        REG_QUEUE_NOTIFY => log_first_n(&VIRTIO_BLK_NOTIFY_LOG_COUNT, 16, |index| {
+            println!(
+                "virtio-blk: queue notify #{} size={} value={:?}",
+                index, size, value
+            );
+        }),
+        REG_INTERRUPT_ACK => log_first_n(&VIRTIO_BLK_ACK_LOG_COUNT, 16, |index| {
+            println!(
+                "virtio-blk: interrupt ack #{} size={} value={:?}",
+                index, size, value
+            );
+        }),
+        _ => log_once(LOG_MMIO_ONCE, || {
+            println!(
+                "virtio-blk: first MMIO {} offset=0x{:x} size={} value={:?}",
+                kind, offset, size, value
+            );
+        }),
+    }
+}
 
 fn checked_guest_base(addr: u64, len: usize) -> Result<usize, VirtioBlkMmioError> {
     let base = usize::try_from(addr)
@@ -80,12 +151,25 @@ impl VirtioBlkMmioGuestMemory for GuestMemoryIdentity {
 
 impl VirtioBlkMmioInterrupt for VgicInterruptSink {
     fn set_irq_level(&self, asserted: bool) -> Result<(), VirtioBlkMmioError> {
+        log_first_n(&VIRTIO_BLK_IRQ_LOG_COUNT, 16, |index| {
+            println!(
+                "virtio-blk: irq transition #{} asserted={}",
+                index, asserted
+            );
+        });
         vgic::inject_virtual_spi(VIRTIO_BLK_IRQ_INTID, asserted)
             .map_err(|_| VirtioBlkMmioError::Interrupt("virtio-blk: IRQ injection failed"))
     }
 }
 
 pub(crate) fn init_with_backend(dev: &'static dyn BlockDevice) -> Result<(), &'static str> {
+    if cfg!(debug_assertions) {
+        println!(
+            "virtio-blk: backend capacity blocks={} block_size={}",
+            dev.num_blocks(),
+            dev.block_size()
+        );
+    }
     let device = VirtioBlkMmioDevice::new(dev, GuestMemoryIdentity, VgicInterruptSink)
         .map_err(map_mmio_error)?;
     let mut guard = VIRTIO_BLK.lock();
@@ -112,7 +196,9 @@ pub(crate) fn handle_mmio_read(addr: usize, size: u8) -> Result<u64, &'static st
     let offset = addr
         .checked_sub(VIRTIO_BLK_MMIO_BASE)
         .ok_or("virtio-blk: MMIO read offset underflow")?;
-    device.mmio_read(offset, size).map_err(map_mmio_error)
+    let value = device.mmio_read(offset, size).map_err(map_mmio_error)?;
+    log_mmio_access("read", offset, size, Some(value));
+    Ok(value)
 }
 
 pub(crate) fn handle_mmio_write(addr: usize, size: u8, value: u64) -> Result<(), &'static str> {
@@ -124,6 +210,7 @@ pub(crate) fn handle_mmio_write(addr: usize, size: u8, value: u64) -> Result<(),
     let offset = addr
         .checked_sub(VIRTIO_BLK_MMIO_BASE)
         .ok_or("virtio-blk: MMIO write offset underflow")?;
+    log_mmio_access("write", offset, size, Some(value));
     device
         .mmio_write(offset, size, value)
         .map_err(map_mmio_error)

@@ -54,6 +54,7 @@ const TARGET_CSI0_PATH: &str = "/soc@107c000000/csi@1c0110000";
 const TARGET_CSI1_PATH: &str = "/soc@107c000000/csi@1c0128000";
 const TARGET_MAILBOX_PATH: &str = "/soc@107c000000/mailbox@7c013880";
 const TARGET_GIO_AON_PATH: &str = "/soc@107c000000/gpio@7d517c00";
+const GUEST_ROOT_TOKEN: &str = "root=/dev/vda2";
 
 const SOURCE_UART0_PATH: &str = "/axi/pcie@1000120000/rp1/serial@30000";
 const SOURCE_GPIO_PATH: &str = "/axi/pcie@1000120000/rp1/gpio@d0000";
@@ -314,9 +315,9 @@ fn add_virtio_mmio_blk_node(
     target: &mut TargetTree<'_>,
     gic_phandle: u32,
 ) -> Result<NodeId, &'static str> {
-    let base = soc_bus_address_from_phys(virtio_blk::VIRTIO_BLK_MMIO_BASE as u64)?;
+    let base = virtio_blk::VIRTIO_BLK_MMIO_BASE as u64;
     let size = virtio_blk::VIRTIO_BLK_MMIO_SIZE as u64;
-    let path = format!("{TARGET_SOC_PATH}/virtio_block@{base:x}");
+    let path = format!("/virtio_mmio@{base:x}");
     let node_id = target.get_or_create_node_by_path(&path)?;
     let node = target
         .node_mut(node_id)
@@ -326,6 +327,10 @@ fn add_virtio_mmio_blk_node(
         ValueRef::Owned(b"virtio,mmio\0".to_vec()),
     );
     node.set_property(
+        NameRef::Borrowed("dma-coherent"),
+        ValueRef::Owned(Vec::new()),
+    );
+    node.set_property(
         NameRef::Borrowed("reg"),
         ValueRef::Owned(encode_reg_entries(&[(base, size)], 2, 1)?),
     );
@@ -333,7 +338,7 @@ fn add_virtio_mmio_blk_node(
         NameRef::Borrowed("interrupt-parent"),
         ValueRef::Owned(gic_phandle.to_be_bytes().to_vec()),
     );
-    let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Level);
+    let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Edge);
     let interrupts = encode_gic_spi_interrupts_with_mapper(
         &[(virtio_blk::VIRTIO_BLK_IRQ_INTID, irq_flags)],
         |intid| Ok(intid),
@@ -1099,6 +1104,8 @@ fn update_bootargs(
     pl011_uart_addr: usize,
 ) -> Result<(), &'static str> {
     let mut args = String::new();
+    let mut saw_rootwait = false;
+    let mut saw_virtio_mmio_device = false;
 
     if let Some(existing) = tree
         .node(chosen)
@@ -1111,6 +1118,16 @@ fn update_bootargs(
             if token.starts_with("console=") || token.starts_with("earlycon=") {
                 continue;
             }
+            if token.starts_with("root=") {
+                continue;
+            }
+            if token == "rootwait" {
+                saw_rootwait = true;
+            }
+            if token.starts_with("virtio_mmio.device=") {
+                saw_virtio_mmio_device = true;
+                continue;
+            }
             if !args.is_empty() {
                 args.push(' ');
             }
@@ -1120,7 +1137,26 @@ fn update_bootargs(
 
     let earlycon = format!("earlycon=pl011,0x{pl011_uart_addr:x}");
     let console = "console=ttyAMA0,115200";
-    for token in [earlycon.as_str(), console] {
+    let virtio_mmio_device = format!(
+        "virtio_mmio.device={}@0x{:x}:{}",
+        virtio_blk::VIRTIO_BLK_MMIO_SIZE,
+        virtio_blk::VIRTIO_BLK_MMIO_BASE,
+        virtio_blk::VIRTIO_BLK_IRQ_INTID,
+    );
+    for token in [
+        GUEST_ROOT_TOKEN,
+        if saw_rootwait { "" } else { "rootwait" },
+        if saw_virtio_mmio_device {
+            ""
+        } else {
+            virtio_mmio_device.as_str()
+        },
+        earlycon.as_str(),
+        console,
+    ] {
+        if token.is_empty() {
+            continue;
+        }
         if !args.is_empty() {
             args.push(' ');
         }

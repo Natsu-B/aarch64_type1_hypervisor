@@ -1860,4 +1860,167 @@ mod tests {
         assert_eq!(memory.read_u32(USED_ADDR + 8), 0);
         assert_eq!(irq.levels(), vec![true]);
     }
+
+    #[test]
+    fn full_mmio_handshake_round_trips_write_then_read() {
+        const WRITE_REQ_ADDR: u64 = REQ_ADDR;
+        const WRITE_DATA_ADDR: u64 = DATA_ADDR;
+        const WRITE_STATUS_ADDR: u64 = STATUS_ADDR;
+        const READ_REQ_ADDR: u64 = 0x7000;
+        const READ_DATA_ADDR: u64 = 0x8000;
+        const READ_STATUS_ADDR: u64 = 0x9000;
+
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 4], false);
+        let memory = FakeGuestMemory::new(0x10_000);
+        let irq = FakeInterrupt::default();
+        let mut device = make_device(&backend, &memory, &irq);
+
+        assert_eq!(
+            device.mmio_read(REG_MAGIC_VALUE, 4).unwrap(),
+            VIRTIO_MMIO_MAGIC_VALUE as u64
+        );
+        assert_eq!(
+            device.mmio_read(REG_DEVICE_ID, 4).unwrap(),
+            VIRTIO_MMIO_DEVICE_ID_BLOCK as u64
+        );
+
+        device
+            .mmio_write(REG_STATUS, 4, VIRTIO_STATUS_ACKNOWLEDGE as u64)
+            .unwrap();
+        device
+            .mmio_write(
+                REG_STATUS,
+                4,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u64,
+            )
+            .unwrap();
+        device.mmio_write(REG_DRIVER_FEATURES_SEL, 4, 1).unwrap();
+        device.mmio_write(REG_DRIVER_FEATURES, 4, 1).unwrap();
+        device
+            .mmio_write(
+                REG_STATUS,
+                4,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+                    as u64,
+            )
+            .unwrap();
+
+        configure_ready_queue(&mut device, &memory, 8);
+
+        device
+            .mmio_write(
+                REG_STATUS,
+                4,
+                (VIRTIO_STATUS_ACKNOWLEDGE
+                    | VIRTIO_STATUS_DRIVER
+                    | VIRTIO_STATUS_FEATURES_OK
+                    | VIRTIO_STATUS_DRIVER_OK) as u64,
+            )
+            .unwrap();
+
+        let write_pattern: Vec<u8> = (0..SECTOR_SIZE)
+            .map(|idx| (idx as u8).wrapping_mul(7).wrapping_add(3))
+            .collect();
+        memory.write_bytes(WRITE_DATA_ADDR, &write_pattern);
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                WRITE_REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            1,
+            desc(WRITE_DATA_ADDR, SECTOR_SIZE as u32, VIRTQ_DESC_F_NEXT, 2),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            2,
+            desc(WRITE_STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0),
+        );
+        memory.write_req(WRITE_REQ_ADDR, make_req(VIRTIO_BLK_T_OUT, 2));
+        memory.write_u16(AVAIL_ADDR + 2, 1);
+        memory.write_u16(AVAIL_ADDR + 4, 0);
+        memory.write_u8(WRITE_STATUS_ADDR, 0xff);
+
+        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+
+        assert_eq!(memory.read_u8(WRITE_STATUS_ADDR), VIRTIO_BLK_S_OK);
+        assert_eq!(memory.read_u16(USED_ADDR + 2), 1);
+        assert_eq!(memory.read_u32(USED_ADDR + 4), 0);
+        assert_eq!(memory.read_u32(USED_ADDR + 8), SECTOR_SIZE as u32);
+        assert_eq!(
+            backend.storage.lock().unwrap()[SECTOR_SIZE * 2..SECTOR_SIZE * 3].to_vec(),
+            write_pattern
+        );
+        assert_eq!(
+            device.mmio_read(REG_INTERRUPT_STATUS, 4).unwrap(),
+            VIRTIO_INT_USED_RING as u64
+        );
+        assert_eq!(irq.levels(), vec![true]);
+
+        device
+            .mmio_write(REG_INTERRUPT_ACK, 4, VIRTIO_INT_USED_RING as u64)
+            .unwrap();
+
+        let mut expected_readback = vec![0u8; SECTOR_SIZE];
+        expected_readback
+            .copy_from_slice(&backend.storage.lock().unwrap()[SECTOR_SIZE * 2..SECTOR_SIZE * 3]);
+        memory.write_desc(
+            DESC_ADDR,
+            3,
+            desc(
+                READ_REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                4,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            4,
+            desc(
+                READ_DATA_ADDR,
+                SECTOR_SIZE as u32,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                5,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            5,
+            desc(READ_STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0),
+        );
+        memory.write_req(READ_REQ_ADDR, make_req(VIRTIO_BLK_T_IN, 2));
+        memory.write_u16(AVAIL_ADDR + 2, 2);
+        memory.write_u16(AVAIL_ADDR + 6, 3);
+        memory.write_u8(READ_STATUS_ADDR, 0xff);
+
+        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+
+        assert_eq!(
+            memory.read_bytes(READ_DATA_ADDR, SECTOR_SIZE),
+            expected_readback
+        );
+        assert_eq!(memory.read_u8(READ_STATUS_ADDR), VIRTIO_BLK_S_OK);
+        assert_eq!(memory.read_u16(USED_ADDR + 2), 2);
+        assert_eq!(memory.read_u32(USED_ADDR + 12), 3);
+        assert_eq!(memory.read_u32(USED_ADDR + 16), SECTOR_SIZE as u32);
+        assert_eq!(
+            device.mmio_read(REG_INTERRUPT_STATUS, 4).unwrap(),
+            VIRTIO_INT_USED_RING as u64
+        );
+        assert_eq!(irq.levels(), vec![true, false, true]);
+
+        device
+            .mmio_write(REG_INTERRUPT_ACK, 4, VIRTIO_INT_USED_RING as u64)
+            .unwrap();
+
+        assert_eq!(device.mmio_read(REG_INTERRUPT_STATUS, 4).unwrap(), 0);
+        assert_eq!(irq.levels(), vec![true, false, true, false]);
+    }
 }
