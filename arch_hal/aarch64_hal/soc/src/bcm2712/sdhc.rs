@@ -1,29 +1,32 @@
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
+use core::mem::size_of;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 
+#[cfg(target_arch = "aarch64")]
+use super::pirq_hook;
 use dtb::DtbParser;
 use dtb::WalkError;
 use io_api::block_device::BlockDevice;
 use io_api::block_device::IoError;
 use io_api::block_device::Lba;
-use mutex::pod::RawAtomicPod;
 use mutex::SpinLock;
+use mutex::pod::RawAtomicPod;
 use print::println;
 
 #[cfg(test)]
 extern crate std;
 
 #[cfg(target_arch = "aarch64")]
-use timer::read_counter;
-#[cfg(target_arch = "aarch64")]
 use timer::SystemTimer;
+#[cfg(target_arch = "aarch64")]
+use timer::read_counter;
 
 #[cfg(not(target_arch = "aarch64"))]
-use self::timer_compat::read_counter;
-#[cfg(not(target_arch = "aarch64"))]
 use self::timer_compat::SystemTimer;
+#[cfg(not(target_arch = "aarch64"))]
+use self::timer_compat::read_counter;
 
 #[cfg(not(target_arch = "aarch64"))]
 mod timer_compat {
@@ -74,12 +77,15 @@ const SDHC_MAX_TRANSFER_BLOCKS_PER_CMD: usize = 1024;
 const SDHC_CMD_TIMEOUT_US: u64 = 100_000;
 const SDHC_DATA_TIMEOUT_US: u64 = 1_000_000;
 const SDHC_CLOCK_TIMEOUT_US: u64 = 20_000;
+#[cfg(target_arch = "aarch64")]
+const BCM2712_SDIO1_PREINIT_DELAY_US: u64 = 100;
 const SDHC_RESET_TIMEOUT_US: u64 = 100_000;
 const SDHC_ACMD41_RETRY_MAX: usize = 1000;
 const SDHC_ACMD41_POLL_DELAY_US: u64 = 10;
 const SDHC_MAX_DT_CANDIDATES: usize = 8;
 const SDHC_MAX_REG_ENTRIES: usize = 8;
 const SDHC_MAX_CLOCK_DIVIDER: u16 = 0x03ff;
+const SDHC_3V3_MICROVOLTS: u32 = 3_300_000;
 const BCM2712_SD_SLOT_HOST_BASE: usize = 0x10_00ff_f000;
 
 const SDHCI_BLOCK_SIZE: usize = 0x04;
@@ -151,46 +157,101 @@ const SDHCI_INT_ALL_MASK: u32 = u32::MAX;
 const SDIO_CFG_CTRL: usize = 0x00;
 const SDIO_CFG_CTRL_SDCD_N_TEST_EN: u32 = 1 << 31;
 const SDIO_CFG_CTRL_SDCD_N_TEST_LEV: u32 = 1 << 30;
-const SDIO_CFG_CLOCK_REGS_OFFSET: usize = 0x04;
-const SDIO_CFG_MODE: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x00;
-const SDIO_CFG_LOCAL: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x08;
-const SDIO_CFG_USE_LOCAL: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x0c;
-const SDIO_CFG_SD_DELAY: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x10;
-const SDIO_CFG_RX_DELAY: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x14;
-const SDIO_CFG_CS: usize = SDIO_CFG_CLOCK_REGS_OFFSET + 0x1c;
 const SDIO_CFG_SD_PIN_SEL: usize = 0x44;
 const SDIO_CFG_SD_PIN_SEL_MASK: u32 = 0x3;
 const SDIO_CFG_SD_PIN_SEL_CARD: u32 = 1 << 1;
-const SDIO_CFG_MODE_SRC_SEL_SHIFT: u32 = 16;
-const SDIO_CFG_MODE_SRC_SEL_PLL_SYS_VCO: u32 = 2;
-const SDIO_CFG_MODE_STEPS_SHIFT: u32 = 28;
-const SDIO_CFG_MODE_STEPS_20_CYCLES: u32 = 0;
-const SDIO_CFG_LOCAL_FREQ_SEL_MASK: u32 = 0x03ff;
-const SDIO_CFG_LOCAL_CLK_GEN_SEL: u32 = 1 << 12;
-const SDIO_CFG_LOCAL_CARD_CLK_EN: u32 = 1 << 16;
-const SDIO_CFG_LOCAL_CLK2CARD_ON: u32 = 1 << 18;
-const SDIO_CFG_USE_LOCAL_FREQ_SEL: u32 = 1 << 0;
-const SDIO_CFG_USE_LOCAL_CLK_GEN_SEL: u32 = 1 << 12;
-const SDIO_CFG_USE_LOCAL_CARD_CLK_EN: u32 = 1 << 16;
-const SDIO_CFG_USE_LOCAL_CLK2CARD_ON: u32 = 1 << 18;
-const SDIO_CFG_SD_DELAY_STEP_MASK: u32 = 0x1f;
-const SDIO_CFG_SD_DELAY_STEP_DEFAULT: u32 = 5;
-const SDIO_CFG_RX_DELAY_FIXED_MASK: u32 = 0x1f;
-const SDIO_CFG_RX_DELAY_FIXED_DEFAULT: u32 = 6;
-const SDIO_CFG_RX_DELAY_MAP_SHIFT: u32 = 8;
-const SDIO_CFG_RX_DELAY_MAP_STRETCH: u32 = 2;
-const SDIO_CFG_RX_DELAY_OVERFLOW_SHIFT: u32 = 12;
-const SDIO_CFG_RX_DELAY_OVERFLOW_CLAMP: u32 = 1;
-const SDIO_CFG_CS_RESET: u32 = 1 << 0;
-const SDIO_CFG_CS_TX_CLK_RUNNING: u32 = 1 << 8;
-const SDIO_CFG_CS_SD_CLK_RUNNING: u32 = 1 << 12;
-const SDIO_CFG_CS_RX_CLK_RUNNING: u32 = 1 << 16;
-const SDIO_CFG_CS_CLOCKS_RUNNING: u32 =
-    SDIO_CFG_CS_TX_CLK_RUNNING | SDIO_CFG_CS_SD_CLK_RUNNING | SDIO_CFG_CS_RX_CLK_RUNNING;
-const BCM2712_SDIO1_SRC_CLOCK_HZ: u32 = 1_000_000_000;
-const BCM2712_SDIO1_CORE_CLOCK_HZ: u32 = 50_000_000;
-const BCM2712_SDIO1_INIT_CLOCK_HZ: u32 = 400_000;
-const BCM2712_SDIO1_CLOCK_START_TIMEOUT_US: u64 = 1_000;
+const OF_GPIO_ACTIVE_LOW: u32 = 1 << 0;
+#[cfg(target_arch = "aarch64")]
+const BRCMSTB_GIO_BANK_SIZE: usize = 0x20;
+#[cfg(target_arch = "aarch64")]
+const BRCMSTB_GIO_ODEN: usize = 0x00;
+#[cfg(target_arch = "aarch64")]
+const BRCMSTB_GIO_DATA: usize = 0x04;
+#[cfg(target_arch = "aarch64")]
+const BRCMSTB_GIO_IODIR: usize = 0x08;
+
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_GPIO_CTRL_REG_OFFSET: usize = 0x0004;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_GPIO_CTRL_STRIDE: usize = size_of::<u32>() * 2;
+#[cfg(target_arch = "aarch64")]
+const RP1_GPIO_CTRL_FUNCSEL_MASK: u32 = 0x1f;
+#[cfg(target_arch = "aarch64")]
+const RP1_GPIO_CTRL_OUTOVER_MASK: u32 = 0b11 << 12;
+#[cfg(target_arch = "aarch64")]
+const RP1_GPIO_CTRL_OEOVER_MASK: u32 = 0b11 << 14;
+#[cfg(target_arch = "aarch64")]
+const RP1_GPIO_FUNCSEL_ALT0: u32 = 0x00;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_SLEWFAST: u32 = 1 << 0;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_SCHMITT: u32 = 1 << 1;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_PULL_SHIFT: u32 = 2;
+#[cfg(target_arch = "aarch64")]
+const RP1_PAD_PULL_MASK: u32 = 0b11 << RP1_PAD_PULL_SHIFT;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_PULL_NONE: u32 = 0 << RP1_PAD_PULL_SHIFT;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_PULL_UP: u32 = 2 << RP1_PAD_PULL_SHIFT;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_DRIVE_SHIFT: u32 = 4;
+#[cfg(target_arch = "aarch64")]
+const RP1_PAD_DRIVE_MASK: u32 = 0b11 << RP1_PAD_DRIVE_SHIFT;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_DRIVE_12MA: u32 = 0b11 << RP1_PAD_DRIVE_SHIFT;
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_PAD_INPUT_ENABLE: u32 = 1 << 6;
+#[cfg(target_arch = "aarch64")]
+const RP1_PAD_OUTPUT_DISABLE: u32 = 1 << 7;
+#[cfg(target_arch = "aarch64")]
+const RP1_PAD_CONFIG_MASK: u32 = RP1_PAD_SLEWFAST
+    | RP1_PAD_SCHMITT
+    | RP1_PAD_PULL_MASK
+    | RP1_PAD_DRIVE_MASK
+    | RP1_PAD_INPUT_ENABLE
+    | RP1_PAD_OUTPUT_DISABLE;
+#[cfg(target_arch = "aarch64")]
+const RP1_SDIO1_PINS: [usize; 6] = [28, 29, 30, 31, 32, 33];
+
+#[cfg(any(test, target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rp1IoBankDesc {
+    min_gpio: usize,
+    num_gpios: usize,
+    gpio_offset: usize,
+    pads_offset: usize,
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
+const RP1_IO_BANKS: [Rp1IoBankDesc; 3] = [
+    Rp1IoBankDesc {
+        min_gpio: 0,
+        num_gpios: 28,
+        gpio_offset: 0x0000,
+        pads_offset: 0x0004,
+    },
+    Rp1IoBankDesc {
+        min_gpio: 28,
+        num_gpios: 6,
+        gpio_offset: 0x4000,
+        pads_offset: 0x4004,
+    },
+    Rp1IoBankDesc {
+        min_gpio: 34,
+        num_gpios: 20,
+        gpio_offset: 0x8000,
+        pads_offset: 0x8004,
+    },
+];
+
+#[cfg(any(test, target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rp1PinPrep {
+    ctrl_offset: usize,
+    pad_offset: usize,
+    pad_value: u32,
+}
 
 const MMC_CMD_GO_IDLE_STATE: u8 = 0;
 const MMC_CMD_ALL_SEND_CID: u8 = 2;
@@ -260,10 +321,31 @@ struct HostRegion {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GpioLineConfig {
+    base: usize,
+    pin: u8,
+    active_low: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GpioOutputConfig {
+    line: GpioLineConfig,
+    logical_high: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SdhcPowerConfig {
+    vqmmc_select: Option<GpioOutputConfig>,
+    vqmmc_settle_us: u32,
+    vmmc_enable: Option<GpioOutputConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SdhcConfig {
     host: HostRegion,
     cfg: HostRegion,
     max_clock_hz: u32,
+    power: SdhcPowerConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -291,6 +373,7 @@ struct SdhcDtCandidate {
     busisol: Option<HostRegion>,
     lcpll: Option<HostRegion>,
     max_clock_hz: u32,
+    power: SdhcPowerConfig,
     has_brcmstb_compat: bool,
     status_okay: bool,
     bus_width: u32,
@@ -323,6 +406,7 @@ impl SdhcDtCandidate {
             host,
             cfg,
             max_clock_hz: self.max_clock_hz,
+            power: self.power,
         })
     }
 }
@@ -353,6 +437,162 @@ static TAKEN: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(fals
 static READY: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 static STATE: SyncUnsafeCell<MaybeUninit<Bcm2712Sdhc>> = SyncUnsafeCell::new(MaybeUninit::uninit());
 
+fn mmio_read_u32(base: *mut u8, offset: usize) -> u32 {
+    // SAFETY: The caller provides a valid MMIO base, and `offset` targets a 32-bit register in
+    // that mapped window.
+    unsafe { core::ptr::read_volatile(base.wrapping_add(offset) as *const u32) }
+}
+
+fn mmio_write_u32(base: *mut u8, offset: usize, value: u32) {
+    // SAFETY: The caller provides a valid MMIO base, and `offset` targets a 32-bit register in
+    // that mapped window.
+    unsafe { core::ptr::write_volatile(base.wrapping_add(offset) as *mut u32, value) };
+}
+
+fn log_init_stage(stage: &str, err: SdhcError) -> SdhcError {
+    if cfg!(debug_assertions) {
+        println!("sdhc: init stage {} failed: {:?}", stage, err);
+    }
+    err
+}
+
+#[cfg(target_arch = "aarch64")]
+fn brcmstb_gpio_bank(pin: u8) -> (usize, u32) {
+    let bank = usize::from(pin / 32);
+    let bit = 1u32 << u32::from(pin % 32);
+    (bank, bit)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn brcmstb_gpio_reg_offset(bank: usize, reg: usize) -> Result<usize, SdhcError> {
+    bank.checked_mul(BRCMSTB_GIO_BANK_SIZE)
+        .and_then(|base| base.checked_add(reg))
+        .ok_or(SdhcError::InvalidParam)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn configure_brcmstb_gpio_output(config: GpioOutputConfig) -> Result<(), SdhcError> {
+    let base = config.line.base as *mut u8;
+    let (bank, bit) = brcmstb_gpio_bank(config.line.pin);
+    let data_offset = brcmstb_gpio_reg_offset(bank, BRCMSTB_GIO_DATA)?;
+    let oden_offset = brcmstb_gpio_reg_offset(bank, BRCMSTB_GIO_ODEN)?;
+    let iodir_offset = brcmstb_gpio_reg_offset(bank, BRCMSTB_GIO_IODIR)?;
+    let raw_high = if config.line.active_low {
+        !config.logical_high
+    } else {
+        config.logical_high
+    };
+
+    let mut data = mmio_read_u32(base, data_offset);
+    if raw_high {
+        data |= bit;
+    } else {
+        data &= !bit;
+    }
+    mmio_write_u32(base, data_offset, data);
+
+    let oden = mmio_read_u32(base, oden_offset) & !bit;
+    mmio_write_u32(base, oden_offset, oden);
+
+    let iodir = mmio_read_u32(base, iodir_offset) & !bit;
+    mmio_write_u32(base, iodir_offset, iodir);
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn wait_micros(delay_us: u64) {
+    if delay_us == 0 {
+        return;
+    }
+    let mut timer = SystemTimer::new();
+    timer.init();
+    timer.wait(Duration::from_micros(delay_us));
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
+fn rp1_io_bank(pin: usize) -> Option<(Rp1IoBankDesc, usize)> {
+    RP1_IO_BANKS.iter().copied().find_map(|bank| {
+        let end = bank.min_gpio.checked_add(bank.num_gpios)?;
+        (bank.min_gpio..end)
+            .contains(&pin)
+            .then_some((bank, pin - bank.min_gpio))
+    })
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
+fn rp1_sdio1_pad_value(pin: usize) -> Option<u32> {
+    let pull = match pin {
+        28 => RP1_PAD_PULL_NONE,
+        29..=33 => RP1_PAD_PULL_UP,
+        _ => return None,
+    };
+    Some(RP1_PAD_SLEWFAST | RP1_PAD_SCHMITT | RP1_PAD_DRIVE_12MA | RP1_PAD_INPUT_ENABLE | pull)
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
+fn rp1_sdio1_pin_prep(pin: usize) -> Option<Rp1PinPrep> {
+    let (bank, pin_offset) = rp1_io_bank(pin)?;
+    Some(Rp1PinPrep {
+        ctrl_offset: bank
+            .gpio_offset
+            .checked_add(pin_offset.checked_mul(RP1_GPIO_CTRL_STRIDE)?)?
+            .checked_add(RP1_GPIO_CTRL_REG_OFFSET)?,
+        pad_offset: bank
+            .pads_offset
+            .checked_add(pin_offset.checked_mul(size_of::<u32>())?)?,
+        pad_value: rp1_sdio1_pad_value(pin)?,
+    })
+}
+
+fn configure_bcm2712_sdio1_clock_regs(_cfg: *mut u8) -> Result<(), SdhcError> {
+    // The Raspberry Pi 5 SD-slot path exposes its base host clock through the DT clock
+    // provider, and the standard SDHCI clock-control register programs the actual card clock.
+    // The STB-specific local-clock-running handshake does not assert on this path, so we must
+    // not gate bring-up on those CFG status bits.
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn configure_bcm2712_sd_power(power: &SdhcPowerConfig) -> Result<(), SdhcError> {
+    if let Some(vqmmc_select) = power.vqmmc_select {
+        configure_brcmstb_gpio_output(vqmmc_select)?;
+    }
+    if let Some(vmmc_enable) = power.vmmc_enable {
+        configure_brcmstb_gpio_output(vmmc_enable)?;
+    }
+    wait_micros(u64::from(power.vqmmc_settle_us));
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn bcm2712_sdio1_preinit(cfg: &SdhcConfig) -> Result<(), SdhcError> {
+    let rp1_base = pirq_hook::rp1_peripheral_base()
+        .ok_or(SdhcError::InvalidState)
+        .map_err(|err| log_init_stage("preinit-rp1-base", err))? as *mut u8;
+    configure_bcm2712_sd_power(&cfg.power).map_err(|err| log_init_stage("preinit-power", err))?;
+    configure_bcm2712_sdio1_clock_regs(cfg.cfg.base as *mut u8)?;
+
+    for pin in RP1_SDIO1_PINS {
+        let prep = rp1_sdio1_pin_prep(pin).ok_or(SdhcError::InvalidParam)?;
+        let ctrl = mmio_read_u32(rp1_base, prep.ctrl_offset)
+            & !(RP1_GPIO_CTRL_FUNCSEL_MASK
+                | RP1_GPIO_CTRL_OUTOVER_MASK
+                | RP1_GPIO_CTRL_OEOVER_MASK);
+        mmio_write_u32(rp1_base, prep.ctrl_offset, ctrl | RP1_GPIO_FUNCSEL_ALT0);
+
+        let pad = mmio_read_u32(rp1_base, prep.pad_offset) & !RP1_PAD_CONFIG_MASK;
+        mmio_write_u32(rp1_base, prep.pad_offset, pad | prep.pad_value);
+    }
+
+    wait_micros(BCM2712_SDIO1_PREINIT_DELAY_US);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn bcm2712_sdio1_preinit(_cfg: &SdhcConfig) -> Result<(), SdhcError> {
+    Ok(())
+}
+
 impl Bcm2712Sdhc {
     pub fn init_from_dtb(dtb: &DtbParser) -> Result<&'static Self, SdhcError> {
         if TAKEN
@@ -380,6 +620,7 @@ impl Bcm2712Sdhc {
         if cfg.max_clock_hz == 0 {
             return Err(SdhcError::InvalidClock);
         }
+        bcm2712_sdio1_preinit(&cfg).map_err(|err| log_init_stage("preinit", err))?;
         let instance = Bcm2712Sdhc {
             host: cfg.host.base as *mut u8,
             cfg: cfg.cfg.base as *mut u8,
@@ -387,13 +628,22 @@ impl Bcm2712Sdhc {
             min_clock_hz: SDHC_DEFAULT_MIN_CLOCK_HZ,
             card: SpinLock::new(None),
         };
-        instance.configure_bcm2712_sdio1_clock()?;
-        instance.reset(SDHCI_RESET_ALL)?;
-        instance.configure_card_detect()?;
-        instance.power_on()?;
-        instance.set_clock(instance.min_clock_hz)?;
+        instance
+            .reset(SDHCI_RESET_ALL)
+            .map_err(|err| log_init_stage("reset", err))?;
+        instance
+            .configure_card_detect()
+            .map_err(|err| log_init_stage("card-detect", err))?;
+        instance
+            .power_on()
+            .map_err(|err| log_init_stage("power-on", err))?;
+        instance
+            .set_clock(instance.min_clock_hz)
+            .map_err(|err| log_init_stage("set-clock", err))?;
         instance.enable_interrupt_masks();
-        instance.card_init_sequence()?;
+        instance
+            .card_init_sequence()
+            .map_err(|err| log_init_stage("card-init", err))?;
 
         // SAFETY: guarded by `TAKEN`; this is one-time initialization.
         unsafe {
@@ -416,21 +666,28 @@ impl Bcm2712Sdhc {
         ((ticks * 1_000_000u128) / hz) as u64
     }
 
-    fn wait_until(
-        &self,
+    fn wait_until_static(
         timeout_us: u64,
-        mut condition: impl FnMut(&Self) -> bool,
+        mut condition: impl FnMut() -> bool,
     ) -> Result<(), SdhcError> {
         let mut timer = SystemTimer::new();
         timer.init();
         let start = Self::now_ticks();
-        while !condition(self) {
+        while !condition() {
             if Self::elapsed_us(&timer, start) >= timeout_us {
                 return Err(SdhcError::Timeout);
             }
             core::hint::spin_loop();
         }
         Ok(())
+    }
+
+    fn wait_until(
+        &self,
+        timeout_us: u64,
+        mut condition: impl FnMut(&Self) -> bool,
+    ) -> Result<(), SdhcError> {
+        Self::wait_until_static(timeout_us, || condition(self))
     }
 
     fn reg_read_u8(&self, offset: usize) -> u8 {
@@ -474,38 +731,7 @@ impl Bcm2712Sdhc {
     }
 
     fn configure_bcm2712_sdio1_clock(&self) -> Result<(), SdhcError> {
-        let steps = match BCM2712_SDIO1_SRC_CLOCK_HZ / BCM2712_SDIO1_CORE_CLOCK_HZ {
-            20 => SDIO_CFG_MODE_STEPS_20_CYCLES,
-            _ => return Err(SdhcError::InvalidClock),
-        };
-
-        let local_divider = bcm2712_sdio1_local_divider(BCM2712_SDIO1_INIT_CLOCK_HZ)?;
-        let mode = (SDIO_CFG_MODE_SRC_SEL_PLL_SYS_VCO << SDIO_CFG_MODE_SRC_SEL_SHIFT)
-            | (steps << SDIO_CFG_MODE_STEPS_SHIFT);
-        let rx_delay = (SDIO_CFG_RX_DELAY_FIXED_DEFAULT & SDIO_CFG_RX_DELAY_FIXED_MASK)
-            | (SDIO_CFG_RX_DELAY_MAP_STRETCH << SDIO_CFG_RX_DELAY_MAP_SHIFT)
-            | (SDIO_CFG_RX_DELAY_OVERFLOW_CLAMP << SDIO_CFG_RX_DELAY_OVERFLOW_SHIFT);
-        let sd_delay = SDIO_CFG_SD_DELAY_STEP_DEFAULT & SDIO_CFG_SD_DELAY_STEP_MASK;
-        let use_local = SDIO_CFG_USE_LOCAL_FREQ_SEL
-            | SDIO_CFG_USE_LOCAL_CLK_GEN_SEL
-            | SDIO_CFG_USE_LOCAL_CARD_CLK_EN
-            | SDIO_CFG_USE_LOCAL_CLK2CARD_ON;
-        let local = (local_divider & SDIO_CFG_LOCAL_FREQ_SEL_MASK)
-            | SDIO_CFG_LOCAL_CLK_GEN_SEL
-            | SDIO_CFG_LOCAL_CARD_CLK_EN
-            | SDIO_CFG_LOCAL_CLK2CARD_ON;
-
-        self.cfg_write_u32(SDIO_CFG_CS, SDIO_CFG_CS_RESET);
-        self.cfg_write_u32(SDIO_CFG_MODE, mode);
-        self.cfg_write_u32(SDIO_CFG_RX_DELAY, rx_delay);
-        self.cfg_write_u32(SDIO_CFG_SD_DELAY, sd_delay);
-        self.cfg_write_u32(SDIO_CFG_USE_LOCAL, use_local);
-        self.cfg_write_u32(SDIO_CFG_LOCAL, local);
-        self.cfg_write_u32(SDIO_CFG_CS, 0);
-
-        self.wait_until(BCM2712_SDIO1_CLOCK_START_TIMEOUT_US, |s| {
-            (s.cfg_read_u32(SDIO_CFG_CS) & SDIO_CFG_CS_CLOCKS_RUNNING) == SDIO_CFG_CS_CLOCKS_RUNNING
-        })
+        configure_bcm2712_sdio1_clock_regs(self.cfg)
     }
 
     fn reset(&self, mask: u8) -> Result<(), SdhcError> {
@@ -1010,19 +1236,6 @@ fn decode_capacity_blocks(csd: &[u32; 4], high_capacity: bool) -> Result<u64, Sd
     Ok(bytes / SDHC_BLOCK_SIZE as u64)
 }
 
-fn bcm2712_sdio1_local_divider(clock_hz: u32) -> Result<u32, SdhcError> {
-    if clock_hz == 0 || clock_hz > BCM2712_SDIO1_CORE_CLOCK_HZ {
-        return Err(SdhcError::InvalidClock);
-    }
-
-    let divider = BCM2712_SDIO1_CORE_CLOCK_HZ / clock_hz;
-    let freq_sel = divider.checked_sub(1).ok_or(SdhcError::InvalidClock)?;
-    if freq_sel > SDIO_CFG_LOCAL_FREQ_SEL_MASK {
-        return Err(SdhcError::InvalidClock);
-    }
-    Ok(freq_sel)
-}
-
 fn encode_clock_divider(requested_clock_hz: u32, max_clock_hz: u32) -> Result<u16, SdhcError> {
     if requested_clock_hz == 0 || max_clock_hz == 0 {
         return Err(SdhcError::InvalidClock);
@@ -1194,6 +1407,241 @@ fn has_wifi_child(view: &dtb::DtbNodeView<'_, '_>) -> Result<bool, SdhcError> {
     }
 }
 
+fn parse_be_u32_triplet(
+    bytes: &[u8],
+    invalid_msg: &'static str,
+) -> Result<(u32, u32, u32), SdhcError> {
+    if bytes.len() < (size_of::<u32>() * 3) || !bytes.len().is_multiple_of(size_of::<u32>()) {
+        return Err(SdhcError::DtbInvalid(invalid_msg));
+    }
+    let phandle = u32::from_be_bytes(
+        bytes[0..4]
+            .try_into()
+            .map_err(|_| SdhcError::DtbInvalid(invalid_msg))?,
+    );
+    let pin = u32::from_be_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| SdhcError::DtbInvalid(invalid_msg))?,
+    );
+    let flags = u32::from_be_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| SdhcError::DtbInvalid(invalid_msg))?,
+    );
+    Ok((phandle, pin, flags))
+}
+
+fn find_gpio_controller_base(dtb: &DtbParser, phandle: u32) -> Result<usize, SdhcError> {
+    let mut found = None;
+    let walk = dtb.for_each_node_view(&mut |node| {
+        let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
+        let secondary = node
+            .property_u32_be("linux,phandle")
+            .map_err(WalkError::Dtb)?;
+        if primary != Some(phandle) && secondary != Some(phandle) {
+            return Ok(core::ops::ControlFlow::Continue(()));
+        }
+        if !node
+            .compatible_contains("brcm,brcmstb-gpio")
+            .map_err(WalkError::Dtb)?
+        {
+            return Err(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: invalid supply gpio controller",
+            )));
+        }
+        let (base, _size) = node
+            .reg_iter()
+            .map_err(WalkError::Dtb)?
+            .next()
+            .ok_or(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: missing supply gpio reg",
+            )))?
+            .map_err(WalkError::Dtb)?;
+        found = Some(base);
+        Ok(core::ops::ControlFlow::Break(()))
+    });
+    match walk {
+        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => found
+            .ok_or(SdhcError::DtbInvalid(
+                "sdhc: supply gpio controller not found",
+            )),
+        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
+        Err(WalkError::User(err)) => Err(err),
+    }
+}
+
+fn parse_gpio_line_config(
+    dtb: &DtbParser,
+    bytes: &[u8],
+    invalid_msg: &'static str,
+) -> Result<GpioLineConfig, SdhcError> {
+    let (controller_phandle, pin, flags) = parse_be_u32_triplet(bytes, invalid_msg)?;
+    let pin = u8::try_from(pin).map_err(|_| SdhcError::DtbInvalid(invalid_msg))?;
+    Ok(GpioLineConfig {
+        base: find_gpio_controller_base(dtb, controller_phandle)?,
+        pin,
+        active_low: (flags & OF_GPIO_ACTIVE_LOW) != 0,
+    })
+}
+
+fn parse_vqmmc_supply(
+    view: &dtb::DtbNodeView<'_, '_>,
+    dtb: &DtbParser,
+) -> Result<Option<(GpioOutputConfig, u32)>, SdhcError> {
+    let Some(supply_phandle) = view
+        .property_u32_be("vqmmc-supply")
+        .map_err(SdhcError::DtbParse)?
+    else {
+        return Ok(None);
+    };
+
+    let mut found = None;
+    let walk = dtb.for_each_node_view(&mut |node| {
+        let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
+        let secondary = node
+            .property_u32_be("linux,phandle")
+            .map_err(WalkError::Dtb)?;
+        if primary != Some(supply_phandle) && secondary != Some(supply_phandle) {
+            return Ok(core::ops::ControlFlow::Continue(()));
+        }
+        if !node
+            .compatible_contains("regulator-gpio")
+            .map_err(WalkError::Dtb)?
+        {
+            return Err(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: invalid vqmmc regulator",
+            )));
+        }
+        let gpios = node
+            .property_bytes("gpios")
+            .map_err(WalkError::Dtb)?
+            .ok_or(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: missing vqmmc gpios property",
+            )))?;
+        let states = node
+            .property_bytes("states")
+            .map_err(WalkError::Dtb)?
+            .ok_or(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: missing vqmmc states property",
+            )))?;
+        if states.len() < (size_of::<u32>() * 2)
+            || !states.len().is_multiple_of(size_of::<u32>() * 2)
+        {
+            return Err(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: invalid vqmmc states property",
+            )));
+        }
+        let desired_uv = node
+            .property_u32_be("regulator-max-microvolt")
+            .map_err(WalkError::Dtb)?
+            .unwrap_or(SDHC_3V3_MICROVOLTS);
+        let settle_us = node
+            .property_u32_be("regulator-settling-time-us")
+            .map_err(WalkError::Dtb)?
+            .unwrap_or(0);
+        let mut fallback = None;
+        let mut selected = None;
+        for chunk in states.chunks_exact(size_of::<u32>() * 2) {
+            let microvolts = u32::from_be_bytes(chunk[0..4].try_into().map_err(|_| {
+                WalkError::User(SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"))
+            })?);
+            let gpio_state = u32::from_be_bytes(chunk[4..8].try_into().map_err(|_| {
+                WalkError::User(SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"))
+            })?);
+            fallback = Some(gpio_state != 0);
+            if microvolts == desired_uv {
+                selected = Some(gpio_state != 0);
+            }
+        }
+        found = Some((
+            GpioOutputConfig {
+                line: parse_gpio_line_config(dtb, gpios, "sdhc: invalid vqmmc gpios property")
+                    .map_err(WalkError::User)?,
+                logical_high: selected.or(fallback).ok_or(WalkError::User(
+                    SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"),
+                ))?,
+            },
+            settle_us,
+        ));
+        Ok(core::ops::ControlFlow::Break(()))
+    });
+    match walk {
+        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => found
+            .map(Some)
+            .ok_or(SdhcError::DtbInvalid("sdhc: vqmmc regulator not found")),
+        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
+        Err(WalkError::User(err)) => Err(err),
+    }
+}
+
+fn parse_vmmc_supply(
+    view: &dtb::DtbNodeView<'_, '_>,
+    dtb: &DtbParser,
+) -> Result<Option<GpioOutputConfig>, SdhcError> {
+    let Some(supply_phandle) = view
+        .property_u32_be("vmmc-supply")
+        .map_err(SdhcError::DtbParse)?
+    else {
+        return Ok(None);
+    };
+
+    let mut found = None;
+    let walk = dtb.for_each_node_view(&mut |node| {
+        let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
+        let secondary = node
+            .property_u32_be("linux,phandle")
+            .map_err(WalkError::Dtb)?;
+        if primary != Some(supply_phandle) && secondary != Some(supply_phandle) {
+            return Ok(core::ops::ControlFlow::Continue(()));
+        }
+        if !node
+            .compatible_contains("regulator-fixed")
+            .map_err(WalkError::Dtb)?
+        {
+            return Err(WalkError::User(SdhcError::DtbInvalid(
+                "sdhc: invalid vmmc regulator",
+            )));
+        }
+        let gpios = match node.property_bytes("gpios").map_err(WalkError::Dtb)? {
+            Some(bytes) => Some(bytes),
+            None => node.property_bytes("gpio").map_err(WalkError::Dtb)?,
+        }
+        .ok_or(WalkError::User(SdhcError::DtbInvalid(
+            "sdhc: missing vmmc gpio property",
+        )))?;
+        found = Some(GpioOutputConfig {
+            line: parse_gpio_line_config(dtb, gpios, "sdhc: invalid vmmc gpio property")
+                .map_err(WalkError::User)?,
+            logical_high: node
+                .property_bytes("enable-active-high")
+                .map_err(WalkError::Dtb)?
+                .is_some(),
+        });
+        Ok(core::ops::ControlFlow::Break(()))
+    });
+    match walk {
+        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => found
+            .map(Some)
+            .ok_or(SdhcError::DtbInvalid("sdhc: vmmc regulator not found")),
+        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
+        Err(WalkError::User(err)) => Err(err),
+    }
+}
+
+fn parse_power_from_view(
+    view: &dtb::DtbNodeView<'_, '_>,
+    dtb: &DtbParser,
+) -> Result<SdhcPowerConfig, SdhcError> {
+    let mut power = SdhcPowerConfig::default();
+    if let Some((vqmmc_select, settle_us)) = parse_vqmmc_supply(view, dtb)? {
+        power.vqmmc_select = Some(vqmmc_select);
+        power.vqmmc_settle_us = settle_us;
+    }
+    power.vmmc_enable = parse_vmmc_supply(view, dtb)?;
+    Ok(power)
+}
+
 fn parse_candidate_from_view(
     view: &dtb::DtbNodeView<'_, '_>,
     dtb: &DtbParser,
@@ -1205,6 +1653,7 @@ fn parse_candidate_from_view(
         busisol: named.busisol,
         lcpll: named.lcpll,
         max_clock_hz: find_clock_frequency(view, dtb)?,
+        power: parse_power_from_view(view, dtb)?,
         has_brcmstb_compat: view
             .compatible_contains(DT_COMPAT_BRCMSTB_SDHCI)
             .map_err(SdhcError::DtbParse)?,
@@ -1402,22 +1851,24 @@ mod tests {
     use dtb::NodeEditExt;
     use dtb::ValueRef;
 
-    use super::decode_capacity_blocks;
-    use super::encode_clock_divider;
-    use super::pack_clock_control_divider;
-    use super::parse_from_dtb;
-    use super::select_card_command;
-    use super::select_sd_slot_candidate;
-    use super::RespType;
-    use super::SdhcConfig;
-    use super::SdhcDtCandidate;
-    use super::SdhcError;
     use super::BCM2712_SD_SLOT_HOST_BASE;
     use super::DT_COMPAT_BCM2712_SDHCI;
     use super::DT_COMPAT_BRCMSTB_SDHCI;
     use super::MMC_CMD_SELECT_CARD;
+    use super::RespType;
     use super::SDHC_BLOCK_SIZE;
     use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
+    use super::SdhcConfig;
+    use super::SdhcDtCandidate;
+    use super::SdhcError;
+    use super::decode_capacity_blocks;
+    use super::encode_clock_divider;
+    use super::pack_clock_control_divider;
+    use super::parse_from_dtb;
+    use super::rp1_sdio1_pad_value;
+    use super::rp1_sdio1_pin_prep;
+    use super::select_card_command;
+    use super::select_sd_slot_candidate;
 
     #[derive(Clone, Copy)]
     struct TestNodeSpec<'a> {
@@ -1433,6 +1884,14 @@ mod tests {
 
     fn u32_prop(value: u32) -> Vec<u8> {
         value.to_be_bytes().to_vec()
+    }
+
+    fn u32_list_prop(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
     }
 
     fn string_prop(value: &str) -> Vec<u8> {
@@ -1493,6 +1952,66 @@ mod tests {
         set_property(&mut tree, clocks, "phandle", u32_prop(1));
         set_property(&mut tree, clocks, "clock-frequency", u32_prop(100_000_000));
 
+        let gpio = tree
+            .add_child(root, NameRef::Borrowed("gpio@7d517c00"))
+            .unwrap();
+        set_property(
+            &mut tree,
+            gpio,
+            "compatible",
+            string_list(&["brcm,brcmstb-gpio"]),
+        );
+        set_property(&mut tree, gpio, "phandle", u32_prop(0x5a));
+        set_property(&mut tree, gpio, "reg", reg_prop(&[(0x10_7d51_7c00, 0x40)]));
+
+        let vqmmc = tree
+            .add_child(root, NameRef::Borrowed("sd-io-1v8-reg"))
+            .unwrap();
+        set_property(
+            &mut tree,
+            vqmmc,
+            "compatible",
+            string_list(&["regulator-gpio"]),
+        );
+        set_property(&mut tree, vqmmc, "phandle", u32_prop(0x0b));
+        set_property(
+            &mut tree,
+            vqmmc,
+            "regulator-max-microvolt",
+            u32_prop(0x325aa0),
+        );
+        set_property(
+            &mut tree,
+            vqmmc,
+            "regulator-settling-time-us",
+            u32_prop(0x1388),
+        );
+        set_property(
+            &mut tree,
+            vqmmc,
+            "gpios",
+            u32_list_prop(&[0x5a, 0x03, 0x00]),
+        );
+        set_property(
+            &mut tree,
+            vqmmc,
+            "states",
+            u32_list_prop(&[0x1b7740, 0x01, 0x325aa0, 0x00]),
+        );
+
+        let vmmc = tree
+            .add_child(root, NameRef::Borrowed("sd-vcc-reg"))
+            .unwrap();
+        set_property(
+            &mut tree,
+            vmmc,
+            "compatible",
+            string_list(&["regulator-fixed"]),
+        );
+        set_property(&mut tree, vmmc, "phandle", u32_prop(0x0c));
+        set_property(&mut tree, vmmc, "enable-active-high", Vec::new());
+        set_property(&mut tree, vmmc, "gpios", u32_list_prop(&[0x5a, 0x04, 0x00]));
+
         for spec in nodes {
             let node = tree.add_child(root, NameRef::Borrowed(spec.name)).unwrap();
             set_property(
@@ -1506,6 +2025,8 @@ mod tests {
             set_property(&mut tree, node, "reg", reg_prop(spec.regs));
             set_property(&mut tree, node, "reg-names", string_list(spec.reg_names));
             set_property(&mut tree, node, "clocks", u32_prop(1));
+            set_property(&mut tree, node, "vqmmc-supply", u32_prop(0x0b));
+            set_property(&mut tree, node, "vmmc-supply", u32_prop(0x0c));
 
             if spec.non_removable {
                 set_property(&mut tree, node, "non-removable", Vec::new());
@@ -1586,6 +2107,12 @@ mod tests {
         let config = parse_test_config(&nodes).unwrap();
         assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
         assert_eq!(config.cfg.base, 0x10_00ff_f200);
+        assert_eq!(config.power.vqmmc_select.unwrap().line.base, 0x10_7d51_7c00);
+        assert_eq!(config.power.vqmmc_select.unwrap().line.pin, 3);
+        assert!(!config.power.vqmmc_select.unwrap().logical_high);
+        assert_eq!(config.power.vqmmc_settle_us, 0x1388);
+        assert_eq!(config.power.vmmc_enable.unwrap().line.pin, 4);
+        assert!(config.power.vmmc_enable.unwrap().logical_high);
     }
 
     #[test]
@@ -1602,6 +2129,7 @@ mod tests {
             busisol: None,
             lcpll: None,
             max_clock_hz: 100_000_000,
+            power: super::SdhcPowerConfig::default(),
             has_brcmstb_compat: true,
             status_okay: true,
             bus_width: 4,
@@ -1675,6 +2203,7 @@ mod tests {
                 busisol: None,
                 lcpll: None,
                 max_clock_hz: 100_000_000,
+                power: super::SdhcPowerConfig::default(),
                 has_brcmstb_compat: true,
                 status_okay: true,
                 bus_width: 4,
@@ -1693,6 +2222,7 @@ mod tests {
                 busisol: None,
                 lcpll: None,
                 max_clock_hz: 100_000_000,
+                power: super::SdhcPowerConfig::default(),
                 has_brcmstb_compat: true,
                 status_okay: true,
                 bus_width: 8,
@@ -1706,6 +2236,28 @@ mod tests {
             err,
             SdhcError::DtbInvalid("sdhc: ambiguous DT candidate selection")
         );
+    }
+
+    #[test]
+    fn rp1_sdio1_pins_use_bank_one_offsets() {
+        let clk = rp1_sdio1_pin_prep(28).unwrap();
+        let cmd = rp1_sdio1_pin_prep(29).unwrap();
+        let dat3 = rp1_sdio1_pin_prep(33).unwrap();
+
+        assert_eq!(clk.ctrl_offset, 0x4004);
+        assert_eq!(clk.pad_offset, 0x4004);
+        assert_eq!(cmd.ctrl_offset, 0x400c);
+        assert_eq!(cmd.pad_offset, 0x4008);
+        assert_eq!(dat3.ctrl_offset, 0x402c);
+        assert_eq!(dat3.pad_offset, 0x4018);
+    }
+
+    #[test]
+    fn rp1_sdio1_pads_match_expected_pull_configuration() {
+        assert_eq!(rp1_sdio1_pad_value(28), Some(0x73));
+        assert_eq!(rp1_sdio1_pad_value(29), Some(0x7b));
+        assert_eq!(rp1_sdio1_pad_value(33), Some(0x7b));
+        assert_eq!(rp1_sdio1_pad_value(27), None);
     }
 
     #[test]

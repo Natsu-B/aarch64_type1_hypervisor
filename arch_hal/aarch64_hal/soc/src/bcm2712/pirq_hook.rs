@@ -25,6 +25,12 @@ pub(crate) unsafe fn set_rp1_peripheral_base(base: Option<usize>) {
     unsafe { *RP1_PERIPHERAL_BASE.get() = base };
 }
 
+pub(crate) fn rp1_peripheral_base() -> Option<usize> {
+    // SAFETY: RP1 base configuration is written during initialization and then treated as
+    // immutable runtime configuration; readers copy out the `Option<usize>` by value.
+    unsafe { *RP1_PERIPHERAL_BASE.get() }
+}
+
 fn map_bcm2712_error(err: Bcm2712Error) -> PirqHookError {
     match err {
         Bcm2712Error::InvalidWindow

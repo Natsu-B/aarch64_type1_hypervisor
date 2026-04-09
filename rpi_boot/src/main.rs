@@ -62,6 +62,10 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts_mut;
+use core::str;
+use file::OpenOptions;
+use file::StorageDevice;
+use file::StorageDeviceErr;
 use mutex::pod::RawAtomicPod;
 use typestate::Le;
 use typestate::ReadWrite;
@@ -111,6 +115,75 @@ struct LinuxHeader {
 
 impl LinuxHeader {
     const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
+}
+
+fn read_sd_boot_config(
+    dev: &'static dyn block_device_api::BlockDevice,
+) -> Result<file::AlignedSliceBox<u8>, StorageDeviceErr> {
+    let storage = StorageDevice::from_ready_block_device(dev)?;
+    let handle = storage.open(0, "/config.txt", &OpenOptions::Read)?;
+    handle.read(1).map_err(StorageDeviceErr::FileSystemErr)
+}
+
+fn print_sd_boot_config(dev: &'static dyn block_device_api::BlockDevice) {
+    match read_sd_boot_config(dev) {
+        Ok(config_txt) => match str::from_utf8(&config_txt) {
+            Ok(text) => {
+                println!("sdhc-fs: /config.txt begin");
+                println!("{}", text);
+                println!("sdhc-fs: /config.txt end");
+            }
+            Err(err) => {
+                println!(
+                    "sdhc-fs: /config.txt is not valid utf-8: {:?} ({} bytes)",
+                    err,
+                    config_txt.len()
+                );
+            }
+        },
+        Err(err) => println!("sdhc-fs: failed to read /config.txt: {:?}", err),
+    }
+}
+
+fn log_guest_virtio_blk_dtb(dtb_bytes: &[u8]) {
+    let parser = match DtbParser::init(dtb_bytes.as_ptr() as usize) {
+        Ok(parser) => parser,
+        Err(err) => {
+            println!("guest-dtb: failed to parse generated dtb: {}", err);
+            return;
+        }
+    };
+
+    let mut found = false;
+    let result = parser.find_nodes_by_compatible_view("virtio,mmio", &mut |view,
+                                                                           name|
+     -> Result<
+        ControlFlow<()>,
+        WalkError<()>,
+    > {
+        let mut regs = view.reg_iter().map_err(WalkError::Dtb)?;
+        let Some(entry) = regs.next() else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let (base, size) = entry.map_err(WalkError::Dtb)?;
+        println!(
+            "guest-dtb: virtio node {} base=0x{:x} size=0x{:x} root=/dev/vda2 irq={}",
+            name,
+            base,
+            size,
+            virtio_blk::VIRTIO_BLK_IRQ_INTID
+        );
+        found = true;
+        Ok(ControlFlow::Break(()))
+    });
+    match result {
+        Ok(ControlFlow::Break(())) | Ok(ControlFlow::Continue(())) => {}
+        Err(WalkError::Dtb(err)) => println!("guest-dtb: virtio node scan failed: {}", err),
+        Err(WalkError::User(())) => println!("guest-dtb: unexpected virtio node scan user error"),
+    }
+    if !found {
+        println!("guest-dtb: no virtio,mmio node found");
+    }
 }
 
 #[cfg(not(all(test, target_arch = "aarch64")))]
@@ -617,8 +690,16 @@ extern "C" fn main() -> ! {
     let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
     println!("set up linux data");
 
-    let virtio_blk_backend = bcm2712::sdhc::init_from_dtb(&dtb_modified)
-        .unwrap_or_else(|err| panic!("virtio-blk: sdhc init failed: {:?}", err));
+    let virtio_blk_backend = match bcm2712::sdhc::init_from_dtb(&dtb_modified) {
+        Ok(backend) => backend,
+        Err(err) => {
+            println!("virtio-blk: sdhc init failed: {:?}", err);
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    };
+    print_sd_boot_config(virtio_blk_backend);
     virtio_blk::init_with_backend(virtio_blk_backend)
         .unwrap_or_else(|err| panic!("virtio-blk: backend install failed: {err}"));
     println!("virtio-blk: enabled with bcm2712 sdhc backend");
@@ -635,6 +716,7 @@ extern "C" fn main() -> ! {
 
     let dtb_box =
         dtb::build_guest_dtb(&dtb_modified, &reserved_memory, &gic_info, uart_irq).unwrap();
+    log_guest_virtio_blk_dtb(&dtb_box);
     unsafe { *DTB_ADDR.get() = dtb_box.as_ptr() as usize };
     cpu::clean_dcache_poc(dtb_box.as_ptr() as usize, dtb_box.len());
     core::mem::forget(dtb_box);

@@ -26,7 +26,7 @@ impl PartitionIndex {
 
     pub(crate) fn new<D>(block_device: &D) -> Result<Self, StorageDeviceErr>
     where
-        D: BlockDevice,
+        D: BlockDevice + ?Sized,
     {
         let mut buffer =
             AlignedSliceBox::<u8>::new_uninit_with_align(block_device.block_size(), 1).unwrap();
