@@ -72,6 +72,7 @@ const DT_COMPAT_BCM2712_SDHCI: &str = "brcm,bcm2712-sdhci";
 const DT_COMPAT_BRCMSTB_SDHCI: &str = "brcm,sdhci-brcmstb";
 const SDHC_DEFAULT_MIN_CLOCK_HZ: u32 = 400_000;
 const SDHC_DEFAULT_MAX_CLOCK_HZ: u32 = 100_000_000;
+const SDHC_CONSERVATIVE_TRANSFER_CLOCK_HZ: u32 = 12_500_000;
 const SDHC_BLOCK_SIZE: usize = 512;
 const SDHC_MAX_TRANSFER_BLOCKS_PER_CMD: usize = 1024;
 const SDHC_CMD_TIMEOUT_US: u64 = 100_000;
@@ -82,6 +83,7 @@ const BCM2712_SDIO1_PREINIT_DELAY_US: u64 = 100;
 const SDHC_RESET_TIMEOUT_US: u64 = 100_000;
 const SDHC_ACMD41_RETRY_MAX: usize = 1000;
 const SDHC_ACMD41_POLL_DELAY_US: u64 = 10;
+const SDHC_POST_CLOCK_SETTLE_DELAY_US: u64 = 50;
 const SDHC_MAX_DT_CANDIDATES: usize = 8;
 const SDHC_MAX_REG_ENTRIES: usize = 8;
 const SDHC_MAX_CLOCK_DIVIDER: u16 = 0x03ff;
@@ -117,6 +119,8 @@ const SDHCI_CMD_INDEX: u16 = 0x10;
 const SDHCI_CMD_DATA: u16 = 0x20;
 const SDHCI_CMD_INHIBIT: u32 = 1 << 0;
 const SDHCI_DATA_INHIBIT: u32 = 1 << 1;
+const SDHCI_DOING_WRITE: u32 = 1 << 8;
+const SDHCI_DOING_READ: u32 = 1 << 9;
 const SDHCI_SPACE_AVAILABLE: u32 = 1 << 10;
 const SDHCI_DATA_AVAILABLE: u32 = 1 << 11;
 const SDHCI_CARD_PRESENT: u32 = 1 << 16;
@@ -160,6 +164,10 @@ const SDIO_CFG_CTRL_SDCD_N_TEST_LEV: u32 = 1 << 30;
 const SDIO_CFG_SD_PIN_SEL: usize = 0x44;
 const SDIO_CFG_SD_PIN_SEL_MASK: u32 = 0x3;
 const SDIO_CFG_SD_PIN_SEL_CARD: u32 = 1 << 1;
+const SDIO_CFG_CQ_CAPABILITY: usize = 0x4c;
+const SDIO_CFG_CQ_CAPABILITY_BASE_CLOCK_MASK: u32 = 0x00ff;
+const SDIO_CFG_CQ_CAPABILITY_FMUL_MASK: u32 = 0b11 << 12;
+const SDIO_CFG_CQ_CAPABILITY_FMUL_DEFAULT: u32 = SDIO_CFG_CQ_CAPABILITY_FMUL_MASK;
 const OF_GPIO_ACTIVE_LOW: u32 = 1 << 0;
 #[cfg(target_arch = "aarch64")]
 const BRCMSTB_GIO_BANK_SIZE: usize = 0x20;
@@ -442,14 +450,12 @@ static TAKEN: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(fals
 static READY: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
 static STATE: SyncUnsafeCell<MaybeUninit<Bcm2712Sdhc>> = SyncUnsafeCell::new(MaybeUninit::uninit());
 
-#[cfg(target_arch = "aarch64")]
 fn mmio_read_u32(base: *mut u8, offset: usize) -> u32 {
     // SAFETY: The caller provides a valid MMIO base, and `offset` targets a 32-bit register in
     // that mapped window.
     unsafe { core::ptr::read_volatile(base.wrapping_add(offset) as *const u32) }
 }
 
-#[cfg(target_arch = "aarch64")]
 fn mmio_write_u32(base: *mut u8, offset: usize, value: u32) {
     // SAFETY: The caller provides a valid MMIO base, and `offset` targets a 32-bit register in
     // that mapped window.
@@ -506,7 +512,6 @@ fn configure_brcmstb_gpio_output(config: GpioOutputConfig) -> Result<(), SdhcErr
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
 fn wait_micros(delay_us: u64) {
     if delay_us == 0 {
         return;
@@ -551,11 +556,15 @@ fn rp1_sdio1_pin_prep(pin: usize) -> Option<Rp1PinPrep> {
     })
 }
 
-fn configure_bcm2712_sdio1_clock_regs(_cfg: *mut u8) -> Result<(), SdhcError> {
+fn configure_bcm2712_sdio1_clock_regs(cfg: *mut u8, max_clock_hz: u32) -> Result<(), SdhcError> {
     // The Raspberry Pi 5 SD-slot path exposes its base host clock through the DT clock
     // provider, and the standard SDHCI clock-control register programs the actual card clock.
     // The STB-specific local-clock-running handshake does not assert on this path, so we must
     // not gate bring-up on those CFG status bits.
+    let mut reg = mmio_read_u32(cfg, SDIO_CFG_CQ_CAPABILITY);
+    reg &= !(SDIO_CFG_CQ_CAPABILITY_FMUL_MASK | SDIO_CFG_CQ_CAPABILITY_BASE_CLOCK_MASK);
+    reg |= bcm2712_cq_capability_value(max_clock_hz);
+    mmio_write_u32(cfg, SDIO_CFG_CQ_CAPABILITY, reg);
     Ok(())
 }
 
@@ -577,7 +586,7 @@ fn bcm2712_sdio1_preinit(cfg: &SdhcConfig) -> Result<(), SdhcError> {
         .ok_or(SdhcError::InvalidState)
         .map_err(|err| log_init_stage("preinit-rp1-base", err))? as *mut u8;
     configure_bcm2712_sd_power(&cfg.power).map_err(|err| log_init_stage("preinit-power", err))?;
-    configure_bcm2712_sdio1_clock_regs(cfg.cfg.base as *mut u8)?;
+    configure_bcm2712_sdio1_clock_regs(cfg.cfg.base as *mut u8, cfg.max_clock_hz)?;
 
     for pin in RP1_SDIO1_PINS {
         let prep = rp1_sdio1_pin_prep(pin).ok_or(SdhcError::InvalidParam)?;
@@ -738,7 +747,7 @@ impl Bcm2712Sdhc {
     }
 
     fn configure_bcm2712_sdio1_clock(&self) -> Result<(), SdhcError> {
-        configure_bcm2712_sdio1_clock_regs(self.cfg)
+        configure_bcm2712_sdio1_clock_regs(self.cfg, self.max_clock_hz)
     }
 
     fn reset(&self, mask: u8) -> Result<(), SdhcError> {
@@ -823,8 +832,10 @@ impl Bcm2712Sdhc {
     #[cfg(any(test, debug_assertions))]
     fn log_controller_failure(&self, site: &str, ctx: CommandFailureContext, err: SdhcError) {
         let snapshot = self.controller_snapshot();
+        let present = decode_present_state(snapshot.present_state);
+        let command = decode_command_register(snapshot.command);
         println!(
-            "sdhc: {} failed op={} lba={} blocks={} cmd_idx={} arg=0x{:08x} data_phase={} err={:?} int_status=0x{:08x} present_state=0x{:08x} block_count=0x{:04x} transfer_mode=0x{:04x} command=0x{:04x} argument=0x{:08x} clock_control=0x{:04x} power_control=0x{:02x}",
+            "sdhc: {} failed op={} lba={} blocks={} cmd_idx={} arg=0x{:08x} data_phase={} err={:?} int_status=0x{:08x} present_state=0x{:08x} cmd_inhibit={} data_inhibit={} doing_read={} doing_write={} card_present={} cd_stable={} write_protect={} block_count=0x{:04x} transfer_mode=0x{:04x} command=0x{:04x} cmd_reg_idx={} cmd_reg_flags=0x{:02x} argument=0x{:08x} clock_control=0x{:04x} power_control=0x{:02x}",
             site,
             ctx.op.as_str(),
             ctx.lba,
@@ -835,9 +846,18 @@ impl Bcm2712Sdhc {
             err,
             snapshot.int_status,
             snapshot.present_state,
+            present.cmd_inhibit,
+            present.data_inhibit,
+            present.doing_read,
+            present.doing_write,
+            present.card_present,
+            present.card_state_stable,
+            present.write_protect,
             snapshot.block_count,
             snapshot.transfer_mode,
             snapshot.command,
+            command.cmd_idx,
+            command.flags,
             snapshot.argument,
             snapshot.clock_control,
             snapshot.power_control,
@@ -880,6 +900,45 @@ impl Bcm2712Sdhc {
     ) {
     }
 
+    #[cfg(any(test, debug_assertions))]
+    fn log_command_retry(&self, ctx: CommandFailureContext, reason: &str, attempt: usize) {
+        println!(
+            "sdhc: retrying command op={} lba={} blocks={} cmd_idx={} arg=0x{:08x} reason={} attempt={}",
+            ctx.op.as_str(),
+            ctx.lba,
+            ctx.block_count,
+            ctx.cmd_idx,
+            ctx.arg,
+            reason,
+            attempt,
+        );
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn log_command_retry(&self, _ctx: CommandFailureContext, _reason: &str, _attempt: usize) {}
+
+    #[cfg(any(test, debug_assertions))]
+    fn log_command_retry_success(&self, ctx: CommandFailureContext) {
+        println!(
+            "sdhc: command retry succeeded op={} lba={} blocks={} cmd_idx={} arg=0x{:08x}",
+            ctx.op.as_str(),
+            ctx.lba,
+            ctx.block_count,
+            ctx.cmd_idx,
+            ctx.arg,
+        );
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn log_command_retry_success(&self, _ctx: CommandFailureContext) {}
+
+    fn prepare_command_retry(&self) -> Result<(), SdhcError> {
+        self.reset(SDHCI_RESET_CMD)?;
+        self.reset(SDHCI_RESET_DATA)?;
+        self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+        Ok(())
+    }
+
     fn cmd_flags(resp_type: RespType, data: bool) -> u16 {
         let mut flags = match resp_type {
             RespType::None => SDHCI_CMD_RESP_NONE,
@@ -912,97 +971,130 @@ impl Bcm2712Sdhc {
         let has_data = data.is_some();
         let transfer_blocks = data.as_ref().map_or(0, |transfer| transfer.blocks);
         let log_ctx = CommandFailureContext::from_io(io, cmd_idx, arg, has_data, transfer_blocks);
+        let mut retried = false;
 
-        self.wait_until(SDHC_CMD_TIMEOUT_US, |s| {
-            (s.reg_read_u32(SDHCI_PRESENT_STATE) & mask) == 0
-        })
-        .inspect_err(|&err| {
-            self.log_controller_failure("waiting for inhibit clear", log_ctx, err);
-        })?;
-
-        self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
-
-        let mut interrupt_mask = SDHCI_INT_RESPONSE;
-        if matches!(resp_type, RespType::R1b) {
-            interrupt_mask |= SDHCI_INT_DATA_END;
-        }
-
-        if let Some(transfer) = data.as_ref() {
-            self.reg_write_u8(SDHCI_TIMEOUT_CONTROL, 0x0e);
-            let mut mode: u16 = SDHCI_TRNS_BLK_CNT_EN;
-            if transfer.blocks > 1 {
-                mode |= SDHCI_TRNS_MULTI;
-            }
-            if transfer.read {
-                mode |= SDHCI_TRNS_READ;
-            }
-            self.reg_write_u16(
-                SDHCI_BLOCK_SIZE,
-                SDHCI_MAKE_BLKSZ | (transfer.block_size as u16 & 0x0fff),
-            );
-            self.reg_write_u16(SDHCI_BLOCK_COUNT, transfer.blocks as u16);
-            self.reg_write_u16(SDHCI_TRANSFER_MODE, mode);
-        }
-
-        self.reg_write_u32(SDHCI_ARGUMENT, arg);
-        let cmd = ((cmd_idx as u16) << 8) | Self::cmd_flags(resp_type, has_data);
-        self.reg_write_u16(SDHCI_COMMAND, cmd);
-
-        self.wait_until(SDHC_CMD_TIMEOUT_US, |s| {
-            let stat = s.reg_read_u32(SDHCI_INT_STATUS);
-            (stat & SDHCI_INT_ERROR) != 0 || (stat & interrupt_mask) == interrupt_mask
-        })
-        .inspect_err(|&err| {
-            self.log_controller_failure("waiting for response completion", log_ctx, err);
-        })?;
-
-        let status = self.reg_read_u32(SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) != 0 {
-            let err = if (status & SDHCI_INT_TIMEOUT) != 0 {
-                SdhcError::Timeout
-            } else {
-                SdhcError::Io
-            };
-            self.log_controller_failure("response completion", log_ctx, err);
-            self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
-            self.reset(SDHCI_RESET_CMD)?;
-            self.reset(SDHCI_RESET_DATA)?;
-            return Err(err);
-        }
-
-        let resp = if matches!(resp_type, RespType::R2) {
-            [
-                (self.reg_read_u32(SDHCI_RESPONSE + 12) << 8)
-                    | u32::from(self.reg_read_u8(SDHCI_RESPONSE + 11)),
-                (self.reg_read_u32(SDHCI_RESPONSE + 8) << 8)
-                    | u32::from(self.reg_read_u8(SDHCI_RESPONSE + 7)),
-                (self.reg_read_u32(SDHCI_RESPONSE + 4) << 8)
-                    | u32::from(self.reg_read_u8(SDHCI_RESPONSE + 3)),
-                self.reg_read_u32(SDHCI_RESPONSE) << 8,
-            ]
-        } else {
-            [self.reg_read_u32(SDHCI_RESPONSE), 0, 0, 0]
-        };
-        if let Some(transfer) = data.take() {
-            self.transfer_data_pio(transfer, log_ctx)?;
-            self.wait_until(SDHC_DATA_TIMEOUT_US, |s| {
-                let stat = s.reg_read_u32(SDHCI_INT_STATUS);
-                (stat & SDHCI_INT_ERROR) != 0 || (stat & SDHCI_INT_DATA_END) != 0
+        for attempt in 0..=1usize {
+            self.wait_until(SDHC_CMD_TIMEOUT_US, |s| {
+                (s.reg_read_u32(SDHCI_PRESENT_STATE) & mask) == 0
             })
             .inspect_err(|&err| {
-                self.log_controller_failure("waiting for data-end", log_ctx, err);
+                self.log_controller_failure("waiting for inhibit clear", log_ctx, err);
             })?;
-            let stat = self.reg_read_u32(SDHCI_INT_STATUS);
-            if (stat & SDHCI_INT_ERROR) != 0 {
-                self.log_controller_failure("data-end", log_ctx, SdhcError::Io);
+
+            self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+
+            let mut interrupt_mask = SDHCI_INT_RESPONSE;
+            if matches!(resp_type, RespType::R1b) {
+                interrupt_mask |= SDHCI_INT_DATA_END;
+            }
+
+            if let Some(transfer) = data.as_ref() {
+                self.reg_write_u8(SDHCI_TIMEOUT_CONTROL, 0x0e);
+                let mut mode: u16 = SDHCI_TRNS_BLK_CNT_EN;
+                if transfer.blocks > 1 {
+                    mode |= SDHCI_TRNS_MULTI;
+                }
+                if transfer.read {
+                    mode |= SDHCI_TRNS_READ;
+                }
+                self.reg_write_u16(
+                    SDHCI_BLOCK_SIZE,
+                    SDHCI_MAKE_BLKSZ | (transfer.block_size as u16 & 0x0fff),
+                );
+                self.reg_write_u16(SDHCI_BLOCK_COUNT, transfer.blocks as u16);
+                self.reg_write_u16(SDHCI_TRANSFER_MODE, mode);
+            }
+
+            self.reg_write_u32(SDHCI_ARGUMENT, arg);
+            let cmd = ((cmd_idx as u16) << 8) | Self::cmd_flags(resp_type, has_data);
+            self.reg_write_u16(SDHCI_COMMAND, cmd);
+
+            let response_wait = self.wait_until(SDHC_CMD_TIMEOUT_US, |s| {
+                let stat = s.reg_read_u32(SDHCI_INT_STATUS);
+                (stat & SDHCI_INT_ERROR) != 0 || (stat & interrupt_mask) == interrupt_mask
+            });
+            if let Err(err) = response_wait {
+                self.log_controller_failure("waiting for response completion", log_ctx, err);
+                if attempt == 0
+                    && should_retry_response_timeout(
+                        cmd_idx,
+                        CommandFailureSite::ResponseCompletionWait,
+                        err,
+                    )
+                {
+                    self.log_command_retry(log_ctx, "response-timeout", attempt + 2);
+                    self.prepare_command_retry()?;
+                    retried = true;
+                    continue;
+                }
+                return Err(err);
+            }
+
+            let status = self.reg_read_u32(SDHCI_INT_STATUS);
+            if (status & SDHCI_INT_ERROR) != 0 {
+                let err = if (status & SDHCI_INT_TIMEOUT) != 0 {
+                    SdhcError::Timeout
+                } else {
+                    SdhcError::Io
+                };
+                self.log_controller_failure("response completion", log_ctx, err);
                 self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
                 self.reset(SDHCI_RESET_CMD)?;
                 self.reset(SDHCI_RESET_DATA)?;
-                return Err(SdhcError::Io);
+                if attempt == 0
+                    && should_retry_response_timeout(
+                        cmd_idx,
+                        CommandFailureSite::ResponseCompletionStatus,
+                        err,
+                    )
+                {
+                    self.log_command_retry(log_ctx, "response-timeout", attempt + 2);
+                    self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+                    retried = true;
+                    continue;
+                }
+                return Err(err);
             }
+
+            let resp = if matches!(resp_type, RespType::R2) {
+                [
+                    (self.reg_read_u32(SDHCI_RESPONSE + 12) << 8)
+                        | u32::from(self.reg_read_u8(SDHCI_RESPONSE + 11)),
+                    (self.reg_read_u32(SDHCI_RESPONSE + 8) << 8)
+                        | u32::from(self.reg_read_u8(SDHCI_RESPONSE + 7)),
+                    (self.reg_read_u32(SDHCI_RESPONSE + 4) << 8)
+                        | u32::from(self.reg_read_u8(SDHCI_RESPONSE + 3)),
+                    self.reg_read_u32(SDHCI_RESPONSE) << 8,
+                ]
+            } else {
+                [self.reg_read_u32(SDHCI_RESPONSE), 0, 0, 0]
+            };
+            if let Some(transfer) = data.take() {
+                self.transfer_data_pio(transfer, log_ctx)?;
+                self.wait_until(SDHC_DATA_TIMEOUT_US, |s| {
+                    let stat = s.reg_read_u32(SDHCI_INT_STATUS);
+                    (stat & SDHCI_INT_ERROR) != 0 || (stat & SDHCI_INT_DATA_END) != 0
+                })
+                .inspect_err(|&err| {
+                    self.log_controller_failure("waiting for data-end", log_ctx, err);
+                })?;
+                let stat = self.reg_read_u32(SDHCI_INT_STATUS);
+                if (stat & SDHCI_INT_ERROR) != 0 {
+                    self.log_controller_failure("data-end", log_ctx, SdhcError::Io);
+                    self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+                    self.reset(SDHCI_RESET_CMD)?;
+                    self.reset(SDHCI_RESET_DATA)?;
+                    return Err(SdhcError::Io);
+                }
+            }
+            self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+            if retried {
+                self.log_command_retry_success(log_ctx);
+            }
+            return Ok(resp);
         }
-        self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
-        Ok(resp)
+
+        Err(SdhcError::InvalidState)
     }
 
     fn transfer_data_pio(
@@ -1105,6 +1197,20 @@ impl Bcm2712Sdhc {
         Err(SdhcError::Timeout)
     }
 
+    fn apply_conservative_transfer_clock(&self, rca: u16) -> Result<(), SdhcError> {
+        self.set_clock(conservative_transfer_clock_hz())?;
+        wait_micros(post_clock_settle_delay_us());
+        self.wait_for_transfer_state(rca).inspect_err(|&err| {
+            #[cfg(any(test, debug_assertions))]
+            println!(
+                "sdhc: post-clock transfer-state recheck failed rca=0x{:x} clock_hz={} err={:?}",
+                rca,
+                conservative_transfer_clock_hz(),
+                err,
+            );
+        })
+    }
+
     fn card_init_sequence(&self) -> Result<(), SdhcError> {
         if !self.card_present() {
             return Err(SdhcError::NoCard);
@@ -1164,7 +1270,7 @@ impl Bcm2712Sdhc {
             None,
         )?;
         self.wait_for_transfer_state(rca)?;
-        self.set_clock(25_000_000)?;
+        self.apply_conservative_transfer_clock(rca)?;
 
         let capacity_blocks = decode_capacity_blocks(&csd, high_capacity)?;
         let read_only = self.card_read_only();
@@ -1440,10 +1546,33 @@ struct ControllerSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentStateDecode {
+    cmd_inhibit: bool,
+    data_inhibit: bool,
+    doing_read: bool,
+    doing_write: bool,
+    card_present: bool,
+    card_state_stable: bool,
+    write_protect: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandRegisterDecode {
+    cmd_idx: u8,
+    flags: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlannedDataCommand {
     cmd_idx: u8,
     arg: u32,
     block_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandFailureSite {
+    ResponseCompletionWait,
+    ResponseCompletionStatus,
 }
 
 fn block_command_arg(lba: u64, high_capacity: bool) -> Result<u32, SdhcError> {
@@ -1482,6 +1611,56 @@ fn plan_data_command(
         arg: block_command_arg(lba, high_capacity)?,
         block_count,
     })
+}
+
+fn conservative_transfer_clock_hz() -> u32 {
+    SDHC_CONSERVATIVE_TRANSFER_CLOCK_HZ
+}
+
+fn post_clock_settle_delay_us() -> u64 {
+    SDHC_POST_CLOCK_SETTLE_DELAY_US
+}
+
+fn bcm2712_base_clock_mhz(clock_hz: u32) -> u32 {
+    (clock_hz / 1_000_000)
+        .max(1)
+        .min(SDIO_CFG_CQ_CAPABILITY_BASE_CLOCK_MASK)
+}
+
+fn bcm2712_cq_capability_value(clock_hz: u32) -> u32 {
+    SDIO_CFG_CQ_CAPABILITY_FMUL_DEFAULT | bcm2712_base_clock_mhz(clock_hz)
+}
+
+fn decode_present_state(state: u32) -> PresentStateDecode {
+    PresentStateDecode {
+        cmd_inhibit: (state & SDHCI_CMD_INHIBIT) != 0,
+        data_inhibit: (state & SDHCI_DATA_INHIBIT) != 0,
+        doing_read: (state & SDHCI_DOING_READ) != 0,
+        doing_write: (state & SDHCI_DOING_WRITE) != 0,
+        card_present: (state & SDHCI_CARD_PRESENT) != 0,
+        card_state_stable: (state & SDHCI_CARD_STATE_STABLE) != 0,
+        write_protect: (state & SDHCI_WRITE_PROTECT) != 0,
+    }
+}
+
+fn decode_command_register(command: u16) -> CommandRegisterDecode {
+    CommandRegisterDecode {
+        cmd_idx: (command >> 8) as u8,
+        flags: (command & 0x00ff) as u8,
+    }
+}
+
+fn should_retry_response_timeout(cmd_idx: u8, site: CommandFailureSite, err: SdhcError) -> bool {
+    err == SdhcError::Timeout
+        && matches!(
+            site,
+            CommandFailureSite::ResponseCompletionWait
+                | CommandFailureSite::ResponseCompletionStatus
+        )
+        && matches!(
+            cmd_idx,
+            MMC_CMD_READ_SINGLE_BLOCK | MMC_CMD_WRITE_SINGLE_BLOCK
+        )
 }
 
 fn card_status_current_state(status: u32) -> u8 {
@@ -2134,32 +2313,40 @@ mod tests {
     use dtb::ValueRef;
 
     use super::BCM2712_SD_SLOT_HOST_BASE;
+    use super::CommandFailureSite;
     use super::DT_COMPAT_BCM2712_SDHCI;
     use super::DT_COMPAT_BRCMSTB_SDHCI;
     use super::MMC_CMD_READ_SINGLE_BLOCK;
     use super::MMC_CMD_SELECT_CARD;
+    use super::MMC_CMD_SEND_STATUS;
     use super::MMC_CMD_WRITE_SINGLE_BLOCK;
     use super::RespType;
     use super::SD_STATUS_READY_FOR_DATA;
     use super::SD_STATUS_TRANSFER_STATE;
     use super::SDHC_BLOCK_SIZE;
+    use super::SDHC_CONSERVATIVE_TRANSFER_CLOCK_HZ;
     use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
     use super::SdhcConfig;
     use super::SdhcDtCandidate;
     use super::SdhcError;
+    use super::bcm2712_base_clock_mhz;
+    use super::bcm2712_cq_capability_value;
     use super::block_command_arg;
     use super::card_status_current_state;
     use super::card_status_is_transfer_state;
     use super::conservative_chunk_blocks;
+    use super::conservative_transfer_clock_hz;
     use super::decode_capacity_blocks;
     use super::encode_clock_divider;
     use super::pack_clock_control_divider;
     use super::parse_from_dtb;
     use super::plan_data_command;
+    use super::post_clock_settle_delay_us;
     use super::rp1_sdio1_pad_value;
     use super::rp1_sdio1_pin_prep;
     use super::select_card_command;
     use super::select_sd_slot_candidate;
+    use super::should_retry_response_timeout;
 
     #[derive(Clone, Copy)]
     struct TestNodeSpec<'a> {
@@ -2579,6 +2766,23 @@ mod tests {
     }
 
     #[test]
+    fn conservative_transfer_clock_is_12_5mhz() {
+        assert_eq!(
+            conservative_transfer_clock_hz(),
+            SDHC_CONSERVATIVE_TRANSFER_CLOCK_HZ
+        );
+        assert_eq!(conservative_transfer_clock_hz(), 12_500_000);
+        assert!((10..=100).contains(&post_clock_settle_delay_us()));
+    }
+
+    #[test]
+    fn bcm2712_cq_capability_uses_mhz_base_clock_estimate() {
+        assert_eq!(bcm2712_base_clock_mhz(100_000_000), 100);
+        assert_eq!(bcm2712_base_clock_mhz(999_999), 1);
+        assert_eq!(bcm2712_cq_capability_value(100_000_000), 0x3064);
+    }
+
+    #[test]
     fn high_capacity_argument_uses_lba() {
         assert_eq!(block_command_arg(7, true).unwrap(), 7);
     }
@@ -2641,5 +2845,29 @@ mod tests {
         assert_eq!(card_status_current_state(status), SD_STATUS_TRANSFER_STATE);
         assert!(card_status_is_transfer_state(status));
         assert!(!card_status_is_transfer_state(0));
+    }
+
+    #[test]
+    fn retry_policy_is_limited_to_single_block_data_commands() {
+        assert!(should_retry_response_timeout(
+            MMC_CMD_READ_SINGLE_BLOCK,
+            CommandFailureSite::ResponseCompletionWait,
+            SdhcError::Timeout,
+        ));
+        assert!(should_retry_response_timeout(
+            MMC_CMD_WRITE_SINGLE_BLOCK,
+            CommandFailureSite::ResponseCompletionStatus,
+            SdhcError::Timeout,
+        ));
+        assert!(!should_retry_response_timeout(
+            MMC_CMD_SEND_STATUS,
+            CommandFailureSite::ResponseCompletionStatus,
+            SdhcError::Timeout,
+        ));
+        assert!(!should_retry_response_timeout(
+            MMC_CMD_READ_SINGLE_BLOCK,
+            CommandFailureSite::ResponseCompletionWait,
+            SdhcError::Io,
+        ));
     }
 }
