@@ -53,7 +53,6 @@ const TARGET_RP1_CLOCKS_PATH: &str = "/soc@107c000000/clocks@1c00018000";
 const TARGET_CSI0_PATH: &str = "/soc@107c000000/csi@1c0110000";
 const TARGET_CSI1_PATH: &str = "/soc@107c000000/csi@1c0128000";
 const TARGET_MAILBOX_PATH: &str = "/soc@107c000000/mailbox@7c013880";
-const TARGET_GIO_AON_PATH: &str = "/soc@107c000000/gpio@7d517c00";
 const GUEST_ROOT_TOKEN: &str = "root=/dev/vda2";
 
 const SOURCE_UART0_PATH: &str = "/axi/pcie@1000120000/rp1/serial@30000";
@@ -65,11 +64,8 @@ const SOURCE_CSI0_PATH: &str = "/axi/pcie@1000120000/rp1/csi@110000";
 const SOURCE_CSI1_PATH: &str = "/axi/pcie@1000120000/rp1/csi@128000";
 
 const SOURCE_CLK_XOSC_PATH: &str = "/clocks/clk_xosc";
-const SOURCE_CLK_EMMC2_PATH: &str = "/clocks/clk-emmc2";
 const SOURCE_IOMMU5_PATH: &str = "/axi/iommu@5280";
 const SOURCE_IOMMUC_PATH: &str = "/axi/iommuc@5b00";
-const SOURCE_SD_IO_1V8_REG_PATH: &str = "/sd-io-1v8-reg";
-const SOURCE_SD_VCC_REG_PATH: &str = "/sd-vcc-reg";
 const SOURCE_CAM0_CLK_PATH: &str = "/cam0_clk";
 const SOURCE_CAM1_CLK_PATH: &str = "/cam1_clk";
 const SOURCE_CAM0_REG_PATH: &str = "/cam0_reg";
@@ -185,12 +181,6 @@ pub(crate) fn build_guest_dtb(
         SOURCE_CLK_XOSC_PATH,
         "dtb: missing clk_xosc node",
     )?;
-    copy_required_same_path_subtree(
-        &source_tree,
-        &mut target,
-        SOURCE_CLK_EMMC2_PATH,
-        "dtb: missing clk-emmc2 node",
-    )?;
 
     init_required_same_path_node(
         &source_tree,
@@ -225,26 +215,6 @@ pub(crate) fn build_guest_dtb(
         &mut target,
         "mailbox@7c013880",
         "dtb: missing mailbox node",
-    )?;
-    copy_optional_soc_child(&source_tree, source, &mut target, "pinctrl@7d504100")?;
-    copy_required_soc_child(
-        &source_tree,
-        source,
-        &mut target,
-        "gpio@7d517c00",
-        "dtb: missing AON GPIO node for SD regulators",
-    )?;
-    copy_required_same_path_subtree(
-        &source_tree,
-        &mut target,
-        SOURCE_SD_IO_1V8_REG_PATH,
-        "dtb: missing sd-io-1v8-reg node",
-    )?;
-    copy_required_same_path_subtree(
-        &source_tree,
-        &mut target,
-        SOURCE_SD_VCC_REG_PATH,
-        "dtb: missing sd-vcc-reg node",
     )?;
     copy_required_same_path_subtree(
         &source_tree,
@@ -296,9 +266,7 @@ pub(crate) fn build_guest_dtb(
         )?;
     }
     add_virtio_mmio_blk_node(&mut target, gic_phandle)?;
-
     copy_reserved_memory(&source_tree, &mut target)?;
-    validate_sd_regulator_gpio_providers(&target)?;
     rebuild_aliases(&source_tree, &mut target)?;
     configure_uart_console(&mut target, chosen_id, PL011_UART_ADDR.0)?;
     append_reserved_memory(&mut target, reserved_memory);
@@ -528,7 +496,6 @@ fn rebuild_aliases(
         ("i2c0", TARGET_I2C0_PATH),
         ("i2c10", TARGET_I2C10_PATH),
         ("mailbox", TARGET_MAILBOX_PATH),
-        ("gpio2", TARGET_GIO_AON_PATH),
     ] {
         if target.find_node_by_path(path).is_none() {
             continue;
@@ -911,35 +878,6 @@ fn find_node_by_phandle_owned(tree: &TargetTree<'_>, phandle: u32) -> Option<Nod
             });
         (matches == Some(phandle)).then_some(id)
     })
-}
-
-fn first_phandle_cell(prop: &[u8]) -> Result<u32, &'static str> {
-    let bytes: [u8; 4] = prop
-        .get(..4)
-        .ok_or("dtb: gpio property too short")?
-        .try_into()
-        .map_err(|_| "dtb: invalid phandle cell width")?;
-    Ok(u32::from_be_bytes(bytes))
-}
-
-fn validate_sd_regulator_gpio_providers(tree: &TargetTree<'_>) -> Result<(), &'static str> {
-    for path in [SOURCE_SD_IO_1V8_REG_PATH, SOURCE_SD_VCC_REG_PATH] {
-        let node_id = tree
-            .find_node_by_path(path)
-            .ok_or("dtb: missing SD regulator node in guest tree")?;
-        let node = tree
-            .node(node_id)
-            .ok_or("dtb: invalid SD regulator node in guest tree")?;
-        let gpio_prop = node
-            .property("gpios")
-            .or_else(|| node.property("gpio"))
-            .ok_or("dtb: SD regulator is missing gpio provider property")?;
-        let phandle = first_phandle_cell(gpio_prop.value.as_slice())?;
-        if find_node_by_phandle_owned(tree, phandle).is_none() {
-            return Err("dtb: SD regulator GPIO provider phandle is unresolved");
-        }
-    }
-    Ok(())
 }
 
 const fn gic_dt_irq_flags_from_sense(sense: IrqSense) -> u32 {
