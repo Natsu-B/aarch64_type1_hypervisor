@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+allocator = { path = "../../allocator" }
 block-device-api = { path = "../block-device-api" }
 virtio = { path = "../../virtio" }
 typestate = { path = "../../typestate" }

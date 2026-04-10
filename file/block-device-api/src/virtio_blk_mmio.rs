@@ -138,8 +138,8 @@ pub enum QueueParseError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VirtioBlkReqLayout {
-    pub header_addr: u64,
-    pub data_addr: u64,
+    pub first_data_desc_idx: Option<u16>,
+    pub status_desc_idx: u16,
     pub data_len: u32,
     pub status_addr: u64,
     pub req_type: u32,
@@ -300,8 +300,11 @@ pub fn parse_req_layout(
 
     let mut visited = 0u16;
     let mut cur = head;
-    let mut chain: [VirtqDesc; 3] = [VirtqDesc::default(); 3];
-    let mut chain_len = 0usize;
+    let mut req_type = None;
+    let mut sector = 0u64;
+    let mut first_data_desc_idx = None;
+    let mut data_desc_count = 0u16;
+    let mut data_len = 0u32;
 
     loop {
         if visited >= queue_size {
@@ -313,87 +316,87 @@ pub fn parse_req_layout(
         if (desc.flags & VIRTQ_DESC_F_INDIRECT) != 0 {
             return Err(QueueParseError::IndirectUnsupported);
         }
-        if chain_len >= chain.len() {
-            return Err(QueueParseError::InvalidChain);
-        }
-        chain[chain_len] = desc;
-        chain_len += 1;
 
-        if (desc.flags & VIRTQ_DESC_F_NEXT) == 0 {
-            break;
+        if visited == 1 {
+            if (desc.flags & VIRTQ_DESC_F_WRITE) != 0 {
+                return Err(QueueParseError::InvalidLayout);
+            }
+            if desc.len != size_of::<VirtioBlkReq>() as u32 {
+                return Err(QueueParseError::InvalidLayout);
+            }
+            if desc.addr == 0 {
+                return Err(QueueParseError::InvalidLayout);
+            }
+
+            let req = read_req_header(desc.addr).ok_or(QueueParseError::InvalidLayout)?;
+            if req.req_type != VIRTIO_BLK_T_IN
+                && req.req_type != VIRTIO_BLK_T_OUT
+                && req.req_type != VIRTIO_BLK_T_FLUSH
+            {
+                return Err(QueueParseError::InvalidRequestType);
+            }
+            req_type = Some(req.req_type);
+            sector = req.sector;
+        } else if (desc.flags & VIRTQ_DESC_F_NEXT) == 0 {
+            if (desc.flags & VIRTQ_DESC_F_WRITE) == 0 || desc.len != 1 {
+                return Err(QueueParseError::MissingStatus);
+            }
+            let req_type = req_type.ok_or(QueueParseError::InvalidLayout)?;
+            if req_type == VIRTIO_BLK_T_FLUSH {
+                if data_desc_count != 0 || data_len != 0 {
+                    return Err(QueueParseError::InvalidLayout);
+                }
+            } else {
+                if data_desc_count == 0 || data_len == 0 {
+                    return Err(QueueParseError::InvalidLayout);
+                }
+                check_aligned_sector_buffer(data_len)?;
+            }
+
+            return Ok(VirtioBlkReqLayout {
+                first_data_desc_idx,
+                status_desc_idx: cur,
+                data_len,
+                status_addr: desc.addr,
+                req_type,
+                sector,
+            });
+        } else {
+            let req_type = req_type.ok_or(QueueParseError::InvalidLayout)?;
+            match req_type {
+                VIRTIO_BLK_T_IN => {
+                    if (desc.flags & VIRTQ_DESC_F_WRITE) == 0 {
+                        return Err(QueueParseError::InvalidLayout);
+                    }
+                }
+                VIRTIO_BLK_T_OUT => {
+                    if (desc.flags & VIRTQ_DESC_F_WRITE) != 0 {
+                        return Err(QueueParseError::InvalidLayout);
+                    }
+                }
+                VIRTIO_BLK_T_FLUSH => return Err(QueueParseError::InvalidLayout),
+                _ => return Err(QueueParseError::InvalidRequestType),
+            }
+
+            if desc.addr == 0 && desc.len != 0 {
+                return Err(QueueParseError::InvalidLayout);
+            }
+            if first_data_desc_idx.is_none() {
+                first_data_desc_idx = Some(cur);
+            }
+            data_desc_count = data_desc_count
+                .checked_add(1)
+                .ok_or(QueueParseError::InvalidChain)?;
+            data_len = data_len
+                .checked_add(desc.len)
+                .ok_or(QueueParseError::InvalidLayout)?;
         }
+
         cur = desc.next;
         if cur >= queue_size {
             return Err(QueueParseError::OutOfRange);
         }
     }
-
-    if !(2..=3).contains(&chain_len) {
-        return Err(QueueParseError::InvalidLayout);
-    }
-
-    let header = chain[0];
-    if (header.flags & VIRTQ_DESC_F_WRITE) != 0 {
-        return Err(QueueParseError::InvalidLayout);
-    }
-    if header.len < size_of::<VirtioBlkReq>() as u32 {
-        return Err(QueueParseError::InvalidLayout);
-    }
-    let req = read_req_header(header.addr).ok_or(QueueParseError::InvalidLayout)?;
-    let req_type = req.req_type;
-    if req_type != VIRTIO_BLK_T_IN && req_type != VIRTIO_BLK_T_OUT && req_type != VIRTIO_BLK_T_FLUSH
-    {
-        return Err(QueueParseError::InvalidRequestType);
-    }
-
-    if chain_len == 2 {
-        if req_type != VIRTIO_BLK_T_FLUSH {
-            return Err(QueueParseError::InvalidLayout);
-        }
-        let status = chain[1];
-        if (status.flags & VIRTQ_DESC_F_WRITE) == 0 || status.len != 1 {
-            return Err(QueueParseError::MissingStatus);
-        }
-        return Ok(VirtioBlkReqLayout {
-            header_addr: header.addr,
-            data_addr: 0,
-            data_len: 0,
-            status_addr: status.addr,
-            req_type,
-            sector: req.sector,
-        });
-    }
-
-    let data = chain[1];
-    let status = chain[2];
-    if (status.flags & VIRTQ_DESC_F_WRITE) == 0 || status.len != 1 {
-        return Err(QueueParseError::MissingStatus);
-    }
-    match req_type {
-        VIRTIO_BLK_T_IN => {
-            if (data.flags & VIRTQ_DESC_F_WRITE) == 0 {
-                return Err(QueueParseError::InvalidLayout);
-            }
-            check_aligned_sector_buffer(data.len)?;
-        }
-        VIRTIO_BLK_T_OUT => {
-            if (data.flags & VIRTQ_DESC_F_WRITE) != 0 {
-                return Err(QueueParseError::InvalidLayout);
-            }
-            check_aligned_sector_buffer(data.len)?;
-        }
-        VIRTIO_BLK_T_FLUSH => return Err(QueueParseError::InvalidLayout),
-        _ => return Err(QueueParseError::InvalidRequestType),
-    }
-
-    Ok(VirtioBlkReqLayout {
-        header_addr: header.addr,
-        data_addr: data.addr,
-        data_len: data.len,
-        status_addr: status.addr,
-        req_type,
-        sector: req.sector,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1003,31 +1006,31 @@ where
     fn execute_request(&self, layout: &VirtioBlkReqLayout) -> RequestOutcome {
         match layout.req_type {
             VIRTIO_BLK_T_IN => {
-                let io_res = self
-                    .memory
-                    .with_write_buffer(layout.data_addr, layout.data_len as usize, |dst| {
+                let io_res = (|| -> Result<(), VirtioBlkMmioError> {
+                    let mut cursor = RequestDataCursor::new(self, layout)?;
+                    let mut staging = [0u8; SECTOR_SIZE];
+                    let sector_count = layout.data_len as usize / SECTOR_SIZE;
+                    for sector_idx in 0..sector_count {
                         self.backend
-                            .read_sectors(layout.sector, dst)
-                            .map_err(|err| match err {
-                                VirtioBlkMmioError::Backend(io) => io,
-                                _ => IoError::Io,
-                            })
-                    })
-                    .map_err(normalize_buffer_io_error);
+                            .read_sectors(layout.sector + sector_idx as u64, &mut staging)?;
+                        cursor.write_to_guest(&staging)?;
+                    }
+                    Ok(())
+                })();
                 map_io_to_outcome(layout, io_res, layout.data_len)
             }
             VIRTIO_BLK_T_OUT => {
-                let io_res = self
-                    .memory
-                    .with_read_buffer(layout.data_addr, layout.data_len as usize, |src| {
+                let io_res = (|| -> Result<(), VirtioBlkMmioError> {
+                    let mut cursor = RequestDataCursor::new(self, layout)?;
+                    let mut staging = [0u8; SECTOR_SIZE];
+                    let sector_count = layout.data_len as usize / SECTOR_SIZE;
+                    for sector_idx in 0..sector_count {
+                        cursor.read_from_guest(&mut staging)?;
                         self.backend
-                            .write_sectors(layout.sector, src)
-                            .map_err(|err| match err {
-                                VirtioBlkMmioError::Backend(io) => io,
-                                _ => IoError::Io,
-                            })
-                    })
-                    .map_err(normalize_buffer_io_error);
+                            .write_sectors(layout.sector + sector_idx as u64, &staging)?;
+                    }
+                    Ok(())
+                })();
                 map_io_to_outcome(layout, io_res, layout.data_len)
             }
             VIRTIO_BLK_T_FLUSH => {
@@ -1046,25 +1049,233 @@ where
         if head >= self.queue.size {
             return None;
         }
-        let first = self.read_descriptor(head).ok()?;
-        if (first.flags & VIRTQ_DESC_F_NEXT) == 0 {
-            return None;
-        }
-        let second = self.read_descriptor(first.next).ok()?;
-        if (second.flags & VIRTQ_DESC_F_NEXT) == 0 {
-            if (second.flags & VIRTQ_DESC_F_WRITE) != 0 && second.len == 1 {
-                return Some(second.addr);
+
+        let mut visited = 0u16;
+        let mut cur = head;
+        loop {
+            if visited >= self.queue.size {
+                return None;
             }
-            return None;
-        }
-        let third = self.read_descriptor(second.next).ok()?;
-        if (third.flags & VIRTQ_DESC_F_WRITE) != 0 && third.len == 1 {
-            Some(third.addr)
-        } else {
-            None
+            visited = visited.wrapping_add(1);
+
+            let desc = self.read_descriptor(cur).ok()?;
+            if (desc.flags & VIRTQ_DESC_F_INDIRECT) != 0 {
+                return None;
+            }
+            if (desc.flags & VIRTQ_DESC_F_NEXT) == 0 {
+                return ((desc.flags & VIRTQ_DESC_F_WRITE) != 0 && desc.len == 1)
+                    .then_some(desc.addr);
+            }
+
+            cur = desc.next;
+            if cur >= self.queue.size {
+                return None;
+            }
         }
     }
+}
 
+struct RequestDataCursor<'device, 'backend, B, M, I>
+where
+    B: BlockDevice + ?Sized,
+    M: VirtioBlkMmioGuestMemory,
+    I: VirtioBlkMmioInterrupt,
+{
+    device: &'device VirtioBlkMmioDevice<'backend, B, M, I>,
+    layout: &'device VirtioBlkReqLayout,
+    current_desc: Option<VirtqDesc>,
+    offset_in_desc: usize,
+    remaining: usize,
+}
+
+impl<'device, 'backend, B, M, I> RequestDataCursor<'device, 'backend, B, M, I>
+where
+    B: BlockDevice + ?Sized,
+    M: VirtioBlkMmioGuestMemory,
+    I: VirtioBlkMmioInterrupt,
+{
+    fn new(
+        device: &'device VirtioBlkMmioDevice<'backend, B, M, I>,
+        layout: &'device VirtioBlkReqLayout,
+    ) -> Result<Self, VirtioBlkMmioError> {
+        let current_desc = match layout.first_data_desc_idx {
+            Some(desc_idx) => Some(Self::read_and_validate_data_desc(device, layout, desc_idx)?),
+            None => None,
+        };
+        Ok(Self {
+            device,
+            layout,
+            current_desc,
+            offset_in_desc: 0,
+            remaining: layout.data_len as usize,
+        })
+    }
+
+    fn read_from_guest(&mut self, dst: &mut [u8]) -> Result<(), VirtioBlkMmioError> {
+        if dst.len() > self.remaining {
+            return Err(VirtioBlkMmioError::InvalidState(
+                "virtio-blk: request data shorter than parsed length",
+            ));
+        }
+
+        let mut copied = 0usize;
+        while copied < dst.len() {
+            let desc = self.current_desc.ok_or(VirtioBlkMmioError::InvalidState(
+                "virtio-blk: request data chain ended before transfer completed",
+            ))?;
+            let desc_len = desc.len as usize;
+            if self.offset_in_desc > desc_len {
+                return Err(VirtioBlkMmioError::InvalidState(
+                    "virtio-blk: request data cursor exceeded descriptor length",
+                ));
+            }
+
+            let available = desc_len - self.offset_in_desc;
+            if available == 0 {
+                self.advance_desc()?;
+                continue;
+            }
+
+            let chunk = available.min(dst.len() - copied);
+            let addr = desc.addr.checked_add(self.offset_in_desc as u64).ok_or(
+                VirtioBlkMmioError::GuestMemory("virtio-blk: guest data address overflow"),
+            )?;
+            let dst_chunk = &mut dst[copied..copied + chunk];
+            self.device.memory.with_read_buffer(addr, chunk, |src| {
+                dst_chunk.copy_from_slice(src);
+                Ok(())
+            })?;
+
+            copied += chunk;
+            self.remaining -= chunk;
+            self.offset_in_desc += chunk;
+            if self.offset_in_desc == desc_len {
+                self.advance_desc()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_to_guest(&mut self, src: &[u8]) -> Result<(), VirtioBlkMmioError> {
+        if src.len() > self.remaining {
+            return Err(VirtioBlkMmioError::InvalidState(
+                "virtio-blk: request data shorter than parsed length",
+            ));
+        }
+
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let desc = self.current_desc.ok_or(VirtioBlkMmioError::InvalidState(
+                "virtio-blk: request data chain ended before transfer completed",
+            ))?;
+            let desc_len = desc.len as usize;
+            if self.offset_in_desc > desc_len {
+                return Err(VirtioBlkMmioError::InvalidState(
+                    "virtio-blk: request data cursor exceeded descriptor length",
+                ));
+            }
+
+            let available = desc_len - self.offset_in_desc;
+            if available == 0 {
+                self.advance_desc()?;
+                continue;
+            }
+
+            let chunk = available.min(src.len() - copied);
+            let addr = desc.addr.checked_add(self.offset_in_desc as u64).ok_or(
+                VirtioBlkMmioError::GuestMemory("virtio-blk: guest data address overflow"),
+            )?;
+            let src_chunk = &src[copied..copied + chunk];
+            self.device.memory.with_write_buffer(addr, chunk, |dst| {
+                dst.copy_from_slice(src_chunk);
+                Ok(())
+            })?;
+
+            copied += chunk;
+            self.remaining -= chunk;
+            self.offset_in_desc += chunk;
+            if self.offset_in_desc == desc_len {
+                self.advance_desc()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn advance_desc(&mut self) -> Result<(), VirtioBlkMmioError> {
+        let desc = self.current_desc.ok_or(VirtioBlkMmioError::InvalidState(
+            "virtio-blk: request data chain ended before transfer completed",
+        ))?;
+        if (desc.flags & VIRTQ_DESC_F_NEXT) == 0 {
+            return Err(VirtioBlkMmioError::InvalidState(
+                "virtio-blk: data descriptor chain terminated before status descriptor",
+            ));
+        }
+
+        let next_idx = desc.next;
+        if next_idx == self.layout.status_desc_idx {
+            self.current_desc = None;
+            self.offset_in_desc = 0;
+            return Ok(());
+        }
+
+        self.current_desc = Some(Self::read_and_validate_data_desc(
+            self.device,
+            self.layout,
+            next_idx,
+        )?);
+        self.offset_in_desc = 0;
+        Ok(())
+    }
+
+    fn read_and_validate_data_desc(
+        device: &VirtioBlkMmioDevice<'backend, B, M, I>,
+        layout: &VirtioBlkReqLayout,
+        desc_idx: u16,
+    ) -> Result<VirtqDesc, VirtioBlkMmioError> {
+        if desc_idx == layout.status_desc_idx {
+            return Err(VirtioBlkMmioError::InvalidState(
+                "virtio-blk: status descriptor reached while walking request data",
+            ));
+        }
+
+        let desc = device.read_descriptor(desc_idx)?;
+        if (desc.flags & VIRTQ_DESC_F_INDIRECT) != 0 {
+            return Err(VirtioBlkMmioError::Queue(
+                QueueParseError::IndirectUnsupported,
+            ));
+        }
+        if desc.addr == 0 && desc.len != 0 {
+            return Err(VirtioBlkMmioError::Queue(QueueParseError::InvalidLayout));
+        }
+
+        match layout.req_type {
+            VIRTIO_BLK_T_IN => {
+                if (desc.flags & VIRTQ_DESC_F_WRITE) == 0 {
+                    return Err(VirtioBlkMmioError::Queue(QueueParseError::InvalidLayout));
+                }
+            }
+            VIRTIO_BLK_T_OUT => {
+                if (desc.flags & VIRTQ_DESC_F_WRITE) != 0 {
+                    return Err(VirtioBlkMmioError::Queue(QueueParseError::InvalidLayout));
+                }
+            }
+            _ => {
+                return Err(VirtioBlkMmioError::Queue(QueueParseError::InvalidLayout));
+            }
+        }
+
+        Ok(desc)
+    }
+}
+
+impl<'a, B, M, I> VirtioBlkMmioDevice<'a, B, M, I>
+where
+    B: BlockDevice + ?Sized,
+    M: VirtioBlkMmioGuestMemory,
+    I: VirtioBlkMmioInterrupt,
+{
     fn read_guest_u16(&self, addr: u64) -> Result<u16, VirtioBlkMmioError> {
         let mut bytes = [0u8; 2];
         self.memory.read(addr, &mut bytes)?;
@@ -1139,10 +1350,6 @@ struct RequestOutcome {
     status: u8,
     status_addr: Option<u64>,
     used_len: u32,
-}
-
-fn normalize_buffer_io_error(err: VirtioBlkMmioError) -> VirtioBlkMmioError {
-    err
 }
 
 fn map_io_to_outcome(
@@ -1260,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_three_desc_read_request() {
+    fn parse_multi_desc_read_request() {
         let req = make_req(VIRTIO_BLK_T_IN, 32);
         let table = [
             desc(
@@ -1269,15 +1476,43 @@ mod tests {
                 VIRTQ_DESC_F_NEXT,
                 1,
             ),
-            desc(0x2000, 1024, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2),
+            desc(0x2000, 256, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2),
+            desc(0x2100, 256, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 3),
             desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
         ];
         let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
         let mut get_desc = |idx: u16| table.get(idx as usize).copied();
         let parsed = parse_req_layout(8, 0, &mut get_desc, &mut read_req).unwrap();
         assert_eq!(parsed.req_type, VIRTIO_BLK_T_IN);
-        assert_eq!(parsed.data_addr, 0x2000);
+        assert_eq!(parsed.first_data_desc_idx, Some(1));
+        assert_eq!(parsed.status_desc_idx, 3);
+        assert_eq!(parsed.data_len, SECTOR_SIZE as u32);
         assert_eq!(parsed.status_addr, 0x3000);
+    }
+
+    #[test]
+    fn parse_multi_desc_write_request() {
+        let req = make_req(VIRTIO_BLK_T_OUT, 9);
+        let table = [
+            desc(
+                0x1000,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+            desc(0x2000, 768, VIRTQ_DESC_F_NEXT, 2),
+            desc(0x2300, 256, VIRTQ_DESC_F_NEXT, 3),
+            desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
+        ];
+        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
+        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
+        let parsed = parse_req_layout(8, 0, &mut get_desc, &mut read_req).unwrap();
+        assert_eq!(parsed.req_type, VIRTIO_BLK_T_OUT);
+        assert_eq!(parsed.first_data_desc_idx, Some(1));
+        assert_eq!(parsed.status_desc_idx, 3);
+        assert_eq!(parsed.data_len, (SECTOR_SIZE * 2) as u32);
+        assert_eq!(parsed.status_addr, 0x3000);
+        assert_eq!(parsed.sector, 9);
     }
 
     #[test]
@@ -1296,11 +1531,13 @@ mod tests {
         let mut get_desc = |idx: u16| table.get(idx as usize).copied();
         let parsed = parse_req_layout(8, 0, &mut get_desc, &mut read_req).unwrap();
         assert_eq!(parsed.req_type, VIRTIO_BLK_T_FLUSH);
+        assert_eq!(parsed.first_data_desc_idx, None);
         assert_eq!(parsed.data_len, 0);
+        assert_eq!(parsed.status_desc_idx, 1);
     }
 
     #[test]
-    fn reject_zero_length_read_request_data() {
+    fn reject_in_request_with_readable_data_desc() {
         let req = make_req(VIRTIO_BLK_T_IN, 32);
         let table = [
             desc(
@@ -1309,7 +1546,7 @@ mod tests {
                 VIRTQ_DESC_F_NEXT,
                 1,
             ),
-            desc(0x2000, 0, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2),
+            desc(0x2000, SECTOR_SIZE as u32, VIRTQ_DESC_F_NEXT, 2),
             desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
         ];
         let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
@@ -1321,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_zero_length_write_request_data() {
+    fn reject_out_request_with_writable_data_desc() {
         let req = make_req(VIRTIO_BLK_T_OUT, 32);
         let table = [
             desc(
@@ -1330,8 +1567,57 @@ mod tests {
                 VIRTQ_DESC_F_NEXT,
                 1,
             ),
-            desc(0x2000, 0, VIRTQ_DESC_F_NEXT, 2),
+            desc(
+                0x2000,
+                SECTOR_SIZE as u32,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                2,
+            ),
             desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
+        ];
+        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
+        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
+        assert_eq!(
+            parse_req_layout(8, 0, &mut get_desc, &mut read_req),
+            Err(QueueParseError::InvalidLayout)
+        );
+    }
+
+    #[test]
+    fn reject_misaligned_total_data_length() {
+        let req = make_req(VIRTIO_BLK_T_OUT, 2);
+        let table = [
+            desc(
+                0x1000,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+            desc(0x2000, 256, VIRTQ_DESC_F_NEXT, 2),
+            desc(0x2100, 128, VIRTQ_DESC_F_NEXT, 3),
+            desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
+        ];
+        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
+        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
+        assert_eq!(
+            parse_req_layout(8, 0, &mut get_desc, &mut read_req),
+            Err(QueueParseError::Align)
+        );
+    }
+
+    #[test]
+    fn reject_status_descriptor_that_is_not_final() {
+        let req = make_req(VIRTIO_BLK_T_OUT, 2);
+        let table = [
+            desc(
+                0x1000,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+            desc(0x2000, SECTOR_SIZE as u32, VIRTQ_DESC_F_NEXT, 2),
+            desc(0x3000, 1, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 3),
+            desc(0x4000, SECTOR_SIZE as u32, 0, 0),
         ];
         let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
         let mut get_desc = |idx: u16| table.get(idx as usize).copied();
@@ -1355,27 +1641,6 @@ mod tests {
         assert_eq!(
             parse_req_layout(1, 0, &mut get_desc, &mut read_req),
             Err(QueueParseError::IndirectUnsupported)
-        );
-    }
-
-    #[test]
-    fn reject_misaligned_data_length() {
-        let req = make_req(VIRTIO_BLK_T_OUT, 2);
-        let table = [
-            desc(
-                0x1000,
-                size_of::<VirtioBlkReq>() as u32,
-                VIRTQ_DESC_F_NEXT,
-                1,
-            ),
-            desc(0x2000, 513, VIRTQ_DESC_F_NEXT, 2),
-            desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
-        ];
-        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
-        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
-        assert_eq!(
-            parse_req_layout(8, 0, &mut get_desc, &mut read_req),
-            Err(QueueParseError::Align)
         );
     }
 
@@ -1795,6 +2060,62 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_status_lookup_walks_long_chain() {
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 2], false);
+        let memory = FakeGuestMemory::new(0x9000);
+        let irq = FakeInterrupt::default();
+        let mut device = make_device(&backend, &memory, &irq);
+
+        configure_ready_queue(&mut device, &memory, 16);
+
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            1,
+            desc(DATA_ADDR, 128, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            2,
+            desc(
+                DATA_ADDR + 0x100,
+                128,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                3,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            3,
+            desc(
+                DATA_ADDR + 0x200,
+                256,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                4,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            4,
+            desc(STATUS_ADDR + 0x100, 1, VIRTQ_DESC_F_WRITE, 0),
+        );
+
+        assert_eq!(
+            device.find_status_addr_best_effort(0),
+            Some(STATUS_ADDR + 0x100)
+        );
+    }
+
+    #[test]
     fn valid_read_request_updates_used_ring_and_irq_ack_deasserts() {
         let mut storage = vec![0u8; SECTOR_SIZE * 3];
         for (idx, byte) in storage[SECTOR_SIZE..SECTOR_SIZE * 2].iter_mut().enumerate() {
@@ -1856,6 +2177,127 @@ mod tests {
 
         assert_eq!(device.mmio_read(REG_INTERRUPT_STATUS, 4).unwrap(), 0);
         assert_eq!(irq.levels(), vec![true, false]);
+    }
+
+    #[test]
+    fn split_descriptor_requests_round_trip_through_mmio_device() {
+        const WRITE_STATUS_ADDR: u64 = STATUS_ADDR;
+        const READ_REQ_ADDR: u64 = REQ_ADDR + 0x1000;
+        const READ_STATUS_ADDR: u64 = STATUS_ADDR + 0x1000;
+        const WRITE_DATA_0: u64 = DATA_ADDR;
+        const WRITE_DATA_1: u64 = DATA_ADDR + 0x100;
+        const WRITE_DATA_2: u64 = DATA_ADDR + 0x200;
+        const READ_DATA_0: u64 = DATA_ADDR + 0x1000;
+        const READ_DATA_1: u64 = DATA_ADDR + 0x1100;
+        const READ_DATA_2: u64 = DATA_ADDR + 0x1200;
+
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 4], false);
+        let memory = FakeGuestMemory::new(0x20_000);
+        let irq = FakeInterrupt::default();
+        let mut device = make_device(&backend, &memory, &irq);
+
+        configure_ready_queue(&mut device, &memory, 16);
+        enable_driver(&mut device);
+
+        let write_pattern: Vec<u8> = (0..SECTOR_SIZE)
+            .map(|idx| (idx as u8).wrapping_mul(11).wrapping_add(5))
+            .collect();
+        memory.write_bytes(WRITE_DATA_0, &write_pattern[..100]);
+        memory.write_bytes(WRITE_DATA_1, &write_pattern[100..256]);
+        memory.write_bytes(WRITE_DATA_2, &write_pattern[256..SECTOR_SIZE]);
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(DESC_ADDR, 1, desc(WRITE_DATA_0, 100, VIRTQ_DESC_F_NEXT, 2));
+        memory.write_desc(DESC_ADDR, 2, desc(WRITE_DATA_1, 156, VIRTQ_DESC_F_NEXT, 3));
+        memory.write_desc(DESC_ADDR, 3, desc(WRITE_DATA_2, 256, VIRTQ_DESC_F_NEXT, 4));
+        memory.write_desc(
+            DESC_ADDR,
+            4,
+            desc(WRITE_STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0),
+        );
+        memory.write_req(REQ_ADDR, make_req(VIRTIO_BLK_T_OUT, 1));
+        memory.write_u16(AVAIL_ADDR + 2, 1);
+        memory.write_u16(AVAIL_ADDR + 4, 0);
+        memory.write_u8(WRITE_STATUS_ADDR, 0xff);
+
+        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+
+        assert_eq!(memory.read_u8(WRITE_STATUS_ADDR), VIRTIO_BLK_S_OK);
+        assert_eq!(memory.read_u16(USED_ADDR + 2), 1);
+        assert_eq!(memory.read_u32(USED_ADDR + 4), 0);
+        assert_eq!(memory.read_u32(USED_ADDR + 8), SECTOR_SIZE as u32);
+        assert_eq!(
+            backend.storage.lock().unwrap()[SECTOR_SIZE..SECTOR_SIZE * 2].to_vec(),
+            write_pattern
+        );
+        assert_eq!(irq.levels(), vec![true]);
+
+        device
+            .mmio_write(REG_INTERRUPT_ACK, 4, VIRTIO_INT_USED_RING as u64)
+            .unwrap();
+
+        memory.write_desc(
+            DESC_ADDR,
+            5,
+            desc(
+                READ_REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                6,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            6,
+            desc(READ_DATA_0, 200, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 7),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            7,
+            desc(READ_DATA_1, 200, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 8),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            8,
+            desc(READ_DATA_2, 112, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 9),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            9,
+            desc(READ_STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0),
+        );
+        memory.write_req(READ_REQ_ADDR, make_req(VIRTIO_BLK_T_IN, 1));
+        memory.write_u16(AVAIL_ADDR + 2, 2);
+        memory.write_u16(AVAIL_ADDR + 6, 5);
+        memory.write_u8(READ_STATUS_ADDR, 0xff);
+
+        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+
+        let mut read_back = Vec::new();
+        read_back.extend(memory.read_bytes(READ_DATA_0, 200));
+        read_back.extend(memory.read_bytes(READ_DATA_1, 200));
+        read_back.extend(memory.read_bytes(READ_DATA_2, 112));
+        assert_eq!(read_back, write_pattern);
+        assert_eq!(memory.read_u8(READ_STATUS_ADDR), VIRTIO_BLK_S_OK);
+        assert_eq!(memory.read_u16(USED_ADDR + 2), 2);
+        assert_eq!(memory.read_u32(USED_ADDR + 12), 5);
+        assert_eq!(memory.read_u32(USED_ADDR + 16), SECTOR_SIZE as u32);
+        assert_eq!(irq.levels(), vec![true, false, true]);
+
+        device
+            .mmio_write(REG_INTERRUPT_ACK, 4, VIRTIO_INT_USED_RING as u64)
+            .unwrap();
+
+        assert_eq!(device.mmio_read(REG_INTERRUPT_STATUS, 4).unwrap(), 0);
+        assert_eq!(irq.levels(), vec![true, false, true, false]);
     }
 
     #[test]

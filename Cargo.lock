@@ -75,6 +75,7 @@ dependencies = [
 name = "block-device"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "arch_hal",
  "block-device-api",
  "cpu",
