@@ -250,7 +250,7 @@ pub fn calc_ring_index(idx: u16, queue_size: u16) -> Result<u16, QueueParseError
 
 pub fn check_aligned_sector_buffer(len: u32) -> Result<(), QueueParseError> {
     if len == 0 {
-        return Ok(());
+        return Err(QueueParseError::InvalidLayout);
     }
     if !(len as usize).is_multiple_of(SECTOR_SIZE) {
         return Err(QueueParseError::Align);
@@ -1297,6 +1297,48 @@ mod tests {
         let parsed = parse_req_layout(8, 0, &mut get_desc, &mut read_req).unwrap();
         assert_eq!(parsed.req_type, VIRTIO_BLK_T_FLUSH);
         assert_eq!(parsed.data_len, 0);
+    }
+
+    #[test]
+    fn reject_zero_length_read_request_data() {
+        let req = make_req(VIRTIO_BLK_T_IN, 32);
+        let table = [
+            desc(
+                0x1000,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+            desc(0x2000, 0, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2),
+            desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
+        ];
+        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
+        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
+        assert_eq!(
+            parse_req_layout(8, 0, &mut get_desc, &mut read_req),
+            Err(QueueParseError::InvalidLayout)
+        );
+    }
+
+    #[test]
+    fn reject_zero_length_write_request_data() {
+        let req = make_req(VIRTIO_BLK_T_OUT, 32);
+        let table = [
+            desc(
+                0x1000,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+            desc(0x2000, 0, VIRTQ_DESC_F_NEXT, 2),
+            desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
+        ];
+        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
+        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
+        assert_eq!(
+            parse_req_layout(8, 0, &mut get_desc, &mut read_req),
+            Err(QueueParseError::InvalidLayout)
+        );
     }
 
     #[test]

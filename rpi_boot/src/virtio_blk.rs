@@ -130,6 +130,9 @@ impl VirtioBlkMmioGuestMemory for GuestMemoryIdentity {
     where
         F: FnOnce(&[u8]) -> Result<(), IoError>,
     {
+        if len == 0 {
+            return f(&[]).map_err(VirtioBlkMmioError::Backend);
+        }
         let base = checked_guest_base(addr, len)?;
         // SAFETY: The guest payload buffer lies in the identity-mapped IPA==PA space, the range
         // was overflow-checked above, and the immutable borrow lives only for this synchronous call.
@@ -141,6 +144,10 @@ impl VirtioBlkMmioGuestMemory for GuestMemoryIdentity {
     where
         F: FnOnce(&mut [u8]) -> Result<(), IoError>,
     {
+        if len == 0 {
+            let mut empty: [u8; 0] = [];
+            return f(&mut empty[..]).map_err(VirtioBlkMmioError::Backend);
+        }
         let base = checked_guest_base(addr, len)?;
         // SAFETY: The guest payload buffer lies in the identity-mapped IPA==PA space, the range
         // was overflow-checked above, and the mutable borrow lives only for this synchronous call.
