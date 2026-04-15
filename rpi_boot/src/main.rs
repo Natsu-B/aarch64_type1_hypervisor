@@ -692,12 +692,7 @@ extern "C" fn main() -> ! {
 
     let virtio_blk_backend = match bcm2712::sdhc::init_from_dtb(&dtb_modified) {
         Ok(backend) => backend,
-        Err(err) => {
-            println!("virtio-blk: sdhc init failed: {:?}", err);
-            loop {
-                core::hint::spin_loop();
-            }
-        }
+        Err(err) => panic!("virtio-blk: sdhc init failed: {:?}", err),
     };
     print_sd_boot_config(virtio_blk_backend);
     virtio_blk::init_with_backend(virtio_blk_backend)

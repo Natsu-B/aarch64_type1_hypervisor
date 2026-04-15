@@ -84,6 +84,7 @@ const SDHC_RESET_TIMEOUT_US: u64 = 100_000;
 const SDHC_ACMD41_RETRY_MAX: usize = 1000;
 const SDHC_ACMD41_POLL_DELAY_US: u64 = 10;
 const SDHC_POST_CLOCK_SETTLE_DELAY_US: u64 = 50;
+const SDHC_CARD_DETECT_SETTLE_DELAY_US: u64 = 50;
 const SDHC_MAX_DT_CANDIDATES: usize = 8;
 const SDHC_MAX_REG_ENTRIES: usize = 8;
 const SDHC_MAX_CLOCK_DIVIDER: u16 = 0x03ff;
@@ -98,6 +99,7 @@ const SDHCI_COMMAND: usize = 0x0e;
 const SDHCI_RESPONSE: usize = 0x10;
 const SDHCI_BUFFER: usize = 0x20;
 const SDHCI_PRESENT_STATE: usize = 0x24;
+const SDHCI_HOST_CONTROL: usize = 0x28;
 const SDHCI_POWER_CONTROL: usize = 0x29;
 const SDHCI_CLOCK_CONTROL: usize = 0x2c;
 const SDHCI_TIMEOUT_CONTROL: usize = 0x2e;
@@ -126,6 +128,8 @@ const SDHCI_DATA_AVAILABLE: u32 = 1 << 11;
 const SDHCI_CARD_PRESENT: u32 = 1 << 16;
 const SDHCI_CARD_STATE_STABLE: u32 = 1 << 17;
 const SDHCI_WRITE_PROTECT: u32 = 1 << 19;
+const SDHCI_CTRL_4BITBUS: u8 = 0x02;
+const SDHCI_CTRL_8BITBUS: u8 = 0x20;
 const SDHCI_POWER_ON: u8 = 0x01;
 const SDHCI_POWER_330: u8 = 0x0e;
 const SDHCI_CLOCK_CARD_EN: u16 = 1 << 2;
@@ -169,11 +173,9 @@ const SDIO_CFG_CQ_CAPABILITY_BASE_CLOCK_MASK: u32 = 0x00ff;
 const SDIO_CFG_CQ_CAPABILITY_FMUL_MASK: u32 = 0b11 << 12;
 const SDIO_CFG_CQ_CAPABILITY_FMUL_DEFAULT: u32 = SDIO_CFG_CQ_CAPABILITY_FMUL_MASK;
 const OF_GPIO_ACTIVE_LOW: u32 = 1 << 0;
-#[cfg(target_arch = "aarch64")]
 const BRCMSTB_GIO_BANK_SIZE: usize = 0x20;
 #[cfg(target_arch = "aarch64")]
 const BRCMSTB_GIO_ODEN: usize = 0x00;
-#[cfg(target_arch = "aarch64")]
 const BRCMSTB_GIO_DATA: usize = 0x04;
 #[cfg(target_arch = "aarch64")]
 const BRCMSTB_GIO_IODIR: usize = 0x08;
@@ -273,7 +275,10 @@ const MMC_CMD_SET_BLOCKLEN: u8 = 16;
 const MMC_CMD_READ_SINGLE_BLOCK: u8 = 17;
 const MMC_CMD_WRITE_SINGLE_BLOCK: u8 = 24;
 const MMC_CMD_APP_CMD: u8 = 55;
+const SD_CMD_APP_SET_BUS_WIDTH: u8 = 6;
 const SD_CMD_APP_SEND_OP_COND: u8 = 41;
+const SD_BUS_WIDTH_1BIT_ARG: u32 = 0;
+const SD_BUS_WIDTH_4BIT_ARG: u32 = 2;
 
 const OCR_BUSY: u32 = 1 << 31;
 const OCR_HCS: u32 = 1 << 30;
@@ -359,6 +364,8 @@ struct SdhcConfig {
     cfg: HostRegion,
     max_clock_hz: u32,
     power: SdhcPowerConfig,
+    card_detect: Option<GpioLineConfig>,
+    bus_width: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -387,6 +394,8 @@ struct SdhcDtCandidate {
     lcpll: Option<HostRegion>,
     max_clock_hz: u32,
     power: SdhcPowerConfig,
+    card_detect: Option<GpioLineConfig>,
+    broken_cd: bool,
     has_brcmstb_compat: bool,
     status_okay: bool,
     bus_width: u32,
@@ -415,11 +424,17 @@ impl SdhcDtCandidate {
         let cfg = self
             .cfg
             .ok_or(SdhcError::DtbInvalid("sdhc: missing cfg reg"))?;
+        let runtime_bus_width = resolve_sd_slot_bus_width(self.bus_width, self.broken_cd)?;
+        if self.card_detect.is_none() && !self.broken_cd {
+            return Err(SdhcError::DtbInvalid("sdhc: missing cd-gpios for SD slot"));
+        }
         Ok(SdhcConfig {
             host,
             cfg,
             max_clock_hz: self.max_clock_hz,
             power: self.power,
+            card_detect: self.card_detect,
+            bus_width: runtime_bus_width,
         })
     }
 }
@@ -436,6 +451,8 @@ pub struct Bcm2712Sdhc {
     cfg: *mut u8,
     max_clock_hz: u32,
     min_clock_hz: u32,
+    card_detect: Option<GpioLineConfig>,
+    bus_width: u32,
     card: SpinLock<Option<CardState>>,
 }
 
@@ -469,18 +486,32 @@ fn log_init_stage(stage: &str, err: SdhcError) -> SdhcError {
     err
 }
 
-#[cfg(target_arch = "aarch64")]
 fn brcmstb_gpio_bank(pin: u8) -> (usize, u32) {
     let bank = usize::from(pin / 32);
     let bit = 1u32 << u32::from(pin % 32);
     (bank, bit)
 }
 
-#[cfg(target_arch = "aarch64")]
 fn brcmstb_gpio_reg_offset(bank: usize, reg: usize) -> Result<usize, SdhcError> {
     bank.checked_mul(BRCMSTB_GIO_BANK_SIZE)
         .and_then(|base| base.checked_add(reg))
         .ok_or(SdhcError::InvalidParam)
+}
+
+fn read_brcmstb_gpio_input(config: GpioLineConfig) -> Result<bool, SdhcError> {
+    if config.base == 0 {
+        return Err(SdhcError::InvalidParam);
+    }
+
+    let base = config.base as *mut u8;
+    let (bank, bit) = brcmstb_gpio_bank(config.pin);
+    let data_offset = brcmstb_gpio_reg_offset(bank, BRCMSTB_GIO_DATA)?;
+    let raw_high = (mmio_read_u32(base, data_offset) & bit) != 0;
+    Ok(if config.active_low {
+        !raw_high
+    } else {
+        raw_high
+    })
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -642,6 +673,8 @@ impl Bcm2712Sdhc {
             cfg: cfg.cfg.base as *mut u8,
             max_clock_hz: cfg.max_clock_hz.min(SDHC_DEFAULT_MAX_CLOCK_HZ),
             min_clock_hz: SDHC_DEFAULT_MIN_CLOCK_HZ,
+            card_detect: cfg.card_detect,
+            bus_width: cfg.bus_width,
             card: SpinLock::new(None),
         };
         instance
@@ -750,6 +783,39 @@ impl Bcm2712Sdhc {
         configure_bcm2712_sdio1_clock_regs(self.cfg, self.max_clock_hz)
     }
 
+    fn card_detect_asserted(&self) -> Result<bool, SdhcError> {
+        // Some BCM2712 firmware DTs expose removable media with `broken-cd`, so there is no
+        // dedicated GPIO to sample and we fall back to host present-state reporting.
+        self.card_detect
+            .map(read_brcmstb_gpio_input)
+            .transpose()
+            .map(|gpio_present| gpio_present.unwrap_or(true))
+    }
+
+    fn ensure_card_inserted(&self) -> Result<(), SdhcError> {
+        let gpio_present = self.card_detect_asserted()?;
+        let present_state = self.reg_read_u32(SDHCI_PRESENT_STATE);
+        let present = decode_present_state(present_state);
+
+        if !gpio_present || !present.card_present {
+            #[cfg(any(test, debug_assertions))]
+            println!(
+                "sdhc: card absent gpio_present={} present_state=0x{:08x}",
+                gpio_present, present_state
+            );
+            return Err(SdhcError::NoCard);
+        }
+        if !present.card_state_stable {
+            #[cfg(any(test, debug_assertions))]
+            println!(
+                "sdhc: card state unstable gpio_present={} present_state=0x{:08x}",
+                gpio_present, present_state
+            );
+            return Err(SdhcError::InvalidState);
+        }
+        Ok(())
+    }
+
     fn reset(&self, mask: u8) -> Result<(), SdhcError> {
         self.reg_write_u8(SDHCI_SOFTWARE_RESET, mask);
         self.wait_until(SDHC_RESET_TIMEOUT_US, |s| {
@@ -758,19 +824,14 @@ impl Bcm2712Sdhc {
     }
 
     fn configure_card_detect(&self) -> Result<(), SdhcError> {
-        // The Raspberry Pi 5 SD-slot path we support here still relies on firmware-prepared
-        // regulator state and does not expose a runtime hotplug controller through the DT we
-        // consume at EL2, so we explicitly force the SD-slot routing instead of guessing.
-        let mut ctrl = self.cfg_read_u32(SDIO_CFG_CTRL);
-        ctrl &= !SDIO_CFG_CTRL_SDCD_N_TEST_LEV;
-        ctrl |= SDIO_CFG_CTRL_SDCD_N_TEST_EN;
+        let ctrl = sdio_cfg_ctrl_real_card_detect(self.cfg_read_u32(SDIO_CFG_CTRL));
         self.cfg_write_u32(SDIO_CFG_CTRL, ctrl);
 
-        let mut pin_sel = self.cfg_read_u32(SDIO_CFG_SD_PIN_SEL);
-        pin_sel &= !SDIO_CFG_SD_PIN_SEL_MASK;
-        pin_sel |= SDIO_CFG_SD_PIN_SEL_CARD;
+        let pin_sel = sdio_cfg_sd_pin_sel_card(self.cfg_read_u32(SDIO_CFG_SD_PIN_SEL));
         self.cfg_write_u32(SDIO_CFG_SD_PIN_SEL, pin_sel);
-        Ok(())
+
+        wait_micros(SDHC_CARD_DETECT_SETTLE_DELAY_US);
+        self.ensure_card_inserted()
     }
 
     fn power_on(&self) -> Result<(), SdhcError> {
@@ -805,11 +866,6 @@ impl Bcm2712Sdhc {
         self.reg_write_u32(SDHCI_INT_ENABLE, SDHCI_INT_CMD_MASK | SDHCI_INT_DATA_MASK);
         self.reg_write_u32(SDHCI_SIGNAL_ENABLE, 0);
         self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
-    }
-
-    fn card_present(&self) -> bool {
-        let state = self.reg_read_u32(SDHCI_PRESENT_STATE);
-        (state & SDHCI_CARD_PRESENT) != 0 && (state & SDHCI_CARD_STATE_STABLE) != 0
     }
 
     fn card_read_only(&self) -> bool {
@@ -1197,7 +1253,30 @@ impl Bcm2712Sdhc {
         Err(SdhcError::Timeout)
     }
 
+    fn set_bus_width(&self, rca: u16, bus_width: u32) -> Result<(), SdhcError> {
+        let setting = sd_bus_width_setting(bus_width)?;
+        let app_cmd_arg = u32::from(rca) << 16;
+
+        self.send_command(MMC_CMD_APP_CMD, app_cmd_arg, RespType::R1, None, None)?;
+        self.send_command(
+            SD_CMD_APP_SET_BUS_WIDTH,
+            setting.acmd6_arg,
+            RespType::R1,
+            None,
+            None,
+        )?;
+
+        let mut host_control = self.reg_read_u8(SDHCI_HOST_CONTROL);
+        host_control &= !(SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS);
+        host_control |= setting.host_control_bits;
+        self.reg_write_u8(SDHCI_HOST_CONTROL, host_control);
+
+        self.wait_for_transfer_state(rca)
+    }
+
     fn apply_conservative_transfer_clock(&self, rca: u16) -> Result<(), SdhcError> {
+        // The EL2 backend intentionally stays in conservative non-UHS mode for correctness
+        // until voltage switching, tuning, and related host-side features are implemented.
         self.set_clock(conservative_transfer_clock_hz())?;
         wait_micros(post_clock_settle_delay_us());
         self.wait_for_transfer_state(rca).inspect_err(|&err| {
@@ -1212,9 +1291,7 @@ impl Bcm2712Sdhc {
     }
 
     fn card_init_sequence(&self) -> Result<(), SdhcError> {
-        if !self.card_present() {
-            return Err(SdhcError::NoCard);
-        }
+        self.ensure_card_inserted()?;
 
         self.send_command(MMC_CMD_GO_IDLE_STATE, 0, RespType::None, None, None)?;
         self.send_command(MMC_CMD_SEND_IF_COND, 0x1aa, RespType::R7, None, None)?;
@@ -1262,6 +1339,8 @@ impl Bcm2712Sdhc {
             None,
             None,
         )?;
+        self.wait_for_transfer_state(rca)?;
+        self.set_bus_width(rca, self.bus_width)?;
         self.send_command(
             MMC_CMD_SET_BLOCKLEN,
             SDHC_BLOCK_SIZE as u32,
@@ -1619,6 +1698,47 @@ fn conservative_transfer_clock_hz() -> u32 {
 
 fn post_clock_settle_delay_us() -> u64 {
     SDHC_POST_CLOCK_SETTLE_DELAY_US
+}
+
+fn sdio_cfg_ctrl_real_card_detect(ctrl: u32) -> u32 {
+    ctrl & !(SDIO_CFG_CTRL_SDCD_N_TEST_EN | SDIO_CFG_CTRL_SDCD_N_TEST_LEV)
+}
+
+fn sdio_cfg_sd_pin_sel_card(pin_sel: u32) -> u32 {
+    (pin_sel & !SDIO_CFG_SD_PIN_SEL_MASK) | SDIO_CFG_SD_PIN_SEL_CARD
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdBusWidthSetting {
+    acmd6_arg: u32,
+    host_control_bits: u8,
+}
+
+fn sd_bus_width_setting(bus_width: u32) -> Result<SdBusWidthSetting, SdhcError> {
+    match bus_width {
+        1 => Ok(SdBusWidthSetting {
+            acmd6_arg: SD_BUS_WIDTH_1BIT_ARG,
+            host_control_bits: 0,
+        }),
+        4 => Ok(SdBusWidthSetting {
+            acmd6_arg: SD_BUS_WIDTH_4BIT_ARG,
+            host_control_bits: SDHCI_CTRL_4BITBUS,
+        }),
+        _ => Err(SdhcError::Unsupported),
+    }
+}
+
+fn resolve_sd_slot_bus_width(bus_width: u32, broken_cd: bool) -> Result<u32, SdhcError> {
+    match bus_width {
+        1 | 4 => Ok(bus_width),
+        8 if broken_cd => Ok(4),
+        0 => Err(SdhcError::DtbInvalid(
+            "sdhc: missing or zero bus-width for SD slot",
+        )),
+        _ => Err(SdhcError::DtbInvalid(
+            "sdhc: unsupported bus-width for SD slot",
+        )),
+    }
 }
 
 fn bcm2712_base_clock_mhz(clock_hz: u32) -> u32 {
@@ -2114,6 +2234,15 @@ fn parse_candidate_from_view(
         lcpll: named.lcpll,
         max_clock_hz: find_clock_frequency(view, dtb)?,
         power: parse_power_from_view(view, dtb)?,
+        card_detect: view
+            .property_bytes("cd-gpios")
+            .map_err(SdhcError::DtbParse)?
+            .map(|bytes| parse_gpio_line_config(dtb, bytes, "sdhc: invalid cd-gpios property"))
+            .transpose()?,
+        broken_cd: view
+            .property_bytes("broken-cd")
+            .map_err(SdhcError::DtbParse)?
+            .is_some(),
         has_brcmstb_compat: view
             .compatible_contains(DT_COMPAT_BRCMSTB_SDHCI)
             .map_err(SdhcError::DtbParse)?,
@@ -2178,10 +2307,12 @@ fn prefer_candidate_subset(
 fn log_dt_candidates(candidates: &[SdhcDtCandidate]) {
     for (index, candidate) in candidates.iter().enumerate() {
         std::println!(
-            "sdhc: dt candidate[{}] host={:?} cfg={:?} bus_width={} non_removable={} has_wifi_child={} has_brcmstb_compat={}",
+            "sdhc: dt candidate[{}] host={:?} cfg={:?} cd={} broken_cd={} bus_width={} non_removable={} has_wifi_child={} has_brcmstb_compat={}",
             index,
             candidate.host,
             candidate.cfg,
+            candidate.card_detect.is_some(),
+            candidate.broken_cd,
             candidate.bus_width,
             candidate.non_removable,
             candidate.has_wifi_child,
@@ -2194,10 +2325,12 @@ fn log_dt_candidates(candidates: &[SdhcDtCandidate]) {
 fn log_dt_candidates(candidates: &[SdhcDtCandidate]) {
     for (index, candidate) in candidates.iter().enumerate() {
         println!(
-            "sdhc: dt candidate[{}] host={:?} cfg={:?} bus_width={} non_removable={} has_wifi_child={} has_brcmstb_compat={}",
+            "sdhc: dt candidate[{}] host={:?} cfg={:?} cd={} broken_cd={} bus_width={} non_removable={} has_wifi_child={} has_brcmstb_compat={}",
             index,
             candidate.host,
             candidate.cfg,
+            candidate.card_detect.is_some(),
+            candidate.broken_cd,
             candidate.bus_width,
             candidate.non_removable,
             candidate.has_wifi_child,
@@ -2316,16 +2449,23 @@ mod tests {
     use super::CommandFailureSite;
     use super::DT_COMPAT_BCM2712_SDHCI;
     use super::DT_COMPAT_BRCMSTB_SDHCI;
+    use super::GpioLineConfig;
     use super::MMC_CMD_READ_SINGLE_BLOCK;
     use super::MMC_CMD_SELECT_CARD;
     use super::MMC_CMD_SEND_STATUS;
     use super::MMC_CMD_WRITE_SINGLE_BLOCK;
+    use super::OF_GPIO_ACTIVE_LOW;
     use super::RespType;
     use super::SD_STATUS_READY_FOR_DATA;
     use super::SD_STATUS_TRANSFER_STATE;
     use super::SDHC_BLOCK_SIZE;
     use super::SDHC_CONSERVATIVE_TRANSFER_CLOCK_HZ;
     use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
+    use super::SDHCI_CTRL_4BITBUS;
+    use super::SDIO_CFG_CTRL_SDCD_N_TEST_EN;
+    use super::SDIO_CFG_CTRL_SDCD_N_TEST_LEV;
+    use super::SDIO_CFG_SD_PIN_SEL_CARD;
+    use super::SDIO_CFG_SD_PIN_SEL_MASK;
     use super::SdhcConfig;
     use super::SdhcDtCandidate;
     use super::SdhcError;
@@ -2342,8 +2482,12 @@ mod tests {
     use super::parse_from_dtb;
     use super::plan_data_command;
     use super::post_clock_settle_delay_us;
+    use super::resolve_sd_slot_bus_width;
     use super::rp1_sdio1_pad_value;
     use super::rp1_sdio1_pin_prep;
+    use super::sd_bus_width_setting;
+    use super::sdio_cfg_ctrl_real_card_detect;
+    use super::sdio_cfg_sd_pin_sel_card;
     use super::select_card_command;
     use super::select_sd_slot_candidate;
     use super::should_retry_response_timeout;
@@ -2356,6 +2500,8 @@ mod tests {
         non_removable: bool,
         wifi_child: bool,
         status: &'a str,
+        has_cd_gpio: bool,
+        broken_cd: bool,
         bus_width: u32,
         has_brcmstb_compat: bool,
     }
@@ -2505,6 +2651,17 @@ mod tests {
             set_property(&mut tree, node, "clocks", u32_prop(1));
             set_property(&mut tree, node, "vqmmc-supply", u32_prop(0x0b));
             set_property(&mut tree, node, "vmmc-supply", u32_prop(0x0c));
+            if spec.has_cd_gpio {
+                set_property(
+                    &mut tree,
+                    node,
+                    "cd-gpios",
+                    u32_list_prop(&[0x5a, 0x05, OF_GPIO_ACTIVE_LOW]),
+                );
+            }
+            if spec.broken_cd {
+                set_property(&mut tree, node, "broken-cd", Vec::new());
+            }
 
             if spec.non_removable {
                 set_property(&mut tree, node, "non-removable", Vec::new());
@@ -2567,6 +2724,8 @@ mod tests {
                 non_removable: true,
                 wifi_child: true,
                 status: "okay",
+                has_cd_gpio: false,
+                broken_cd: false,
                 bus_width: 4,
                 has_brcmstb_compat: true,
             },
@@ -2577,6 +2736,8 @@ mod tests {
                 non_removable: false,
                 wifi_child: false,
                 status: "okay",
+                has_cd_gpio: true,
+                broken_cd: false,
                 bus_width: 4,
                 has_brcmstb_compat: true,
             },
@@ -2591,6 +2752,15 @@ mod tests {
         assert_eq!(config.power.vqmmc_settle_us, 0x1388);
         assert_eq!(config.power.vmmc_enable.unwrap().line.pin, 4);
         assert!(config.power.vmmc_enable.unwrap().logical_high);
+        assert_eq!(
+            config.card_detect,
+            Some(GpioLineConfig {
+                base: 0x10_7d51_7c00,
+                pin: 5,
+                active_low: true,
+            })
+        );
+        assert_eq!(config.bus_width, 4);
     }
 
     #[test]
@@ -2608,6 +2778,8 @@ mod tests {
             lcpll: None,
             max_clock_hz: 100_000_000,
             power: super::SdhcPowerConfig::default(),
+            card_detect: None,
+            broken_cd: false,
             has_brcmstb_compat: true,
             status_okay: true,
             bus_width: 4,
@@ -2623,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn sd_slot_host_base_accepts_bus_width_eight_without_optional_regions() {
+    fn selected_sd_slot_candidate_without_cd_gpios_is_rejected() {
         let regs = &[
             (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
             (0x10_00ff_f200, 0x80),
@@ -2635,13 +2807,43 @@ mod tests {
             non_removable: false,
             wifi_child: false,
             status: "okay",
+            has_cd_gpio: false,
+            broken_cd: false,
+            bus_width: 4,
+            has_brcmstb_compat: false,
+        }];
+
+        let err = parse_test_config(&nodes).unwrap_err();
+        assert_eq!(
+            err,
+            SdhcError::DtbInvalid("sdhc: missing cd-gpios for SD slot")
+        );
+    }
+
+    #[test]
+    fn selected_sd_slot_candidate_with_unsupported_bus_width_is_rejected() {
+        let regs = &[
+            (BCM2712_SD_SLOT_HOST_BASE as u64, 0x104),
+            (0x10_00ff_f200, 0x80),
+        ];
+        let nodes = [TestNodeSpec {
+            name: "mmc@fff000",
+            reg_names: &["host", "cfg"],
+            regs,
+            non_removable: false,
+            wifi_child: false,
+            status: "okay",
+            has_cd_gpio: true,
+            broken_cd: false,
             bus_width: 8,
             has_brcmstb_compat: false,
         }];
 
-        let config = parse_test_config(&nodes).unwrap();
-        assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
-        assert_eq!(config.cfg.base, 0x10_00ff_f200);
+        let err = parse_test_config(&nodes).unwrap_err();
+        assert_eq!(
+            err,
+            SdhcError::DtbInvalid("sdhc: unsupported bus-width for SD slot")
+        );
     }
 
     #[test]
@@ -2657,6 +2859,8 @@ mod tests {
             non_removable: false,
             wifi_child: false,
             status: "okay",
+            has_cd_gpio: true,
+            broken_cd: false,
             bus_width: 4,
             has_brcmstb_compat: true,
         }];
@@ -2682,6 +2886,12 @@ mod tests {
                 lcpll: None,
                 max_clock_hz: 100_000_000,
                 power: super::SdhcPowerConfig::default(),
+                card_detect: Some(GpioLineConfig {
+                    base: 0x10_7d51_7c00,
+                    pin: 5,
+                    active_low: true,
+                }),
+                broken_cd: false,
                 has_brcmstb_compat: true,
                 status_okay: true,
                 bus_width: 4,
@@ -2701,9 +2911,15 @@ mod tests {
                 lcpll: None,
                 max_clock_hz: 100_000_000,
                 power: super::SdhcPowerConfig::default(),
+                card_detect: Some(GpioLineConfig {
+                    base: 0x10_7d51_7c00,
+                    pin: 5,
+                    active_low: true,
+                }),
+                broken_cd: false,
                 has_brcmstb_compat: true,
                 status_okay: true,
-                bus_width: 8,
+                bus_width: 4,
                 non_removable: false,
                 has_wifi_child: false,
             },
@@ -2749,6 +2965,69 @@ mod tests {
         let encoded = encode_clock_divider(100_000, 200_000_000).unwrap();
         assert_eq!(encoded, 1000);
         assert_eq!(pack_clock_control_divider(encoded), 0xe8c0);
+    }
+
+    #[test]
+    fn broken_cd_eight_bit_dt_width_maps_to_four_bit_sd_runtime() {
+        assert_eq!(resolve_sd_slot_bus_width(8, true).unwrap(), 4);
+        assert_eq!(
+            resolve_sd_slot_bus_width(8, false),
+            Err(SdhcError::DtbInvalid(
+                "sdhc: unsupported bus-width for SD slot"
+            ))
+        );
+    }
+
+    #[test]
+    fn broken_cd_candidate_without_gpio_is_accepted() {
+        let regs = &[
+            (BCM2712_SD_SLOT_HOST_BASE as u64, 0x260),
+            (0x10_00ff_f400, 0x200),
+        ];
+        let nodes = [TestNodeSpec {
+            name: "mmc@fff000",
+            reg_names: &["host", "cfg"],
+            regs,
+            non_removable: false,
+            wifi_child: false,
+            status: "okay",
+            has_cd_gpio: false,
+            broken_cd: true,
+            bus_width: 8,
+            has_brcmstb_compat: true,
+        }];
+
+        let config = parse_test_config(&nodes).unwrap();
+        assert_eq!(config.host.base, BCM2712_SD_SLOT_HOST_BASE);
+        assert_eq!(config.cfg.base, 0x10_00ff_f400);
+        assert_eq!(config.card_detect, None);
+        assert_eq!(config.bus_width, 4);
+    }
+
+    #[test]
+    fn sd_bus_width_settings_map_to_acmd6_and_host_control_bits() {
+        let one_bit = sd_bus_width_setting(1).unwrap();
+        assert_eq!(one_bit.acmd6_arg, 0);
+        assert_eq!(one_bit.host_control_bits, 0);
+
+        let four_bit = sd_bus_width_setting(4).unwrap();
+        assert_eq!(four_bit.acmd6_arg, 2);
+        assert_eq!(four_bit.host_control_bits, SDHCI_CTRL_4BITBUS);
+
+        assert_eq!(sd_bus_width_setting(0), Err(SdhcError::Unsupported));
+        assert_eq!(sd_bus_width_setting(8), Err(SdhcError::Unsupported));
+    }
+
+    #[test]
+    fn real_card_detect_programming_disables_fake_detect_and_routes_sd_slot() {
+        let ctrl = sdio_cfg_ctrl_real_card_detect(
+            0x55aa_0000 | SDIO_CFG_CTRL_SDCD_N_TEST_EN | SDIO_CFG_CTRL_SDCD_N_TEST_LEV,
+        );
+        assert_eq!(ctrl & SDIO_CFG_CTRL_SDCD_N_TEST_EN, 0);
+        assert_eq!(ctrl & SDIO_CFG_CTRL_SDCD_N_TEST_LEV, 0);
+
+        let pin_sel = sdio_cfg_sd_pin_sel_card(0xffff_ffff);
+        assert_eq!(pin_sel & SDIO_CFG_SD_PIN_SEL_MASK, SDIO_CFG_SD_PIN_SEL_CARD);
     }
 
     #[test]
