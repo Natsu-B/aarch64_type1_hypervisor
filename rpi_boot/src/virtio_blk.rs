@@ -1,6 +1,5 @@
 use arch_hal::println;
 use block_device_api::BlockDevice;
-use block_device_api::IoError;
 use block_device_api::virtio_blk_mmio::VIRTIO_BLK_T_FLUSH;
 use block_device_api::virtio_blk_mmio::VIRTIO_BLK_T_IN;
 use block_device_api::virtio_blk_mmio::VIRTIO_BLK_T_OUT;
@@ -157,35 +156,6 @@ impl VirtioBlkMmioGuestMemory for GuestMemoryIdentity {
             unsafe { write_volatile((base + idx) as *mut u8, *byte) };
         }
         Ok(())
-    }
-
-    fn with_read_buffer<F>(&self, addr: u64, len: usize, f: F) -> Result<(), VirtioBlkMmioError>
-    where
-        F: FnOnce(&[u8]) -> Result<(), IoError>,
-    {
-        if len == 0 {
-            return f(&[]).map_err(VirtioBlkMmioError::Backend);
-        }
-        let base = checked_guest_base(addr, len)?;
-        // SAFETY: The guest payload buffer lies in the identity-mapped IPA==PA space, the range
-        // was overflow-checked above, and the immutable borrow lives only for this synchronous call.
-        let buf = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-        f(buf).map_err(VirtioBlkMmioError::Backend)
-    }
-
-    fn with_write_buffer<F>(&self, addr: u64, len: usize, f: F) -> Result<(), VirtioBlkMmioError>
-    where
-        F: FnOnce(&mut [u8]) -> Result<(), IoError>,
-    {
-        if len == 0 {
-            let mut empty: [u8; 0] = [];
-            return f(&mut empty[..]).map_err(VirtioBlkMmioError::Backend);
-        }
-        let base = checked_guest_base(addr, len)?;
-        // SAFETY: The guest payload buffer lies in the identity-mapped IPA==PA space, the range
-        // was overflow-checked above, and the mutable borrow lives only for this synchronous call.
-        let buf = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
-        f(buf).map_err(VirtioBlkMmioError::Backend)
     }
 }
 

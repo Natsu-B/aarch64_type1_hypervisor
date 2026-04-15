@@ -353,9 +353,6 @@ pub fn parse_req_layout(
             if desc.len != size_of::<VirtioBlkReq>() as u32 {
                 return Err(QueueParseError::InvalidLayout);
             }
-            if desc.addr == 0 {
-                return Err(QueueParseError::InvalidLayout);
-            }
 
             let req = read_req_header(desc.addr).ok_or(QueueParseError::InvalidLayout)?;
             if req.req_type != VIRTIO_BLK_T_IN
@@ -407,9 +404,6 @@ pub fn parse_req_layout(
                 _ => return Err(QueueParseError::InvalidRequestType),
             }
 
-            if desc.addr == 0 && desc.len != 0 {
-                return Err(QueueParseError::InvalidLayout);
-            }
             if first_data_desc_idx.is_none() {
                 first_data_desc_idx = Some(cur);
             }
@@ -506,14 +500,6 @@ pub trait VirtioBlkMmioGuestMemory {
     fn read(&self, addr: u64, out: &mut [u8]) -> Result<(), VirtioBlkMmioError>;
 
     fn write(&self, addr: u64, value: &[u8]) -> Result<(), VirtioBlkMmioError>;
-
-    fn with_read_buffer<F>(&self, addr: u64, len: usize, f: F) -> Result<(), VirtioBlkMmioError>
-    where
-        F: FnOnce(&[u8]) -> Result<(), IoError>;
-
-    fn with_write_buffer<F>(&self, addr: u64, len: usize, f: F) -> Result<(), VirtioBlkMmioError>
-    where
-        F: FnOnce(&mut [u8]) -> Result<(), IoError>;
 }
 
 pub trait VirtioBlkMmioInterrupt {
@@ -1313,10 +1299,7 @@ where
                 VirtioBlkMmioError::GuestMemory("virtio-blk: guest data address overflow"),
             )?;
             let dst_chunk = &mut dst[copied..copied + chunk];
-            self.device.memory.with_read_buffer(addr, chunk, |src| {
-                dst_chunk.copy_from_slice(src);
-                Ok(())
-            })?;
+            self.device.memory.read(addr, dst_chunk)?;
 
             copied += chunk;
             self.remaining -= chunk;
@@ -1359,10 +1342,7 @@ where
                 VirtioBlkMmioError::GuestMemory("virtio-blk: guest data address overflow"),
             )?;
             let src_chunk = &src[copied..copied + chunk];
-            self.device.memory.with_write_buffer(addr, chunk, |dst| {
-                dst.copy_from_slice(src_chunk);
-                Ok(())
-            })?;
+            self.device.memory.write(addr, src_chunk)?;
 
             copied += chunk;
             self.remaining -= chunk;
@@ -1417,9 +1397,6 @@ where
             return Err(VirtioBlkMmioError::Queue(
                 QueueParseError::IndirectUnsupported,
             ));
-        }
-        if desc.addr == 0 && desc.len != 0 {
-            return Err(VirtioBlkMmioError::Queue(QueueParseError::InvalidLayout));
         }
 
         match layout.req_type {
@@ -1851,6 +1828,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_req_layout_allows_zero_guest_address_for_data_desc() {
+        let req = make_req(VIRTIO_BLK_T_IN, 32);
+        let table = [
+            desc(
+                0x1000,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+            desc(
+                0,
+                SECTOR_SIZE as u32,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                2,
+            ),
+            desc(0x3000, 1, VIRTQ_DESC_F_WRITE, 0),
+        ];
+        let mut read_req = |addr: u64| (addr == 0x1000).then_some(req);
+        let mut get_desc = |idx: u16| table.get(idx as usize).copied();
+        let parsed = parse_req_layout(8, 0, &mut get_desc, &mut read_req).unwrap();
+        assert_eq!(parsed.first_data_desc_idx, Some(1));
+        assert_eq!(parsed.data_len, SECTOR_SIZE as u32);
+        assert_eq!(parsed.status_addr, 0x3000);
+    }
+
+    #[test]
     fn used_ring_update_wraps_index() {
         let update = used_update(0x5000, 8, 0xffff, 3, 4096).unwrap();
         assert_eq!(update.ring_index, 7);
@@ -2092,39 +2095,6 @@ mod tests {
                 ))?
                 .copy_from_slice(value);
             Ok(())
-        }
-
-        fn with_read_buffer<F>(&self, addr: u64, len: usize, f: F) -> Result<(), VirtioBlkMmioError>
-        where
-            F: FnOnce(&[u8]) -> Result<(), IoError>,
-        {
-            let (start, end) = FakeGuestMemory::range(addr, len)?;
-            let bytes = self.bytes.lock().unwrap();
-            let slice = bytes
-                .get(start..end)
-                .ok_or(VirtioBlkMmioError::GuestMemory(
-                    "virtio-blk test: guest memory read buffer out of range",
-                ))?;
-            f(slice).map_err(VirtioBlkMmioError::Backend)
-        }
-
-        fn with_write_buffer<F>(
-            &self,
-            addr: u64,
-            len: usize,
-            f: F,
-        ) -> Result<(), VirtioBlkMmioError>
-        where
-            F: FnOnce(&mut [u8]) -> Result<(), IoError>,
-        {
-            let (start, end) = FakeGuestMemory::range(addr, len)?;
-            let mut bytes = self.bytes.lock().unwrap();
-            let slice = bytes
-                .get_mut(start..end)
-                .ok_or(VirtioBlkMmioError::GuestMemory(
-                    "virtio-blk test: guest memory write buffer out of range",
-                ))?;
-            f(slice).map_err(VirtioBlkMmioError::Backend)
         }
     }
 
@@ -2384,6 +2354,105 @@ mod tests {
 
         assert_eq!(device.mmio_read(REG_INTERRUPT_STATUS, 4).unwrap(), 0);
         assert_eq!(irq.levels(), vec![true, false]);
+    }
+
+    #[test]
+    fn queue_notify_read_request_to_guest_addr_zero_succeeds() {
+        let mut storage = vec![0u8; SECTOR_SIZE * 3];
+        for (idx, byte) in storage[SECTOR_SIZE..SECTOR_SIZE * 2].iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(5).wrapping_add(7);
+        }
+        let backend = FakeBlockDevice::new(storage.clone(), false);
+        let memory = FakeGuestMemory::new(0x8000);
+        let irq = FakeInterrupt::default();
+        let trace = FakeTrace::default();
+        let mut device = make_device_with_trace(&backend, &memory, &irq, &trace);
+
+        configure_ready_queue(&mut device, &memory, 8);
+        enable_driver(&mut device);
+
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            1,
+            desc(
+                0,
+                SECTOR_SIZE as u32,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                2,
+            ),
+        );
+        memory.write_desc(DESC_ADDR, 2, desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0));
+        memory.write_req(REQ_ADDR, make_req(VIRTIO_BLK_T_IN, 1));
+        memory.write_u16(AVAIL_ADDR + 2, 1);
+        memory.write_u16(AVAIL_ADDR + 4, 0);
+        memory.write_u8(STATUS_ADDR, 0xff);
+
+        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+
+        assert_eq!(
+            memory.read_bytes(0, SECTOR_SIZE),
+            storage[SECTOR_SIZE..SECTOR_SIZE * 2].to_vec()
+        );
+        assert_eq!(memory.read_u8(STATUS_ADDR), VIRTIO_BLK_S_OK);
+        assert_eq!(memory.read_u16(USED_ADDR + 2), 1);
+        assert!(trace.events().is_empty());
+    }
+
+    #[test]
+    fn queue_notify_write_request_from_guest_addr_zero_succeeds() {
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 3], false);
+        let memory = FakeGuestMemory::new(0x8000);
+        let irq = FakeInterrupt::default();
+        let trace = FakeTrace::default();
+        let mut device = make_device_with_trace(&backend, &memory, &irq, &trace);
+
+        configure_ready_queue(&mut device, &memory, 8);
+        enable_driver(&mut device);
+
+        let pattern: Vec<u8> = (0..SECTOR_SIZE)
+            .map(|idx| (idx as u8).wrapping_mul(13).wrapping_add(9))
+            .collect();
+        memory.write_bytes(0, &pattern);
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            1,
+            desc(0, SECTOR_SIZE as u32, VIRTQ_DESC_F_NEXT, 2),
+        );
+        memory.write_desc(DESC_ADDR, 2, desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0));
+        memory.write_req(REQ_ADDR, make_req(VIRTIO_BLK_T_OUT, 1));
+        memory.write_u16(AVAIL_ADDR + 2, 1);
+        memory.write_u16(AVAIL_ADDR + 4, 0);
+        memory.write_u8(STATUS_ADDR, 0xff);
+
+        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+
+        assert_eq!(
+            backend.storage.lock().unwrap()[SECTOR_SIZE..SECTOR_SIZE * 2].to_vec(),
+            pattern
+        );
+        assert_eq!(memory.read_u8(STATUS_ADDR), VIRTIO_BLK_S_OK);
+        assert_eq!(memory.read_u16(USED_ADDR + 2), 1);
+        assert!(trace.events().is_empty());
     }
 
     #[test]
