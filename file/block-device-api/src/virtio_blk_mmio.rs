@@ -82,7 +82,7 @@ pub struct VirtioBlkConfig {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VirtqDesc {
     pub addr: u64,
     pub len: u32,
@@ -114,6 +114,8 @@ pub struct VirtqUsedElem {
 const _: () = assert!(size_of::<VirtioBlkReq>() == 16);
 const _: () = assert!(size_of::<VirtqDesc>() == 16);
 const _: () = assert!(size_of::<VirtqUsedElem>() == 8);
+const VIRTIO_BLK_REQ_HEADER_RAW_LEN: usize = size_of::<VirtioBlkReq>();
+const PARSE_FAILURE_DESCRIPTOR_CAPTURE_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MmioAccessError {
@@ -144,6 +146,33 @@ pub struct VirtioBlkReqLayout {
     pub status_addr: u64,
     pub req_type: u32,
     pub sector: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioBlkDescriptorSnapshot {
+    pub descriptor_count_captured: u8,
+    pub descriptors: [Option<VirtqDesc>; PARSE_FAILURE_DESCRIPTOR_CAPTURE_LIMIT],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioBlkParseFailureDetail {
+    pub head: u16,
+    pub queue_size: u16,
+    pub status_addr_hint: Option<u64>,
+    pub mapped_status: u8,
+    pub parse_error: QueueParseError,
+    pub header_addr: Option<u64>,
+    pub header_readable: bool,
+    pub header_raw: Option<[u8; VIRTIO_BLK_REQ_HEADER_RAW_LEN]>,
+    pub descriptor_snapshot: VirtioBlkDescriptorSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioBlkExecutionFailureDetail {
+    pub head: u16,
+    pub layout: VirtioBlkReqLayout,
+    pub mapped_status: u8,
+    pub err: VirtioBlkMmioError,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,6 +520,18 @@ pub trait VirtioBlkMmioInterrupt {
     fn set_irq_level(&self, asserted: bool) -> Result<(), VirtioBlkMmioError>;
 }
 
+pub trait VirtioBlkMmioTrace: Sync {
+    fn on_parse_failure(&self, _detail: &VirtioBlkParseFailureDetail) {}
+
+    fn on_execution_failure(&self, _detail: &VirtioBlkExecutionFailureDetail) {}
+}
+
+pub struct NoopVirtioBlkMmioTrace;
+
+impl VirtioBlkMmioTrace for NoopVirtioBlkMmioTrace {}
+
+static NOOP_VIRTIO_BLK_MMIO_TRACE: NoopVirtioBlkMmioTrace = NoopVirtioBlkMmioTrace;
+
 #[derive(Clone, Copy, Debug)]
 struct QueueState {
     size: u16,
@@ -605,6 +646,7 @@ where
     backend: VirtioBlkBackend<'a, B>,
     memory: M,
     interrupt: I,
+    trace: &'a dyn VirtioBlkMmioTrace,
     status: u32,
     device_features_sel: u32,
     driver_features_sel: u32,
@@ -622,10 +664,20 @@ where
     I: VirtioBlkMmioInterrupt,
 {
     pub fn new(backend: &'a B, memory: M, interrupt: I) -> Result<Self, VirtioBlkMmioError> {
+        Self::new_with_trace(backend, memory, interrupt, &NOOP_VIRTIO_BLK_MMIO_TRACE)
+    }
+
+    pub fn new_with_trace(
+        backend: &'a B,
+        memory: M,
+        interrupt: I,
+        trace: &'a dyn VirtioBlkMmioTrace,
+    ) -> Result<Self, VirtioBlkMmioError> {
         Ok(Self {
             backend: VirtioBlkBackend::new(backend)?,
             memory,
             interrupt,
+            trace,
             status: 0,
             device_features_sel: 0,
             driver_features_sel: 0,
@@ -939,6 +991,9 @@ where
             ));
         }
 
+        // Ensure the device observes the guest's descriptor table and avail-ring writes in
+        // normal memory before consuming the avail index published by the queue notify.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let avail_idx = self.read_guest_u16(self.queue.avail_addr + 2)?;
         let pending = avail_idx.wrapping_sub(self.queue.last_avail_idx);
         if pending == 0 {
@@ -993,17 +1048,19 @@ where
         let layout = match parsed {
             Ok(layout) => layout,
             Err(err) => {
+                let detail = self.collect_parse_failure_detail(head, status_addr_hint, err);
+                self.trace.on_parse_failure(&detail);
                 return RequestOutcome {
-                    status: parse_error_status(err),
-                    status_addr: status_addr_hint,
+                    status: detail.mapped_status,
+                    status_addr: detail.status_addr_hint,
                     used_len: 0,
                 };
             }
         };
-        self.execute_request(&layout)
+        self.execute_request(head, &layout)
     }
 
-    fn execute_request(&self, layout: &VirtioBlkReqLayout) -> RequestOutcome {
+    fn execute_request(&self, head: u16, layout: &VirtioBlkReqLayout) -> RequestOutcome {
         match layout.req_type {
             VIRTIO_BLK_T_IN => {
                 let io_res = (|| -> Result<(), VirtioBlkMmioError> {
@@ -1017,7 +1074,7 @@ where
                     }
                     Ok(())
                 })();
-                map_io_to_outcome(layout, io_res, layout.data_len)
+                self.map_io_to_outcome(head, layout, io_res, layout.data_len)
             }
             VIRTIO_BLK_T_OUT => {
                 let io_res = (|| -> Result<(), VirtioBlkMmioError> {
@@ -1031,16 +1088,131 @@ where
                     }
                     Ok(())
                 })();
-                map_io_to_outcome(layout, io_res, layout.data_len)
+                self.map_io_to_outcome(head, layout, io_res, layout.data_len)
             }
             VIRTIO_BLK_T_FLUSH => {
                 let io_res = self.backend.flush();
-                map_io_to_outcome(layout, io_res, 0)
+                self.map_io_to_outcome(head, layout, io_res, 0)
             }
-            _ => RequestOutcome {
-                status: VIRTIO_BLK_S_UNSUPP,
+            _ => {
+                let detail = VirtioBlkExecutionFailureDetail {
+                    head,
+                    layout: *layout,
+                    mapped_status: VIRTIO_BLK_S_UNSUPP,
+                    err: VirtioBlkMmioError::Queue(QueueParseError::InvalidRequestType),
+                };
+                self.trace.on_execution_failure(&detail);
+                RequestOutcome {
+                    status: VIRTIO_BLK_S_UNSUPP,
+                    status_addr: Some(layout.status_addr),
+                    used_len: 0,
+                }
+            }
+        }
+    }
+
+    fn map_io_to_outcome(
+        &self,
+        head: u16,
+        layout: &VirtioBlkReqLayout,
+        io_result: Result<(), VirtioBlkMmioError>,
+        used_len: u32,
+    ) -> RequestOutcome {
+        match io_result {
+            Ok(()) => RequestOutcome {
+                status: VIRTIO_BLK_S_OK,
                 status_addr: Some(layout.status_addr),
-                used_len: 0,
+                used_len,
+            },
+            Err(err) => {
+                let mapped_status = match err {
+                    VirtioBlkMmioError::Backend(IoError::Unsupported) => VIRTIO_BLK_S_UNSUPP,
+                    _ => VIRTIO_BLK_S_IOERR,
+                };
+                let detail = VirtioBlkExecutionFailureDetail {
+                    head,
+                    layout: *layout,
+                    mapped_status,
+                    err,
+                };
+                self.trace.on_execution_failure(&detail);
+                RequestOutcome {
+                    status: mapped_status,
+                    status_addr: Some(layout.status_addr),
+                    used_len: 0,
+                }
+            }
+        }
+    }
+
+    fn collect_parse_failure_detail(
+        &self,
+        head: u16,
+        status_addr_hint: Option<u64>,
+        err: QueueParseError,
+    ) -> VirtioBlkParseFailureDetail {
+        let mut descriptors = [None; PARSE_FAILURE_DESCRIPTOR_CAPTURE_LIMIT];
+        let mut descriptor_count_captured = 0u8;
+        let mut seen = [0u16; PARSE_FAILURE_DESCRIPTOR_CAPTURE_LIMIT];
+        let mut seen_count = 0usize;
+        let mut cur = head;
+        let mut header_addr = None;
+        let mut header_readable = false;
+        let mut header_raw = None;
+
+        while usize::from(descriptor_count_captured) < PARSE_FAILURE_DESCRIPTOR_CAPTURE_LIMIT {
+            if cur >= self.queue.size {
+                break;
+            }
+            if seen[..seen_count].contains(&cur) {
+                break;
+            }
+
+            seen[seen_count] = cur;
+            seen_count += 1;
+
+            let slot = usize::from(descriptor_count_captured);
+            descriptor_count_captured = descriptor_count_captured.wrapping_add(1);
+
+            let Ok(desc) = self.read_descriptor(cur) else {
+                break;
+            };
+            descriptors[slot] = Some(desc);
+
+            if slot == 0 {
+                header_addr = Some(desc.addr);
+                header_readable = (desc.flags & VIRTQ_DESC_F_WRITE) == 0
+                    && desc.len >= VIRTIO_BLK_REQ_HEADER_RAW_LEN as u32
+                    && desc.addr != 0;
+                if header_readable {
+                    let mut raw = [0u8; VIRTIO_BLK_REQ_HEADER_RAW_LEN];
+                    if self.memory.read(desc.addr, &mut raw).is_ok() {
+                        header_raw = Some(raw);
+                    }
+                }
+            }
+
+            if (desc.flags & VIRTQ_DESC_F_NEXT) == 0 {
+                break;
+            }
+            if desc.next >= self.queue.size {
+                break;
+            }
+            cur = desc.next;
+        }
+
+        VirtioBlkParseFailureDetail {
+            head,
+            queue_size: self.queue.size,
+            status_addr_hint,
+            mapped_status: parse_error_status(err),
+            parse_error: err,
+            header_addr,
+            header_readable,
+            header_raw,
+            descriptor_snapshot: VirtioBlkDescriptorSnapshot {
+                descriptor_count_captured,
+                descriptors,
             },
         }
     }
@@ -1350,30 +1522,6 @@ struct RequestOutcome {
     status: u8,
     status_addr: Option<u64>,
     used_len: u32,
-}
-
-fn map_io_to_outcome(
-    layout: &VirtioBlkReqLayout,
-    io_result: Result<(), VirtioBlkMmioError>,
-    used_len: u32,
-) -> RequestOutcome {
-    match io_result {
-        Ok(()) => RequestOutcome {
-            status: VIRTIO_BLK_S_OK,
-            status_addr: Some(layout.status_addr),
-            used_len,
-        },
-        Err(VirtioBlkMmioError::Backend(IoError::Unsupported)) => RequestOutcome {
-            status: VIRTIO_BLK_S_UNSUPP,
-            status_addr: Some(layout.status_addr),
-            used_len: 0,
-        },
-        Err(_) => RequestOutcome {
-            status: VIRTIO_BLK_S_IOERR,
-            status_addr: Some(layout.status_addr),
-            used_len: 0,
-        },
-    }
 }
 
 fn parse_error_status(err: QueueParseError) -> u8 {
@@ -1717,9 +1865,41 @@ mod tests {
         assert_eq!(new, 1 << 7);
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TraceEvent {
+        Parse(VirtioBlkParseFailureDetail),
+        Execution(VirtioBlkExecutionFailureDetail),
+    }
+
+    #[derive(Default)]
+    struct FakeTrace {
+        events: Mutex<Vec<TraceEvent>>,
+    }
+
+    impl FakeTrace {
+        fn events(&self) -> Vec<TraceEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl VirtioBlkMmioTrace for FakeTrace {
+        fn on_parse_failure(&self, detail: &VirtioBlkParseFailureDetail) {
+            self.events.lock().unwrap().push(TraceEvent::Parse(*detail));
+        }
+
+        fn on_execution_failure(&self, detail: &VirtioBlkExecutionFailureDetail) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(TraceEvent::Execution(*detail));
+        }
+    }
+
     struct FakeBlockDevice {
         storage: Mutex<Vec<u8>>,
         read_only: bool,
+        read_error: Option<IoError>,
+        flush_error: Option<IoError>,
     }
 
     impl FakeBlockDevice {
@@ -1728,7 +1908,19 @@ mod tests {
             Self {
                 storage: Mutex::new(storage),
                 read_only,
+                read_error: None,
+                flush_error: None,
             }
+        }
+
+        fn with_read_error(mut self, err: IoError) -> Self {
+            self.read_error = Some(err);
+            self
+        }
+
+        fn with_flush_error(mut self, err: IoError) -> Self {
+            self.flush_error = Some(err);
+            self
         }
     }
 
@@ -1746,6 +1938,9 @@ mod tests {
         }
 
         fn read_at(&self, lba: u64, buf: &mut [MaybeUninit<u8>]) -> Result<(), IoError> {
+            if let Some(err) = self.read_error {
+                return Err(err);
+            }
             if (buf.len() % SECTOR_SIZE) != 0 {
                 return Err(IoError::Align);
             }
@@ -1779,6 +1974,9 @@ mod tests {
         }
 
         fn flush(&self) -> Result<(), IoError> {
+            if let Some(err) = self.flush_error {
+                return Err(err);
+            }
             Ok(())
         }
 
@@ -1961,6 +2159,15 @@ mod tests {
         irq: &'a FakeInterrupt,
     ) -> VirtioBlkMmioDevice<'a, FakeBlockDevice, &'a FakeGuestMemory, &'a FakeInterrupt> {
         VirtioBlkMmioDevice::new(backend, memory, irq).unwrap()
+    }
+
+    fn make_device_with_trace<'a>(
+        backend: &'a FakeBlockDevice,
+        memory: &'a FakeGuestMemory,
+        irq: &'a FakeInterrupt,
+        trace: &'a dyn VirtioBlkMmioTrace,
+    ) -> VirtioBlkMmioDevice<'a, FakeBlockDevice, &'a FakeGuestMemory, &'a FakeInterrupt> {
+        VirtioBlkMmioDevice::new_with_trace(backend, memory, irq, trace).unwrap()
     }
 
     fn enable_driver<B, M, I>(device: &mut VirtioBlkMmioDevice<'_, B, M, I>)
@@ -2301,14 +2508,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_descriptor_chain_completes_with_ioerr_status() {
+    fn parse_failure_detail_captures_first_descriptors() {
         let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 2], false);
         let memory = FakeGuestMemory::new(0x8000);
         let irq = FakeInterrupt::default();
         let mut device = make_device(&backend, &memory, &irq);
 
         configure_ready_queue(&mut device, &memory, 8);
-        enable_driver(&mut device);
 
         memory.write_desc(
             DESC_ADDR,
@@ -2332,17 +2538,193 @@ mod tests {
         );
         memory.write_desc(DESC_ADDR, 2, desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0));
         memory.write_req(REQ_ADDR, make_req(VIRTIO_BLK_T_OUT, 0));
-        memory.write_u16(AVAIL_ADDR + 2, 1);
-        memory.write_u16(AVAIL_ADDR + 4, 0);
-        memory.write_u8(STATUS_ADDR, 0xff);
 
-        device.mmio_write(REG_QUEUE_NOTIFY, 4, 0).unwrap();
+        let detail = device.collect_parse_failure_detail(
+            0,
+            Some(STATUS_ADDR),
+            QueueParseError::InvalidLayout,
+        );
 
-        assert_eq!(memory.read_u8(STATUS_ADDR), VIRTIO_BLK_S_IOERR);
-        assert_eq!(memory.read_u16(USED_ADDR + 2), 1);
-        assert_eq!(memory.read_u32(USED_ADDR + 4), 0);
-        assert_eq!(memory.read_u32(USED_ADDR + 8), 0);
-        assert_eq!(irq.levels(), vec![true]);
+        assert_eq!(detail.mapped_status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(detail.parse_error, QueueParseError::InvalidLayout);
+        assert_eq!(detail.status_addr_hint, Some(STATUS_ADDR));
+        assert_eq!(detail.header_addr, Some(REQ_ADDR));
+        assert!(detail.header_readable);
+        assert_eq!(
+            detail.header_raw,
+            Some([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,])
+        );
+        assert_eq!(detail.descriptor_snapshot.descriptor_count_captured, 3);
+        assert_eq!(
+            detail.descriptor_snapshot.descriptors[0],
+            Some(desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_failure_invalid_request_type_maps_to_unsupp_and_logs_detail() {
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 2], false);
+        let memory = FakeGuestMemory::new(0x8000);
+        let irq = FakeInterrupt::default();
+        let trace = FakeTrace::default();
+        let mut device = make_device_with_trace(&backend, &memory, &irq, &trace);
+
+        configure_ready_queue(&mut device, &memory, 8);
+
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(DESC_ADDR, 1, desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0));
+        memory.write_req(REQ_ADDR, make_req(99, 7));
+
+        let outcome = device.process_one_request(0);
+
+        assert_eq!(outcome.status, VIRTIO_BLK_S_UNSUPP);
+        assert_eq!(outcome.status_addr, Some(STATUS_ADDR));
+        assert_eq!(outcome.used_len, 0);
+        assert_eq!(
+            trace.events(),
+            vec![TraceEvent::Parse(VirtioBlkParseFailureDetail {
+                head: 0,
+                queue_size: 8,
+                status_addr_hint: Some(STATUS_ADDR),
+                mapped_status: VIRTIO_BLK_S_UNSUPP,
+                parse_error: QueueParseError::InvalidRequestType,
+                header_addr: Some(REQ_ADDR),
+                header_readable: true,
+                header_raw: Some([99, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]),
+                descriptor_snapshot: VirtioBlkDescriptorSnapshot {
+                    descriptor_count_captured: 2,
+                    descriptors: [
+                        Some(desc(
+                            REQ_ADDR,
+                            size_of::<VirtioBlkReq>() as u32,
+                            VIRTQ_DESC_F_NEXT,
+                            1,
+                        )),
+                        Some(desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0)),
+                        None,
+                        None,
+                    ],
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn execution_failure_preserves_original_error_for_trace() {
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 2], false)
+            .with_read_error(IoError::Device);
+        let memory = FakeGuestMemory::new(0x8000);
+        let irq = FakeInterrupt::default();
+        let trace = FakeTrace::default();
+        let mut device = make_device_with_trace(&backend, &memory, &irq, &trace);
+
+        configure_ready_queue(&mut device, &memory, 8);
+
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(
+            DESC_ADDR,
+            1,
+            desc(
+                DATA_ADDR,
+                SECTOR_SIZE as u32,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                2,
+            ),
+        );
+        memory.write_desc(DESC_ADDR, 2, desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0));
+        memory.write_req(REQ_ADDR, make_req(VIRTIO_BLK_T_IN, 0));
+
+        let outcome = device.process_one_request(0);
+
+        assert_eq!(outcome.status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(outcome.status_addr, Some(STATUS_ADDR));
+        assert_eq!(outcome.used_len, 0);
+        assert_eq!(
+            trace.events(),
+            vec![TraceEvent::Execution(VirtioBlkExecutionFailureDetail {
+                head: 0,
+                layout: VirtioBlkReqLayout {
+                    first_data_desc_idx: Some(1),
+                    status_desc_idx: 2,
+                    data_len: SECTOR_SIZE as u32,
+                    status_addr: STATUS_ADDR,
+                    req_type: VIRTIO_BLK_T_IN,
+                    sector: 0,
+                },
+                err: VirtioBlkMmioError::Backend(IoError::Device),
+                mapped_status: VIRTIO_BLK_S_IOERR,
+            })]
+        );
+    }
+
+    #[test]
+    fn execution_failure_backend_unsupported_maps_to_unsupp() {
+        let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 2], false)
+            .with_flush_error(IoError::Unsupported);
+        let memory = FakeGuestMemory::new(0x8000);
+        let irq = FakeInterrupt::default();
+        let trace = FakeTrace::default();
+        let mut device = make_device_with_trace(&backend, &memory, &irq, &trace);
+
+        configure_ready_queue(&mut device, &memory, 8);
+
+        memory.write_desc(
+            DESC_ADDR,
+            0,
+            desc(
+                REQ_ADDR,
+                size_of::<VirtioBlkReq>() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            ),
+        );
+        memory.write_desc(DESC_ADDR, 1, desc(STATUS_ADDR, 1, VIRTQ_DESC_F_WRITE, 0));
+        memory.write_req(REQ_ADDR, make_req(VIRTIO_BLK_T_FLUSH, 0));
+
+        let outcome = device.process_one_request(0);
+
+        assert_eq!(outcome.status, VIRTIO_BLK_S_UNSUPP);
+        assert_eq!(outcome.status_addr, Some(STATUS_ADDR));
+        assert_eq!(outcome.used_len, 0);
+        assert_eq!(
+            trace.events(),
+            vec![TraceEvent::Execution(VirtioBlkExecutionFailureDetail {
+                head: 0,
+                layout: VirtioBlkReqLayout {
+                    first_data_desc_idx: None,
+                    status_desc_idx: 1,
+                    data_len: 0,
+                    status_addr: STATUS_ADDR,
+                    req_type: VIRTIO_BLK_T_FLUSH,
+                    sector: 0,
+                },
+                err: VirtioBlkMmioError::Backend(IoError::Unsupported),
+                mapped_status: VIRTIO_BLK_S_UNSUPP,
+            })]
+        );
     }
 
     #[test]

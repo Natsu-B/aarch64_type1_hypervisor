@@ -1,10 +1,16 @@
 use arch_hal::println;
 use block_device_api::BlockDevice;
 use block_device_api::IoError;
+use block_device_api::virtio_blk_mmio::VIRTIO_BLK_T_FLUSH;
+use block_device_api::virtio_blk_mmio::VIRTIO_BLK_T_IN;
+use block_device_api::virtio_blk_mmio::VIRTIO_BLK_T_OUT;
+use block_device_api::virtio_blk_mmio::VirtioBlkExecutionFailureDetail;
 use block_device_api::virtio_blk_mmio::VirtioBlkMmioDevice;
 use block_device_api::virtio_blk_mmio::VirtioBlkMmioError;
 use block_device_api::virtio_blk_mmio::VirtioBlkMmioGuestMemory;
 use block_device_api::virtio_blk_mmio::VirtioBlkMmioInterrupt;
+use block_device_api::virtio_blk_mmio::VirtioBlkMmioTrace;
+use block_device_api::virtio_blk_mmio::VirtioBlkParseFailureDetail;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::sync::atomic::AtomicU32;
@@ -31,6 +37,9 @@ static VIRTIO_BLK_LOG_ONCE: AtomicU32 = AtomicU32::new(0);
 static VIRTIO_BLK_NOTIFY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VIRTIO_BLK_ACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VIRTIO_BLK_IRQ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VIRTIO_BLK_PARSE_FAIL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VIRTIO_BLK_EXEC_FAIL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RPI_VIRTIO_BLK_TRACE_SINK: RpiVirtioBlkTraceSink = RpiVirtioBlkTraceSink;
 
 type RpiVirtioBlkDevice =
     VirtioBlkMmioDevice<'static, dyn BlockDevice, GuestMemoryIdentity, VgicInterruptSink>;
@@ -39,6 +48,30 @@ static VIRTIO_BLK: SpinLock<Option<RpiVirtioBlkDevice>> = SpinLock::new(None);
 
 struct GuestMemoryIdentity;
 struct VgicInterruptSink;
+struct RpiVirtioBlkTraceSink;
+
+fn request_type_label(req_type: u32) -> &'static str {
+    match req_type {
+        VIRTIO_BLK_T_IN => "in",
+        VIRTIO_BLK_T_OUT => "out",
+        VIRTIO_BLK_T_FLUSH => "flush",
+        _ => "unknown",
+    }
+}
+
+fn log_failure(counter: &AtomicUsize, label: &str, msg: impl FnOnce()) {
+    const LIMIT: usize = 64;
+
+    let index = counter.fetch_add(1, Ordering::Relaxed);
+    if index < LIMIT {
+        msg();
+    } else if index == LIMIT {
+        println!(
+            "virtio-blk: suppressing further {} failure logs after {} entries",
+            label, LIMIT
+        );
+    }
+}
 
 fn log_once(mask: u32, msg: impl FnOnce()) {
     if !cfg!(debug_assertions) {
@@ -169,6 +202,85 @@ impl VirtioBlkMmioInterrupt for VgicInterruptSink {
     }
 }
 
+impl VirtioBlkMmioTrace for RpiVirtioBlkTraceSink {
+    fn on_parse_failure(&self, detail: &VirtioBlkParseFailureDetail) {
+        log_failure(&VIRTIO_BLK_PARSE_FAIL_LOG_COUNT, "parse", || {
+            match (detail.status_addr_hint, detail.header_addr) {
+                (Some(status_addr_hint), Some(header_addr)) => println!(
+                    "virtio-blk: parse failure head={} queue_size={} status_addr_hint=0x{:x} mapped_status=0x{:02x} parse_error={:?} header_addr=0x{:x} header_readable={} header_raw={:?}",
+                    detail.head,
+                    detail.queue_size,
+                    status_addr_hint,
+                    detail.mapped_status,
+                    detail.parse_error,
+                    header_addr,
+                    detail.header_readable,
+                    detail.header_raw
+                ),
+                (Some(status_addr_hint), None) => println!(
+                    "virtio-blk: parse failure head={} queue_size={} status_addr_hint=0x{:x} mapped_status=0x{:02x} parse_error={:?} header_addr=<none> header_readable={} header_raw={:?}",
+                    detail.head,
+                    detail.queue_size,
+                    status_addr_hint,
+                    detail.mapped_status,
+                    detail.parse_error,
+                    detail.header_readable,
+                    detail.header_raw
+                ),
+                (None, Some(header_addr)) => println!(
+                    "virtio-blk: parse failure head={} queue_size={} status_addr_hint=<none> mapped_status=0x{:02x} parse_error={:?} header_addr=0x{:x} header_readable={} header_raw={:?}",
+                    detail.head,
+                    detail.queue_size,
+                    detail.mapped_status,
+                    detail.parse_error,
+                    header_addr,
+                    detail.header_readable,
+                    detail.header_raw
+                ),
+                (None, None) => println!(
+                    "virtio-blk: parse failure head={} queue_size={} status_addr_hint=<none> mapped_status=0x{:02x} parse_error={:?} header_addr=<none> header_readable={} header_raw={:?}",
+                    detail.head,
+                    detail.queue_size,
+                    detail.mapped_status,
+                    detail.parse_error,
+                    detail.header_readable,
+                    detail.header_raw
+                ),
+            }
+
+            for (index, desc) in detail.descriptor_snapshot.descriptors
+                [..usize::from(detail.descriptor_snapshot.descriptor_count_captured)]
+                .iter()
+                .enumerate()
+            {
+                match desc {
+                    Some(desc) => println!(
+                        "virtio-blk: parse desc[{}] addr=0x{:x} len={} flags=0x{:x} next={}",
+                        index, desc.addr, desc.len, desc.flags, desc.next
+                    ),
+                    None => println!("virtio-blk: parse desc[{}] <unavailable>", index),
+                }
+            }
+        });
+    }
+
+    fn on_execution_failure(&self, detail: &VirtioBlkExecutionFailureDetail) {
+        log_failure(&VIRTIO_BLK_EXEC_FAIL_LOG_COUNT, "execution", || {
+            println!(
+                "virtio-blk: execution failure head={} req_type={}({:#x}) sector={} data_len={} status_addr=0x{:x} mapped_status=0x{:02x} err={:?}",
+                detail.head,
+                request_type_label(detail.layout.req_type),
+                detail.layout.req_type,
+                detail.layout.sector,
+                detail.layout.data_len,
+                detail.layout.status_addr,
+                detail.mapped_status,
+                detail.err
+            );
+        });
+    }
+}
+
 pub(crate) fn init_with_backend(dev: &'static dyn BlockDevice) -> Result<(), &'static str> {
     if cfg!(debug_assertions) {
         println!(
@@ -177,8 +289,13 @@ pub(crate) fn init_with_backend(dev: &'static dyn BlockDevice) -> Result<(), &'s
             dev.block_size()
         );
     }
-    let device = VirtioBlkMmioDevice::new(dev, GuestMemoryIdentity, VgicInterruptSink)
-        .map_err(map_mmio_error)?;
+    let device = VirtioBlkMmioDevice::new_with_trace(
+        dev,
+        GuestMemoryIdentity,
+        VgicInterruptSink,
+        &RPI_VIRTIO_BLK_TRACE_SINK,
+    )
+    .map_err(map_mmio_error)?;
     let mut guard = VIRTIO_BLK.lock();
     if guard.is_some() {
         return Err("virtio-blk: backend is already initialized");
