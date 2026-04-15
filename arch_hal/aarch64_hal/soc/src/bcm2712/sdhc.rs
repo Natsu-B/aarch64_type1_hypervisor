@@ -868,8 +868,14 @@ impl Bcm2712Sdhc {
         self.reg_write_u32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
     }
 
+    fn write_protect_bit_set(&self) -> bool {
+        write_protect_bit_set_from_present_state(self.reg_read_u32(SDHCI_PRESENT_STATE))
+    }
+
     fn card_read_only(&self) -> bool {
-        (self.reg_read_u32(SDHCI_PRESENT_STATE) & SDHCI_WRITE_PROTECT) != 0
+        // Match the Linux default SDHCI path: a clear PRESENT_STATE write-protect bit means
+        // the media should be treated as read-only, while a set bit means writable.
+        !self.write_protect_bit_set()
     }
 
     fn controller_snapshot(&self) -> ControllerSnapshot {
@@ -1352,7 +1358,10 @@ impl Bcm2712Sdhc {
         self.apply_conservative_transfer_clock(rca)?;
 
         let capacity_blocks = decode_capacity_blocks(&csd, high_capacity)?;
-        let read_only = self.card_read_only();
+        let present_state = self.reg_read_u32(SDHCI_PRESENT_STATE);
+        let write_protect_bit_set = write_protect_bit_set_from_present_state(present_state);
+        let read_only = !write_protect_bit_set;
+        debug_assert_eq!(read_only, self.card_read_only());
         let mut guard = self.card.lock();
         *guard = Some(CardState {
             high_capacity,
@@ -1362,6 +1371,10 @@ impl Bcm2712Sdhc {
         println!(
             "sdhc: initialized rca=0x{:x} high_capacity={} blocks={}",
             rca, high_capacity, capacity_blocks
+        );
+        println!(
+            "sdhc: ro-detect present_state=0x{:08x} wp_bit_set={} read_only={}",
+            present_state, write_protect_bit_set, read_only
         );
         Ok(())
     }
@@ -1761,6 +1774,10 @@ fn decode_present_state(state: u32) -> PresentStateDecode {
         card_state_stable: (state & SDHCI_CARD_STATE_STABLE) != 0,
         write_protect: (state & SDHCI_WRITE_PROTECT) != 0,
     }
+}
+
+fn write_protect_bit_set_from_present_state(present_state: u32) -> bool {
+    (present_state & SDHCI_WRITE_PROTECT) != 0
 }
 
 fn decode_command_register(command: u16) -> CommandRegisterDecode {
@@ -2437,6 +2454,7 @@ mod tests {
 
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::mem::size_of;
 
     use dtb::DeviceTree;
     use dtb::DeviceTreeEditExt;
@@ -2444,8 +2462,11 @@ mod tests {
     use dtb::NameRef;
     use dtb::NodeEditExt;
     use dtb::ValueRef;
+    use mutex::SpinLock;
 
     use super::BCM2712_SD_SLOT_HOST_BASE;
+    use super::Bcm2712Sdhc;
+    use super::CardState;
     use super::CommandFailureSite;
     use super::DT_COMPAT_BCM2712_SDHCI;
     use super::DT_COMPAT_BRCMSTB_SDHCI;
@@ -2460,8 +2481,11 @@ mod tests {
     use super::SD_STATUS_TRANSFER_STATE;
     use super::SDHC_BLOCK_SIZE;
     use super::SDHC_CONSERVATIVE_TRANSFER_CLOCK_HZ;
+    use super::SDHC_DEFAULT_MIN_CLOCK_HZ;
     use super::SDHC_MAX_TRANSFER_BLOCKS_PER_CMD;
     use super::SDHCI_CTRL_4BITBUS;
+    use super::SDHCI_PRESENT_STATE;
+    use super::SDHCI_WRITE_PROTECT;
     use super::SDIO_CFG_CTRL_SDCD_N_TEST_EN;
     use super::SDIO_CFG_CTRL_SDCD_N_TEST_LEV;
     use super::SDIO_CFG_SD_PIN_SEL_CARD;
@@ -2680,11 +2704,77 @@ mod tests {
         parse_from_dtb(&parser)
     }
 
+    struct RegisterBackedTestSdhc {
+        host_regs: Vec<u32>,
+        _cfg_regs: Vec<u32>,
+        dev: Bcm2712Sdhc,
+    }
+
+    impl RegisterBackedTestSdhc {
+        fn new() -> Self {
+            let mut host_regs = vec![0u32; 0x100 / size_of::<u32>()];
+            let mut cfg_regs = vec![0u32; 0x80 / size_of::<u32>()];
+            let dev = Bcm2712Sdhc {
+                host: host_regs.as_mut_ptr() as *mut u8,
+                cfg: cfg_regs.as_mut_ptr() as *mut u8,
+                max_clock_hz: 100_000_000,
+                min_clock_hz: SDHC_DEFAULT_MIN_CLOCK_HZ,
+                card_detect: None,
+                bus_width: 4,
+                card: SpinLock::new(None),
+            };
+            Self {
+                host_regs,
+                _cfg_regs: cfg_regs,
+                dev,
+            }
+        }
+
+        fn set_host_u32(&mut self, offset: usize, value: u32) {
+            assert_eq!(offset % size_of::<u32>(), 0);
+            let index = offset / size_of::<u32>();
+            self.host_regs[index] = value;
+        }
+
+        fn set_card_state(&self, read_only: bool) {
+            *self.dev.card.lock() = Some(CardState {
+                high_capacity: true,
+                capacity_blocks: 4096,
+                read_only,
+            });
+        }
+    }
+
     #[test]
     fn decode_capacity_high_capacity() {
         let csd = [0u32, 0x3f, 0xffff_0000, 0];
         let blocks = decode_capacity_blocks(&csd, true).unwrap();
         assert!(blocks > 0);
+    }
+
+    #[test]
+    fn card_read_only_matches_linux_default_path_when_wp_bit_clear() {
+        let mut harness = RegisterBackedTestSdhc::new();
+        harness.set_host_u32(SDHCI_PRESENT_STATE, 0);
+        assert!(harness.dev.card_read_only());
+    }
+
+    #[test]
+    fn card_read_only_matches_linux_default_path_when_wp_bit_set() {
+        let mut harness = RegisterBackedTestSdhc::new();
+        harness.set_host_u32(SDHCI_PRESENT_STATE, SDHCI_WRITE_PROTECT);
+        assert!(!harness.dev.card_read_only());
+    }
+
+    #[test]
+    fn block_device_is_read_only_reflects_stored_card_state_after_wp_sample() {
+        let mut harness = RegisterBackedTestSdhc::new();
+        harness.set_host_u32(SDHCI_PRESENT_STATE, SDHCI_WRITE_PROTECT);
+        harness.set_card_state(harness.dev.card_read_only());
+        assert!(
+            !<Bcm2712Sdhc as io_api::block_device::BlockDevice>::is_read_only(&harness.dev)
+                .unwrap()
+        );
     }
 
     #[test]
