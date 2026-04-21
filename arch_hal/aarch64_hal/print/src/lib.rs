@@ -55,6 +55,13 @@ impl DebugUart {
     pub fn get_mut(&mut self) -> Option<&mut Pl011Uart> {
         self.uart.get_mut()
     }
+
+    /// Releases EL2-side interrupt ownership while keeping the UART configured.
+    pub fn detach_for_guest_passthrough(&mut self) {
+        let Some(uart) = self.get_mut() else { return };
+
+        uart.detach_for_guest_passthrough();
+    }
 }
 
 struct MirrorWriter<'a> {
@@ -196,6 +203,15 @@ pub mod debug_uart {
         let Some(uart) = guard.get_mut() else { return };
 
         uart.enable_rx_interrupts(level, enable_timeout);
+    }
+
+    /// Releases EL2-side PL011 interrupt ownership before guest entry.
+    ///
+    /// EL2 may use the PL011 for early boot logs, but once guest handoff is
+    /// imminent Linux owns the passthrough console input path. This only masks
+    /// EL2 RX/TX interrupts and clears pending UART interrupt state.
+    pub fn detach_for_guest_passthrough() {
+        DEBUG_UART.lock().detach_for_guest_passthrough();
     }
 
     /// IRQ-context RX handler that never takes the lock.

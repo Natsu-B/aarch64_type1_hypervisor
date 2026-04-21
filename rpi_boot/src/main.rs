@@ -239,6 +239,7 @@ extern "C" fn main() -> ! {
         .unwrap()
     };
 
+    // EL2 uses the guest-facing PL011 only for early boot logs during bring-up.
     debug_uart::init(PL011_UART_ADDR.0, PL011_UART_ADDR.1, 115200);
     cpu::isb();
     cpu::dsb_ish();
@@ -628,8 +629,6 @@ extern "C" fn main() -> ! {
 
     apply_guest_timer_policy_for_current_cpu();
 
-    debug_uart::enable_rx_interrupts(arch_hal::pl011::FifoLevel::OneEighth, true);
-
     println!("gicv2 setup success!!!");
 
     unsafe {
@@ -717,15 +716,6 @@ extern "C" fn main() -> ! {
     core::mem::forget(dtb_box);
 
     println!("jumping linux...\njump addr: 0x{:X}", jump_addr as usize);
-
-    // Install an EL1 vector table so that early guest faults are captured.
-    exceptions::setup_el1_exception();
-
-    cpu::clean_dcache_poc(LINUX_ADDR.get() as usize, size_of::<usize>());
-    cpu::clean_dcache_poc(DTB_ADDR.get() as usize, size_of::<usize>());
-
-    cpu::invalidate_icache_all();
-
     let el1_main = el1_main as *const fn() as usize as u64;
     let stack_addr =
         unsafe { alloc::alloc::alloc(Layout::from_size_align_unchecked(0x1000, 0x1000)) } as usize
@@ -734,6 +724,18 @@ extern "C" fn main() -> ! {
         "el1_main addr: 0x{:X}\nsp_el1 addr: 0x{:X}",
         el1_main, stack_addr
     );
+
+    // EL2 must stop owning PL011 RX/TX interrupts before guest entry so Linux
+    // owns the passthrough console input path and sees a clean UART IRQ state.
+    debug_uart::detach_for_guest_passthrough();
+
+    // Install an EL1 vector table so that early guest faults are captured.
+    exceptions::setup_el1_exception();
+
+    cpu::clean_dcache_poc(LINUX_ADDR.get() as usize, size_of::<usize>());
+    cpu::clean_dcache_poc(DTB_ADDR.get() as usize, size_of::<usize>());
+
+    cpu::invalidate_icache_all();
     // SAFETY: The EL2 boot path is about to transfer control to the prepared EL1 entry point
     // with a freshly allocated EL1 stack and the expected saved program state.
     unsafe {

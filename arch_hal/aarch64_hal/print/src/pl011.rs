@@ -398,6 +398,13 @@ impl Pl011Uart {
         self.enable_interrupts(mask);
     }
 
+    /// Stop EL2-side UART interrupt ownership while leaving the UART configured.
+    pub fn detach_for_guest_passthrough(&self) {
+        self.set_rx_irq_enabled(false);
+        self.set_tx_irq_enabled(false);
+        self.clear_interrupts(UARTICR::all());
+    }
+
     /// Enable selected interrupts by unmasking bits in UARTIMSC.
     pub fn enable_interrupts(&self, mask: UARTIMSC) {
         self.registers.interrupt_mask_set_clear.set_bits(mask);
@@ -516,5 +523,76 @@ impl SerialIrqCtrl for Pl011Uart {
         } else {
             self.disable_interrupts(mask);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
+    use typestate::Readable;
+    use typestate::Writable;
+
+    use super::Pl011Peripherals;
+    use super::Pl011Uart;
+    use super::UARTICR;
+    use super::UARTIMSC;
+
+    struct TestPl011 {
+        registers: *mut Pl011Peripherals,
+        uart: Pl011Uart,
+    }
+
+    impl TestPl011 {
+        fn new() -> Self {
+            // SAFETY: A zeroed register block is sufficient for host-side MMIO tests because
+            // the register wrappers are plain volatile storage and every field accepts zero.
+            let registers =
+                Box::into_raw(Box::new(unsafe { core::mem::zeroed::<Pl011Peripherals>() }));
+            let uart = Pl011Uart::new(registers as usize, 48_000_000);
+
+            Self { registers, uart }
+        }
+
+        fn interrupt_mask(&self) -> UARTIMSC {
+            unsafe { (*self.registers).interrupt_mask_set_clear.read() }
+        }
+
+        fn interrupt_clear(&self) -> UARTICR {
+            unsafe { core::ptr::read_volatile((*self.registers).interrupt_clear.as_mut_ptr()) }
+        }
+    }
+
+    impl Drop for TestPl011 {
+        fn drop(&mut self) {
+            unsafe {
+                drop(Box::from_raw(self.registers));
+            }
+        }
+    }
+
+    #[test]
+    fn detach_for_guest_passthrough_masks_rx_tx_irqs_and_clears_pending_state() {
+        let fixture = TestPl011::new();
+
+        unsafe {
+            (*fixture.registers).interrupt_mask_set_clear.write(
+                UARTIMSC::new()
+                    .set(UARTIMSC::rxim, 1)
+                    .set(UARTIMSC::rtim, 1)
+                    .set(UARTIMSC::txim, 1)
+                    .set(UARTIMSC::feim, 1),
+            );
+        }
+
+        fixture.uart.detach_for_guest_passthrough();
+
+        let mask = fixture.interrupt_mask();
+        assert_eq!(mask.get(UARTIMSC::rxim), 0);
+        assert_eq!(mask.get(UARTIMSC::rtim), 0);
+        assert_eq!(mask.get(UARTIMSC::txim), 0);
+        assert_eq!(mask.get(UARTIMSC::feim), 1);
+        assert_eq!(fixture.interrupt_clear().bits(), UARTICR::all().bits());
     }
 }
