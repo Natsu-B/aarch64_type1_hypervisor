@@ -256,7 +256,7 @@ extern "C" fn main() -> ! {
     let gic_info = find_gicv2_info(&dtb).unwrap();
     let uart_irq = vgic::UartIrq {
         pintid: bcm2712::pirq_hook::RP1_UART0_SPI,
-        sense: arch_hal::gic::IrqSense::Edge,
+        sense: arch_hal::gic::IrqSense::Level,
     };
 
     let mut systimer = SystemTimer::new();
@@ -606,34 +606,8 @@ extern "C" fn main() -> ! {
         })
         .unwrap();
 
-    // setup pl011 interrupts
-    gicv2
-        .configure_spi(
-            uart_irq.pintid,
-            arch_hal::gic::IrqGroup::Group1,
-            0x80,
-            arch_hal::gic::TriggerMode::Edge,
-            arch_hal::gic::SpiRoute::Specific(cpu::get_current_core_id()),
-            arch_hal::gic::EnableOp::Enable,
-        )
-        .unwrap();
-
     handler::register_gic(gicv2);
     let gicv2 = handler::gic().unwrap();
-
-    println!("setup vgic...");
-
-    vgic::init(gicv2, &gic_info, Some(uart_irq)).unwrap();
-
-    println!("vgic setup success!!!");
-
-    apply_guest_timer_policy_for_current_cpu();
-
-    println!("gicv2 setup success!!!");
-
-    unsafe {
-        core::arch::asm!("msr daifclr, #3", options(nostack, preserves_flags)); // enable irq
-    }
 
     let result = dtb.find_nodes_by_compatible_view("brcm,bcm2712-pcie", &mut |view, _name| {
         pcie::init_pcie_with_node(view)
@@ -645,16 +619,7 @@ extern "C" fn main() -> ! {
     }
 
     // check rp1
-    let rp1 = match bcm2712::init_rp1(&dtb) {
-        Ok(config) => {
-            vgic::set_pirq_hook(Some(bcm2712::pirq_hook)).unwrap();
-            config
-        }
-        Err(err) => {
-            let _ = vgic::set_pirq_hook(None);
-            panic!("rp1 init failed: {:?}", err);
-        }
-    };
+    let rp1 = bcm2712::init_rp1(&dtb).unwrap_or_else(|err| panic!("rp1 init failed: {:?}", err));
     println!(
         "RP1: Peripheral addr: 0x{:x} SRAM addr: 0x{:x}",
         rp1.peripheral_addr.unwrap().0,
@@ -662,6 +627,31 @@ extern "C" fn main() -> ! {
     );
 
     debug_assert_eq!(rp1.peripheral_addr.unwrap().0, RP1_BASE as u64);
+
+    println!("setup vgic...");
+    vgic::init(gicv2, &gic_info, Some(uart_irq)).unwrap();
+    vgic::set_pirq_hook(Some(bcm2712::pirq_hook)).unwrap();
+    println!("vgic setup success!!!");
+
+    // Arm the physical RP1 UART SPI only after the RP1 hook and vGIC passthrough are ready.
+    gicv2
+        .configure_spi(
+            uart_irq.pintid,
+            arch_hal::gic::IrqGroup::Group1,
+            0x80,
+            arch_hal::gic::TriggerMode::Level,
+            arch_hal::gic::SpiRoute::Specific(cpu::get_current_core_id()),
+            arch_hal::gic::EnableOp::Enable,
+        )
+        .unwrap();
+
+    apply_guest_timer_policy_for_current_cpu();
+
+    println!("gicv2 setup success!!!");
+
+    unsafe {
+        core::arch::asm!("msr daifclr, #3", options(nostack, preserves_flags)); // enable irq
+    }
 
     // setup guest RP1 MSI-X interrupts
     // SAFETY: RP1 peripheral MMIO is mapped; the table is sized for the index used below.
@@ -725,8 +715,8 @@ extern "C" fn main() -> ! {
         el1_main, stack_addr
     );
 
-    // EL2 must stop owning PL011 RX/TX interrupts before guest entry so Linux
-    // owns the passthrough console input path and sees a clean UART IRQ state.
+    // Final EL2-side UART IRQ ownership drop before guest entry. The helper masks RX/TX
+    // interrupts and clears pending UART state so Linux takes over a clean passthrough console.
     debug_uart::detach_for_guest_passthrough();
 
     // Install an EL1 vector table so that early guest faults are captured.

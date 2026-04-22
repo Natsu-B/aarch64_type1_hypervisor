@@ -722,10 +722,10 @@ fn rewrite_rp1_interrupts_from_source(
     gic_phandle: u32,
     uart_irq: Option<vgic::UartIrq>,
 ) -> Result<(), &'static str> {
-    let specifiers = if let Some(uart_irq) = uart_irq {
-        vec![(uart_irq.pintid, gic_dt_irq_flags_from_sense(uart_irq.sense))]
+    let interrupts = if let Some(uart_irq) = uart_irq {
+        encode_uart_passthrough_interrupts(uart_irq)?
     } else {
-        with_source_node_view(source, source_path, &mut |view| {
+        let specifiers = with_source_node_view(source, source_path, &mut |view| {
             let Some(iter) = view.interrupts_iter::<2>()? else {
                 return Ok(Vec::new());
             };
@@ -736,17 +736,15 @@ fn rewrite_rp1_interrupts_from_source(
             }
             Ok(values)
         })?
-        .ok_or("dtb: missing source node view")?
-    };
-    if specifiers.is_empty() {
-        return Ok(());
-    }
-
-    let interrupts = if uart_irq.is_some() {
-        encode_gic_spi_interrupts_with_mapper(&specifiers, |intid| Ok(intid))?
-    } else {
+        .ok_or("dtb: missing source node view")?;
+        if specifiers.is_empty() {
+            return Ok(());
+        }
         encode_gic_spi_interrupts_with_mapper(&specifiers, rp1_msix_index_to_intid)?
     };
+    if interrupts.is_empty() {
+        return Ok(());
+    }
 
     let node = target
         .node_mut(target_id)
@@ -757,6 +755,11 @@ fn rewrite_rp1_interrupts_from_source(
     );
     node.set_property(NameRef::Borrowed("interrupts"), ValueRef::Owned(interrupts));
     Ok(())
+}
+
+fn encode_uart_passthrough_interrupts(uart_irq: vgic::UartIrq) -> Result<Vec<u8>, &'static str> {
+    let specifiers = [(uart_irq.pintid, gic_dt_irq_flags_from_sense(uart_irq.sense))];
+    encode_gic_spi_interrupts_with_mapper(&specifiers, |intid| Ok(intid))
 }
 
 fn with_source_node_view<R>(
@@ -1274,9 +1277,16 @@ fn write_be_u32s(
 #[cfg(test)]
 mod tests {
     use super::GUEST_ROOT_TOKEN;
+    use super::encode_uart_passthrough_interrupts;
+    use super::gic_dt_irq_flags_from_sense;
     use super::rewrite_bootargs;
+    use crate::vgic::UartIrq;
+    use alloc::vec::Vec;
+    use arch_hal::gic::IrqSense;
+    use arch_hal::gic::dt_irq::decode_gicv2_irq;
 
     const TEST_UART_ADDR: usize = 0x1c00_030000;
+    const TEST_UART_INTID: u32 = 265;
 
     fn token_count(text: &str, needle: &str) -> usize {
         text.split_whitespace()
@@ -1284,7 +1294,8 @@ mod tests {
             .count()
     }
 
-    #[test]
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn rewrite_bootargs_replaces_root_console_and_earlycon() {
         let rewritten = rewrite_bootargs(
             Some(
@@ -1303,7 +1314,8 @@ mod tests {
         assert!(!rewritten.contains("earlycon=uart8250"));
     }
 
-    #[test]
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn rewrite_bootargs_preserves_single_rootwait_and_drops_virtio_mmio_device() {
         let rewritten = rewrite_bootargs(
             Some("rootwait root=/dev/vda1 virtio_mmio.device=0x200@0x1000:3 splash rootwait"),
@@ -1316,7 +1328,8 @@ mod tests {
         assert!(rewritten.contains("splash"));
     }
 
-    #[test]
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn rewrite_bootargs_inserts_required_tokens_when_missing() {
         let rewritten = rewrite_bootargs(None, TEST_UART_ADDR);
 
@@ -1325,5 +1338,30 @@ mod tests {
         assert!(rewritten.contains("console=ttyAMA0,115200"));
         assert!(rewritten.contains("earlycon=pl011,0x1c00030000"));
         assert!(!rewritten.contains("virtio_mmio.device="));
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
+    fn gic_dt_irq_flags_follow_uart_irq_sense() {
+        assert_eq!(gic_dt_irq_flags_from_sense(IrqSense::Level), 4);
+        assert_eq!(gic_dt_irq_flags_from_sense(IrqSense::Edge), 1);
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
+    fn encode_uart_passthrough_interrupts_uses_level_triggered_spi_specifier() {
+        let interrupts = encode_uart_passthrough_interrupts(UartIrq {
+            pintid: TEST_UART_INTID,
+            sense: IrqSense::Level,
+        })
+        .unwrap();
+        let cells: Vec<u32> = interrupts
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let decoded = decode_gicv2_irq(&cells).unwrap();
+
+        assert_eq!(decoded.intid, TEST_UART_INTID);
+        assert_eq!(decoded.flags, 4);
     }
 }
