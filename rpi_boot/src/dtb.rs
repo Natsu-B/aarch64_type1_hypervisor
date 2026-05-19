@@ -1075,6 +1075,9 @@ fn rewrite_bootargs(existing: Option<&str>, pl011_uart_addr: usize) -> String {
                 continue;
             }
             if token == "rootwait" {
+                if saw_rootwait {
+                    continue;
+                }
                 saw_rootwait = true;
             }
             if !args.is_empty() {
