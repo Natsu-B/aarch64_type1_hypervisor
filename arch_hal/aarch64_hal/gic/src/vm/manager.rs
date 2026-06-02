@@ -268,6 +268,28 @@ where
         self.apply_update(hw, update)
     }
 
+    pub fn bind_spi_pirq_write_through_software_lr<H: VgicHw>(
+        &self,
+        hw: &H,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<(), GicError> {
+        let vm = self.model()?;
+        let update = vm.bind_spi_pirq_write_through_software_lr(pintid, vintid)?;
+        self.apply_update(hw, update)
+    }
+
+    pub fn bind_spi_pirq_shadow_software_lr<H: VgicHw>(
+        &self,
+        hw: &H,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<(), GicError> {
+        let vm = self.model()?;
+        let update = vm.bind_spi_pirq_shadow_software_lr(pintid, vintid)?;
+        self.apply_update(hw, update)
+    }
+
     pub fn set_pirq_hook(&self, hook: Option<PirqHookFn>) -> Result<(), GicError> {
         let vm = self.model()?;
         vm.set_pirq_hook(hook);

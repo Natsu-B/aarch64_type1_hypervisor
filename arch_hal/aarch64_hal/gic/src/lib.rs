@@ -549,6 +549,8 @@ pub enum VirtualInterrupt {
     Software {
         /// Virtual interrupt ID presented to the guest.
         vintid: u32,
+        /// Physical interrupt ID associated with this software-composed pIRQ, if any.
+        pintid: Option<u32>,
         /// Whether guest deactivation should raise an EOI maintenance interrupt.
         eoi_maintenance: bool,
         /// Virtual priority.
@@ -571,7 +573,7 @@ impl VirtualInterrupt {
     pub const fn pintid(&self) -> Option<u32> {
         match self {
             Self::Hardware { pintid, .. } => Some(*pintid),
-            Self::Software { .. } => None,
+            Self::Software { pintid, .. } => *pintid,
         }
     }
 
@@ -1294,6 +1296,22 @@ pub(crate) trait VgicPirqModel: VgicVmInfo {
     /// Guest Distributor writes remain authoritative in the virtual shadow state and are mirrored
     /// immediately into the physical Distributor, while delivery uses hardware-backed LRs.
     fn bind_spi_pirq_passthrough(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError>;
+
+    /// Bind a host SPI pIRQ to a guest SPI vIRQ while keeping write-through Distributor mirroring
+    /// but forcing software-backed LR delivery.
+    fn bind_spi_pirq_write_through_software_lr(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError>;
+
+    /// Bind a host SPI pIRQ to a guest SPI vIRQ with shadow-only Distributor state and
+    /// software-backed LR delivery.
+    fn bind_spi_pirq_shadow_software_lr(
         &self,
         pintid: PIntId,
         vintid: VIntId,

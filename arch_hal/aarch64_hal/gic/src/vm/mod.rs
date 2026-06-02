@@ -1032,6 +1032,22 @@ where
         self.bind_spi_pirq_inner_passthrough(pintid, vintid)
     }
 
+    fn bind_spi_pirq_write_through_software_lr(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        self.bind_spi_pirq_inner_write_through_software_lr(pintid, vintid)
+    }
+
+    fn bind_spi_pirq_shadow_software_lr(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        self.bind_spi_pirq_inner_shadow_software_lr(pintid, vintid)
+    }
+
     #[cfg(test)]
     fn unmap_pirq(&self, pintid: PIntId) -> Result<VgicUpdate, GicError> {
         self.unmap_pirq_inner(pintid)
@@ -1417,6 +1433,67 @@ mod tests {
         assert_eq!(
             vm.physical_irq_binding_kind(VcpuId(0), pintid).unwrap(),
             Some(PhysicalIrqBindingKind::HardwareLr)
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn software_lr_spi_binding_remains_write_through() {
+        let vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+
+        vm.bind_spi_pirq_write_through_software_lr(pintid, vintid)
+            .unwrap();
+
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            let entry = routing
+                .pirqs
+                .get(pintid)
+                .unwrap()
+                .expect("expected pIRQ map");
+            assert!(matches!(
+                entry.delivery,
+                PirqDelivery::Spi {
+                    dist_mode: DistMirrorMode::WriteThrough,
+                    cpu_mode: CpuDeliveryMode::SoftwareLr,
+                }
+            ));
+        }
+
+        assert_eq!(
+            vm.physical_irq_binding_kind(VcpuId(0), pintid).unwrap(),
+            Some(PhysicalIrqBindingKind::SoftwareLr)
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn software_lr_spi_binding_can_remain_shadow_only() {
+        let vm = recording_vm(1);
+        let pintid = PIntId(48);
+        let vintid = VIntId(40);
+
+        vm.bind_spi_pirq_shadow_software_lr(pintid, vintid).unwrap();
+
+        {
+            let routing = vm.common.routing_lock.lock_irqsave();
+            let entry = routing
+                .pirqs
+                .get(pintid)
+                .unwrap()
+                .expect("expected pIRQ map");
+            assert!(matches!(
+                entry.delivery,
+                PirqDelivery::Spi {
+                    dist_mode: DistMirrorMode::ShadowOnly,
+                    cpu_mode: CpuDeliveryMode::SoftwareLr,
+                }
+            ));
+        }
+
+        assert_eq!(
+            vm.physical_irq_binding_kind(VcpuId(0), pintid).unwrap(),
+            Some(PhysicalIrqBindingKind::SoftwareLr)
         );
     }
 
@@ -2315,6 +2392,25 @@ mod tests {
 
         assert_signature(
             manager::VgicManager::<TEST_VCPUS>::handle_physical_irq_asserted::<SignatureOnlyHw>,
+        );
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn manager_exposes_spi_software_lr_binding_wrapper() {
+        fn assert_signature(
+            _: fn(
+                &manager::VgicManager<TEST_VCPUS>,
+                &SignatureOnlyHw,
+                PIntId,
+                VIntId,
+            ) -> Result<(), GicError>,
+        ) {
+        }
+
+        assert_signature(
+            manager::VgicManager::<TEST_VCPUS>::bind_spi_pirq_write_through_software_lr::<
+                SignatureOnlyHw,
+            >,
         );
     }
 

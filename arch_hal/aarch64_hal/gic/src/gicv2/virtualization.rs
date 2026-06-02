@@ -173,6 +173,7 @@ pub fn decode_lr(raw: GICH_LR) -> Result<VirtualInterrupt, GicError> {
         };
         Ok(VirtualInterrupt::Software {
             vintid,
+            pintid: None,
             eoi_maintenance: raw.get(GICH_LR::eoi) != 0,
             priority,
             group,
@@ -500,6 +501,7 @@ mod misr_tests {
     fn lr_roundtrip_sw_irq_basic_fields() {
         let irq = VirtualInterrupt::Software {
             vintid: 48,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0x12,
             group: IrqGroup::Group1,
@@ -523,6 +525,7 @@ mod misr_tests {
     fn lr_encode_rejects_invalid_vintid() {
         let irq = VirtualInterrupt::Software {
             vintid: 1020,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0,
             group: IrqGroup::Group1,
@@ -575,6 +578,7 @@ mod misr_tests {
     fn lr_encode_decode_sgi_source() {
         let irq = VirtualInterrupt::Software {
             vintid: 7,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0x30,
             group: IrqGroup::Group1,
@@ -591,6 +595,7 @@ mod misr_tests {
     fn lr_encode_sgi_requires_source_when_active() {
         let irq = VirtualInterrupt::Software {
             vintid: 3,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0x10,
             group: IrqGroup::Group1,

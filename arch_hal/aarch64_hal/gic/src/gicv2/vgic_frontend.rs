@@ -1181,6 +1181,22 @@ mod tests {
             Ok(VgicUpdate::None)
         }
 
+        fn bind_spi_pirq_write_through_software_lr(
+            &self,
+            _pintid: PIntId,
+            _vintid: VIntId,
+        ) -> Result<VgicUpdate, GicError> {
+            Ok(VgicUpdate::None)
+        }
+
+        fn bind_spi_pirq_shadow_software_lr(
+            &self,
+            _pintid: PIntId,
+            _vintid: VIntId,
+        ) -> Result<VgicUpdate, GicError> {
+            Ok(VgicUpdate::None)
+        }
+
         fn unmap_pirq(&self, _pintid: PIntId) -> Result<VgicUpdate, GicError> {
             Ok(VgicUpdate::None)
         }

@@ -230,8 +230,18 @@ where
                             source,
                         }
                     }
-                    _ => VirtualInterrupt::Software {
+                    Some((pintid, _)) => VirtualInterrupt::Software {
                         vintid: vintid.0,
+                        pintid: Some(pintid.0),
+                        eoi_maintenance: true,
+                        priority: attrs.priority,
+                        group: attrs.group,
+                        state: Self::state_from_attrs(attrs),
+                        source,
+                    },
+                    None => VirtualInterrupt::Software {
+                        vintid: vintid.0,
+                        pintid: None,
                         eoi_maintenance: false,
                         priority: attrs.priority,
                         group: attrs.group,
@@ -276,8 +286,18 @@ where
                             source,
                         }
                     }
-                    _ => VirtualInterrupt::Software {
+                    Some((pintid, _)) => VirtualInterrupt::Software {
                         vintid: vintid.0,
+                        pintid: Some(pintid.0),
+                        eoi_maintenance: true,
+                        priority: attrs.priority,
+                        group: attrs.group,
+                        state: Self::state_from_attrs(attrs),
+                        source,
+                    },
+                    None => VirtualInterrupt::Software {
+                        vintid: vintid.0,
+                        pintid: None,
                         eoi_maintenance: false,
                         priority: attrs.priority,
                         group: attrs.group,

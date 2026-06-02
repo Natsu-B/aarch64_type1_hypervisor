@@ -374,6 +374,47 @@ where
         pintid: PIntId,
         vintid: VIntId,
     ) -> Result<VgicUpdate, GicError> {
+        self.bind_spi_pirq_inner(
+            pintid,
+            vintid,
+            DistMirrorMode::WriteThrough,
+            CpuDeliveryMode::HardwareLr,
+        )
+    }
+
+    pub(crate) fn bind_spi_pirq_inner_write_through_software_lr(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        self.bind_spi_pirq_inner(
+            pintid,
+            vintid,
+            DistMirrorMode::WriteThrough,
+            CpuDeliveryMode::SoftwareLr,
+        )
+    }
+
+    pub(crate) fn bind_spi_pirq_inner_shadow_software_lr(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+    ) -> Result<VgicUpdate, GicError> {
+        self.bind_spi_pirq_inner(
+            pintid,
+            vintid,
+            DistMirrorMode::ShadowOnly,
+            CpuDeliveryMode::SoftwareLr,
+        )
+    }
+
+    fn bind_spi_pirq_inner(
+        &self,
+        pintid: PIntId,
+        vintid: VIntId,
+        dist_mode: DistMirrorMode,
+        cpu_mode: CpuDeliveryMode,
+    ) -> Result<VgicUpdate, GicError> {
         if vintid.0 < LOCAL_INTID_COUNT as u32 {
             return Err(GicError::UnsupportedIntId);
         }
@@ -386,8 +427,8 @@ where
         let entry = PirqEntry {
             vintid,
             delivery: PirqDelivery::Spi {
-                dist_mode: DistMirrorMode::WriteThrough,
-                cpu_mode: CpuDeliveryMode::HardwareLr,
+                dist_mode,
+                cpu_mode,
             },
         };
 
@@ -616,7 +657,8 @@ where
                         },
                         CpuDeliveryMode::SoftwareLr => VirtualInterrupt::Software {
                             vintid: entry.vintid.0,
-                            eoi_maintenance: false,
+                            pintid: Some(pintid.0),
+                            eoi_maintenance: true,
                             priority: attrs.priority,
                             group: attrs.group,
                             state: shadow_state,
@@ -646,7 +688,8 @@ where
                             },
                             CpuDeliveryMode::SoftwareLr => VirtualInterrupt::Software {
                                 vintid: entry.vintid.0,
-                                eoi_maintenance: false,
+                                pintid: Some(pintid.0),
+                                eoi_maintenance: true,
                                 priority: attrs.priority,
                                 group: attrs.group,
                                 state: shadow_state,

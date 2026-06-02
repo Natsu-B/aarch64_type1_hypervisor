@@ -59,6 +59,7 @@ const NO_SLOT: usize = usize::MAX;
 const fn pending_placeholder_irq() -> VirtualInterrupt {
     VirtualInterrupt::Software {
         vintid: 0,
+        pintid: None,
         eoi_maintenance: false,
         priority: 0,
         group: IrqGroup::Group0,
@@ -400,6 +401,7 @@ impl<
     ) -> Result<(), GicError> {
         let invalid = VirtualInterrupt::Software {
             vintid: 0,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0,
             group: IrqGroup::Group0,
@@ -849,6 +851,7 @@ impl<
                 let old = inner.lr_state[idx];
                 let mut irq = hw.read_lr(idx)?;
                 let new = irq.state();
+                let tracked_pintid = irq.pintid().map(PIntId).or(inner.lr_pintid[idx]);
 
                 // EISR is architecturally meaningful only for SW-composed LRs; HW-backed LRs do
                 // not set EISR status bits. For HW entries we therefore infer EOI from observed
@@ -861,21 +864,21 @@ impl<
                 };
                 if !eoi_event {
                     inner.lr_state[idx] = new;
-                    inner.lr_pintid[idx] = irq.pintid().map(PIntId);
+                    inner.lr_pintid[idx] = tracked_pintid;
                     continue;
                 }
 
                 any_eoi = true;
 
                 inner.lr_state[idx] = new;
-                inner.lr_pintid[idx] = irq.pintid().map(PIntId);
+                inner.lr_pintid[idx] = tracked_pintid;
 
-                if let Some(pintid) = irq.pintid() {
-                    notifications.eoi.push(PIntId(pintid))?;
+                if let Some(pintid) = tracked_pintid {
+                    notifications.eoi.push(pintid)?;
                     match irq.state() {
-                        IrqState::Inactive => notifications.deactivate.push(PIntId(pintid))?,
+                        IrqState::Inactive => notifications.deactivate.push(pintid)?,
                         IrqState::Pending | IrqState::PendingActive => {
-                            notifications.resample.push(PIntId(pintid))?
+                            notifications.resample.push(pintid)?
                         }
                         IrqState::Active => {}
                     }
@@ -914,12 +917,16 @@ impl<
                 } else {
                     match eoi_mode {
                         EoiMode::DropOnly => {
-                            // Clear EOI-maintenance on SW entries after we've observed the event.
-                            if irq.eoi_maintenance() {
-                                irq.set_eoi_maintenance(false);
-                                hw.write_lr(idx, irq)?;
-                                inner.lr_state[idx] = irq.state();
-                                inner.lr_pintid[idx] = irq.pintid().map(PIntId);
+                            // Keep physical SW-backed pIRQs armed so each guest EOI reaches the
+                            // pIRQ completion path.
+                            if irq.state() != IrqState::Inactive {
+                                let should_arm_eoi = tracked_pintid.is_some();
+                                if irq.eoi_maintenance() != should_arm_eoi {
+                                    irq.set_eoi_maintenance(should_arm_eoi);
+                                    hw.write_lr(idx, irq)?;
+                                    inner.lr_state[idx] = irq.state();
+                                    inner.lr_pintid[idx] = tracked_pintid;
+                                }
                             }
 
                             if irq.state() == IrqState::Inactive {
@@ -936,10 +943,13 @@ impl<
                             // In drop-and-deactivate mode, keep pending SW entries resident but
                             // invalidate active/inactive ones to free space.
                             if irq.state() == IrqState::Pending {
-                                irq.set_eoi_maintenance(false);
-                                hw.write_lr(idx, irq)?;
-                                inner.lr_state[idx] = irq.state();
-                                inner.lr_pintid[idx] = irq.pintid().map(PIntId);
+                                let should_arm_eoi = tracked_pintid.is_some();
+                                if irq.eoi_maintenance() != should_arm_eoi {
+                                    irq.set_eoi_maintenance(should_arm_eoi);
+                                    hw.write_lr(idx, irq)?;
+                                    inner.lr_state[idx] = irq.state();
+                                    inner.lr_pintid[idx] = tracked_pintid;
+                                }
                                 inner.in_lr[idx] = Some(key);
                                 inner.sw_empty_lrs &= !bit;
                             } else {
@@ -1064,6 +1074,7 @@ mod tests {
     fn invalid_irq() -> VirtualInterrupt {
         VirtualInterrupt::Software {
             vintid: 0,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0,
             group: IrqGroup::Group0,
@@ -1361,6 +1372,7 @@ mod tests {
         } else {
             VirtualInterrupt::Software {
                 vintid,
+                pintid: None,
                 eoi_maintenance: false,
                 priority,
                 group: IrqGroup::Group1,
@@ -1444,6 +1456,7 @@ mod tests {
             let mut st = hw.state.borrow_mut();
             st.lrs[0] = VirtualInterrupt::Software {
                 vintid: key.vintid.0,
+                pintid: None,
                 eoi_maintenance: false,
                 priority: 0x20,
                 group: IrqGroup::Group1,
@@ -1459,6 +1472,7 @@ mod tests {
 
         let updated_irq = VirtualInterrupt::Software {
             vintid: key.vintid.0,
+            pintid: None,
             eoi_maintenance: false,
             priority: 0x10,
             group: IrqGroup::Group1,
@@ -1492,6 +1506,7 @@ mod tests {
             let mut st = hw.state.borrow_mut();
             st.lrs[0] = VirtualInterrupt::Software {
                 vintid: key.vintid.0,
+                pintid: None,
                 eoi_maintenance: false,
                 priority: 0x10,
                 group: IrqGroup::Group1,
@@ -1537,6 +1552,7 @@ mod tests {
             inner.in_lr[0] = None;
             inner.lr_updates[0] = Some(VirtualInterrupt::Software {
                 vintid: key.vintid.0,
+                pintid: None,
                 eoi_maintenance: false,
                 priority: 0x18,
                 group: IrqGroup::Group1,
@@ -1944,6 +1960,60 @@ mod tests {
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn sw_pirq_eoi_uses_shadow_pintid_for_notifications() {
+        let vcpu = TestVcpu::with_id(VcpuId(0));
+        let hw = FakeHw::new(1);
+        vcpu.set_resident(cpu::get_current_core_id()).unwrap();
+        hw.set_eoi_mode(EoiMode::DropOnly);
+
+        let key = LrKey {
+            vintid: VIntId(48),
+            source: None,
+        };
+        {
+            let mut state = hw.state.borrow_mut();
+            state.lrs[0] = VirtualInterrupt::Software {
+                vintid: 48,
+                pintid: None,
+                eoi_maintenance: true,
+                priority: 0x10,
+                group: IrqGroup::Group1,
+                state: IrqState::Active,
+                source: None,
+            };
+            state.elrsr &= !1;
+            state.eisr = 1;
+            state.misr = MaintenanceReasons(MaintenanceReasons::EOI);
+        }
+        {
+            let mut inner = vcpu.inner.lock_irqsave();
+            inner.in_lr[0] = Some(key);
+            inner.lr_state[0] = IrqState::Active;
+            inner.lr_pintid[0] = Some(PIntId(93));
+            inner.sw_empty_lrs &= !1;
+        }
+
+        let mut eoi = CallbackLog::<4>::new();
+        let mut deactivate = CallbackLog::<4>::new();
+        let mut resample = CallbackLog::<4>::new();
+        let update = vcpu
+            .handle_maintenance(
+                &hw,
+                &mut |id| eoi.push(id.0),
+                &mut |id| deactivate.push(id.0),
+                &mut |id| resample.push(id.0),
+            )
+            .unwrap();
+
+        assert_eq!(eoi.as_slice(), &[93]);
+        assert!(deactivate.as_slice().is_empty());
+        assert!(resample.as_slice().is_empty());
+        assert!(matches!(update, VgicUpdate::Some { work, .. } if work.refill));
+        assert!(hw.state.borrow().lrs[0].eoi_maintenance());
+        assert_eq!(vcpu.inner.lock_irqsave().lr_pintid[0], Some(PIntId(93)));
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     fn eoi_mode_drop_and_deactivate_invalidates_and_preserves_pending() {
         let vcpu = TestVcpu::with_id(VcpuId(0));
         let hw = FakeHw::new(1);
@@ -1952,6 +2022,7 @@ mod tests {
             let mut st = hw.state.borrow_mut();
             st.lrs[0] = VirtualInterrupt::Software {
                 vintid: 3,
+                pintid: None,
                 eoi_maintenance: true,
                 priority: 0x20,
                 group: IrqGroup::Group1,
@@ -2048,6 +2119,7 @@ mod tests {
             let mut st = hw.state.borrow_mut();
             st.lrs[0] = VirtualInterrupt::Software {
                 vintid: 10,
+                pintid: None,
                 eoi_maintenance: false,
                 priority: 0x40,
                 group: IrqGroup::Group1,
@@ -2112,6 +2184,7 @@ mod tests {
             let mut st = hw.state.borrow_mut();
             st.lrs[0] = VirtualInterrupt::Software {
                 vintid: 5,
+                pintid: None,
                 eoi_maintenance: false,
                 priority: 0x60,
                 group: IrqGroup::Group1,
@@ -2216,6 +2289,7 @@ mod tests {
             let mut st = hw.state.borrow_mut();
             st.lrs[0] = VirtualInterrupt::Software {
                 vintid: 3,
+                pintid: None,
                 eoi_maintenance: true,
                 priority: 0x20,
                 group: IrqGroup::Group1,
