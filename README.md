@@ -99,6 +99,56 @@ cargo xrun rpi5
 This builds `rpi_boot.elf` and converts it to `kernel_2712.img` using `rust-objcopy`.
 Copy the resulting `kernel_2712.img` to your Pi boot media as appropriate.
 
+For local development with the repository toolchain, use the Nix shell explicitly if `cargo`
+is not already on `PATH`:
+
+```sh
+/nix/var/nix/profiles/default/bin/nix develop --accept-flake-config --command cargo xrun rpi5
+```
+
+The generated Pi 5 firmware image is:
+
+```sh
+bin/kernel_2712.img
+```
+
+Copy that file to the Pi 5 boot partition as `kernel_2712.img`, then power-cycle or reset the
+board so the firmware starts it from reset. This is the preferred execution path for `rpi_boot`;
+loading `bin/rpi_boot.elf` over OpenOCD after Linux or another EL2 payload is already running can
+leave the MMU/cache state enabled and jump back into the existing high virtual address space.
+
+To start the local OpenOCD server for inspection:
+
+```sh
+./run.sh
+```
+
+This opens the OpenOCD command port on `4444` and CPU GDB ports starting at `3333`. If OpenOCD
+reports stale debug state or secondary-core `DSCR_DTR_RX_FULL` errors, stop OpenOCD and do a real
+board reset before retrying. The helper below toggles USB hub power for the default hub location:
+
+```sh
+./reboot.sh 3
+```
+
+If your Pi is connected through a different controllable hub, override the hub location:
+
+```sh
+LOCATION=1-1 ./reboot.sh 5
+```
+
+Use `sudo uhubctl` to list controllable hubs and connected debug/UART adapters. Note that toggling
+the hub containing only the debug probe resets the probe, not necessarily the Pi board itself; for a
+clean boot test, reset or power-cycle the Pi 5 power input or boot media path.
+
+## TODO
+
+* Raspberry Pi 5 UART0 input currently relies on a workaround in `rpi_boot`: RP1 UART0 MSI-X/IACK is
+  explicitly kicked after routing/unmasking, when PL011 `MIS` is asserted from EL2 IRQ handling, and
+  after guest UART0 MMIO passthrough reads or interrupt-clear writes. This keeps Linux input working
+  on `ttyAMA0`, but the proper RP1 interrupt acknowledgement/rearm semantics should be understood and
+  folded into the normal pIRQ/vGIC path instead of living as UART-specific handling.
+
 ## Testing
 
 ```sh
