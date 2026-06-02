@@ -59,7 +59,6 @@ use core::fmt::Write;
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
-use core::ptr;
 use core::ptr::NonNull;
 use core::ptr::slice_from_raw_parts_mut;
 use core::str;
@@ -87,8 +86,22 @@ static LINUX_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 static DTB_ADDR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 pub(crate) static GICV2_DRIVER: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 pub(crate) const RP1_BASE: usize = 0x1c_0000_0000;
-pub(crate) const PL011_UART_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
-// static PL011_UART_ADDR: (usize, u64) = (0x10_7D00_1000, 44 * 1000 * 1000);
+pub(crate) const GUEST_PL011_UART0_ADDR: (usize, u64) = (RP1_BASE + 0x3_0000, 48 * 1000 * 1000);
+pub(crate) const HYPERVISOR_PL011_UART1_ADDR: (usize, u64) =
+    (RP1_BASE + 0x3_4000, 48 * 1000 * 1000);
+const RP1_GPIO_BANK0_BASE: usize = RP1_BASE + 0xd_0000;
+const RP1_PAD_BANK0_BASE: usize = RP1_BASE + 0xf_0000;
+const RP1_GPIO_CTRL_FUNCSEL_MASK: u32 = 0x1f;
+// GPIO14/15 route RP1 UART0 on the 40-pin header with the legacy ALT0 selector.
+// The uart0-pi5 firmware overlay leaves the control registers as 0x84, where
+// the function selector bits are 0x04.
+const RP1_GPIO_FUNCSEL_UART0: u32 = 0x04;
+const RP1_PAD_SCHMITT: u32 = 1 << 1;
+const RP1_PAD_PULL_SHIFT: u32 = 2;
+const RP1_PAD_PULL_MASK: u32 = 0b11 << RP1_PAD_PULL_SHIFT;
+const RP1_PAD_PULL_UP: u32 = 2 << RP1_PAD_PULL_SHIFT;
+const RP1_PAD_INPUT_ENABLE: u32 = 1 << 6;
+const RP1_PAD_RX_MASK: u32 = RP1_PAD_SCHMITT | RP1_PAD_PULL_MASK | RP1_PAD_INPUT_ENABLE;
 
 #[derive(Copy, Clone, Debug)]
 struct Gicv2Info {
@@ -220,6 +233,33 @@ loop:
     "#
 );
 
+fn configure_rp1_uart0_pinmux() {
+    fn gpio_ctrl_addr(pin: usize) -> *mut u32 {
+        (RP1_GPIO_BANK0_BASE + pin * 8 + 4) as *mut u32
+    }
+
+    fn pad_ctrl_addr(pin: usize) -> *mut u32 {
+        (RP1_PAD_BANK0_BASE + 4 + pin * 4) as *mut u32
+    }
+
+    // SAFETY: RP1 peripheral MMIO is identity-mapped in EL2 stage-1 at this point, and these are
+    // naturally aligned 32-bit GPIO/PAD control registers for GPIO14/15.
+    unsafe {
+        for pin in [14, 15] {
+            let ctrl_addr = gpio_ctrl_addr(pin);
+            let ctrl = core::ptr::read_volatile(ctrl_addr) & !RP1_GPIO_CTRL_FUNCSEL_MASK;
+            core::ptr::write_volatile(ctrl_addr, ctrl | RP1_GPIO_FUNCSEL_UART0);
+        }
+
+        let rx_pad_addr = pad_ctrl_addr(15);
+        let rx_pad = core::ptr::read_volatile(rx_pad_addr) & !RP1_PAD_RX_MASK;
+        core::ptr::write_volatile(
+            rx_pad_addr,
+            rx_pad | RP1_PAD_SCHMITT | RP1_PAD_PULL_UP | RP1_PAD_INPUT_ENABLE,
+        );
+    }
+}
+
 #[cfg(not(all(test, target_arch = "aarch64")))]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
@@ -239,8 +279,12 @@ extern "C" fn main() -> ! {
         .unwrap()
     };
 
-    // EL2 uses the guest-facing PL011 only for early boot logs during bring-up.
-    debug_uart::init(PL011_UART_ADDR.0, PL011_UART_ADDR.1, 115200);
+    // EL2 uses RP1 UART1 for hypervisor-only logs.
+    debug_uart::init(
+        HYPERVISOR_PL011_UART1_ADDR.0,
+        HYPERVISOR_PL011_UART1_ADDR.1,
+        115200,
+    );
     cpu::isb();
     cpu::dsb_ish();
     debug_uart::write("HelloWorld!!!");
@@ -467,7 +511,8 @@ extern "C" fn main() -> ! {
     let mut trap_windows = [
         trap_window(gic_info.dist.base, gic_info.dist.size, "gicd"),
         trap_window(gic_info.cpu.base, gic_info.cpu.size, "gicc"),
-        trap_window(PL011_UART_ADDR.0, 0x1000, "pl011"),
+        trap_window(GUEST_PL011_UART0_ADDR.0, 0x1000, "guest-uart0"),
+        trap_window(HYPERVISOR_PL011_UART1_ADDR.0, 0x1000, "hypervisor-uart1"),
         trap_window(
             virtio_blk::VIRTIO_BLK_MMIO_BASE,
             virtio_blk::VIRTIO_BLK_MMIO_SIZE,
@@ -627,6 +672,7 @@ extern "C" fn main() -> ! {
     );
 
     debug_assert_eq!(rp1.peripheral_addr.unwrap().0, RP1_BASE as u64);
+    configure_rp1_uart0_pinmux();
 
     println!("setup vgic...");
     vgic::init(gicv2, &gic_info, Some(uart_irq)).unwrap();
@@ -639,7 +685,9 @@ extern "C" fn main() -> ! {
             uart_irq.pintid,
             arch_hal::gic::IrqGroup::Group1,
             0x80,
-            arch_hal::gic::TriggerMode::Level,
+            // RP1 translates the PL011 level source into an MSI-X message, so the host GIC sees
+            // an edge even though the guest DT describes the UART interrupt as level-sensitive.
+            arch_hal::gic::TriggerMode::Edge,
             arch_hal::gic::SpiRoute::Specific(cpu::get_current_core_id()),
             arch_hal::gic::EnableOp::Enable,
         )
@@ -664,6 +712,11 @@ extern "C" fn main() -> ! {
     for msix_index in bcm2712::pirq_hook::GUEST_RP1_PASSTHROUGH_MSIX_INDICES {
         pcie_config[msix_index].set_bits(0b1001);
     }
+    bcm2712::rp1_interrupt::enable_interrupt(uart_irq.pintid)
+        .unwrap_or_else(|err| panic!("rp1 uart0 interrupt enable failed: {:?}", err));
+    // Prime the RP1 MSI-X source after routing and unmasking it. Without this IACK, UART0 MIS can
+    // assert in the PL011 while source 25 remains unarmed and never posts SPI 185 to the GIC.
+    pcie_config[bcm2712::pirq_hook::RP1_UART0_MSIX_INDEX].set_bits(0b0100);
 
     multicore::setup_multicore(stack_top);
 
@@ -738,11 +791,6 @@ extern "C" fn main() -> ! {
 }
 
 extern "C" fn el1_main() {
-    let hello = "hello world from el1_main\n";
-    for i in hello.as_bytes() {
-        unsafe { ptr::write_volatile(PL011_UART_ADDR.0 as *mut u8, *i) };
-    }
-
     // jump linux
     unsafe {
         core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
@@ -875,7 +923,8 @@ fn panic(info: &PanicInfo) -> ! {
     if ALREADY_PANICKED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         loop {}
     }
-    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR.0, PL011_UART_ADDR.1);
+    let mut debug_uart =
+        Pl011Uart::new(HYPERVISOR_PL011_UART1_ADDR.0, HYPERVISOR_PL011_UART1_ADDR.1);
     debug_uart.init(115200);
     debug_uart.write("\r\n\r\n=================================\r\n");
     debug_uart.write("kernel panicked!!!\r\n\r\n\r\n");

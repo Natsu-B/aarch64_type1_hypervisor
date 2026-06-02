@@ -31,8 +31,8 @@ use ::dtb::encode_gic_spi_interrupts_with_mapper;
 use ::dtb::encode_reg_entries;
 use ::dtb::node_path;
 
+use crate::GUEST_PL011_UART0_ADDR;
 use crate::Gicv2Info;
-use crate::PL011_UART_ADDR;
 use crate::RP1_BASE;
 use crate::vgic;
 use crate::virtio_blk;
@@ -54,6 +54,25 @@ const TARGET_CSI0_PATH: &str = "/soc@107c000000/csi@1c0110000";
 const TARGET_CSI1_PATH: &str = "/soc@107c000000/csi@1c0128000";
 const TARGET_MAILBOX_PATH: &str = "/soc@107c000000/mailbox@7c013880";
 const GUEST_ROOT_TOKEN: &str = "root=/dev/vda2";
+const GUEST_SYSTEMD_MASK_TOKENS: [&str; 13] = [
+    "systemd.mask=boot-firmware.mount",
+    "systemd.mask=cloud-config.service",
+    "systemd.mask=cloud-final.service",
+    "systemd.mask=cloud-init-local.service",
+    "systemd.mask=cloud-init-network.service",
+    "systemd.mask=cloud-init-main.service",
+    "systemd.mask=dev-zram0.swap",
+    "systemd.mask=plymouth-quit-wait.service",
+    "systemd.mask=plymouth-quit.service",
+    "systemd.mask=plymouth-start.service",
+    "systemd.mask=proc-sys-fs-binfmt_misc.mount",
+    "systemd.mask=systemd-binfmt.service",
+    "systemd.mask=systemd-zram-setup@zram0.service",
+];
+const GUEST_SYSTEMD_BOOT_TOKENS: [&str; 2] = [
+    "systemd.unit=multi-user.target",
+    "systemd.wants=serial-getty@ttyAMA0.service",
+];
 
 const SOURCE_UART0_PATH: &str = "/axi/pcie@1000120000/rp1/serial@30000";
 const SOURCE_GPIO_PATH: &str = "/axi/pcie@1000120000/rp1/gpio@d0000";
@@ -268,7 +287,7 @@ pub(crate) fn build_guest_dtb(
     add_virtio_mmio_blk_node(&mut target, gic_phandle)?;
     copy_reserved_memory(&source_tree, &mut target)?;
     rebuild_aliases(&source_tree, &mut target)?;
-    configure_uart_console(&mut target, chosen_id, PL011_UART_ADDR.0)?;
+    configure_uart_console(&mut target, chosen_id, GUEST_PL011_UART0_ADDR.0)?;
     append_reserved_memory(&mut target, reserved_memory);
 
     let gicv = gic_info
@@ -605,6 +624,9 @@ fn project_rp1_subtree(
         node.remove_property("dma-ranges");
         node.remove_property("msi-parent");
         node.remove_property("interrupt-parent");
+        if matches!(projection.interrupts, ProjectionInterrupts::Uart0) {
+            sanitize_guest_uart0_node(node);
+        }
         if projection.force_status_ok {
             node.set_property(
                 NameRef::Borrowed("status"),
@@ -637,6 +659,12 @@ fn project_rp1_subtree(
         }
     }
     Ok(target_id)
+}
+
+fn sanitize_guest_uart0_node(node: &mut ::dtb::ast::Node<'_>) {
+    node.remove_property("cts-event-workaround");
+    node.remove_property("skip-init");
+    node.remove_property("uart-has-rtscts");
 }
 
 fn rewrite_soc_child_reg_from_source(
@@ -1070,7 +1098,13 @@ fn rewrite_bootargs(existing: Option<&str>, pl011_uart_addr: usize) -> String {
             if token.starts_with("console=")
                 || token.starts_with("earlycon=")
                 || token.starts_with("root=")
+                || token.starts_with("systemd.unit=")
+                || token.starts_with("systemd.wants=")
                 || token.starts_with("virtio_mmio.device=")
+                || GUEST_SYSTEMD_MASK_TOKENS.contains(&token)
+                || GUEST_SYSTEMD_BOOT_TOKENS.contains(&token)
+                || token == "splash"
+                || token == "plymouth.ignore-serial-console"
             {
                 continue;
             }
@@ -1094,16 +1128,47 @@ fn rewrite_bootargs(existing: Option<&str>, pl011_uart_addr: usize) -> String {
         earlycon.as_str(),
         "console=ttyAMA0,115200",
     ] {
-        if token.is_empty() {
-            continue;
-        }
-        if !args.is_empty() {
-            args.push(' ');
-        }
-        args.push_str(token);
+        append_bootarg_token(&mut args, token);
+    }
+    for token in GUEST_SYSTEMD_BOOT_TOKENS {
+        append_bootarg_token(&mut args, token);
+    }
+    for token in GUEST_SYSTEMD_MASK_TOKENS {
+        append_bootarg_token(&mut args, token);
     }
 
     args
+}
+
+fn append_bootarg_token(args: &mut String, token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    if !args.is_empty() {
+        args.push(' ');
+    }
+    args.push_str(token);
+}
+
+#[cfg(test)]
+fn bootarg_token_count(text: &str, needle: &str) -> usize {
+    text.split_whitespace()
+        .filter(|token| *token == needle)
+        .count()
+}
+
+#[cfg(test)]
+fn bootargs_contains_guest_systemd_masks(text: &str) -> bool {
+    GUEST_SYSTEMD_MASK_TOKENS
+        .iter()
+        .all(|token| bootarg_token_count(text, token) == 1)
+}
+
+#[cfg(test)]
+fn bootargs_contains_guest_systemd_boot_tokens(text: &str) -> bool {
+    GUEST_SYSTEMD_BOOT_TOKENS
+        .iter()
+        .all(|token| bootarg_token_count(text, token) == 1)
 }
 
 fn update_gicv2_cpu_interface_reg(
@@ -1280,6 +1345,9 @@ fn write_be_u32s(
 #[cfg(test)]
 mod tests {
     use super::GUEST_ROOT_TOKEN;
+    use super::GUEST_SYSTEMD_MASK_TOKENS;
+    use super::bootargs_contains_guest_systemd_boot_tokens;
+    use super::bootargs_contains_guest_systemd_masks;
     use super::encode_uart_passthrough_interrupts;
     use super::gic_dt_irq_flags_from_sense;
     use super::rewrite_bootargs;
@@ -1312,9 +1380,14 @@ mod tests {
         assert!(rewritten.contains("rootwait"));
         assert!(rewritten.contains("console=ttyAMA0,115200"));
         assert!(rewritten.contains("earlycon=pl011,0x1c00030000"));
+        assert!(rewritten.contains("systemd.wants=serial-getty@ttyAMA0.service"));
+        assert!(!rewritten.contains("systemd.mask=serial-getty@ttyAMA0.service"));
+        assert!(bootargs_contains_guest_systemd_masks(&rewritten));
+        assert!(bootargs_contains_guest_systemd_boot_tokens(&rewritten));
         assert!(!rewritten.contains("root=/dev/mmcblk0p2"));
         assert!(!rewritten.contains("console=ttyS0,115200"));
         assert!(!rewritten.contains("earlycon=uart8250"));
+        assert!(!rewritten.contains("plymouth.ignore-serial-console"));
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
@@ -1327,6 +1400,8 @@ mod tests {
 
         assert_eq!(token_count(&rewritten, "rootwait"), 1);
         assert_eq!(token_count(&rewritten, GUEST_ROOT_TOKEN), 1);
+        assert!(bootargs_contains_guest_systemd_masks(&rewritten));
+        assert!(bootargs_contains_guest_systemd_boot_tokens(&rewritten));
         assert!(!rewritten.contains("virtio_mmio.device="));
         assert!(rewritten.contains("splash"));
     }
@@ -1340,7 +1415,32 @@ mod tests {
         assert_eq!(token_count(&rewritten, "rootwait"), 1);
         assert!(rewritten.contains("console=ttyAMA0,115200"));
         assert!(rewritten.contains("earlycon=pl011,0x1c00030000"));
+        assert!(bootargs_contains_guest_systemd_masks(&rewritten));
+        assert!(bootargs_contains_guest_systemd_boot_tokens(&rewritten));
         assert!(!rewritten.contains("virtio_mmio.device="));
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
+    fn rewrite_bootargs_deduplicates_guest_systemd_masks() {
+        let existing = "systemd.mask=boot-firmware.mount quiet systemd.mask=dev-zram0.swap";
+        let rewritten = rewrite_bootargs(Some(existing), TEST_UART_ADDR);
+
+        assert!(rewritten.contains("quiet"));
+        for token in GUEST_SYSTEMD_MASK_TOKENS {
+            assert_eq!(token_count(&rewritten, token), 1);
+        }
+    }
+
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
+    fn rewrite_bootargs_deduplicates_guest_systemd_boot_tokens() {
+        let existing = "systemd.unit=graphical.target quiet";
+        let rewritten = rewrite_bootargs(Some(existing), TEST_UART_ADDR);
+
+        assert!(rewritten.contains("quiet"));
+        assert!(!rewritten.contains("systemd.unit=graphical.target"));
+        assert_eq!(token_count(&rewritten, "systemd.unit=multi-user.target"), 1);
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]

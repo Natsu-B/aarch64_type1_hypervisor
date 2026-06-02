@@ -13,11 +13,13 @@ use arch_hal::gic::PIntId;
 use arch_hal::gic::PhysicalIrqBindingKind;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
+use arch_hal::gic::vm::PirqHookOp;
 use arch_hal::println;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
+use arch_hal::soc::bcm2712;
 use arch_hal::tls;
 use core::ffi::c_void;
 use core::ptr::read_volatile;
@@ -32,8 +34,8 @@ use exceptions::synchronous_handler::DataAbortInfo;
 use mutex::pod::RawAtomicPod;
 
 use crate::GICV2_DRIVER;
-use crate::PL011_UART_ADDR;
-use crate::multicore::ap_on;
+use crate::GUEST_PL011_UART0_ADDR;
+use crate::HYPERVISOR_PL011_UART1_ADDR;
 use crate::vgic;
 use crate::virtio_blk;
 
@@ -70,18 +72,24 @@ pub(crate) fn gic() -> Option<&'static Gicv2> {
 }
 
 fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
-    unsafe {
-        Ok(match size {
+    // SAFETY: `passthrough_probe` admits only aligned device-MMIO-sized accesses for trapped
+    // identity-mapped regions; the access width is the decoded guest access size.
+    let value = unsafe {
+        match size {
             1 => read_volatile(ipa as *const u8) as u64,
             2 => read_volatile(ipa as *const u16) as u64,
             4 => read_volatile(ipa as *const u32) as u64,
             8 => read_volatile(ipa as *const u64),
             _ => return Err(MmioError::Unhandled),
-        })
-    }
+        }
+    };
+    ack_guest_uart0_msix_after_passthrough(ipa as usize, false);
+    Ok(value)
 }
 
 fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
+    // SAFETY: `passthrough_probe` admits only aligned device-MMIO-sized accesses for trapped
+    // identity-mapped regions; the access width is the decoded guest access size.
     unsafe {
         match size {
             1 => write_volatile(ipa as *mut u8, value as u8),
@@ -91,6 +99,7 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
             _ => return Err(MmioError::Unhandled),
         }
     }
+    ack_guest_uart0_msix_after_passthrough(ipa as usize, true);
     Ok(())
 }
 
@@ -99,6 +108,7 @@ fn passthrough_probe(_ctx: *const (), ipa: u64, size: u8, _is_write: bool) -> bo
     matches!(size, 1 | 2 | 4 | 8)
         && !vgic::handles_gicd(addr)
         && !vgic::handles_gicc_phys(addr)
+        && !is_hypervisor_uart_addr(addr)
         && !virtio_blk::handles_mmio(addr)
 }
 
@@ -155,6 +165,9 @@ fn data_abort_handler(
         }
         if gicc_access_denied(plan) {
             panic!("gicc: physical GICC access denied; guest must use GICV");
+        }
+        if hypervisor_uart_access_denied(plan) {
+            panic!("uart1: guest access to hypervisor debug UART denied");
         }
         log_uart_write(plan, regs);
         match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
@@ -240,7 +253,12 @@ fn data_abort_handler(
     if vgic::handles_gicc_phys(address as usize) {
         panic!("gicc: physical GICC access denied; guest must use GICV");
     }
+    if is_hypervisor_uart_addr(address as usize) {
+        panic!("uart1: guest access to hypervisor debug UART denied");
+    }
 
+    // SAFETY: The abort IPA is in an identity-mapped device region admitted by the stage-2 trap
+    // policy, and the access size comes from the decoded ESR syndrome.
     unsafe {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
@@ -261,8 +279,8 @@ fn data_abort_handler(
                 } else {
                     regs.gprs()[reg_num]
                 };
-                let uart = PL011_UART_ADDR.0;
-                if (uart..uart + 0x1000).contains(&(address as usize)) {
+                let uart = GUEST_PL011_UART0_ADDR.0;
+                if is_guest_uart_addr(address as usize) {
                     if uart == address as usize && reg_val == b'\n' as u64 {
                         println!("\nhypervisor: alive");
                     }
@@ -292,6 +310,10 @@ fn data_abort_handler(
             }
         }
     }
+    ack_guest_uart0_msix_after_passthrough(
+        address as usize,
+        write_access == WriteNotRead::WritingMemoryAbort,
+    );
     // advance elr_el2
     cpu::set_elr_el2(cpu::get_elr_el2() + 4);
 }
@@ -349,6 +371,31 @@ fn gicc_access_denied(plan: &MmioDecoded) -> bool {
     }
 }
 
+fn hypervisor_uart_access_denied(plan: &MmioDecoded) -> bool {
+    match plan {
+        MmioDecoded::Single { ipa, .. } => is_hypervisor_uart_addr(*ipa as usize),
+        MmioDecoded::Pair { ipa0, ipa1, .. } => {
+            is_hypervisor_uart_addr(*ipa0 as usize) || is_hypervisor_uart_addr(*ipa1 as usize)
+        }
+        MmioDecoded::Prefetch { .. } => false,
+    }
+}
+
+fn is_hypervisor_uart_addr(addr: usize) -> bool {
+    in_mmio_window(addr, HYPERVISOR_PL011_UART1_ADDR.0, 0x1000)
+}
+
+fn is_guest_uart_addr(addr: usize) -> bool {
+    in_mmio_window(addr, GUEST_PL011_UART0_ADDR.0, 0x1000)
+}
+
+fn in_mmio_window(addr: usize, base: usize, size: usize) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    (base..end).contains(&addr)
+}
+
 fn gic_access_size_from_bytes(access_bytes: u8) -> Option<Gicv2AccessSize> {
     match access_bytes {
         1 => Some(Gicv2AccessSize::U8),
@@ -399,7 +446,14 @@ const LOG_PIRQ_ERR: u32 = 1 << 1;
 const LOG_EOI_ERR: u32 = 1 << 3;
 const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
+const LOG_UART0_MSIX_KICK_ERR: u32 = 1 << 6;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
+// SAFETY: `bool` has no invalid bit patterns; `false` is canonical for `RawAtomicPod<bool>`.
+static UART0_MSIX_KICK_INFLIGHT: RawAtomicPod<bool> =
+    unsafe { RawAtomicPod::new_raw_unchecked(false) };
+
+const PL011_MIS_OFFSET: usize = 0x40;
+const PL011_ICR_OFFSET: usize = 0x44;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum AckedPirqDelivery {
@@ -454,6 +508,51 @@ fn needs_deactivate_after_ack(
     }
 }
 
+fn ack_guest_uart0_msix() -> bool {
+    match bcm2712::pirq_hook(bcm2712::pirq_hook::RP1_UART0_SPI, PirqHookOp::Eoi) {
+        Ok(()) => true,
+        Err(err) => {
+            if IRQ_LOG_ONCE.fetch_or(LOG_UART0_MSIX_KICK_ERR, Ordering::Relaxed)
+                & LOG_UART0_MSIX_KICK_ERR
+                == 0
+            {
+                println!("uart0: RP1 MSI-X kick failed: {:?}", err);
+            }
+            false
+        }
+    }
+}
+
+fn ack_guest_uart0_msix_after_passthrough(addr: usize, is_write: bool) {
+    if !is_guest_uart_addr(addr) {
+        return;
+    }
+    let offset = addr - GUEST_PL011_UART0_ADDR.0;
+    if !is_write || offset == PL011_ICR_OFFSET {
+        ack_guest_uart0_msix();
+        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
+    }
+}
+
+fn kick_guest_uart0_msix_if_asserted() {
+    // SAFETY: UART0 is a mapped RP1 PL011 MMIO window trapped for guest passthrough, and PL011 MIS
+    // is a naturally aligned 32-bit read-only status register.
+    let mis = unsafe { read_volatile((GUEST_PL011_UART0_ADDR.0 + PL011_MIS_OFFSET) as *const u32) };
+    if mis == 0 {
+        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
+        return;
+    }
+    if UART0_MSIX_KICK_INFLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if !ack_guest_uart0_msix() {
+        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
+    }
+}
+
 fn irq_handler(_regs: &mut cpu::Registers) {
     let Some(gicv2) = gic() else {
         return;
@@ -461,6 +560,9 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     let Ok(Some(irq)) = gicv2.acknowledge() else {
         return;
     };
+    if irq.intid == bcm2712::pirq_hook::RP1_UART0_SPI {
+        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
+    }
     let maintenance_intid = vgic::maintenance_intid();
     let kick_sgi_intid = vgic::kick_sgi_intid();
     let mut pirq_delivery = None;
@@ -504,6 +606,9 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             }
         }
     }
+    if irq.intid != bcm2712::pirq_hook::RP1_UART0_SPI {
+        kick_guest_uart0_msix_if_asserted();
+    }
 }
 
 static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
@@ -532,10 +637,10 @@ fn log_uart_write(plan: &MmioDecoded, regs: &cpu::Registers) {
         } if desc.is_store => (*ipa as usize, desc),
         _ => return,
     };
-    let uart = PL011_UART_ADDR.0;
-    if !(uart..uart + 0x1000).contains(&ipa) {
+    if !is_guest_uart_addr(ipa) {
         return;
     }
+    let uart = GUEST_PL011_UART0_ADDR.0;
     let value = store_value(desc, regs);
     if ipa == uart && value == b'\n' as u64 {
         println!("\nhypervisor: alive");

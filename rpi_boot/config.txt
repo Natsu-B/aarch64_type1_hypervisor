@@ -41,6 +41,8 @@ arm_boost=0
 
 pciex4_reset=0
 enable_rp1_uart=1
+dtoverlay=uart0-pi5
+dtoverlay=uart1-pi5
 
 enable_jtag_gpio=1
 device_tree_address=0x20000000

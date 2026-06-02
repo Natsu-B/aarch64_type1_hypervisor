@@ -177,6 +177,26 @@ fn bind_spi_passthrough(gic: &Gicv2, spi: u32) -> Result<(), &'static str> {
     }
 }
 
+fn bind_spi_write_through_software_lr(gic: &Gicv2, spi: u32) -> Result<(), &'static str> {
+    match VGIC.bind_spi_pirq_write_through_software_lr(gic, PIntId(spi), VIntId(spi)) {
+        Ok(()) | Err(GicError::InvalidState) => Ok(()),
+        Err(err) => {
+            println!("vgic: map software-lr pirq failed: {:?}", err);
+            Err("vgic: map software-lr pirq failed")
+        }
+    }
+}
+
+fn bind_spi_shadow_software_lr(gic: &Gicv2, spi: u32) -> Result<(), &'static str> {
+    match VGIC.bind_spi_pirq_shadow_software_lr(gic, PIntId(spi), VIntId(spi)) {
+        Ok(()) | Err(GicError::InvalidState) => Ok(()),
+        Err(err) => {
+            println!("vgic: map shadow software-lr pirq failed: {:?}", err);
+            Err("vgic: map shadow software-lr pirq failed")
+        }
+    }
+}
+
 pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<(), &'static str> {
     reset_online_state_for_init();
     reset_vcpu_affinities_for_init();
@@ -204,7 +224,9 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         && uart_irq.pintid >= MIP_SPI_OFFSET + 32
         && !is_explicit_spi_passthrough(uart_irq.pintid)
     {
-        bind_spi_passthrough(gic, uart_irq.pintid)?;
+        // RP1 MSI-X sources use a separate IACK path. Software LR delivery keeps that IACK tied
+        // to the guest EOI, after the PL011 driver has drained RX state.
+        bind_spi_write_through_software_lr(gic, uart_irq.pintid)?;
     }
 
     let max_intid = gic.max_intid();
@@ -227,7 +249,13 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         bind_spi_passthrough(gic, spi)?;
     }
     for spi in bcm2712::pirq_hook::GUEST_RP1_PASSTHROUGH_SPIS {
-        bind_spi_passthrough(gic, spi)?;
+        if uart_irq.is_some_and(|irq| irq.pintid == spi) {
+            // Guest UART0 is level-triggered PL011 state, but the host sees an RP1 MSI-X edge.
+            // Keep the virtual line shadowed and tie MSI-X IACK to the guest EOI.
+            bind_spi_shadow_software_lr(gic, spi)?;
+        } else {
+            bind_spi_passthrough(gic, spi)?;
+        }
     }
 
     // SAFETY: vGIC state is initialized once before guest entry.
