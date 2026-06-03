@@ -141,13 +141,11 @@ Use `sudo uhubctl` to list controllable hubs and connected debug/UART adapters. 
 the hub containing only the debug probe resets the probe, not necessarily the Pi board itself; for a
 clean boot test, reset or power-cycle the Pi 5 power input or boot media path.
 
-## TODO
+## Raspberry Pi 5 UART0 Input
 
-* Raspberry Pi 5 UART0 input currently relies on a workaround in `rpi_boot`: RP1 UART0 MSI-X/IACK is
-  explicitly kicked after routing/unmasking, when PL011 `MIS` is asserted from EL2 IRQ handling, and
-  after guest UART0 MMIO passthrough reads or interrupt-clear writes. This keeps Linux input working
-  on `ttyAMA0`, but the proper RP1 interrupt acknowledgement/rearm semantics should be understood and
-  folded into the normal pIRQ/vGIC path instead of living as UART-specific handling.
+RP1 UART0 input is handled by the RP1 pIRQ hook as a level MSI-X source. The `rpi_boot`
+exception handler reports generic passthrough-MMIO completion and IRQ resample points, while the
+RP1 hook owns the source-specific PL011 status/completion checks and MSI-X IACK/reissue.
 
 ## Testing
 

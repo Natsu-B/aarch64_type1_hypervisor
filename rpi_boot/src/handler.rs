@@ -13,7 +13,6 @@ use arch_hal::gic::PIntId;
 use arch_hal::gic::PhysicalIrqBindingKind;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
-use arch_hal::gic::vm::PirqHookOp;
 use arch_hal::println;
 use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
@@ -83,7 +82,7 @@ fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioErro
             _ => return Err(MmioError::Unhandled),
         }
     };
-    ack_guest_uart0_msix_after_passthrough(ipa as usize, false);
+    note_rp1_passthrough_mmio_access(ipa as usize, false);
     Ok(value)
 }
 
@@ -99,7 +98,7 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
             _ => return Err(MmioError::Unhandled),
         }
     }
-    ack_guest_uart0_msix_after_passthrough(ipa as usize, true);
+    note_rp1_passthrough_mmio_access(ipa as usize, true);
     Ok(())
 }
 
@@ -310,7 +309,7 @@ fn data_abort_handler(
             }
         }
     }
-    ack_guest_uart0_msix_after_passthrough(
+    note_rp1_passthrough_mmio_access(
         address as usize,
         write_access == WriteNotRead::WritingMemoryAbort,
     );
@@ -446,14 +445,9 @@ const LOG_PIRQ_ERR: u32 = 1 << 1;
 const LOG_EOI_ERR: u32 = 1 << 3;
 const LOG_DEACT_ERR: u32 = 1 << 4;
 const LOG_KICK_ERR: u32 = 1 << 5;
-const LOG_UART0_MSIX_KICK_ERR: u32 = 1 << 6;
+const LOG_RP1_RESAMPLE_ERR: u32 = 1 << 6;
+const LOG_RP1_MMIO_ERR: u32 = 1 << 7;
 static IRQ_LOG_ONCE: RawAtomicPod<u32> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
-// SAFETY: `bool` has no invalid bit patterns; `false` is canonical for `RawAtomicPod<bool>`.
-static UART0_MSIX_KICK_INFLIGHT: RawAtomicPod<bool> =
-    unsafe { RawAtomicPod::new_raw_unchecked(false) };
-
-const PL011_MIS_OFFSET: usize = 0x40;
-const PL011_ICR_OFFSET: usize = 0x44;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum AckedPirqDelivery {
@@ -512,48 +506,11 @@ fn pirq_error_requires_panic(err: GicError) -> bool {
     matches!(err, GicError::UnsupportedIntId)
 }
 
-fn ack_guest_uart0_msix() -> bool {
-    match bcm2712::pirq_hook(bcm2712::pirq_hook::RP1_UART0_SPI, PirqHookOp::Eoi) {
-        Ok(()) => true,
-        Err(err) => {
-            if IRQ_LOG_ONCE.fetch_or(LOG_UART0_MSIX_KICK_ERR, Ordering::Relaxed)
-                & LOG_UART0_MSIX_KICK_ERR
-                == 0
-            {
-                println!("uart0: RP1 MSI-X kick failed: {:?}", err);
-            }
-            false
+fn note_rp1_passthrough_mmio_access(addr: usize, is_write: bool) {
+    if let Err(err) = bcm2712::pirq_hook::after_passthrough_mmio_access(addr, is_write) {
+        if IRQ_LOG_ONCE.fetch_or(LOG_RP1_MMIO_ERR, Ordering::Relaxed) & LOG_RP1_MMIO_ERR == 0 {
+            println!("rp1: passthrough MMIO completion failed: {:?}", err);
         }
-    }
-}
-
-fn ack_guest_uart0_msix_after_passthrough(addr: usize, is_write: bool) {
-    if !is_guest_uart_addr(addr) {
-        return;
-    }
-    let offset = addr - GUEST_PL011_UART0_ADDR.0;
-    if !is_write || offset == PL011_ICR_OFFSET {
-        ack_guest_uart0_msix();
-        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
-    }
-}
-
-fn kick_guest_uart0_msix_if_asserted() {
-    // SAFETY: UART0 is a mapped RP1 PL011 MMIO window trapped for guest passthrough, and PL011 MIS
-    // is a naturally aligned 32-bit read-only status register.
-    let mis = unsafe { read_volatile((GUEST_PL011_UART0_ADDR.0 + PL011_MIS_OFFSET) as *const u32) };
-    if mis == 0 {
-        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
-        return;
-    }
-    if UART0_MSIX_KICK_INFLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    if !ack_guest_uart0_msix() {
-        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
     }
 }
 
@@ -564,9 +521,6 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     let Ok(Some(irq)) = gicv2.acknowledge() else {
         return;
     };
-    if irq.intid == bcm2712::pirq_hook::RP1_UART0_SPI {
-        UART0_MSIX_KICK_INFLIGHT.store(false, Ordering::Release);
-    }
     let maintenance_intid = vgic::maintenance_intid();
     let kick_sgi_intid = vgic::kick_sgi_intid();
     let mut pirq_delivery = None;
@@ -610,8 +564,12 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             }
         }
     }
-    if irq.intid != bcm2712::pirq_hook::RP1_UART0_SPI {
-        kick_guest_uart0_msix_if_asserted();
+    if let Err(err) = bcm2712::pirq_hook::resample_level_sources(Some(irq.intid)) {
+        if IRQ_LOG_ONCE.fetch_or(LOG_RP1_RESAMPLE_ERR, Ordering::Relaxed) & LOG_RP1_RESAMPLE_ERR
+            == 0
+        {
+            println!("rp1: level MSI-X resample failed: {:?}", err);
+        }
     }
 }
 

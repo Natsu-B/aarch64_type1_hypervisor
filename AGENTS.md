@@ -38,11 +38,12 @@ The workspace uses Rust nightly with `rust-src` and target `aarch64-unknown-none
 
 Tests are driven by `xtask` and `xtest.txt`. Place Rust integration tests under each crate’s `tests/` directory, as in `gdb_remote/tests/` and `net/tests/`. Use descriptive test names that match filterable behavior, for example `uefi_packet_size` or `net_udp_ipv4`. Run targeted tests with `cargo xtest -p gdb_remote -t uefi_packet_size` when iterating, then run `cargo xtest` before submitting.
 
-## TODO: Raspberry Pi 5 UART0 Input
+## Raspberry Pi 5 UART0 Input
 
 Linux console and input must stay on RP1 UART0 (`ttyAMA0`). Hypervisor-only output uses RP1 UART1.
-The current working fix keeps UART0 input alive by explicitly rearming the RP1 UART0 MSI-X source
-from the `rpi_boot` MMIO/IRQ path. Treat this as hardware-integration debt, not as the final model.
+UART0 input is handled by the RP1 pIRQ hook as a level MSI-X source: the `rpi_boot` handler reports
+generic passthrough-MMIO completion and IRQ resample points, while the RP1 hook owns source-specific
+PL011 status/completion checks and MSI-X IACK/reissue.
 
 Observed history:
 
@@ -55,9 +56,8 @@ Observed history:
   not restore UART0 login input.
 * Polling/resampling all RP1 passthrough MSI-X sources, or all enabled sources, from the generic IRQ
   path caused boot regressions and systemd stalls.
-* A better fix should identify the RP1 interrupt-source pending/armed state and model source
-  reissue in the RP1 pIRQ hook or generic pIRQ layer, without open-coded UART0 MMIO checks in
-  `rpi_boot/src/handler.rs`.
+* The current fix models source reissue in `arch_hal/aarch64_hal/soc/src/bcm2712/pirq_hook.rs`
+  without open-coded UART0 MMIO checks in `rpi_boot/src/handler.rs`.
 
 ## Commit & Pull Request Guidelines
 

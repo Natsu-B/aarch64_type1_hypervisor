@@ -60,14 +60,12 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
-use core::ptr::slice_from_raw_parts_mut;
 use core::str;
 use file::OpenOptions;
 use file::StorageDevice;
 use file::StorageDeviceErr;
 use mutex::pod::RawAtomicPod;
 use typestate::Le;
-use typestate::ReadWrite;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -700,23 +698,6 @@ extern "C" fn main() -> ! {
     unsafe {
         core::arch::asm!("msr daifclr, #3", options(nostack, preserves_flags)); // enable irq
     }
-
-    // setup guest RP1 MSI-X interrupts
-    // SAFETY: RP1 peripheral MMIO is mapped; the table is sized for the index used below.
-    let pcie_config = unsafe {
-        &*slice_from_raw_parts_mut(
-            (rp1.peripheral_addr.unwrap().0 + 0x10_8000 + 0x08) as *mut ReadWrite<u32>,
-            64,
-        )
-    };
-    for msix_index in bcm2712::pirq_hook::GUEST_RP1_PASSTHROUGH_MSIX_INDICES {
-        pcie_config[msix_index].set_bits(0b1001);
-    }
-    bcm2712::rp1_interrupt::enable_interrupt(uart_irq.pintid)
-        .unwrap_or_else(|err| panic!("rp1 uart0 interrupt enable failed: {:?}", err));
-    // Prime the RP1 MSI-X source after routing and unmasking it. Without this IACK, UART0 MIS can
-    // assert in the PL011 while source 25 remains unarmed and never posts SPI 185 to the GIC.
-    pcie_config[bcm2712::pirq_hook::RP1_UART0_MSIX_INDEX].set_bits(0b0100);
 
     multicore::setup_multicore(stack_top);
 
