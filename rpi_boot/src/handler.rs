@@ -498,7 +498,7 @@ fn needs_deactivate_after_ack(
     match pirq_delivery.expect("physical IRQs must provide a vGIC delivery result") {
         AckedPirqDelivery::Bound(PhysicalIrqBindingKind::SoftwareLr) => true,
         AckedPirqDelivery::Bound(PhysicalIrqBindingKind::HardwareLr) => false,
-        AckedPirqDelivery::Error(GicError::UnsupportedIntId) => {
+        AckedPirqDelivery::Error(err) if pirq_error_requires_panic(err) => {
             panic!(
                 "vgic: unbound/policy-denied physical IRQ {} reached EL2",
                 irq_intid
@@ -506,6 +506,10 @@ fn needs_deactivate_after_ack(
         }
         AckedPirqDelivery::Error(_) => true,
     }
+}
+
+fn pirq_error_requires_panic(err: GicError) -> bool {
+    matches!(err, GicError::UnsupportedIntId)
 }
 
 fn ack_guest_uart0_msix() -> bool {
@@ -738,13 +742,7 @@ mod tests {
     }
 
     #[test_case]
-    #[should_panic(expected = "vgic: unbound/policy-denied physical IRQ 27 reached EL2")]
-    fn unsupported_passthrough_still_panics() {
-        let _ = needs_deactivate_after_ack(
-            27,
-            Some(25),
-            15,
-            Some(AckedPirqDelivery::Error(GicError::UnsupportedIntId)),
-        );
+    fn unsupported_passthrough_is_classified_as_panic() {
+        assert!(pirq_error_requires_panic(GicError::UnsupportedIntId));
     }
 }

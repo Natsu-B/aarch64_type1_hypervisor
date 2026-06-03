@@ -272,6 +272,7 @@ fn test_virtual_interrupt_helpers() -> Result<(), &'static str> {
 
     let mut sw = VirtualInterrupt::Software {
         vintid: 10,
+        pintid: None,
         eoi_maintenance: true,
         priority: 0x40,
         group: IrqGroup::Group0,

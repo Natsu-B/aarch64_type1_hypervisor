@@ -1103,7 +1103,6 @@ fn rewrite_bootargs(existing: Option<&str>, pl011_uart_addr: usize) -> String {
                 || token.starts_with("virtio_mmio.device=")
                 || GUEST_SYSTEMD_MASK_TOKENS.contains(&token)
                 || GUEST_SYSTEMD_BOOT_TOKENS.contains(&token)
-                || token == "splash"
                 || token == "plymouth.ignore-serial-console"
             {
                 continue;
