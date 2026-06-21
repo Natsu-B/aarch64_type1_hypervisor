@@ -44,7 +44,7 @@ use typestate::Readable;
 pub mod brcmstb;
 #[cfg(target_arch = "aarch64")]
 pub mod mip;
-pub(crate) mod pcie_validation;
+pub mod pcie_validation;
 #[cfg(target_arch = "aarch64")]
 pub mod pirq_hook;
 #[cfg(target_arch = "aarch64")]

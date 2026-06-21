@@ -158,12 +158,16 @@ const PL011_CR_TXE: u32 = 1 << 8;
 const DW_AXI_DMAC_CHANNEL: usize = 0;
 const DW_AXI_DMAC_CFG: usize = 0x010;
 const DW_AXI_DMAC_CHEN: usize = 0x018;
+const DW_AXI_DMAC_INTSTATUS: usize = 0x030;
 const DW_AXI_DMAC_COMMON_INTCLEAR: usize = 0x038;
+const DW_AXI_DMAC_COMMON_INTSTATUS: usize = 0x050;
+const DW_AXI_DMAC_RESET: usize = 0x058;
 const DW_AXI_DMAC_CHANNEL_BASE: usize = 0x100;
 const DW_AXI_DMAC_CHANNEL_STRIDE: usize = 0x100;
 const DW_AXI_DMAC_CH_CFG_L: usize = 0x020;
 const DW_AXI_DMAC_CH_CFG_H: usize = 0x024;
 const DW_AXI_DMAC_CH_LLP: usize = 0x028;
+const DW_AXI_DMAC_CH_STATUS: usize = 0x030;
 const DW_AXI_DMAC_CH_INTSTATUS_ENA: usize = 0x080;
 const DW_AXI_DMAC_CH_INTSTATUS: usize = 0x088;
 const DW_AXI_DMAC_CH_INTSIGNAL_ENA: usize = 0x090;
@@ -171,9 +175,19 @@ const DW_AXI_DMAC_CH_INTCLEAR: usize = 0x098;
 const DW_AXI_DMAC_IRQ_DMA_TRF: u32 = 1 << 1;
 const DW_AXI_DMAC_IRQ_ALL_ERR: u32 = 0x003f_7fe0;
 const DW_AXI_DMAC_IRQ_ALL: u32 = u32::MAX;
-const DW_AXI_DMAC_CH_CFG_L_LLP: u32 = (3 << 2) | 3;
-const DW_AXI_DMAC_CH_CFG_H_MEM_TO_PER_DMAC: u32 = 1;
-const DW_AXI_DMAC_CH_CFG_H_DST_PER_SHIFT: u32 = 12;
+const DW_AXI_DMAC_CFG_EN: u32 = 1;
+const DW_AXI_DMAC_RESET_SOFT: u32 = 1;
+const DW_AXI_DMAC_MBLK_TYPE_LL: u32 = 3;
+const CH_CFG2_L_SRC_MULTBLK_TYPE_POS: u32 = 0;
+const CH_CFG2_L_DST_MULTBLK_TYPE_POS: u32 = 2;
+const CH_CFG2_L_SRC_PER_POS: u32 = 4;
+const CH_CFG2_L_DST_PER_POS: u32 = 11;
+const CH_CFG2_H_TT_FC_POS: u32 = 0;
+const CH_CFG2_H_HS_SEL_SRC_POS: u32 = 3;
+const CH_CFG2_H_HS_SEL_DST_POS: u32 = 4;
+const CH_CFG2_H_PRIORITY_POS: u32 = 20;
+const DW_AXI_DMAC_TT_FC_MEM_TO_PER_DMAC: u32 = 1;
+const DW_AXI_DMAC_HS_SEL_HW: u32 = 0;
 const DW_AXI_DMAC_LLI_CTL_LO_MEM_TO_PER_8BIT: u32 =
     (1 << 18) | (1 << 14) | (1 << 6); // burst=4, dst no-increment, src increment
 const DW_AXI_DMAC_LLI_CTL_H_LAST_VALID: u32 = (1 << 31) | (1 << 30);
@@ -542,6 +556,7 @@ enum UartDmaError {
     MissingDmaWindow,
     InvalidDmaController,
     AddressTranslation,
+    ResetTimeout { reset: u32 },
     DmaEngineError { status: u32 },
     Timeout { status: u32 },
 }
@@ -587,12 +602,20 @@ fn run_uart0_dma_tx(
             u64::try_from(size_of::<DwAxiDmacLli>()).map_err(|_| UartDmaError::AddressTranslation)?,
         )
         .map_err(|_| UartDmaError::AddressTranslation)?;
+    let uart_cpu_alias = uart0_base as u64;
+    let uart_bar_relative = uart_cpu_alias
+        .checked_sub(rp1_map.base())
+        .ok_or(UartDmaError::AddressTranslation)?;
+    let uart_local_dma = rp1_map
+        .peripheral_dma_addr(uart_cpu_alias, 4)
+        .map_err(|_| UartDmaError::AddressTranslation)?;
 
     let descriptor = DwAxiDmacLli {
         sar: tx_dma,
-        // `reg` is the RP1 40-bit system address from the generated DTB,
-        // not the CPU's BAR-translated MMIO address.
-        dar: dma.reg_base,
+        // Linux passes PL011 mapbase through phys_to_dma() before assigning
+        // DAR. RP1 `dma-ranges` maps BAR1's peripheral address zero to the
+        // local APB0 system address 0xc0_4000_0000.
+        dar: uart_local_dma,
         block_ts_lo: (UART_DMA_TEST_BYTES.len() - 1) as u32,
         block_ts_hi: 0,
         llp: 0,
@@ -605,9 +628,22 @@ fn run_uart0_dma_tx(
     cpu::clean_dcache_range(tx_va as *const u8, UART_DMA_TEST_BYTES.len());
     cpu::clean_dcache_range(descriptor_va as *const u8, size_of::<DwAxiDmacLli>());
 
+    semihost_log(format_args!("[rpi5-rp1-init] UART DMA DMAC layout: CFG2"));
     semihost_log(format_args!(
-        "[rpi5-rp1-init] UART DMA TX DREQ=0x{:x} dmac=0x{:x} src_dma=0x{:x} desc_dma=0x{:x} dst=0x{:x} len={}",
-        request, dmac_base, tx_dma, descriptor_dma, dma.reg_base, UART_DMA_TEST_BYTES.len()
+        "[rpi5-rp1-init] UART DMA DREQ tx=0x{:x} buffer va=0x{:x} pa=0x{:x} dma=0x{:x} len={}",
+        request, tx_va, tx_phys, tx_dma, UART_DMA_TEST_BYTES.len()
+    ));
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART0 DR cpu=0x{:x} bar-relative=0x{:x} rp1-dma=0x{:x} dtb-reg=0x{:x}",
+        uart_cpu_alias, uart_bar_relative, uart_local_dma, dma.reg_base
+    ));
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART DMA selected DAR mode=rp1-local-dma addr=0x{:x} desc_dma=0x{:x}",
+        uart_local_dma, descriptor_dma
+    ));
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART DMA LLI sar=0x{:x} dar=0x{:x} block=0x{:x} ctl=0x{:08x}/0x{:08x} llp=0x{:x}",
+        descriptor.sar, descriptor.dar, descriptor.block_ts_lo, descriptor.ctl_lo, descriptor.ctl_hi, descriptor.llp
     ));
 
     // Do not use `Pl011Uart::init` here: its normal flush waits indefinitely
@@ -629,37 +665,75 @@ fn run_uart0_dma_tx(
         original_cr | PL011_CR_UARTEN | PL011_CR_TXE,
     );
     semihost_log(format_args!(
-        "[rpi5-rp1-init] UART DMA UARTFR=0x{:08x} CR=0x{:08x} DMACR=0x{:08x}",
+        "[rpi5-rp1-init] UART DMA PL011 before FR=0x{:08x} CR=0x{:08x} DMACR=0x{:08x}",
         mmio_read32(uart0_base, RP1_UART_FR_OFFSET),
         mmio_read32(uart0_base, RP1_UART_CR_OFFSET),
         original_dmacr,
     ));
 
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART DMA DMAC id=0x{:08x} cfg=0x{:08x} chen-before=0x{:08x} raw=0x{:08x} common=0x{:08x}",
+        dmac_read32(dmac_base, 0),
+        dmac_read32(dmac_base, DW_AXI_DMAC_CFG),
+        dmac_read32(dmac_base, DW_AXI_DMAC_CHEN),
+        dmac_read32(dmac_base, DW_AXI_DMAC_INTSTATUS),
+        dmac_read32(dmac_base, DW_AXI_DMAC_COMMON_INTSTATUS),
+    ));
+    dmac_soft_reset(dmac_base)?;
     dmac_disable_channel(dmac_base, DW_AXI_DMAC_CHANNEL);
-    dmac_write32(dmac_base, DW_AXI_DMAC_CFG, 1);
+    let cfg = dmac_read32(dmac_base, DW_AXI_DMAC_CFG) | DW_AXI_DMAC_CFG_EN;
+    dmac_write32(dmac_base, DW_AXI_DMAC_CFG, cfg);
     let channel = dmac_channel_offset(DW_AXI_DMAC_CHANNEL);
-    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTSTATUS_ENA, DW_AXI_DMAC_IRQ_ALL);
-    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTSIGNAL_ENA, 0);
+    let irq_mask = DW_AXI_DMAC_IRQ_DMA_TRF | DW_AXI_DMAC_IRQ_ALL_ERR;
+    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTSTATUS_ENA, irq_mask);
+    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTSIGNAL_ENA, irq_mask);
     dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTCLEAR, DW_AXI_DMAC_IRQ_ALL);
     dmac_write32(dmac_base, DW_AXI_DMAC_COMMON_INTCLEAR, 1 << DW_AXI_DMAC_CHANNEL);
-    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_L, DW_AXI_DMAC_CH_CFG_L_LLP);
-    dmac_write32(
-        dmac_base,
-        channel + DW_AXI_DMAC_CH_CFG_H,
-        DW_AXI_DMAC_CH_CFG_H_MEM_TO_PER_DMAC | (request << DW_AXI_DMAC_CH_CFG_H_DST_PER_SHIFT),
-    );
+    let cfg_l = dmac_cfg2_l(request);
+    let cfg_h = dmac_cfg2_h(0);
+    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_L, cfg_l);
+    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_H, cfg_h);
     dmac_write64(dmac_base, channel + DW_AXI_DMAC_CH_LLP, descriptor_dma);
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART DMA cfg_l=0x{:08x} cfg_h=0x{:08x} llp=0x{:016x} intena=0x{:08x} signal=0x{:08x}",
+        dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_L),
+        dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_H),
+        dmac_read64(dmac_base, channel + DW_AXI_DMAC_CH_LLP),
+        dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_INTSTATUS_ENA),
+        dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_INTSIGNAL_ENA),
+    ));
 
     // The UART request is enabled only after the descriptor and channel state
     // are visible to RP1. It is always restored below, including on timeout.
     mmio_write32(uart0_base, RP1_UART_DMACR_OFFSET, original_dmacr | PL011_DMACR_TXDMAE);
+    cpu::dsb_sy();
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART DMA PL011 enabled FR=0x{:08x} CR=0x{:08x} DMACR=0x{:08x}",
+        mmio_read32(uart0_base, RP1_UART_FR_OFFSET),
+        mmio_read32(uart0_base, RP1_UART_CR_OFFSET),
+        mmio_read32(uart0_base, RP1_UART_DMACR_OFFSET),
+    ));
     dmac_enable_channel(dmac_base, DW_AXI_DMAC_CHANNEL);
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART DMA chen-after-enable=0x{:08x}",
+        dmac_read32(dmac_base, DW_AXI_DMAC_CHEN),
+    ));
 
     let mut final_status = 0;
+    let mut last_status = u32::MAX;
     let mut result = Err(UartDmaError::Timeout { status: 0 });
     for _ in 0..UART_DMA_POLL_LIMIT {
         let status = dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_INTSTATUS);
         final_status = status;
+        if status != last_status {
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART DMA poll ch-status=0x{:08x} raw=0x{:08x} common=0x{:08x}",
+                status,
+                dmac_read32(dmac_base, DW_AXI_DMAC_INTSTATUS),
+                dmac_read32(dmac_base, DW_AXI_DMAC_COMMON_INTSTATUS),
+            ));
+            last_status = status;
+        }
         if status & DW_AXI_DMAC_IRQ_ALL_ERR != 0 {
             result = Err(UartDmaError::DmaEngineError { status });
             break;
@@ -678,15 +752,57 @@ fn run_uart0_dma_tx(
     dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTCLEAR, DW_AXI_DMAC_IRQ_ALL);
     mmio_write32(uart0_base, RP1_UART_DMACR_OFFSET, original_dmacr);
     semihost_log(format_args!(
-        "[rpi5-rp1-init] UART DMA status=0x{:08x} channel_cfg_h=0x{:08x}",
+        "[rpi5-rp1-init] UART DMA final status=0x{:08x} chstat=0x{:08x} raw=0x{:08x} common=0x{:08x} chen=0x{:08x}",
         final_status,
-        dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_H),
+        dmac_read32(dmac_base, channel + DW_AXI_DMAC_CH_STATUS),
+        dmac_read32(dmac_base, DW_AXI_DMAC_INTSTATUS),
+        dmac_read32(dmac_base, DW_AXI_DMAC_COMMON_INTSTATUS),
+        dmac_read32(dmac_base, DW_AXI_DMAC_CHEN),
     ));
     result
 }
 
 const fn dmac_channel_offset(channel: usize) -> usize {
     DW_AXI_DMAC_CHANNEL_BASE + channel * DW_AXI_DMAC_CHANNEL_STRIDE
+}
+
+/// Linux's `use_cfg2` path for controllers with the RP1's 64 DMA targets.
+/// Source/destination multiblock modes are linked-list; destination request
+/// comes exclusively from the generated DTB's `dmas` TX specifier.
+const fn dmac_cfg2_l(dst_per: u32) -> u32 {
+    (DW_AXI_DMAC_MBLK_TYPE_LL << CH_CFG2_L_SRC_MULTBLK_TYPE_POS)
+        | (DW_AXI_DMAC_MBLK_TYPE_LL << CH_CFG2_L_DST_MULTBLK_TYPE_POS)
+        | (0 << CH_CFG2_L_SRC_PER_POS)
+        | (dst_per << CH_CFG2_L_DST_PER_POS)
+}
+
+/// Memory-to-peripheral, DMAC flow-control and hardware handshaking exactly
+/// match the Linux DW AXI DMAC slave path for a TX peripheral.
+const fn dmac_cfg2_h(priority: u32) -> u32 {
+    (DW_AXI_DMAC_TT_FC_MEM_TO_PER_DMAC << CH_CFG2_H_TT_FC_POS)
+        | (DW_AXI_DMAC_HS_SEL_HW << CH_CFG2_H_HS_SEL_SRC_POS)
+        | (DW_AXI_DMAC_HS_SEL_HW << CH_CFG2_H_HS_SEL_DST_POS)
+        | (priority << CH_CFG2_H_PRIORITY_POS)
+}
+
+fn dmac_soft_reset(base: usize) -> Result<(), UartDmaError> {
+    // Linux's DW AXI DMAC header defines DMAC_RESET at 0x58. The Synopsys
+    // soft-reset request is self-clearing, so bound the readback loop.
+    dmac_write32(base, DW_AXI_DMAC_RESET, DW_AXI_DMAC_RESET_SOFT);
+    for _ in 0..UART_DMA_POLL_LIMIT {
+        let reset = dmac_read32(base, DW_AXI_DMAC_RESET);
+        if reset & DW_AXI_DMAC_RESET_SOFT == 0 {
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART DMA reset complete cfg=0x{:08x}",
+                dmac_read32(base, DW_AXI_DMAC_CFG)
+            ));
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(UartDmaError::ResetTimeout {
+        reset: dmac_read32(base, DW_AXI_DMAC_RESET),
+    })
 }
 
 fn dmac_enable_channel(base: usize, channel: usize) {
@@ -714,6 +830,10 @@ fn dmac_write32(base: usize, offset: usize, value: u32) {
 fn dmac_write64(base: usize, offset: usize, value: u64) {
     dmac_write32(base, offset, value as u32);
     dmac_write32(base, offset + 4, (value >> 32) as u32);
+}
+
+fn dmac_read64(base: usize, offset: usize) -> u64 {
+    (dmac_read32(base, offset) as u64) | ((dmac_read32(base, offset + 4) as u64) << 32)
 }
 
 /// Volatile MMIO access invariant: callers pass a BAR-validated device base

@@ -44,6 +44,13 @@ Linux's known values (`RX=0x19`, `TX=0x1a`) are diagnostic comparisons only.
 BAR/MMIO reachability. UART DMA is attempted only after BAR1 smoke, bridge,
 MSI-X, and DMA-preflight gates pass.
 
+The RP1 controller uses the Synopsys AXI DMAC CFG2 channel layout (`dma-targets
+= 64`). The TX test places the DTB TX request in CFG2 `dst_per` and translates
+UART0 DR from its CPU BAR alias to the RP1 local DMA address
+`0xc040030000`. A successful DMA completion is distinct from observing bytes
+on external UART pins; capture those separately when validating physical UART
+wiring.
+
 Expected minimum debug UART log:
 
 ```text

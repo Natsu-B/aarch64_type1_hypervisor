@@ -6,6 +6,7 @@ pub const MIB: u64 = 1024 * 1024;
 pub const RP1_LOW_BAR1_BASE: u64 = 0x0000_0000;
 pub const RP1_LOW_BAR2_BASE: u64 = 0x0040_0000;
 pub const RP1_LOW_BAR0_BASE: u64 = 0x0080_0000;
+pub const RP1_PERIPHERAL_DMA_BASE: u64 = 0xc0_4000_0000;
 
 pub const fn bar_size_from_mask(mask: u32) -> Option<u64> {
     let size = (!(mask & !0xf)).wrapping_add(1) as u64;
@@ -28,6 +29,41 @@ pub const fn range_fits(base: u64, size: u64, outer_base: u64, outer_size: u64) 
         (Some(end), Some(outer_end)) => end <= outer_end,
         _ => false,
     }
+}
+
+pub const fn encode_dw_axi_dmac_cfg2_l(dst_per: u32) -> Option<u32> {
+    if dst_per > 0x3f {
+        return None;
+    }
+    // Linked-list multiblock source/destination and CFG2 destination request.
+    Some((3 << 0) | (3 << 2) | (dst_per << 11))
+}
+
+pub const fn encode_dw_axi_dmac_cfg2_h(priority: u32) -> Option<u32> {
+    if priority > 0x7 {
+        return None;
+    }
+    // Mem->peripheral, DMAC flow controller, both handshake selectors HW.
+    Some(1 | (priority << 20))
+}
+
+pub const fn rp1_peripheral_dma_address(
+    bar_cpu_base: u64,
+    cpu_alias: u64,
+    len: u64,
+) -> Option<u64> {
+    if len == 0 || cpu_alias < bar_cpu_base {
+        return None;
+    }
+    let offset = cpu_alias - bar_cpu_base;
+    let end = match offset.checked_add(len) {
+        Some(value) => value,
+        None => return None,
+    };
+    if end > 0x41_0000 {
+        return None;
+    }
+    RP1_PERIPHERAL_DMA_BASE.checked_add(offset)
 }
 
 pub const fn outbound_window_is_valid(cpu_base: u64, pcie_base: u64, size: u64) -> bool {
@@ -140,5 +176,21 @@ mod tests {
         );
         assert!(assigned_bar_is_probe_mask(0xffff_c000, 0xffff_c000));
         assert!(!assigned_bar_is_probe_mask(0x0080_0000, 0xffff_c000));
+    }
+
+    #[test]
+    fn cfg2_encodes_rp1_tx_request_without_old_layout_bits() {
+        assert_eq!(encode_dw_axi_dmac_cfg2_l(0x1a), Some(0x0000_d00f));
+        assert_eq!(encode_dw_axi_dmac_cfg2_h(0), Some(1));
+        assert_eq!(encode_dw_axi_dmac_cfg2_h(3), Some(0x0030_0001));
+        assert_eq!(encode_dw_axi_dmac_cfg2_l(64), None);
+    }
+
+    #[test]
+    fn rp1_uart_dr_uses_local_dma_address_not_cpu_alias() {
+        assert_eq!(
+            rp1_peripheral_dma_address(0x1f_0000_0000, 0x1f_0003_0000, 4),
+            Some(0xc0_4003_0000)
+        );
     }
 }

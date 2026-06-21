@@ -2,8 +2,12 @@
 
 use crate::bcm2712::Bcm2712Error;
 use crate::bcm2712::Rp1Config;
+use crate::bcm2712::pcie_validation;
 
 pub const RP1_PERIPHERAL_SIZE: u64 = 0x40_0000;
+/// RP1 `dma-ranges` maps local APB0 peripherals from this 40-bit system
+/// address. The RP1 DW AXI DMAC must use this address, not the CPU BAR alias.
+pub const RP1_PERIPHERAL_DMA_BASE: u64 = pcie_validation::RP1_PERIPHERAL_DMA_BASE;
 // Verified by the existing Raspberry Pi 5 boot path and pIRQ hook in this repository.
 pub const RP1_UART0_OFFSET: u64 = 0x3_0000;
 pub const RP1_GEM_OFFSET: u64 = 0x0010_0000;
@@ -61,5 +65,16 @@ impl Rp1PeripheralMap {
 
     pub fn rp1_gem_base(&self) -> Result<usize, Bcm2712Error> {
         self.mmio_base(RP1_GEM_OFFSET, 0x4000)
+    }
+
+    /// Translate a CPU BAR1 MMIO address to RP1's local DMA address space.
+    /// The caller supplies an address previously validated as belonging to
+    /// this BAR1 map; the result matches the RP1 `dma-ranges` APB0 mapping.
+    pub fn peripheral_dma_addr(&self, cpu_mmio: u64, size: u64) -> Result<u64, Bcm2712Error> {
+        if self.size > RP1_PERIPHERAL_SIZE {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+        pcie_validation::rp1_peripheral_dma_address(self.base, cpu_mmio, size)
+            .ok_or(Bcm2712Error::InvalidWindow)
     }
 }
