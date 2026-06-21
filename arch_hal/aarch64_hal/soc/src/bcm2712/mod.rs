@@ -6,7 +6,13 @@ use core::ptr::slice_from_raw_parts;
 #[cfg(target_arch = "aarch64")]
 use crate::bcm2712::brcmstb::BrcmStb;
 #[cfg(target_arch = "aarch64")]
+use crate::bcm2712::brcmstb::PcieDmaWindow;
+#[cfg(target_arch = "aarch64")]
 use crate::bcm2712::brcmstb::PcieStatus;
+#[cfg(target_arch = "aarch64")]
+use crate::bcm2712::brcmstb::RP1_EXPECTED_DMA_CPU_BASE;
+#[cfg(target_arch = "aarch64")]
+use crate::bcm2712::brcmstb::RP1_EXPECTED_DMA_PCIE_BASE;
 #[cfg(target_arch = "aarch64")]
 use dtb::DtbNodeView;
 #[cfg(target_arch = "aarch64")]
@@ -37,6 +43,8 @@ pub mod mip;
 #[cfg(target_arch = "aarch64")]
 pub mod pirq_hook;
 #[cfg(target_arch = "aarch64")]
+pub mod rp1;
+#[cfg(target_arch = "aarch64")]
 pub mod rp1_interrupt;
 pub mod sdhc;
 #[cfg(target_arch = "aarch64")]
@@ -65,6 +73,9 @@ pub(crate) fn get_msi_x_table(table: &MsiXTablePtr) -> &'static [PciMsiXTable] {
 pub struct Rp1Config {
     pub peripheral_addr: Option<(u64, u64)>,
     pub shared_sram_addr: Option<(u64, u64)>,
+    pub dma_window: Option<PcieDmaWindow>,
+    pub msi_x_table_addr: Option<(u64, u64)>,
+    pub pcie_base: Option<(u64, u64)>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -158,50 +169,113 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
                     return Err(Bcm2712Error::InvalidPciHeaderType.into());
                 }
 
+                // SAFETY: `set_config_window` above selected RP1 function 0, and this scan
+                // only reads its standard PCI capability list.
                 let msi_x = unsafe { brcm_stb.get_msi_x_capability() }?;
+                // SAFETY: `msi_x` points into the currently selected RP1 config space and
+                // remains valid until the next config-window change in this initialization.
                 let (msi_x_bar, msi_x_entries) = unsafe { brcm_stb.msi_x_table_bar_addr(msi_x)? };
-                let msi_x_end = msi_x_bar + (msi_x_entries as u64) * size_of::<PciMsiXTable>() as u64;
+                let msi_x_len = (msi_x_entries as u64)
+                    .checked_mul(size_of::<PciMsiXTable>() as u64)
+                    .ok_or(Bcm2712Error::InvalidWindow)?;
+                let msi_x_end = msi_x_bar
+                    .checked_add(msi_x_len)
+                    .ok_or(Bcm2712Error::InvalidWindow)?;
+                // SAFETY: the RP1 config window is selected and BAR access reads function 0.
                 let bar1 = unsafe { brcm_stb.read_bar_address(1) }?;
+                // SAFETY: the RP1 config window is selected and BAR access reads function 0.
                 let bar2 = unsafe { brcm_stb.read_bar_address(2) }?;
                 println!("PCIE: RP1 Pheripheral BAR addr: 0x{:x}", bar1);
                 println!("PCIE: RP1 Shared SRAM BAR addr: 0x{:x}", bar2);
 
                 let mut msi_x_table_addr = None;
                 let mut peripheral_addr = None;
-                let mut  shared_sram_addr = None;
+                let mut shared_sram_addr = None;
 
                 // check outbound windows
-                for i in 0..=4 {
-                   if let Ok(Some(bar)) = brcm_stb
-                        .read_outbound_window(i){
-                    println!(
-                        "PCIE: outbound window {}: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
-                        i, bar.pcie_base, bar.cpu_base, bar.size
-                    );
-                    if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&msi_x_bar)
-                        && msi_x_end <= bar.pcie_base + bar.size {
-                        msi_x_table_addr = Some(msi_x_bar - bar.pcie_base + bar.cpu_base);
+                for i in 1..=4 {
+                    if let Ok(Some(bar)) = brcm_stb.read_outbound_window(i) {
+                        println!(
+                            "PCIE: outbound window {}: pcie_base: 0x{:x} cpu_base: 0x{:x} size: 0x{:x}",
+                            i, bar.pcie_base, bar.cpu_base, bar.size
+                        );
+                        let Some(bar_end) = bar.pcie_base.checked_add(bar.size) else {
+                            return Err(Bcm2712Error::InvalidWindow.into());
+                        };
+                        if bar.pcie_base <= msi_x_bar && msi_x_end <= bar_end {
+                            let offset = msi_x_bar
+                                .checked_sub(bar.pcie_base)
+                                .ok_or(Bcm2712Error::InvalidWindow)?;
+                            msi_x_table_addr = Some(
+                                bar.cpu_base
+                                    .checked_add(offset)
+                                    .ok_or(Bcm2712Error::InvalidWindow)?,
+                            );
+                        }
+                        if (bar.pcie_base..bar_end).contains(&bar1) {
+                            let peripheral_end = bar1
+                                .checked_add(0x40_0000)
+                                .ok_or(Bcm2712Error::InvalidWindow)?;
+                            if peripheral_end > bar_end {
+                                return Err(Bcm2712Error::InvalidWindow.into());
+                            }
+                            let offset = bar1
+                                .checked_sub(bar.pcie_base)
+                                .ok_or(Bcm2712Error::InvalidWindow)?;
+                            peripheral_addr = Some((
+                                bar.cpu_base
+                                    .checked_add(offset)
+                                    .ok_or(Bcm2712Error::InvalidWindow)?,
+                                0x40_0000,
+                            ));
+                        }
+                        if (bar.pcie_base..bar_end).contains(&bar2) {
+                            let shared_sram_end = bar2
+                                .checked_add(0x1_0000)
+                                .ok_or(Bcm2712Error::InvalidWindow)?;
+                            if shared_sram_end > bar_end {
+                                return Err(Bcm2712Error::InvalidWindow.into());
+                            }
+                            let offset = bar2
+                                .checked_sub(bar.pcie_base)
+                                .ok_or(Bcm2712Error::InvalidWindow)?;
+                            shared_sram_addr = Some((
+                                bar.cpu_base
+                                    .checked_add(offset)
+                                    .ok_or(Bcm2712Error::InvalidWindow)?,
+                                0x1_0000,
+                            ));
+                        }
                     }
-                    if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&bar1) {
-                        peripheral_addr = Some((bar1 - bar.pcie_base + bar.cpu_base, 0x40_0000));
-                    }
-                    if (bar.pcie_base..(bar.pcie_base + bar.size)).contains(&bar2) {
-                        shared_sram_addr = Some((bar2 - bar.pcie_base + bar.cpu_base, 0x1_0000));
-                    }
-                }
                 }
                 let Some(msi_x_table_addr) = msi_x_table_addr else {
                     println!("PCIE: msi x window are not set");
                     return Err(Bcm2712Error::InvalidWindow.into());
                 };
                 let mut table = MSIX_TABLE.lock();
-                *table = Some(unsafe { brcm_stb.init_rp1_msi_x_settings(msi_x, msi_x_table_addr, 0xff_ffff_f000) }?);
+                // SAFETY: the selected outbound window maps the complete MSI-X table range
+                // calculated above, and the config window has not changed since `msi_x`.
+                *table = Some(unsafe {
+                    brcm_stb.init_rp1_msi_x_settings(msi_x, msi_x_table_addr, 0xff_ffff_f000)
+                }?);
+
+                let dma_window = match brcm_stb.find_dma_window(
+                    RP1_EXPECTED_DMA_PCIE_BASE,
+                    RP1_EXPECTED_DMA_CPU_BASE,
+                    0x1_0000_0000,
+                )? {
+                    Some(window) => window,
+                    None => brcm_stb.ensure_dma_window(None, PcieDmaWindow::expected_rp1())?,
+                };
 
                 rp1_interrupt::init_rp1_interrupt(brcm_stb, mip_reg.0 as u64)?;
 
                 Ok(ControlFlow::Break(Rp1Config {
                     peripheral_addr,
                     shared_sram_addr,
+                    dma_window: Some(dma_window),
+                    msi_x_table_addr: Some((msi_x_table_addr, msi_x_len)),
+                    pcie_base: Some((pcie_reg.0 as u64, pcie_reg.1 as u64)),
                 }))
             });
 

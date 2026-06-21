@@ -135,7 +135,7 @@ pub fn write(args: fmt::Arguments) {
     let mut guard = DEBUG_UART.lock();
     let mirror = guard.mirror;
     let mut writer = MirrorWriter {
-        uart: Some(guard.get_mut().unwrap()),
+        uart: guard.get_mut(),
         mirror,
     };
     writer.write_fmt(args).unwrap();
@@ -153,7 +153,7 @@ pub fn _print_force(args: fmt::Arguments) {
     let mut guard = unsafe { DEBUG_UART.no_lock() };
     let mirror = guard.mirror;
     let mut writer = MirrorWriter {
-        uart: Some(guard.get_mut().unwrap()),
+        uart: guard.get_mut(),
         mirror,
     };
     writer.write_fmt(args).unwrap();

@@ -43,6 +43,9 @@ const _: () = assert!(offset_of!(BrcmStb, config_address) == 0x9000);
 const _: () = assert!(core::mem::size_of::<BrcmStb>() == 0x10000);
 
 const SHIFT_1MB: u64 = 20;
+pub const RP1_EXPECTED_DMA_PCIE_BASE: u64 = 0x10_0000_0000;
+pub const RP1_EXPECTED_DMA_CPU_BASE: u64 = 0;
+pub const RP1_EXPECTED_DMA_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,8 +120,104 @@ pub(crate) struct InBoundData {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcieDmaWindow {
+    pub pcie_base: u64,
+    pub cpu_base: u64,
+    pub size: u64,
+}
+
+impl PcieDmaWindow {
+    pub const fn expected_rp1() -> Self {
+        Self {
+            pcie_base: RP1_EXPECTED_DMA_PCIE_BASE,
+            cpu_base: RP1_EXPECTED_DMA_CPU_BASE,
+            size: RP1_EXPECTED_DMA_SIZE,
+        }
+    }
+
+    pub fn contains_cpu_phys(&self, phys: u64, len: u64) -> bool {
+        range_contains(self.cpu_base, self.size, phys, len)
+    }
+
+    pub fn contains_dma_addr(&self, dma: u64, len: u64) -> bool {
+        range_contains(self.pcie_base, self.size, dma, len)
+    }
+
+    pub fn cpu_phys_to_dma(&self, phys: u64, len: u64) -> Result<u64, Bcm2712Error> {
+        if !self.contains_cpu_phys(phys, len) {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+
+        let offset = phys
+            .checked_sub(self.cpu_base)
+            .ok_or(Bcm2712Error::InvalidWindow)?;
+        let dma = self
+            .pcie_base
+            .checked_add(offset)
+            .ok_or(Bcm2712Error::InvalidWindow)?;
+        if !self.contains_dma_addr(dma, len) {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+        Ok(dma)
+    }
+
+    pub fn dma_to_cpu_phys(&self, dma: u64, len: u64) -> Result<u64, Bcm2712Error> {
+        if !self.contains_dma_addr(dma, len) {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+
+        let offset = dma
+            .checked_sub(self.pcie_base)
+            .ok_or(Bcm2712Error::InvalidWindow)?;
+        let phys = self
+            .cpu_base
+            .checked_add(offset)
+            .ok_or(Bcm2712Error::InvalidWindow)?;
+        if !self.contains_cpu_phys(phys, len) {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+        Ok(phys)
+    }
+}
+
+fn range_contains(base: u64, size: u64, addr: u64, len: u64) -> bool {
+    if size == 0 || len == 0 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    let Some(window_end) = base.checked_add(size) else {
+        return false;
+    };
+    addr >= base && end <= window_end
+}
+
+impl From<InBoundData> for PcieDmaWindow {
+    fn from(window: InBoundData) -> Self {
+        Self {
+            pcie_base: window.pcie_base,
+            cpu_base: window.cpu_base,
+            size: window.size,
+        }
+    }
+}
+
+impl From<PcieDmaWindow> for InBoundData {
+    fn from(window: PcieDmaWindow) -> Self {
+        Self {
+            pcie_base: window.pcie_base,
+            cpu_base: window.cpu_base,
+            size: window.size,
+        }
+    }
+}
+
 impl BrcmStb {
     pub(crate) fn new(addr: usize) -> &'static Self {
+        // SAFETY: The caller passes the MMIO base from the DTB `reg` entry for the BCM2712 PCIe
+        // controller, and `BrcmStb` is a register-layout view over that mapped region.
         unsafe { &*(addr as *const Self) }
     }
 
@@ -290,6 +389,80 @@ impl BrcmStb {
         Ok(())
     }
 
+    pub fn find_dma_window(
+        &self,
+        expected_pcie_base: u64,
+        expected_cpu_base: u64,
+        min_size: u64,
+    ) -> Result<Option<PcieDmaWindow>, Bcm2712Error> {
+        if min_size == 0 {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+
+        for num in 1..=10 {
+            let Some(inbound) = self.read_inbound_window(num)? else {
+                continue;
+            };
+            if inbound.pcie_base == expected_pcie_base
+                && inbound.cpu_base == expected_cpu_base
+                && inbound.size >= min_size
+            {
+                println!("PCIE: DMA inbound window {} selected", num);
+                return Ok(Some(inbound.into()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn ensure_dma_window(
+        &self,
+        num_preference: Option<u8>,
+        window: PcieDmaWindow,
+    ) -> Result<PcieDmaWindow, Bcm2712Error> {
+        if window.size == 0 {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+
+        if let Some(num) = num_preference {
+            match self.read_inbound_window(num)? {
+                Some(existing) if PcieDmaWindow::from(existing) == window => {
+                    println!("PCIE: DMA inbound window {} already matches", num);
+                    return Ok(window);
+                }
+                Some(_) => return Err(Bcm2712Error::InvalidWindow),
+                None => {
+                    println!("PCIE: Setting DMA inbound window {}...", num);
+                    self.set_inbound_window(num, window.into())?;
+                    cpu::dsb_sy();
+                    return Ok(window);
+                }
+            }
+        }
+
+        let mut first_free = None;
+        for num in 1..=10 {
+            match self.read_inbound_window(num)? {
+                Some(existing) if PcieDmaWindow::from(existing) == window => {
+                    println!("PCIE: DMA inbound window {} already matches", num);
+                    return Ok(window);
+                }
+                Some(_) => {}
+                None if first_free.is_none() => first_free = Some(num),
+                None => {}
+            }
+        }
+
+        let Some(num) = first_free else {
+            println!("PCIE: inbound windows are full; cannot install DMA window");
+            return Err(Bcm2712Error::InvalidWindow);
+        };
+        println!("PCIE: Setting DMA inbound window {}...", num);
+        self.set_inbound_window(num, window.into())?;
+        cpu::dsb_sy();
+        Ok(window)
+    }
+
     /// have to ensure that config windows are mapped rp1 config space
     unsafe fn read_bar_raw_u32(&self, num: u8) -> Result<u32, Bcm2712Error> {
         if num > 5 {
@@ -307,6 +480,8 @@ impl BrcmStb {
             return Err(Bcm2712Error::InvalidSettings);
         }
 
+        // SAFETY: this method requires the RP1 config window to remain selected for the
+        // duration of the BAR read, which is the caller contract.
         let raw = unsafe { self.read_bar_raw_u32(num) }?;
         if raw == 0 {
             return Err(Bcm2712Error::InvalidWindow);
@@ -322,6 +497,7 @@ impl BrcmStb {
                 if num >= 5 {
                     return Err(Bcm2712Error::InvalidSettings);
                 }
+                // SAFETY: the high dword is part of the same selected RP1 config space.
                 let hi = unsafe { self.read_bar_raw_u32(num + 1) }?;
                 Ok(((hi as u64) << 32) | ((raw & 0xffff_fff0) as u64))
             }
@@ -331,6 +507,8 @@ impl BrcmStb {
     }
 
     pub(crate) fn set_config_window(&self) -> Result<&mut PCIConfigRegType0, Bcm2712Error> {
+        // SAFETY: the barrier does not dereference memory; it orders this core's MMIO writes
+        // before programming the configuration address register.
         unsafe { asm!("dmb oshst") };
         self.config_address.write(
             ConfigAddress::new()
@@ -339,6 +517,8 @@ impl BrcmStb {
                 .set(ConfigAddress::function_num, 0),
         );
         cpu::dsb_sy();
+        // SAFETY: `config_data` is the controller's 4KB configuration-space aperture and the
+        // address register above selected RP1 function 0 before this typed register view.
         let config = unsafe { &mut *(self.config_data.get() as *mut PCIConfigRegType0) };
         if config.id.read().bits() == !0 || config.bhlc.read().bits() == !0 {
             return Err(Bcm2712Error::DtbDeviceNotFound);
@@ -368,6 +548,8 @@ impl BrcmStb {
             println!("PCIE: Invalid capabilities pointer: 0x{:x}", cap);
             return Err(Bcm2712Error::InvalidSettings);
         }
+        // SAFETY: `config_data` is exactly a 4KB config aperture, which provides 256 aligned
+        // u32 words while the selected RP1 function remains unchanged in this call.
         let config_data =
             unsafe { &*slice_from_raw_parts_mut(self.config_data.get() as *mut u32, 256) };
         let mut cap = cap;
@@ -414,10 +596,14 @@ impl BrcmStb {
         let offset_bytes = table_offset.offset_bytes() as u64;
         println!("PCIE: MSI-X bar is bar[{}]", bir);
         println!("PCIE: MSI-X table offset bytes: 0x{:x}", offset_bytes);
-        let bar_addr = (unsafe { self.read_bar_address(bir as u8) })?;
+        // SAFETY: the caller provides an MSI-X capability from the currently selected RP1
+        // config window, so reading its referenced BAR uses the same selected function.
+        let bar_addr = unsafe { self.read_bar_address(bir as u8) }?;
         println!("PCIE: MSI-X bar decoded base: 0x{:x}", bar_addr);
         Ok((
-            bar_addr + offset_bytes,
+            bar_addr
+                .checked_add(offset_bytes)
+                .ok_or(Bcm2712Error::InvalidWindow)?,
             msi_x.configurations.read().table_entry_count() as u64,
         ))
     }
