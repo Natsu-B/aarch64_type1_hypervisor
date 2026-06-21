@@ -8,6 +8,23 @@ cargo check --manifest-path arch_hal/aarch64_hal/soc/example/rpi5_rp1_init/Cargo
 
 The example emits its validation log through AArch64 semihosting when launched through OpenOCD. This avoids relying on the unavailable UART10 channel during debug-probe validation. It validates the firmware-provided RP1 PCIe setup, resolves RP1 BAR mappings, verifies the inbound PCIe DMA window, and writes a PL011 message through RP1 UART0 at BAR offset `0x30000`.
 
+## UART0 DMA DTB discovery
+
+For UART0 DMA discovery, the boot partition `config.txt` must contain:
+
+```text
+dtparam=uart0=on
+dtparam=uart0_dma=on
+```
+
+The Raspberry Pi firmware [overlays README](https://github.com/raspberrypi/firmware/blob/master/boot/overlays/README)
+defines `uart0_dma` as enabling DMA usage on UART0 for BCM2712; it is off by default.
+The test must use the firmware-generated DTB from that boot, not an unmodified
+base DTB. The example logs the UART0 node path, compatible string, `reg`,
+`dmas`, and `dma-names`, then obtains TX/RX request IDs from the DTB specifiers.
+Linux's known values (`RX=0x19`, `TX=0x1a`) are diagnostic comparisons only.
+No DMA transaction is started by this discovery path.
+
 Expected minimum debug UART log:
 
 ```text

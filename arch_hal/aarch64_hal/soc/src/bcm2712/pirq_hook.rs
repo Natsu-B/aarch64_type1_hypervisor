@@ -75,6 +75,9 @@ fn map_bcm2712_error(err: Bcm2712Error) -> PirqHookError {
         Bcm2712Error::DtbParseError(_)
         | Bcm2712Error::DtbDeviceNotFound
         | Bcm2712Error::PcieIsNotInitialized
+        | Bcm2712Error::MdioTimeout
+        | Bcm2712Error::LinkTimeout
+        | Bcm2712Error::PcieEndpointNotFound
         | Bcm2712Error::UnexpectedDevice(_) => PirqHookError::InvalidState,
     }
 }
