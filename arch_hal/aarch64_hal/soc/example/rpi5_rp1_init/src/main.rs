@@ -283,6 +283,19 @@ extern "C" fn main() -> ! {
     };
     semihost_log(format_args!("[rpi5-rp1-init] RP1 GEM base 0x{:x}", gem_base));
 
+    if let Err(smoke) = bar1_mmio_smoke_test(&rp1_map, uart0_base, gem_base) {
+        semihost_log(format_args!(
+            "[rpi5-rp1-init] BAR1 smoke FAIL uart=0x{:08x} dmac=0x{:08x} gem=0x{:08x}",
+            smoke.uart_value, smoke.dmac_value, smoke.gem_value
+        ));
+        semihost_log(format_args!(
+            "[rpi5-rp1-init] UART DMA: BLOCKED, BAR1 MMIO aperture is not reachable"
+        ));
+        bcm2712::dump_rp1_pcie_diagnostics(&rp1);
+        wait_forever()
+    }
+    semihost_log(format_args!("[rpi5-rp1-init] BAR1 MMIO smoke PASS"));
+
     if let Err(reason) = dma_preflight(&rp1) {
         fail(format_args!("DMA PREFLIGHT FAIL: {:?}", reason));
     }
@@ -346,6 +359,47 @@ struct Uart0DmaInfo {
     reg_base: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Bar1SmokeFailure {
+    uart_value: u32,
+    dmac_value: u32,
+    gem_value: u32,
+}
+
+/// Prove that BAR1 is a live RP1 aperture before any UART or DMA programming.
+/// BAR1 intentionally starts at PCI address zero in the full-RC layout, so its
+/// CPU address is the outbound window's CPU base (`0x1f00000000` on CM5).
+fn bar1_mmio_smoke_test(
+    rp1_map: &Rp1PeripheralMap,
+    uart0_base: usize,
+    gem_base: usize,
+) -> Result<(), Bar1SmokeFailure> {
+    let dmac_base = rp1_map
+        .mmio_base(RP1_DMA_OFFSET, 0x1000)
+        .map_err(|_| Bar1SmokeFailure {
+            uart_value: u32::MAX,
+            dmac_value: u32::MAX,
+            gem_value: u32::MAX,
+        })?;
+    // UARTFR, DW AXI DMAC ID, and the first GEM register are read-only smoke
+    // probes.  Any all-ones completion means PCIe BAR1 was not reachable.
+    let uart_value = mmio_read32(uart0_base, RP1_UART_FR_OFFSET);
+    let dmac_value = mmio_read32(dmac_base, 0);
+    let gem_value = mmio_read32(gem_base, 0);
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] BAR1 smoke pcie=0x0 cpu=0x{:x} uart=0x{:x} dmac=0x{:x} gem=0x{:x} values=0x{:08x}/0x{:08x}/0x{:08x}",
+        rp1_map.base(), uart0_base, dmac_base, gem_base, uart_value, dmac_value, gem_value
+    ));
+    if uart_value == u32::MAX || dmac_value == u32::MAX || gem_value == u32::MAX {
+        return Err(Bar1SmokeFailure {
+            uart_value,
+            dmac_value,
+            gem_value,
+        });
+    }
+    Ok(())
+}
+
 fn read_be_cell(bytes: &[u8]) -> Result<u32, &'static str> {
     let array: [u8; 4] = bytes.try_into().map_err(|_| "truncated DTB cell")?;
     Ok(u32::from_be_bytes(array))
@@ -390,6 +444,12 @@ fn discover_uart0_dma(dtb: &DtbParser) -> Result<Option<Uart0DmaInfo>, &'static 
             "[rpi5-rp1-init] UART0 DTB compatible={:?} dmas={:?} dma-names={:?}",
             compatible, dmas, dma_names
         ));
+        if !compatible
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"arm,pl011-axi")
+        {
+            return Err("UART0 compatible is not arm,pl011-axi".into());
+        }
         let (Some(dmas), Some(names)) = (dmas, dma_names) else {
             return Ok(ControlFlow::Break(None));
         };

@@ -52,6 +52,11 @@ pub const RP1_EXPECTED_DMA_PCIE_BASE: u64 = 0x10_0000_0000;
 pub const RP1_EXPECTED_DMA_CPU_BASE: u64 = 0;
 pub const RP1_EXPECTED_DMA_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
+/// The RP1 endpoint's firmware and Linux DTB describe BAR1 at PCI address
+/// zero.  It is an intentional, valid mapping in the local full-RC layout.
+const RP1_BAR1_PCIE_BASE: u64 = 0x0000_0000;
+const RP1_BAR2_PCIE_BASE: u64 = 0x0040_0000;
+const RP1_BAR0_PCIE_BASE: u64 = 0x0080_0000;
 
 // BCM2712 BRCM STB PCIe offsets.  These are deliberately kept as narrow raw
 // MMIO constants rather than making the `repr(C)` view more fragile.
@@ -627,9 +632,6 @@ impl BrcmStb {
         // SAFETY: this method requires the RP1 config window to remain selected for the
         // duration of the BAR read, which is the caller contract.
         let raw = unsafe { self.read_bar_raw_u32(num) }?;
-        if raw == 0 {
-            return Err(Bcm2712Error::InvalidWindow);
-        }
         if (raw & 0x1) != 0 {
             return Err(Bcm2712Error::InvalidSettings);
         }
@@ -1096,8 +1098,23 @@ impl BrcmStb {
         })
     }
 
-    fn assign_bar(&self, probe: PcieBarProbe, pcie_address: u64) -> Result<(), Bcm2712Error> {
-        if pcie_address == 0 || pcie_address & (probe.size - 1) != 0 {
+    fn assign_bar(
+        &self,
+        probe: PcieBarProbe,
+        outbound: OutBoundData,
+        pcie_address: u64,
+    ) -> Result<(), Bcm2712Error> {
+        if pcie_address & (probe.size - 1) != 0 {
+            return Err(Bcm2712Error::InvalidWindow);
+        }
+        let assigned_end = pcie_address
+            .checked_add(probe.size)
+            .ok_or(Bcm2712Error::InvalidWindow)?;
+        let outbound_end = outbound
+            .pcie_base
+            .checked_add(outbound.size)
+            .ok_or(Bcm2712Error::InvalidWindow)?;
+        if pcie_address < outbound.pcie_base || assigned_end > outbound_end {
             return Err(Bcm2712Error::InvalidWindow);
         }
         let config = self.set_config_window_for(RP1_BDF)?;
@@ -1121,8 +1138,14 @@ impl BrcmStb {
             return Err(Bcm2712Error::InvalidWindow);
         }
         println!(
-            "PCIE: BAR{} assigned=0x{:x} size=0x{:x}",
-            probe.bar, readback, probe.size
+            "PCIE: BAR{} assigned pcie=0x{:x} cpu=0x{:x} size=0x{:x}",
+            probe.bar,
+            readback,
+            outbound
+                .cpu_base
+                .checked_add(readback - outbound.pcie_base)
+                .ok_or(Bcm2712Error::InvalidWindow)?,
+            probe.size,
         );
         Ok(())
     }
@@ -1140,30 +1163,27 @@ impl BrcmStb {
             id & 0xffff,
             id >> 16
         );
-        let outbound_end = outbound
-            .pcie_base
-            .checked_add(outbound.size)
-            .ok_or(Bcm2712Error::InvalidWindow)?;
         let probes = [
             self.probe_bar_size(0)?,
             self.probe_bar_size(1)?,
             self.probe_bar_size(2)?,
         ];
-        if probes.iter().any(|probe| probe.original_high.is_some()) {
-            // BAR0/BAR1/BAR2 must be independently assignable for RP1.  Do
-            // not overwrite the high dword of a 64-bit BAR with another BAR.
-            return Err(Bcm2712Error::InvalidSettings);
-        }
-        let mut cursor = outbound_end;
-        for probe in probes {
-            cursor = cursor
-                .checked_sub(probe.size)
-                .map(|address| address & !(probe.size - 1))
-                .ok_or(Bcm2712Error::InvalidWindow)?;
-            if cursor == 0 || cursor < outbound.pcie_base {
-                return Err(Bcm2712Error::InvalidWindow);
+        // Assign in the RP1/Linux low-address layout.  BAR1=0 is deliberate:
+        // the RP1 child bus in the firmware DTB maps its peripheral region
+        // from PCI address zero.  BAR0 is assigned last so MSI-X never
+        // affects BAR1/BAR2 placement.
+        for (probe, address) in [
+            (probes[1], RP1_BAR1_PCIE_BASE),
+            (probes[2], RP1_BAR2_PCIE_BASE),
+            (probes[0], RP1_BAR0_PCIE_BASE),
+        ] {
+            if probe.original_high.is_some() {
+                // `probe_bar_size` has fully restored the paired dword, but
+                // this fixed three-BAR layout cannot safely consume an
+                // adjacent BAR as a 64-bit high dword.
+                return Err(Bcm2712Error::InvalidSettings);
             }
-            self.assign_bar(probe, cursor)?;
+            self.assign_bar(probe, outbound, address)?;
         }
         let config = self.set_config_window_for(RP1_BDF)?;
         config.cmd_status.update_bits(
