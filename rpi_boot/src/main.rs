@@ -90,6 +90,11 @@ pub(crate) const HYPERVISOR_PL011_UART1_ADDR: (usize, u64) =
 const RP1_GPIO_BANK0_BASE: usize = RP1_BASE + 0xd_0000;
 const RP1_PAD_BANK0_BASE: usize = RP1_BASE + 0xf_0000;
 const RP1_GPIO_CTRL_FUNCSEL_MASK: u32 = 0x1f;
+const RP1_GPIO_CTRL_OUTOVER_MASK: u32 = 0x0000_3000;
+const RP1_GPIO_CTRL_OEOVER_MASK: u32 = 0x0000_c000;
+const RP1_GPIO_CTRL_INOVER_MASK: u32 = 0x0003_0000;
+const RP1_GPIO_CTRL_OVERRIDE_MASK: u32 =
+    RP1_GPIO_CTRL_OUTOVER_MASK | RP1_GPIO_CTRL_OEOVER_MASK | RP1_GPIO_CTRL_INOVER_MASK;
 // GPIO14/15 route RP1 UART0 on the 40-pin header with the legacy ALT0 selector.
 // The uart0-pi5 firmware overlay leaves the control registers as 0x84, where
 // the function selector bits are 0x04.
@@ -249,9 +254,15 @@ fn configure_rp1_uart0_pinmux() {
     unsafe {
         for pin in [14, 15] {
             let ctrl_addr = gpio_ctrl_addr(pin);
-            let ctrl = core::ptr::read_volatile(ctrl_addr) & !RP1_GPIO_CTRL_FUNCSEL_MASK;
+            let ctrl = core::ptr::read_volatile(ctrl_addr)
+                & !(RP1_GPIO_CTRL_FUNCSEL_MASK | RP1_GPIO_CTRL_OVERRIDE_MASK);
             core::ptr::write_volatile(ctrl_addr, ctrl | RP1_GPIO_FUNCSEL_UART0);
         }
+
+        let tx_pad_addr = pad_ctrl_addr(14);
+        let tx_pad =
+            core::ptr::read_volatile(tx_pad_addr) & !(RP1_PAD_PULL_MASK | RP1_PAD_OUTPUT_DISABLE);
+        core::ptr::write_volatile(tx_pad_addr, tx_pad);
 
         let rx_pad_addr = pad_ctrl_addr(15);
         let rx_pad = core::ptr::read_volatile(rx_pad_addr) & !RP1_PAD_RX_MASK;
@@ -268,7 +279,8 @@ fn configure_rp1_uart1_pinmux() {
     unsafe {
         for pin in [0, 1] {
             let ctrl_addr = gpio_ctrl_addr(pin);
-            let ctrl = core::ptr::read_volatile(ctrl_addr) & !RP1_GPIO_CTRL_FUNCSEL_MASK;
+            let ctrl = core::ptr::read_volatile(ctrl_addr)
+                & !(RP1_GPIO_CTRL_FUNCSEL_MASK | RP1_GPIO_CTRL_OVERRIDE_MASK);
             core::ptr::write_volatile(ctrl_addr, ctrl | RP1_GPIO_FUNCSEL_UART1);
         }
 
@@ -282,6 +294,20 @@ fn configure_rp1_uart1_pinmux() {
         core::ptr::write_volatile(
             rx_pad_addr,
             rx_pad | RP1_PAD_SCHMITT | RP1_PAD_PULL_UP | RP1_PAD_INPUT_ENABLE,
+        );
+    }
+}
+
+fn log_rp1_uart0_pinmux() {
+    // SAFETY: RP1 peripheral MMIO is identity-mapped in EL2 stage-1 at this point. GPIO14/15
+    // control and pad addresses are naturally aligned 32-bit registers in the RP1 bank 0 range.
+    unsafe {
+        println!(
+            "RP1 UART0 pinmux: gpio14 ctrl=0x{:08x} pad=0x{:08x}; gpio15 ctrl=0x{:08x} pad=0x{:08x}",
+            core::ptr::read_volatile(gpio_ctrl_addr(14)),
+            core::ptr::read_volatile(pad_ctrl_addr(14)),
+            core::ptr::read_volatile(gpio_ctrl_addr(15)),
+            core::ptr::read_volatile(pad_ctrl_addr(15)),
         );
     }
 }
@@ -702,6 +728,7 @@ extern "C" fn main() -> ! {
 
     debug_assert_eq!(rp1.peripheral_addr.unwrap().0, RP1_BASE as u64);
     configure_rp1_uart0_pinmux();
+    log_rp1_uart0_pinmux();
 
     println!("setup vgic...");
     vgic::init(gicv2, &gic_info, Some(uart_irq)).unwrap();
