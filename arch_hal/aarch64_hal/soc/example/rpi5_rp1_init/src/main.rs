@@ -144,6 +144,7 @@ static mut UART_DMA_TX_AREA: UartDmaTxArea = UartDmaTxArea {
 };
 
 const RP1_DMA_OFFSET: u64 = 0x18_8000;
+const RP1_UART_DR_OFFSET: usize = 0x00;
 const RP1_UART_DMACR_OFFSET: usize = 0x48;
 const RP1_UART_FR_OFFSET: usize = 0x18;
 const RP1_UART_IBRD_OFFSET: usize = 0x24;
@@ -155,6 +156,8 @@ const PL011_LCRH_FEN: u32 = 1 << 4;
 const PL011_LCRH_WLEN_8: u32 = 3 << 5;
 const PL011_CR_UARTEN: u32 = 1;
 const PL011_CR_TXE: u32 = 1 << 8;
+const PL011_FR_BUSY: u32 = 1 << 3;
+const PL011_FR_TXFF: u32 = 1 << 5;
 const DW_AXI_DMAC_CHANNEL: usize = 0;
 const DW_AXI_DMAC_CFG: usize = 0x010;
 const DW_AXI_DMAC_CHEN: usize = 0x018;
@@ -193,6 +196,7 @@ const DW_AXI_DMAC_LLI_CTL_LO_MEM_TO_PER_8BIT: u32 =
 const DW_AXI_DMAC_LLI_CTL_H_LAST_VALID: u32 = (1 << 31) | (1 << 30);
 const UART_DMA_POLL_LIMIT: usize = 1_000_000;
 const UART_DMA_TEST_BYTES: &[u8] = b"[rp1-uart-dma] TX\\n";
+const UART_DIRECT_TEST_BYTES: &[u8] = b"[rpi5-rp1-init] RP1 UART0 DIRECT TX PASS\\n";
 
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
@@ -323,6 +327,14 @@ extern "C" fn main() -> ! {
                 wait_forever()
             }
         }
+    }
+    // The preceding DMA transfer completed but was not observable on the
+    // external UART0 receiver.  Keep this CPU-driven transfer as an explicit
+    // control experiment: it proves (or disproves) the same BAR1/PL011 path
+    // without involving the DMAC request/descriptor machinery.
+    match uart0_direct_tx(uart0_base, UART_DIRECT_TEST_BYTES) {
+        Ok(()) => semihost_log(format_args!("[rpi5-rp1-init] UART0 direct TX PASS")),
+        Err(err) => semihost_log(format_args!("[rpi5-rp1-init] UART0 direct TX FAIL: {:?}", err)),
     }
     semihost_log(format_args!("[rpi5-rp1-init] BAR/DMA validation PASS; Ethernet intentionally not run"));
     wait_forever()
@@ -559,6 +571,66 @@ enum UartDmaError {
     ResetTimeout { reset: u32 },
     DmaEngineError { status: u32 },
     Timeout { status: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UartDirectTxError {
+    TxFifoTimeout { fr: u32 },
+    BusyTimeout { fr: u32 },
+}
+
+/// Send a bounded CPU-polled UART0 message as a control experiment for the
+/// DMA test.  BAR1 reachability was gated before this call, and every polling
+/// loop is bounded so an unavailable UART cannot stall the validator.
+fn uart0_direct_tx(uart0_base: usize, bytes: &[u8]) -> Result<(), UartDirectTxError> {
+    let original_dmacr = mmio_read32(uart0_base, RP1_UART_DMACR_OFFSET);
+    mmio_write32(uart0_base, RP1_UART_DMACR_OFFSET, original_dmacr & !PL011_DMACR_TXDMAE);
+    mmio_write32(uart0_base, RP1_UART_IBRD_OFFSET, 26); // 48 MHz / 115200 baud.
+    mmio_write32(uart0_base, RP1_UART_FBRD_OFFSET, 3);
+    mmio_write32(
+        uart0_base,
+        RP1_UART_LCRH_OFFSET,
+        mmio_read32(uart0_base, RP1_UART_LCRH_OFFSET) | PL011_LCRH_FEN | PL011_LCRH_WLEN_8,
+    );
+    mmio_write32(
+        uart0_base,
+        RP1_UART_CR_OFFSET,
+        mmio_read32(uart0_base, RP1_UART_CR_OFFSET) | PL011_CR_UARTEN | PL011_CR_TXE,
+    );
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART0 direct TX begin FR=0x{:08x} CR=0x{:08x} len={}",
+        mmio_read32(uart0_base, RP1_UART_FR_OFFSET),
+        mmio_read32(uart0_base, RP1_UART_CR_OFFSET),
+        bytes.len(),
+    ));
+
+    for byte in bytes {
+        let mut fr = 0;
+        let mut ready = false;
+        for _ in 0..UART_DMA_POLL_LIMIT {
+            fr = mmio_read32(uart0_base, RP1_UART_FR_OFFSET);
+            if fr & PL011_FR_TXFF == 0 {
+                ready = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !ready {
+            return Err(UartDirectTxError::TxFifoTimeout { fr });
+        }
+        mmio_write32(uart0_base, RP1_UART_DR_OFFSET, u32::from(*byte));
+    }
+
+    let mut fr = 0;
+    for _ in 0..UART_DMA_POLL_LIMIT {
+        fr = mmio_read32(uart0_base, RP1_UART_FR_OFFSET);
+        if fr & PL011_FR_BUSY == 0 {
+            semihost_log(format_args!("[rpi5-rp1-init] UART0 direct TX final FR=0x{:08x}", fr));
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(UartDirectTxError::BusyTimeout { fr })
 }
 
 /// Execute one DTB-described UART0 TX DMA transaction after PCIe and DMA
