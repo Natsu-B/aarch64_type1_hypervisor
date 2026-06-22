@@ -7,6 +7,8 @@ use arch_hal::MirrorOps;
 use arch_hal::cpu;
 use arch_hal::set_mirror;
 use arch_hal::soc::bcm2712;
+use arch_hal::soc::bcm2712::rp1::Rp1Clocks;
+use arch_hal::soc::bcm2712::rp1::Rp1GpioBank0;
 use arch_hal::soc::bcm2712::rp1::Rp1PeripheralMap;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
@@ -143,7 +145,6 @@ static mut UART_DMA_TX_AREA: UartDmaTxArea = UartDmaTxArea {
     descriptor: DwAxiDmacLli::ZERO,
 };
 
-const RP1_DMA_OFFSET: u64 = 0x18_8000;
 const RP1_UART_DR_OFFSET: usize = 0x00;
 const RP1_UART_DMACR_OFFSET: usize = 0x48;
 const RP1_UART_FR_OFFSET: usize = 0x18;
@@ -283,6 +284,17 @@ extern "C" fn main() -> ! {
         }
     };
 
+    let uart0_clock_state = match discover_uart0_clock_state(&dtb) {
+        Ok(state) => state,
+        Err(err) => {
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART0 clock DTB parse FAIL: {}",
+                err
+            ));
+            Rp1ClockState::empty()
+        }
+    };
+
     log_rp1_config(&rp1);
 
     let rp1_map = match Rp1PeripheralMap::from_config(&rp1) {
@@ -313,6 +325,51 @@ extern "C" fn main() -> ! {
         wait_forever()
     }
     semihost_log(format_args!("[rpi5-rp1-init] BAR1 MMIO smoke PASS"));
+
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] UART clock DTB reg={:?} uartclk={:?}:{:?} apb_pclk={:?}:{:?}",
+        uart0_clock_state.clocks_reg_base,
+        uart0_clock_state.uart_clock_phandle,
+        uart0_clock_state.uart_clock_id,
+        uart0_clock_state.apb_clock_phandle,
+        uart0_clock_state.apb_clock_id
+    ));
+    match Rp1Clocks::from_map(&rp1_map) {
+        Ok(clocks) => {
+            let snapshot = clocks.uart_snapshot();
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART clock ctrl=0x{:08x} div_int=0x{:08x} sel=0x{:08x}",
+                snapshot.ctrl, snapshot.div_int, snapshot.sel
+            ));
+        }
+        Err(err) => semihost_log(format_args!(
+            "[rpi5-rp1-init] UART clock snapshot unavailable: {:?}",
+            err
+        )),
+    }
+    match Rp1GpioBank0::from_map(&rp1_map) {
+        Ok(gpio) => {
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART0 pins before gpio14.ctrl=0x{:08x} gpio14.pad=0x{:08x} gpio15.ctrl=0x{:08x} gpio15.pad=0x{:08x}",
+                gpio.gpio_ctrl(14),
+                gpio.pad_ctrl(14),
+                gpio.gpio_ctrl(15),
+                gpio.pad_ctrl(15),
+            ));
+            gpio.configure_uart0_14_15_like_linux();
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART0 pins after gpio14.ctrl=0x{:08x} gpio14.pad=0x{:08x} gpio15.ctrl=0x{:08x} gpio15.pad=0x{:08x}",
+                gpio.gpio_ctrl(14),
+                gpio.pad_ctrl(14),
+                gpio.gpio_ctrl(15),
+                gpio.pad_ctrl(15),
+            ));
+        }
+        Err(err) => semihost_log(format_args!(
+            "[rpi5-rp1-init] UART0 pinctrl unavailable: {:?}",
+            err
+        )),
+    }
 
     if let Err(reason) = dma_preflight(&rp1) {
         fail(format_args!("DMA PREFLIGHT FAIL: {:?}", reason));
@@ -386,6 +443,27 @@ struct Uart0DmaInfo {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct Rp1ClockState {
+    clocks_reg_base: Option<u64>,
+    uart_clock_phandle: Option<u32>,
+    uart_clock_id: Option<u32>,
+    apb_clock_phandle: Option<u32>,
+    apb_clock_id: Option<u32>,
+}
+
+impl Rp1ClockState {
+    const fn empty() -> Self {
+        Self {
+            clocks_reg_base: None,
+            uart_clock_phandle: None,
+            uart_clock_id: None,
+            apb_clock_phandle: None,
+            apb_clock_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Bar1SmokeFailure {
     uart_value: u32,
     dmac_value: u32,
@@ -401,7 +479,7 @@ fn bar1_mmio_smoke_test(
     gem_base: usize,
 ) -> Result<(), Bar1SmokeFailure> {
     let dmac_base = rp1_map
-        .mmio_base(RP1_DMA_OFFSET, 0x1000)
+        .rp1_dmac_base()
         .map_err(|_| Bar1SmokeFailure {
             uart_value: u32::MAX,
             dmac_value: u32::MAX,
@@ -530,6 +608,88 @@ fn discover_uart0_dma(dtb: &DtbParser) -> Result<Option<Uart0DmaInfo>, &'static 
     }
 }
 
+fn discover_uart0_clock_state(dtb: &DtbParser) -> Result<Rp1ClockState, &'static str> {
+    let mut state = Rp1ClockState::empty();
+
+    let result = dtb.for_each_node_view(&mut |view| {
+        if view.name() == "clocks@18000" {
+            if let Some(reg) = view.reg_iter()?.next().transpose()? {
+                state.clocks_reg_base = Some(reg.0 as u64);
+                semihost_log(format_args!(
+                    "[rpi5-rp1-init] RP1 clocks DTB node={} reg=0x{:x}/0x{:x}",
+                    view.name(),
+                    reg.0,
+                    reg.1
+                ));
+            }
+        }
+
+        if view.name() == "serial@30000" {
+            let clocks = view.property_bytes("clocks")?;
+            let clock_names = view.property_bytes("clock-names")?;
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART0 DTB clocks={:?} clock-names={:?}",
+                clocks, clock_names
+            ));
+
+            if let Some(clocks) = clocks {
+                let mut offset = 0usize;
+                let mut index = 0usize;
+                while clocks.len() - offset >= 8 {
+                    let phandle = read_be_cell(&clocks[offset..offset + 4])?;
+                    let clock_id = read_be_cell(&clocks[offset + 4..offset + 8])?;
+                    match clock_name_at(clock_names.unwrap_or(&[]), index)? {
+                        Some("uartclk") => {
+                            state.uart_clock_phandle = Some(phandle);
+                            state.uart_clock_id = Some(clock_id);
+                        }
+                        Some("apb_pclk") => {
+                            state.apb_clock_phandle = Some(phandle);
+                            state.apb_clock_id = Some(clock_id);
+                        }
+                        _ => {}
+                    }
+                    offset += 8;
+                    index += 1;
+                }
+            }
+        }
+
+        Ok::<ControlFlow<(), ()>, WalkError<&'static str>>(ControlFlow::Continue(()))
+    });
+
+    match result {
+        Ok(_) => Ok(state),
+        Err(WalkError::Dtb(err)) => Err(err),
+        Err(WalkError::User(err)) => Err(err),
+    }
+}
+
+fn clock_name_at(names: &[u8], wanted: usize) -> Result<Option<&str>, &'static str> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while start < names.len() {
+        let end = names[start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| start + offset)
+            .ok_or("clock-names missing NUL")?;
+        if index == wanted {
+            return core::str::from_utf8(&names[start..end])
+                .map(Some)
+                .map_err(|_| "clock-names invalid UTF-8");
+        }
+        index += 1;
+        start = end + 1;
+    }
+
+    Ok(None)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmaPreflightError {
     MissingWindow,
@@ -648,7 +808,7 @@ fn run_uart0_dma_tx(
     }
     let dma_window = rp1.dma_window.ok_or(UartDmaError::MissingDmaWindow)?;
     let dmac_base = rp1_map
-        .mmio_base(RP1_DMA_OFFSET, 0x1000)
+        .rp1_dmac_base()
         .map_err(|_| UartDmaError::InvalidDmaController)?;
     let area = core::ptr::addr_of_mut!(UART_DMA_TX_AREA);
 
