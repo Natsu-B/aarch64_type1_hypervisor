@@ -284,7 +284,7 @@ fn search_rp1(view: &DtbNodeView, options: Rp1InitOptions) -> WalkResult<Rp1Conf
                     .checked_add(msi_x_len)
                     .ok_or(Bcm2712Error::InvalidWindow)?;
                 // SAFETY: the RP1 config window is selected and BAR access reads function 0.
-                let bar1 = unsafe { brcm_stb.read_bar_address(1) }?;
+                let bar1 = unsafe { brcm_stb.read_rp1_bar1_address() }?;
                 // SAFETY: the RP1 config window is selected and BAR access reads function 0.
                 let bar2 = unsafe { brcm_stb.read_bar_address(2) }?;
                 println!("PCIE: RP1 Pheripheral BAR addr: 0x{:x}", bar1);

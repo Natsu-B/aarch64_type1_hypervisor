@@ -22,6 +22,10 @@ pub const fn assigned_bar_is_probe_mask(raw: u32, probe_mask: u32) -> bool {
     raw == probe_mask || (raw & !0xf) == (probe_mask & !0xf)
 }
 
+pub const fn assigned_bar_address_is_valid(bar: u8, address: u64) -> bool {
+    address != 0 || bar == 1
+}
+
 pub const fn range_fits(base: u64, size: u64, outer_base: u64, outer_size: u64) -> bool {
     if size == 0 || outer_size == 0 || base < outer_base {
         return false;
@@ -167,6 +171,15 @@ mod tests {
         assert!(range_fits(RP1_LOW_BAR0_BASE, 0x4000, 0, 0x0090_0000));
         assert_eq!(RP1_LOW_BAR1_BASE + 0x400000, RP1_LOW_BAR2_BASE);
         assert!(RP1_LOW_BAR2_BASE + 0x10000 <= RP1_LOW_BAR0_BASE);
+    }
+
+    #[test]
+    fn only_rp1_bar1_accepts_zero_address() {
+        assert!(!assigned_bar_address_is_valid(0, 0));
+        assert!(assigned_bar_address_is_valid(1, 0));
+        assert!(!assigned_bar_address_is_valid(2, 0));
+        assert!(assigned_bar_address_is_valid(0, 0x0080_0000));
+        assert!(assigned_bar_address_is_valid(2, 0x0040_0000));
     }
 
     #[test]

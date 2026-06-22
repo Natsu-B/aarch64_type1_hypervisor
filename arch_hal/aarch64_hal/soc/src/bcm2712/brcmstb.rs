@@ -623,8 +623,15 @@ impl BrcmStb {
         Ok(config.bar[num as usize].read())
     }
 
-    /// have to ensure that config windows are mapped rp1 config space
-    pub(crate) unsafe fn read_bar_address(&self, num: u8) -> Result<u64, Bcm2712Error> {
+    /// Decodes an RP1 memory BAR while applying its caller-selected zero-address policy.
+    ///
+    /// Safety invariant: the caller must keep the RP1 function 0 config window selected for
+    /// the entire read, including the high dword of a 64-bit BAR.
+    unsafe fn read_bar_address_with_zero_policy(
+        &self,
+        num: u8,
+        allow_zero: bool,
+    ) -> Result<u64, Bcm2712Error> {
         if num > 5 {
             return Err(Bcm2712Error::InvalidSettings);
         }
@@ -637,19 +644,41 @@ impl BrcmStb {
         }
 
         let bar_type = (raw >> 1) & 0x3;
-        match bar_type {
-            0b00 => Ok((raw & 0xffff_fff0) as u64),
+        let address = match bar_type {
+            0b00 => (raw & 0xffff_fff0) as u64,
             0b10 => {
                 if num >= 5 {
                     return Err(Bcm2712Error::InvalidSettings);
                 }
                 // SAFETY: the high dword is part of the same selected RP1 config space.
                 let hi = unsafe { self.read_bar_raw_u32(num + 1) }?;
-                Ok(((hi as u64) << 32) | ((raw & 0xffff_fff0) as u64))
+                ((hi as u64) << 32) | ((raw & 0xffff_fff0) as u64)
             }
-            0b01 | 0b11 => Err(Bcm2712Error::InvalidSettings),
-            _ => Err(Bcm2712Error::InvalidSettings),
+            0b01 | 0b11 => return Err(Bcm2712Error::InvalidSettings),
+            _ => return Err(Bcm2712Error::InvalidSettings),
+        };
+        if address == 0 && !allow_zero {
+            return Err(Bcm2712Error::InvalidSettings);
         }
+        Ok(address)
+    }
+
+    /// Reads an assigned RP1 memory BAR address.
+    ///
+    /// Safety invariant: the caller must keep the RP1 function 0 config window selected for
+    /// the duration of the BAR read.
+    pub(crate) unsafe fn read_bar_address(&self, num: u8) -> Result<u64, Bcm2712Error> {
+        // SAFETY: this method preserves the caller's selected-RP1-config-window invariant.
+        unsafe { self.read_bar_address_with_zero_policy(num, false) }
+    }
+
+    /// Reads RP1 BAR1, whose explicit low-BAR peripheral layout intentionally uses address zero.
+    ///
+    /// Safety invariant: the caller must keep the RP1 function 0 config window selected for
+    /// the duration of the BAR read.
+    pub(crate) unsafe fn read_rp1_bar1_address(&self) -> Result<u64, Bcm2712Error> {
+        // SAFETY: this method preserves the caller's selected-RP1-config-window invariant.
+        unsafe { self.read_bar_address_with_zero_policy(1, true) }
     }
 
     pub const fn config_window_value(bdf: PcieBdf) -> u32 {
