@@ -6,6 +6,7 @@ pub const MIB: u64 = 1024 * 1024;
 pub const RP1_LOW_BAR1_BASE: u64 = 0x0000_0000;
 pub const RP1_LOW_BAR2_BASE: u64 = 0x0040_0000;
 pub const RP1_LOW_BAR0_BASE: u64 = 0x0080_0000;
+pub const RP1_PERIPHERAL_SIZE: u64 = 0x40_0000;
 pub const RP1_PERIPHERAL_DMA_BASE: u64 = 0xc0_4000_0000;
 
 pub const fn bar_size_from_mask(mask: u32) -> Option<u64> {
@@ -60,7 +61,7 @@ pub const fn rp1_peripheral_dma_address(
         Some(value) => value,
         None => return None,
     };
-    if end > 0x41_0000 {
+    if end > RP1_PERIPHERAL_SIZE {
         return None;
     }
     RP1_PERIPHERAL_DMA_BASE.checked_add(offset)
@@ -191,6 +192,30 @@ mod tests {
         assert_eq!(
             rp1_peripheral_dma_address(0x1f_0000_0000, 0x1f_0003_0000, 4),
             Some(0xc0_4003_0000)
+        );
+    }
+
+    #[test]
+    fn rp1_peripheral_dma_accepts_last_byte_in_bar1() {
+        assert_eq!(
+            rp1_peripheral_dma_address(0x1f_0000_0000, 0x1f_003f_ffff, 1),
+            Some(0xc0_403f_ffff)
+        );
+    }
+
+    #[test]
+    fn rp1_peripheral_dma_rejects_first_byte_after_bar1() {
+        assert_eq!(
+            rp1_peripheral_dma_address(0x1f_0000_0000, 0x1f_0040_0000, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rp1_peripheral_dma_rejects_range_crossing_bar1_end() {
+        assert_eq!(
+            rp1_peripheral_dma_address(0x1f_0000_0000, 0x1f_003f_ffff, 2),
+            None
         );
     }
 }

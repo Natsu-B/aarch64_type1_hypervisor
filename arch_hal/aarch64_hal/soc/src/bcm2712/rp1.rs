@@ -5,7 +5,7 @@ use crate::bcm2712::Rp1Config;
 use crate::bcm2712::pcie_validation;
 use cpu::dsb_sy;
 
-pub const RP1_PERIPHERAL_SIZE: u64 = 0x40_0000;
+pub const RP1_PERIPHERAL_SIZE: u64 = pcie_validation::RP1_PERIPHERAL_SIZE;
 /// RP1 `dma-ranges` maps local APB0 peripherals from this 40-bit system
 /// address. The RP1 DW AXI DMAC must use this address, not the CPU BAR alias.
 pub const RP1_PERIPHERAL_DMA_BASE: u64 = pcie_validation::RP1_PERIPHERAL_DMA_BASE;
@@ -31,8 +31,10 @@ const RP1_GPIO_CTRL_OVERRIDE_MASK: u32 =
 const RP1_GPIO_FUNCSEL_UART0: u32 = 4;
 
 const RP1_PAD_SCHMITT: u32 = 1 << 1;
-const RP1_PAD_PULL_MASK: u32 = 0b11 << 2;
-const RP1_PAD_PULL_UP: u32 = 0b01 << 2;
+const RP1_PAD_PULL_SHIFT: u32 = 2;
+const RP1_PAD_PULL_MASK: u32 = 0b11 << RP1_PAD_PULL_SHIFT;
+const RP1_PAD_PULL_DOWN: u32 = 1 << RP1_PAD_PULL_SHIFT;
+const RP1_PAD_PULL_UP: u32 = 2 << RP1_PAD_PULL_SHIFT;
 const RP1_PAD_INPUT_ENABLE: u32 = 1 << 6;
 const RP1_PAD_OUTPUT_DISABLE: u32 = 1 << 7;
 
