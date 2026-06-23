@@ -83,3 +83,37 @@ For OpenOCD validation, enable semihosting before loading the ELF:
 ```gdb
 monitor arm semihosting enable
 ```
+
+## RP1 GEM wire-level TX validation
+
+The Ethernet part of this example has two distinct success levels:
+
+* `[rp1-gem] TX broadcast PASS` is local RP1 GEM TX descriptor/MAC-side success.
+* A matching host `tcpdump` frame is wire-level TX success. ELF load and the local marker alone
+  do not prove that a frame left the CM5 and reached the host NIC.
+
+Before launching this validator, bring up the directly connected host interface and start a capture
+in a separate terminal:
+
+```sh
+sudo ip link set enp2s0 up
+sudo tcpdump -i enp2s0 -e -n -XX 'ether proto 0x88b5'
+```
+
+Use the delayed CM5 `force-boot` and OpenOCD procedure from `$HOME/README.md`. Do not attach
+direct `gdb-multiarch` until OpenOCD has logged `SWD DPIDR 0x2ba01477`, detected
+`bcm2712.cpu0`, reported its port-3333 listener, and `ss` confirms `:3333` is listening. Enable
+semihosting before `load` and `continue` when required.
+
+For the latest validated configuration, the host capture included:
+
+```text
+2c:cf:67:c2:9a:58 > ff:ff:ff:ff:ff:ff, ethertype Unknown (0x88b5), length 60
+```
+
+Its payload was repeated `0xa5` bytes. The source MAC must match the example's
+`[rp1-gem] using MAC ...` marker. The target must also report BAR1 smoke and DMA preflight PASS,
+a PHY ID, `link up Mbps1000 full duplex`, `[rp1-gem] TX broadcast PASS`, and the final
+`BAR/DMA/Ethernet validation PASS` marker. This proves GEM DMA TX, MAC TX, PHY link, cable, and
+host-NIC reception only; it does not claim RX descriptor, ARP/IP, interrupt, guest, or sustained
+traffic support.

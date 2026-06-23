@@ -141,6 +141,80 @@ Use `sudo uhubctl` to list controllable hubs and connected debug/UART adapters. 
 the hub containing only the debug probe resets the probe, not necessarily the Pi board itself; for a
 clean boot test, reset or power-cycle the Pi 5 power input or boot media path.
 
+## CM5 RP1 GEM wire-level TX validation
+
+The `rpi5_rp1_init` example validates the RP1 Cadence GEM transmit path. ELF load success is
+not Ethernet validation success, and `[rp1-gem] TX broadcast PASS` alone establishes only local
+GEM descriptor/MAC-side completion. A wire-level TX PASS requires both the target-side markers
+and receipt of the generated frame by the directly connected host NIC.
+
+Run the capture from the repository root. `enp2s0` is the interface used by the latest validated
+CM5 setup; choose the interface that is physically cabled to the CM5 on another host setup.
+
+1. Bring up the host interface:
+
+   ```sh
+   sudo ip link set enp2s0 up
+   ```
+
+2. Start the capture before booting the validator. Run it in a separate terminal or background it
+   so it remains active while the target runs:
+
+   ```sh
+   sudo timeout 180s tcpdump -i enp2s0 -e -n -XX 'ether proto 0x88b5' > host-tcpdump.log 2>&1
+   ```
+
+3. Follow the delayed `force-boot` procedure in `$HOME/README.md`, then start OpenOCD only after
+   that delay has elapsed.
+
+4. Do not start GDB until all of the following are true:
+
+   * OpenOCD logged `SWD DPIDR 0x2ba01477`.
+   * OpenOCD detected `bcm2712.cpu0`.
+   * OpenOCD logged `Listening on port 3333 for gdb connections`.
+   * `ss` shows `:3333` in `LISTEN` state.
+
+5. Load the `rpi5_rp1_init` ELF with direct `gdb-multiarch`, rather than a loader helper. Enable
+   semihosting before `load` and `continue` when required:
+
+   ```gdb
+   target remote :3333
+   monitor arm semihosting enable
+   load
+   continue
+   ```
+
+The required target-side evidence is:
+
+```text
+[rpi5-rp1-init] BAR1 MMIO smoke PASS
+[rpi5-rp1-init] DMA PREFLIGHT PASS
+[rp1-gem] PHY addr ... id ...
+[rp1-gem] link up Mbps1000 full duplex
+[rp1-gem] TX broadcast PASS
+[rpi5-rp1-init] BAR/DMA/Ethernet validation PASS
+```
+
+The host capture must show a frame whose source is the MAC logged by the validator, whose
+destination is `ff:ff:ff:ff:ff:ff`, whose EtherType is `0x88b5`, whose length is 60, and whose
+payload contains repeated `0xa5` bytes. Only the combination of this capture and the target-side
+markers is a wire-level TX PASS. It validates the GEM DMA descriptor path, MAC transmit path,
+PHY link, Ethernet cable, and host NIC receive path. It does not validate RP1 GEM RX descriptors,
+ARP/IP, interrupt-driven networking, Linux guest integration, or sustained bidirectional traffic.
+
+Latest validated example (logs are deliberately retained outside this repository):
+
+```text
+Host interface: enp2s0
+Source MAC: 2c:cf:67:c2:9a:58
+Destination MAC: ff:ff:ff:ff:ff:ff
+EtherType: 0x88b5
+Length: 60
+Link: 1000 Mbps full duplex
+Result: Host wire RX PASS
+Log directory: /opt/rpi-cm5-hack/logs/20260623-135901-rp1-gem-wire-rx/
+```
+
 ## Raspberry Pi 5 UART0 Input
 
 RP1 UART0 input is handled by the RP1 pIRQ hook as a level MSI-X source. The `rpi_boot`
