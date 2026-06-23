@@ -49,6 +49,8 @@ pub mod pcie_validation;
 pub mod pirq_hook;
 #[cfg(target_arch = "aarch64")]
 pub mod rp1;
+#[cfg(any(target_arch = "aarch64", test))]
+pub mod rp1_gem;
 #[cfg(target_arch = "aarch64")]
 pub mod rp1_interrupt;
 pub mod sdhc;

@@ -9,6 +9,7 @@ members = ["."]
 [dependencies]
 arch_hal = { path = "../../../../../arch_hal" }
 dtb = { path = "../../../../../dtb" }
+io-api = { path = "../../../../../io_api" }
 
 [profile.dev]
 panic = "abort"

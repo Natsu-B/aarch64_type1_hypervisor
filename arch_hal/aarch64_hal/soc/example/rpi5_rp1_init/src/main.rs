@@ -10,6 +10,8 @@ use arch_hal::soc::bcm2712;
 use arch_hal::soc::bcm2712::rp1::Rp1Clocks;
 use arch_hal::soc::bcm2712::rp1::Rp1GpioBank0;
 use arch_hal::soc::bcm2712::rp1::Rp1PeripheralMap;
+use arch_hal::soc::bcm2712::rp1_gem::Rp1Gem;
+use arch_hal::soc::bcm2712::rp1_gem::Rp1GemOptions;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 use core::arch::asm;
@@ -23,6 +25,7 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use dtb::DtbParser;
 use dtb::WalkError;
+use io_api::ethernet::MacAddr;
 
 const DTB_PTR: usize = 0x2000_0000;
 const HEAP_SIZE: usize = 1024 * 1024;
@@ -192,8 +195,7 @@ const CH_CFG2_H_HS_SEL_DST_POS: u32 = 4;
 const CH_CFG2_H_PRIORITY_POS: u32 = 20;
 const DW_AXI_DMAC_TT_FC_MEM_TO_PER_DMAC: u32 = 1;
 const DW_AXI_DMAC_HS_SEL_HW: u32 = 0;
-const DW_AXI_DMAC_LLI_CTL_LO_MEM_TO_PER_8BIT: u32 =
-    (1 << 18) | (1 << 14) | (1 << 6); // burst=4, dst no-increment, src increment
+const DW_AXI_DMAC_LLI_CTL_LO_MEM_TO_PER_8BIT: u32 = (1 << 18) | (1 << 14) | (1 << 6); // burst=4, dst no-increment, src increment
 const DW_AXI_DMAC_LLI_CTL_H_LAST_VALID: u32 = (1 << 31) | (1 << 30);
 const UART_DMA_POLL_LIMIT: usize = 1_000_000;
 const UART_DMA_TEST_BYTES: &[u8] = b"[rp1-uart-dma] TX\\n";
@@ -256,7 +258,10 @@ extern "C" fn main() -> ! {
             // This validator deliberately preserves a semihosting diagnostic
             // result when Auto cannot train the link.  The normal boot path
             // remains strict firmware-assisted through `init_rp1`.
-            semihost_log(format_args!("[rpi5-rp1-init] PCIe full init FAIL: {:?}", err));
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] PCIe full init FAIL: {:?}",
+                err
+            ));
             semihost_log(format_args!(
                 "[rpi5-rp1-init] PASS: diagnostic run completed with skips"
             ));
@@ -279,7 +284,10 @@ extern "C" fn main() -> ! {
             None
         }
         Err(err) => {
-            semihost_log(format_args!("[rpi5-rp1-init] UART DMA DTB parse FAIL: {}", err));
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART DMA DTB parse FAIL: {}",
+                err
+            ));
             None
         }
     };
@@ -305,13 +313,27 @@ extern "C" fn main() -> ! {
         Ok(base) => base,
         Err(err) => fail(format_args!("RP1 UART0 BAR offset invalid: {:?}", err)),
     };
-    semihost_log(format_args!("[rpi5-rp1-init] RP1 UART0 base 0x{:x}", uart0_base));
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] RP1 UART0 base 0x{:x}",
+        uart0_base
+    ));
 
     let gem_base = match rp1_map.rp1_gem_base() {
         Ok(base) => base,
         Err(err) => fail(format_args!("RP1 GEM BAR offset invalid: {:?}", err)),
     };
-    semihost_log(format_args!("[rpi5-rp1-init] RP1 GEM base 0x{:x}", gem_base));
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] RP1 GEM base 0x{:x}",
+        gem_base
+    ));
+    let gem_cfg_base = match rp1_map.rp1_gem_cfg_base() {
+        Ok(base) => base,
+        Err(err) => fail(format_args!("RP1 GEM CFG BAR offset invalid: {:?}", err)),
+    };
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] RP1 GEM CFG base 0x{:x}",
+        gem_cfg_base
+    ));
 
     if let Err(smoke) = bar1_mmio_smoke_test(&rp1_map, uart0_base, gem_base) {
         semihost_log(format_args!(
@@ -391,10 +413,86 @@ extern "C" fn main() -> ! {
     // without involving the DMAC request/descriptor machinery.
     match uart0_direct_tx(uart0_base, UART_DIRECT_TEST_BYTES) {
         Ok(()) => semihost_log(format_args!("[rpi5-rp1-init] UART0 direct TX PASS")),
-        Err(err) => semihost_log(format_args!("[rpi5-rp1-init] UART0 direct TX FAIL: {:?}", err)),
+        Err(err) => semihost_log(format_args!(
+            "[rpi5-rp1-init] UART0 direct TX FAIL: {:?}",
+            err
+        )),
     }
-    semihost_log(format_args!("[rpi5-rp1-init] BAR/DMA validation PASS; Ethernet intentionally not run"));
+    let cfg_before = (
+        mmio_read32(gem_cfg_base, 0x00),
+        mmio_read32(gem_cfg_base, 0x04),
+        mmio_read32(gem_cfg_base, 0x14),
+    );
+    semihost_log(format_args!(
+        "[rp1-gem] cfg before control=0x{:08x} status=0x{:08x} clkgen=0x{:08x}",
+        cfg_before.0, cfg_before.1, cfg_before.2
+    ));
+    let mac_addr = discover_rp1_gem_mac(&dtb).unwrap_or(MacAddr([0x02, 0, 0, 0, 0, 5]));
+    semihost_log(format_args!(
+        "[rp1-gem] using MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac_addr.0[0], mac_addr.0[1], mac_addr.0[2], mac_addr.0[3], mac_addr.0[4], mac_addr.0[5]
+    ));
+    let gem = match Rp1Gem::init_from_rp1_config(&rp1, mac_addr, Rp1GemOptions::default()) {
+        Ok(gem) => gem,
+        Err(err) => fail(format_args!("RP1 GEM init FAIL: {:?}", err)),
+    };
+    semihost_log(format_args!("[rp1-gem] PHY reset complete"));
+    let diagnostic = gem.diagnostic_snapshot();
+    semihost_log(format_args!(
+        "[rp1-gem] MID=0x{:08x} cfg after control=0x{:08x} status=0x{:08x} clkgen=0x{:08x}",
+        diagnostic.mid, diagnostic.cfg_control, diagnostic.cfg_status, diagnostic.cfg_clkgen
+    ));
+    let (phy_id1, phy_id2) = match gem.phy_id() {
+        Ok(ids) => ids,
+        Err(err) => fail(format_args!("RP1 GEM PHY ID FAIL: {:?}", err)),
+    };
+    semihost_log(format_args!(
+        "[rp1-gem] PHY addr {} id {:04x}:{:04x}",
+        gem.phy_address(),
+        phy_id1,
+        phy_id2
+    ));
+    let link = match gem.link_state() {
+        Ok(link) => link,
+        Err(err) => fail(format_args!("RP1 GEM link FAIL: {:?}", err)),
+    };
+    semihost_log(format_args!(
+        "[rp1-gem] link up {:?} {} duplex",
+        link.speed,
+        if link.full_duplex { "full" } else { "half" }
+    ));
+    match gem.send_test_broadcast() {
+        Ok(()) => semihost_log(format_args!("[rp1-gem] TX broadcast PASS")),
+        Err(err) => fail(format_args!("RP1 GEM TX broadcast FAIL: {:?}", err)),
+    }
+    semihost_log(format_args!(
+        "[rpi5-rp1-init] BAR/DMA/Ethernet validation PASS"
+    ));
     wait_forever()
+}
+
+fn discover_rp1_gem_mac(dtb: &DtbParser) -> Option<MacAddr> {
+    let mut found = None;
+    let result = dtb.for_each_node_view(&mut |view| {
+        if view.name() == "ethernet@100000" {
+            let bytes = view
+                .property_bytes("local-mac-address")?
+                .or(view.property_bytes("mac-address")?);
+            if let Some(bytes) = bytes {
+                if bytes.len() == 6 && bytes.iter().any(|byte| *byte != 0) {
+                    found = Some(MacAddr([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                    ]));
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok::<ControlFlow<(), ()>, WalkError<&'static str>>(ControlFlow::Continue(()))
+    });
+    match result {
+        Ok(_) => found,
+        Err(_) => None,
+    }
 }
 
 fn log_rp1_config(rp1: &bcm2712::Rp1Config) {
@@ -478,13 +576,11 @@ fn bar1_mmio_smoke_test(
     uart0_base: usize,
     gem_base: usize,
 ) -> Result<(), Bar1SmokeFailure> {
-    let dmac_base = rp1_map
-        .rp1_dmac_base()
-        .map_err(|_| Bar1SmokeFailure {
-            uart_value: u32::MAX,
-            dmac_value: u32::MAX,
-            gem_value: u32::MAX,
-        })?;
+    let dmac_base = rp1_map.rp1_dmac_base().map_err(|_| Bar1SmokeFailure {
+        uart_value: u32::MAX,
+        dmac_value: u32::MAX,
+        gem_value: u32::MAX,
+    })?;
     // UARTFR, DW AXI DMAC ID, and the first GEM register are read-only smoke
     // probes.  Any all-ones completion means PCIe BAR1 was not reachable.
     let uart_value = mmio_read32(uart0_base, RP1_UART_FR_OFFSET);
@@ -492,7 +588,13 @@ fn bar1_mmio_smoke_test(
     let gem_value = mmio_read32(gem_base, 0);
     semihost_log(format_args!(
         "[rpi5-rp1-init] BAR1 smoke pcie=0x0 cpu=0x{:x} uart=0x{:x} dmac=0x{:x} gem=0x{:x} values=0x{:08x}/0x{:08x}/0x{:08x}",
-        rp1_map.base(), uart0_base, dmac_base, gem_base, uart_value, dmac_value, gem_value
+        rp1_map.base(),
+        uart0_base,
+        dmac_base,
+        gem_base,
+        uart_value,
+        dmac_value,
+        gem_value
     ));
     if uart_value == u32::MAX || dmac_value == u32::MAX || gem_value == u32::MAX {
         return Err(Bar1SmokeFailure {
@@ -744,7 +846,11 @@ enum UartDirectTxError {
 /// loop is bounded so an unavailable UART cannot stall the validator.
 fn uart0_direct_tx(uart0_base: usize, bytes: &[u8]) -> Result<(), UartDirectTxError> {
     let original_dmacr = mmio_read32(uart0_base, RP1_UART_DMACR_OFFSET);
-    mmio_write32(uart0_base, RP1_UART_DMACR_OFFSET, original_dmacr & !PL011_DMACR_TXDMAE);
+    mmio_write32(
+        uart0_base,
+        RP1_UART_DMACR_OFFSET,
+        original_dmacr & !PL011_DMACR_TXDMAE,
+    );
     mmio_write32(uart0_base, RP1_UART_IBRD_OFFSET, 26); // 48 MHz / 115200 baud.
     mmio_write32(uart0_base, RP1_UART_FBRD_OFFSET, 3);
     mmio_write32(
@@ -785,7 +891,10 @@ fn uart0_direct_tx(uart0_base: usize, bytes: &[u8]) -> Result<(), UartDirectTxEr
     for _ in 0..UART_DMA_POLL_LIMIT {
         fr = mmio_read32(uart0_base, RP1_UART_FR_OFFSET);
         if fr & PL011_FR_BUSY == 0 {
-            semihost_log(format_args!("[rpi5-rp1-init] UART0 direct TX final FR=0x{:08x}", fr));
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] UART0 direct TX final FR=0x{:08x}",
+                fr
+            ));
             return Ok(());
         }
         core::hint::spin_loop();
@@ -819,19 +928,24 @@ fn run_uart0_dma_tx(
         tx[..UART_DMA_TEST_BYTES.len()].copy_from_slice(UART_DMA_TEST_BYTES);
         tx[UART_DMA_TEST_BYTES.len()..].fill(0);
     }
+    // SAFETY: `area` points to the exclusively owned `UART_DMA_TX_AREA` static.
     let tx_va = unsafe { core::ptr::addr_of_mut!((*area).tx).cast::<u8>() } as usize;
-    let descriptor_va = unsafe { core::ptr::addr_of_mut!((*area).descriptor).cast::<u8>() } as usize;
+    // SAFETY: `area` points to the exclusively owned `UART_DMA_TX_AREA` static.
+    let descriptor_va =
+        unsafe { core::ptr::addr_of_mut!((*area).descriptor).cast::<u8>() } as usize;
     let tx_phys = cpu::va_to_pa_el2_read(tx_va as u64).ok_or(UartDmaError::AddressTranslation)?;
     let descriptor_phys =
         cpu::va_to_pa_el2_read(descriptor_va as u64).ok_or(UartDmaError::AddressTranslation)?;
-    let tx_len = u64::try_from(UART_DMA_TEST_BYTES.len()).map_err(|_| UartDmaError::AddressTranslation)?;
+    let tx_len =
+        u64::try_from(UART_DMA_TEST_BYTES.len()).map_err(|_| UartDmaError::AddressTranslation)?;
     let tx_dma = dma_window
         .cpu_phys_to_dma(tx_phys, tx_len)
         .map_err(|_| UartDmaError::AddressTranslation)?;
     let descriptor_dma = dma_window
         .cpu_phys_to_dma(
             descriptor_phys,
-            u64::try_from(size_of::<DwAxiDmacLli>()).map_err(|_| UartDmaError::AddressTranslation)?,
+            u64::try_from(size_of::<DwAxiDmacLli>())
+                .map_err(|_| UartDmaError::AddressTranslation)?,
         )
         .map_err(|_| UartDmaError::AddressTranslation)?;
     let uart_cpu_alias = uart0_base as u64;
@@ -863,7 +977,11 @@ fn run_uart0_dma_tx(
     semihost_log(format_args!("[rpi5-rp1-init] UART DMA DMAC layout: CFG2"));
     semihost_log(format_args!(
         "[rpi5-rp1-init] UART DMA DREQ tx=0x{:x} buffer va=0x{:x} pa=0x{:x} dma=0x{:x} len={}",
-        request, tx_va, tx_phys, tx_dma, UART_DMA_TEST_BYTES.len()
+        request,
+        tx_va,
+        tx_phys,
+        tx_dma,
+        UART_DMA_TEST_BYTES.len()
     ));
     semihost_log(format_args!(
         "[rpi5-rp1-init] UART0 DR cpu=0x{:x} bar-relative=0x{:x} rp1-dma=0x{:x} dtb-reg=0x{:x}",
@@ -875,7 +993,12 @@ fn run_uart0_dma_tx(
     ));
     semihost_log(format_args!(
         "[rpi5-rp1-init] UART DMA LLI sar=0x{:x} dar=0x{:x} block=0x{:x} ctl=0x{:08x}/0x{:08x} llp=0x{:x}",
-        descriptor.sar, descriptor.dar, descriptor.block_ts_lo, descriptor.ctl_lo, descriptor.ctl_hi, descriptor.llp
+        descriptor.sar,
+        descriptor.dar,
+        descriptor.block_ts_lo,
+        descriptor.ctl_lo,
+        descriptor.ctl_hi,
+        descriptor.llp
     ));
 
     // Do not use `Pl011Uart::init` here: its normal flush waits indefinitely
@@ -919,8 +1042,16 @@ fn run_uart0_dma_tx(
     let irq_mask = DW_AXI_DMAC_IRQ_DMA_TRF | DW_AXI_DMAC_IRQ_ALL_ERR;
     dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTSTATUS_ENA, irq_mask);
     dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTSIGNAL_ENA, irq_mask);
-    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTCLEAR, DW_AXI_DMAC_IRQ_ALL);
-    dmac_write32(dmac_base, DW_AXI_DMAC_COMMON_INTCLEAR, 1 << DW_AXI_DMAC_CHANNEL);
+    dmac_write32(
+        dmac_base,
+        channel + DW_AXI_DMAC_CH_INTCLEAR,
+        DW_AXI_DMAC_IRQ_ALL,
+    );
+    dmac_write32(
+        dmac_base,
+        DW_AXI_DMAC_COMMON_INTCLEAR,
+        1 << DW_AXI_DMAC_CHANNEL,
+    );
     let cfg_l = dmac_cfg2_l(request);
     let cfg_h = dmac_cfg2_h(0);
     dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_CFG_L, cfg_l);
@@ -937,7 +1068,11 @@ fn run_uart0_dma_tx(
 
     // The UART request is enabled only after the descriptor and channel state
     // are visible to RP1. It is always restored below, including on timeout.
-    mmio_write32(uart0_base, RP1_UART_DMACR_OFFSET, original_dmacr | PL011_DMACR_TXDMAE);
+    mmio_write32(
+        uart0_base,
+        RP1_UART_DMACR_OFFSET,
+        original_dmacr | PL011_DMACR_TXDMAE,
+    );
     cpu::dsb_sy();
     semihost_log(format_args!(
         "[rpi5-rp1-init] UART DMA PL011 enabled FR=0x{:08x} CR=0x{:08x} DMACR=0x{:08x}",
@@ -977,11 +1112,17 @@ fn run_uart0_dma_tx(
         core::hint::spin_loop();
     }
     if matches!(result, Err(UartDmaError::Timeout { .. })) {
-        result = Err(UartDmaError::Timeout { status: final_status });
+        result = Err(UartDmaError::Timeout {
+            status: final_status,
+        });
     }
 
     dmac_disable_channel(dmac_base, DW_AXI_DMAC_CHANNEL);
-    dmac_write32(dmac_base, channel + DW_AXI_DMAC_CH_INTCLEAR, DW_AXI_DMAC_IRQ_ALL);
+    dmac_write32(
+        dmac_base,
+        channel + DW_AXI_DMAC_CH_INTCLEAR,
+        DW_AXI_DMAC_IRQ_ALL,
+    );
     mmio_write32(uart0_base, RP1_UART_DMACR_OFFSET, original_dmacr);
     semihost_log(format_args!(
         "[rpi5-rp1-init] UART DMA final status=0x{:08x} chstat=0x{:08x} raw=0x{:08x} common=0x{:08x} chen=0x{:08x}",
@@ -1038,7 +1179,11 @@ fn dmac_soft_reset(base: usize) -> Result<(), UartDmaError> {
 }
 
 fn dmac_enable_channel(base: usize, channel: usize) {
-    dmac_write32(base, DW_AXI_DMAC_CHEN, (1 << channel) | (1 << (channel + 8)));
+    dmac_write32(
+        base,
+        DW_AXI_DMAC_CHEN,
+        (1 << channel) | (1 << (channel + 8)),
+    );
 }
 
 fn dmac_disable_channel(base: usize, channel: usize) {
