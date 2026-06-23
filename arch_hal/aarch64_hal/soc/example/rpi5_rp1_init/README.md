@@ -117,3 +117,45 @@ a PHY ID, `link up Mbps1000 full duplex`, `[rp1-gem] TX broadcast PASS`, and the
 `BAR/DMA/Ethernet validation PASS` marker. This proves GEM DMA TX, MAC TX, PHY link, cable, and
 host-NIC reception only; it does not claim RX descriptor, ARP/IP, interrupt, guest, or sustained
 traffic support.
+
+## RP1 GEM RX validation
+
+TX validation does not establish that RP1 GEM can receive a host frame. The RX stage runs after
+the broadcast TX test and emits an RX-ready marker containing the exact destination MAC. Send the
+following deterministic unicast test frame only after that marker appears:
+
+```text
+destination: MAC printed by [rp1-gem] RX test ready
+source:      02:48:4f:53:54:01
+EtherType:   0x88b5
+payload:     RP1-GEM-RX-TEST
+length:      60 bytes excluding FCS
+```
+
+The local, standard-library-only sender is outside this repository:
+
+```sh
+sudo /opt/rpi-cm5-hack/scripts/send-rp1-gem-rx.py \
+  --interface enp2s0 \
+  --destination <MAC-from-RX-ready-marker> \
+  --log-dir /opt/rpi-cm5-hack/logs/<timestamp>-rp1-gem-rx
+```
+
+The validator polls `Rp1Gem::try_recv_frame()` at one millisecond intervals for at most 30 seconds.
+It requires the complete 60-byte unicast frame, checks both MAC addresses, EtherType, and the
+payload marker, and fails on descriptor errors or oversized frames. Reflected broadcast traffic
+from the preceding TX test is explicitly rejected as a test frame and recorded, while the bounded
+wait continues for the required host unicast.
+
+RX success requires both markers:
+
+```text
+[rp1-gem] RX test frame PASS
+[rpi5-rp1-init] Ethernet RX validation PASS
+```
+
+A full polling Ethernet smoke requires the prior TX markers and these RX markers. The validated
+CM5 run received the unicast `02:48:4f:53:54:01 > 2c:cf:67:c2:9a:58`, EtherType `0x88b5`, length
+60, with payload `RP1-GEM-RX-TEST`. It establishes host TX through the cable/PHY/MAC/DMA RX
+descriptor path into `try_recv_frame()`; it does not claim ARP/IP, interrupt-driven networking,
+Linux guest integration, or sustained bidirectional traffic.

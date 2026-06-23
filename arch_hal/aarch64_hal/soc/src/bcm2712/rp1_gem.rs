@@ -265,7 +265,8 @@ pub enum Rp1GemError {
     LinkTimeout,
     TxTimeout,
     TxFrameInvalid,
-    RxFrameInvalid,
+    RxDescriptorError { addr_lo: u32, status: u32 },
+    RxFrameTooLarge { len: usize },
     Gpio(Bcm2712Error),
 }
 
@@ -285,6 +286,11 @@ pub struct Rp1GemDiagnostic {
     pub rsr: u32,
     pub isr: u32,
     pub imr: u32,
+    pub nsr: u32,
+    pub rx_ring_index: usize,
+    pub rx_desc_addr_lo: u32,
+    pub rx_desc_ctrl_status: u32,
+    pub rx_desc_addr_hi: u32,
 }
 
 /// Polling, no-allocation RP1 Cadence GEM instance.
@@ -379,7 +385,14 @@ impl Rp1Gem {
         }
     }
 
-    pub fn diagnostic_snapshot(&self) -> Rp1GemDiagnostic {
+    pub fn diagnostic_snapshot(&mut self) -> Rp1GemDiagnostic {
+        let rx_index = self.rx_index;
+        let storage = dma_storage();
+        let rx_desc = &storage.rx_desc[rx_index];
+        invalidate_dcache_range(
+            rx_desc as *const GemDescriptor as *const u8,
+            core::mem::size_of::<GemDescriptor>(),
+        );
         Rp1GemDiagnostic {
             gem_base: self.config.gem_base,
             gem_cfg_base: self.config.gem_cfg_base,
@@ -394,6 +407,11 @@ impl Rp1Gem {
             rsr: self.reg_read(RSR),
             isr: self.reg_read(ISR),
             imr: self.reg_read(IMR),
+            nsr: self.reg_read(NSR),
+            rx_ring_index: rx_index,
+            rx_desc_addr_lo: rx_desc.addr_lo,
+            rx_desc_ctrl_status: rx_desc.ctrl_status,
+            rx_desc_addr_hi: rx_desc.addr_hi,
         }
     }
 
@@ -703,16 +721,20 @@ impl Rp1Gem {
         if desc.addr_lo & RX_DESC_USED == 0 {
             return Ok(None);
         }
+        let addr_lo = desc.addr_lo;
         let status = desc.ctrl_status;
         let length = (status & RX_STATUS_LEN_MASK) as usize;
-        let valid = status & (RX_STATUS_SOF | RX_STATUS_EOF) == (RX_STATUS_SOF | RX_STATUS_EOF)
-            && length >= 14
-            && length <= MAX_FRAME_LEN
-            && length <= buffer.len();
-        if valid {
+        let result = if status & (RX_STATUS_SOF | RX_STATUS_EOF) != (RX_STATUS_SOF | RX_STATUS_EOF)
+            || length < 14
+        {
+            Err(Rp1GemError::RxDescriptorError { addr_lo, status })
+        } else if length > MAX_FRAME_LEN || length > buffer.len() {
+            Err(Rp1GemError::RxFrameTooLarge { len: length })
+        } else {
             invalidate_dcache_range(storage.rx_buffers[index].as_ptr(), length);
             buffer[..length].copy_from_slice(&storage.rx_buffers[index][..length]);
-        }
+            Ok(Some(length))
+        };
         desc.addr_lo &= !(RX_DESC_USED | RX_DESC_WRAP);
         if index + 1 == RX_RING_LEN {
             desc.addr_lo |= RX_DESC_WRAP;
@@ -724,11 +746,7 @@ impl Rp1Gem {
         );
         dma_write_barrier();
         self.rx_index = (index + 1) % RX_RING_LEN;
-        if valid {
-            Ok(Some(length))
-        } else {
-            Err(Rp1GemError::RxFrameInvalid)
-        }
+        result
     }
 
     fn wait_mdio_idle(&self) -> Result<(), Rp1GemError> {

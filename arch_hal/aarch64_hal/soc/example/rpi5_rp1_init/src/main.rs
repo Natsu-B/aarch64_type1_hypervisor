@@ -11,6 +11,7 @@ use arch_hal::soc::bcm2712::rp1::Rp1Clocks;
 use arch_hal::soc::bcm2712::rp1::Rp1GpioBank0;
 use arch_hal::soc::bcm2712::rp1::Rp1PeripheralMap;
 use arch_hal::soc::bcm2712::rp1_gem::Rp1Gem;
+use arch_hal::soc::bcm2712::rp1_gem::Rp1GemError;
 use arch_hal::soc::bcm2712::rp1_gem::Rp1GemOptions;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
@@ -23,13 +24,23 @@ use core::panic::PanicInfo;
 use core::ptr::null_mut;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 use dtb::DtbParser;
 use dtb::WalkError;
+use io_api::ethernet::EthernetFrameIo;
 use io_api::ethernet::MacAddr;
+use timer::SystemTimer;
 
 const DTB_PTR: usize = 0x2000_0000;
 const HEAP_SIZE: usize = 1024 * 1024;
 const SEMIHOST_SYS_WRITE: u64 = 0x05;
+const RP1_GEM_RX_TEST_SOURCE_MAC: [u8; 6] = [0x02, 0x48, 0x4f, 0x53, 0x54, 0x01];
+const RP1_GEM_RX_TEST_ETHERTYPE: u16 = 0x88b5;
+const RP1_GEM_RX_TEST_PAYLOAD: &[u8] = b"RP1-GEM-RX-TEST";
+const RP1_GEM_RX_TEST_MIN_FRAME_LEN: usize = 60;
+const RP1_GEM_RX_TEST_BUFFER_LEN: usize = 2048;
+const RP1_GEM_RX_POLL_INTERVAL_US: u64 = 1_000;
+const RP1_GEM_RX_POLL_ATTEMPTS: usize = 30_000;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -466,9 +477,153 @@ extern "C" fn main() -> ! {
         Err(err) => fail(format_args!("RP1 GEM TX broadcast FAIL: {:?}", err)),
     }
     semihost_log(format_args!(
+        "[rp1-gem] RX test ready: send unicast dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype=0x{:04x} payload=RP1-GEM-RX-TEST",
+        mac_addr.0[0],
+        mac_addr.0[1],
+        mac_addr.0[2],
+        mac_addr.0[3],
+        mac_addr.0[4],
+        mac_addr.0[5],
+        RP1_GEM_RX_TEST_SOURCE_MAC[0],
+        RP1_GEM_RX_TEST_SOURCE_MAC[1],
+        RP1_GEM_RX_TEST_SOURCE_MAC[2],
+        RP1_GEM_RX_TEST_SOURCE_MAC[3],
+        RP1_GEM_RX_TEST_SOURCE_MAC[4],
+        RP1_GEM_RX_TEST_SOURCE_MAC[5],
+        RP1_GEM_RX_TEST_ETHERTYPE
+    ));
+    match poll_rp1_gem_rx_test(gem, mac_addr) {
+        Ok(()) => {
+            semihost_log(format_args!("[rp1-gem] RX test frame PASS"));
+            semihost_log(format_args!(
+                "[rpi5-rp1-init] Ethernet RX validation PASS"
+            ));
+        }
+        Err(err) => {
+            let diagnostic = gem.diagnostic_snapshot();
+            semihost_log(format_args!(
+                "[rp1-gem] RX diagnostic index={} desc=0x{:08x}/0x{:08x}/0x{:08x} rsr=0x{:08x} isr=0x{:08x} nsr=0x{:08x} ncr=0x{:08x} dmacfg=0x{:08x}",
+                diagnostic.rx_ring_index,
+                diagnostic.rx_desc_addr_lo,
+                diagnostic.rx_desc_ctrl_status,
+                diagnostic.rx_desc_addr_hi,
+                diagnostic.rsr,
+                diagnostic.isr,
+                diagnostic.nsr,
+                diagnostic.ncr,
+                diagnostic.dmacfg
+            ));
+            fail(format_args!("RP1 GEM RX validation FAIL: {}", err));
+        }
+    }
+    semihost_log(format_args!(
         "[rpi5-rp1-init] BAR/DMA/Ethernet validation PASS"
     ));
     wait_forever()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Rp1GemRxValidationError {
+    Timeout,
+    Descriptor(Rp1GemError),
+    OversizedFrame { len: usize },
+    ShortFrame { len: usize },
+    WrongDestinationMac { got: [u8; 6] },
+    WrongSourceMac { got: [u8; 6] },
+    WrongEtherType { got: u16 },
+    MissingPayloadMarker,
+}
+
+impl fmt::Display for Rp1GemRxValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => formatter.write_str("timeout waiting for host RX test frame"),
+            Self::Descriptor(err) => write!(formatter, "RX descriptor error: {:?}", err),
+            Self::OversizedFrame { len } => write!(formatter, "oversized frame length {}", len),
+            Self::ShortFrame { len } => write!(formatter, "short frame length {}", len),
+            Self::WrongDestinationMac { got } => write!(
+                formatter,
+                "wrong destination MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                got[0], got[1], got[2], got[3], got[4], got[5]
+            ),
+            Self::WrongSourceMac { got } => write!(
+                formatter,
+                "wrong source MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                got[0], got[1], got[2], got[3], got[4], got[5]
+            ),
+            Self::WrongEtherType { got } => write!(formatter, "wrong EtherType 0x{:04x}", got),
+            Self::MissingPayloadMarker => formatter.write_str("missing RP1-GEM-RX-TEST payload"),
+        }
+    }
+}
+
+fn poll_rp1_gem_rx_test(
+    gem: &mut Rp1Gem,
+    expected_destination: MacAddr,
+) -> Result<(), Rp1GemRxValidationError> {
+    let mut frame = [0u8; RP1_GEM_RX_TEST_BUFFER_LEN];
+    let mut timer = SystemTimer::new();
+    timer.init();
+    let mut last_unexpected = None;
+
+    for _ in 0..RP1_GEM_RX_POLL_ATTEMPTS {
+        if let Some(len) = gem.try_recv_frame(&mut frame) {
+            match validate_rp1_gem_rx_test_frame(&frame[..len], expected_destination) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // The preceding broadcast TX test can be reflected into RX by the PHY or
+                    // peer NIC. Reject it as this test frame, but continue the bounded wait for
+                    // the required host-to-CM5 unicast instead of making timing decisive.
+                    semihost_log(format_args!("[rp1-gem] RX ignored frame: {}", err));
+                    last_unexpected = Some(err);
+                }
+            }
+        }
+        if let Some(err) = gem.take_last_error() {
+            return match err {
+                Rp1GemError::RxFrameTooLarge { len } => {
+                    Err(Rp1GemRxValidationError::OversizedFrame { len })
+                }
+                _ => Err(Rp1GemRxValidationError::Descriptor(err)),
+            };
+        }
+        timer.wait(Duration::from_micros(RP1_GEM_RX_POLL_INTERVAL_US));
+    }
+    Err(last_unexpected.unwrap_or(Rp1GemRxValidationError::Timeout))
+}
+
+fn validate_rp1_gem_rx_test_frame(
+    frame: &[u8],
+    expected_destination: MacAddr,
+) -> Result<(), Rp1GemRxValidationError> {
+    if frame.len() > RP1_GEM_RX_TEST_BUFFER_LEN {
+        return Err(Rp1GemRxValidationError::OversizedFrame { len: frame.len() });
+    }
+    if frame.len() < RP1_GEM_RX_TEST_MIN_FRAME_LEN {
+        return Err(Rp1GemRxValidationError::ShortFrame { len: frame.len() });
+    }
+
+    let mut destination = [0u8; 6];
+    destination.copy_from_slice(&frame[..6]);
+    if destination != expected_destination.0 {
+        return Err(Rp1GemRxValidationError::WrongDestinationMac { got: destination });
+    }
+    let mut source = [0u8; 6];
+    source.copy_from_slice(&frame[6..12]);
+    if source != RP1_GEM_RX_TEST_SOURCE_MAC {
+        return Err(Rp1GemRxValidationError::WrongSourceMac { got: source });
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype != RP1_GEM_RX_TEST_ETHERTYPE {
+        return Err(Rp1GemRxValidationError::WrongEtherType { got: ethertype });
+    }
+    if !frame[14..]
+        .windows(RP1_GEM_RX_TEST_PAYLOAD.len())
+        .any(|window| window == RP1_GEM_RX_TEST_PAYLOAD)
+    {
+        return Err(Rp1GemRxValidationError::MissingPayloadMarker);
+    }
+    Ok(())
 }
 
 fn discover_rp1_gem_mac(dtb: &DtbParser) -> Option<MacAddr> {
