@@ -233,21 +233,24 @@ pub fn download_into(
     let mut transfer_port = None;
     let mut written = 0usize;
     let mut rx = [0u8; MAX_FRAME_LEN];
+    let mut send_before_wait = true;
 
     loop {
         let mut received_expected_data = false;
-        for _ in 0..=cfg.max_retries {
-            if !send_udp_packet(
-                eth_io,
-                local_mac,
-                server_mac,
-                cfg.local_ip,
-                cfg.server_ip,
-                CLIENT_PORT,
-                transfer_port.unwrap_or(cfg.server_port),
-                &packet[..packet_len],
-            )? {
-                return Err(TftpError::TransmitFailed);
+        for retry in 0..=cfg.max_retries {
+            if send_before_wait || retry != 0 {
+                if !send_udp_packet(
+                    eth_io,
+                    local_mac,
+                    server_mac,
+                    cfg.local_ip,
+                    cfg.server_ip,
+                    CLIENT_PORT,
+                    transfer_port.unwrap_or(cfg.server_port),
+                    &packet[..packet_len],
+                )? {
+                    return Err(TftpError::TransmitFailed);
+                }
             }
 
             let start = clock.now_us();
@@ -339,6 +342,7 @@ pub fn download_into(
                         expected_block = expected_block
                             .checked_add(1)
                             .ok_or(TftpError::BlockNumberOverflow)?;
+                        send_before_wait = false;
                         received_expected_data = true;
                         break;
                     }
@@ -441,8 +445,8 @@ mod tests {
     }
 
     struct TestEthernet {
-        frames: [[u8; MAX_FRAME_LEN]; 2],
-        frame_lens: [usize; 2],
+        frames: [[u8; MAX_FRAME_LEN]; 3],
+        frame_lens: [usize; 3],
         next_frame: usize,
         sent: usize,
     }
@@ -550,7 +554,7 @@ mod tests {
 
     #[test]
     fn destination_overflow_is_reported() {
-        let mut frames = [[0u8; MAX_FRAME_LEN]; 2];
+        let mut frames = [[0u8; MAX_FRAME_LEN]; 3];
         let arp_len =
             arp::encode_arp_reply(&mut frames[0], SERVER_MAC, SERVER_IP, LOCAL_MAC, LOCAL_IP)
                 .unwrap();
@@ -570,7 +574,7 @@ mod tests {
         .unwrap();
         let mut eth = TestEthernet {
             frames,
-            frame_lens: [arp_len, data_len],
+            frame_lens: [arp_len, data_len, 0],
             next_frame: 0,
             sent: 0,
         };
@@ -579,5 +583,53 @@ mod tests {
             Err(TftpError::DestinationTooSmall)
         );
         assert_eq!(eth.sent, 2);
+    }
+
+    #[test]
+    fn download_acknowledges_each_data_block_once() {
+        let mut frames = [[0u8; MAX_FRAME_LEN]; 3];
+        let arp_len =
+            arp::encode_arp_reply(&mut frames[0], SERVER_MAC, SERVER_IP, LOCAL_MAC, LOCAL_IP)
+                .unwrap();
+        let mut first_data = [0u8; 4 + DATA_BLOCK_LEN];
+        write_be_u16(&mut first_data, 0, OP_DATA);
+        write_be_u16(&mut first_data, 2, 1);
+        first_data[4..].fill(0x5a);
+        let first_len = crate::encode_udp_ipv4_frame(
+            &mut frames[1],
+            SERVER_MAC,
+            LOCAL_MAC,
+            SERVER_IP,
+            LOCAL_IP,
+            20_000,
+            CLIENT_PORT,
+            &first_data,
+        )
+        .unwrap();
+        let final_data = [0, 3, 0, 2];
+        let final_len = crate::encode_udp_ipv4_frame(
+            &mut frames[2],
+            SERVER_MAC,
+            LOCAL_MAC,
+            SERVER_IP,
+            LOCAL_IP,
+            20_000,
+            CLIENT_PORT,
+            &final_data,
+        )
+        .unwrap();
+        let mut eth = TestEthernet {
+            frames,
+            frame_lens: [arp_len, first_len, final_len],
+            next_frame: 0,
+            sent: 0,
+        };
+        let mut out = [0u8; DATA_BLOCK_LEN];
+        assert_eq!(
+            download_into(&mut eth, &Clock, &tftp_config(), &mut out),
+            Ok(512)
+        );
+        assert_eq!(out, [0x5a; DATA_BLOCK_LEN]);
+        assert_eq!(eth.sent, 4); // ARP, RRQ, ACK block 1, ACK block 2.
     }
 }
