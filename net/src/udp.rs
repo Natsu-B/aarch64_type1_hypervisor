@@ -108,3 +108,31 @@ pub fn compute_ipv4_udp_checksum(
         Ok(checksum)
     }
 }
+
+/// Validates an IPv4 UDP checksum when one is present.
+///
+/// A zero checksum is legal for IPv4 UDP and is therefore accepted.  Non-zero
+/// checksums are checked against the IPv4 pseudo header and UDP length field.
+pub fn validate_ipv4_udp_checksum(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    udp_datagram: &[u8],
+) -> Result<(), ParseError> {
+    if udp_datagram.len() < HEADER_LEN {
+        return Err(ParseError::UdpHeaderTooShort);
+    }
+    let udp_len = usize::from(read_be_u16(udp_datagram, 4));
+    if udp_len < HEADER_LEN || udp_len > udp_datagram.len() {
+        return Err(ParseError::UdpLenInvalid);
+    }
+    let received = read_be_u16(udp_datagram, 6);
+    if received == 0 {
+        return Ok(());
+    }
+    let calculated = compute_ipv4_udp_checksum(src_ip, dst_ip, &udp_datagram[..udp_len])
+        .map_err(|_| ParseError::UdpLenInvalid)?;
+    if received != calculated {
+        return Err(ParseError::UdpChecksumMismatch);
+    }
+    Ok(())
+}

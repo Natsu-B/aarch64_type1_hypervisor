@@ -14,6 +14,8 @@ pub mod checksum;
 pub mod eth;
 /// IPv4 protocol.
 pub mod ipv4;
+/// TFTP client protocol support.
+pub mod tftp;
 /// UDP protocol.
 pub mod udp;
 
@@ -45,12 +47,20 @@ pub enum ParseError {
     UdpHeaderTooShort,
     /// UDP length field is invalid.
     UdpLenInvalid,
+    /// UDP checksum mismatch.
+    UdpChecksumMismatch,
     /// ARP packet is too short.
     ArpPacketTooShort,
     /// ARP format is not supported.
     ArpUnsupportedFormat,
     /// ARP operation is not a request.
     ArpNotRequest,
+    /// ARP operation is not a reply.
+    ArpNotReply,
+    /// ARP sender MAC address is not usable.
+    ArpInvalidSenderMac,
+    /// Ethernet and ARP sender MAC addresses do not agree.
+    ArpSenderMacMismatch,
 }
 
 /// Errors that can occur when encoding network frames.
@@ -182,6 +192,25 @@ pub fn encode_arp_reply(
     peer_ip: Ipv4Addr,
 ) -> Result<usize, EncodeError> {
     arp::encode_arp_reply(buf, local_mac, local_ip, peer_mac, peer_ip)
+}
+
+/// Encodes an ARP request frame.
+pub fn encode_arp_request(
+    buf: &mut [u8],
+    local_mac: MacAddr,
+    local_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> Result<usize, EncodeError> {
+    arp::encode_arp_request(buf, local_mac, local_ip, target_ip)
+}
+
+/// Parses a validated ARP reply and returns the requested sender MAC address.
+pub fn parse_arp_reply(
+    frame: &[u8],
+    local_ip: Ipv4Addr,
+    requested_ip: Ipv4Addr,
+) -> Result<MacAddr, ParseError> {
+    arp::parse_arp_reply(frame, local_ip, requested_ip)
 }
 
 pub(crate) fn read_be_u16(data: &[u8], offset: usize) -> u16 {

@@ -1,0 +1,21 @@
+[package]
+name = "soc-rpi5-rp1-net-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["."]
+
+[dependencies]
+arch_hal = { path = "../../../../../arch_hal" }
+dtb = { path = "../../../../../dtb" }
+io-api = { path = "../../../../../io_api" }
+net = { path = "../../../../../net" }
+timer = { path = "../../../timer" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = true

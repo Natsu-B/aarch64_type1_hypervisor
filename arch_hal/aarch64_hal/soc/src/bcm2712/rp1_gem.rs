@@ -138,6 +138,8 @@ const DMA_BUF_LEN: usize = 2048;
 const MAX_FRAME_LEN: usize = 1518;
 const MDIO_POLL_LIMIT: usize = 20_000;
 const TX_POLL_LIMIT: usize = 100_000;
+#[cfg(target_arch = "aarch64")]
+const QUIESCE_POLL_LIMIT: usize = 1_000;
 const LINK_POLL_INTERVAL_US: u64 = 10_000;
 const DEFAULT_LINK_WAIT_US: u64 = 5_000_000;
 
@@ -432,6 +434,38 @@ impl Rp1Gem {
 
     pub fn take_last_error(&mut self) -> Option<Rp1GemError> {
         self.last_error.take()
+    }
+
+    /// Stops DMA activity and leaves the GEM idle for a firmware or Linux handoff.
+    ///
+    /// Descriptor and packet storage remain allocated so this operation is safe
+    /// to call repeatedly and never invalidates the driver's static DMA area.
+    pub fn quiesce(&mut self) {
+        // Disable every interrupt source before changing DMA ownership.  IDR is
+        // a set-disable register, so writing all ones is idempotent.
+        self.reg_write(IDR, u32::MAX);
+
+        // Clear receive/transmit enable and the transmit-start command while
+        // retaining no management-port enable: a handoff does not need MDIO,
+        // and this leaves the MAC fully idle.
+        let ncr = self.reg_read(NCR);
+        self.reg_write(
+            NCR,
+            (ncr & !(NCR_RE | NCR_TE | NCR_TSTART | NCR_MPE)) | NCR_CLRSTAT,
+        );
+        for _ in 0..QUIESCE_POLL_LIMIT {
+            if self.reg_read(NCR) & (NCR_RE | NCR_TE | NCR_TSTART) == 0 {
+                break;
+            }
+            spin_loop();
+        }
+
+        // These status registers are write-one-to-clear.  A final ISR read is
+        // intentionally avoided because it can have device-specific effects.
+        self.reg_write(TSR, u32::MAX);
+        self.reg_write(RSR, u32::MAX);
+        self.reg_write(ISR, u32::MAX);
+        dsb_sy();
     }
 
     pub fn send_test_broadcast(&mut self) -> Result<(), Rp1GemError> {
