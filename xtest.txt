@@ -11,6 +11,7 @@
 std allocator
 std common
 std dtb
+std elf
 std block-device-api
 std intrusive_linked_list
 std mutex
