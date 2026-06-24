@@ -823,6 +823,25 @@ mod tests {
     }
 
     #[test]
+    fn materializes_one_load_segment() {
+        let mut data = elf32_with_headers(&[load(0x100, BASE, 3, 3)], 512);
+        data[0x100..0x103].copy_from_slice(&[7, 8, 9]);
+        let mut output = [0u8; 8];
+        let image = materialize_elf32_arm_le(
+            &data,
+            &mut output,
+            MaterializeOptions {
+                load_base: u64::from(BASE),
+                max_image_size: 8,
+                require_entry_in_range: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(image.image_len, 3);
+        assert_eq!(&output[..3], &[7, 8, 9]);
+    }
+
+    #[test]
     fn rejects_materialization_range_and_overlap_errors() {
         let below = elf32_with_headers(&[load(0x100, BASE - 4, 1, 1)], 512);
         let mut output = [0; 8];
