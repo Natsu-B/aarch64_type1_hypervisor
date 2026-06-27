@@ -436,6 +436,19 @@ impl Rp1Gem {
         self.last_error.take()
     }
 
+    /// Quiesces the device and releases the singleton claim.
+    ///
+    /// # Safety
+    ///
+    /// The caller must stop using this `Rp1Gem` reference immediately after
+    /// this call returns. The next successful `init_from_rp1_config` will
+    /// overwrite the same static driver storage and create a fresh unique
+    /// mutable reference for the reinitialized RP1 instance.
+    pub unsafe fn release_after_quiesce(&mut self) {
+        self.quiesce();
+        release_singleton();
+    }
+
     /// Stops DMA activity and leaves the GEM idle for a firmware or Linux handoff.
     ///
     /// Descriptor and packet storage remain allocated so this operation is safe
