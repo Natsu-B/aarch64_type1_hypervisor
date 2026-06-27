@@ -449,6 +449,40 @@ impl Rp1Gem {
         release_singleton();
     }
 
+    /// Quiesces the device for Linux and releases the singleton claim.
+    ///
+    /// # Safety
+    ///
+    /// The caller must stop using this `Rp1Gem` reference immediately after
+    /// this call returns. This is intended for the terminal Linux handoff path.
+    pub unsafe fn release_after_linux_handoff(&mut self) {
+        self.handoff_to_linux();
+        release_singleton();
+    }
+
+    /// Leaves GEM in an idle, driver-neutral state before Linux probes it.
+    ///
+    /// This deliberately does not reset RP1 or power down the GEM block, because
+    /// Linux still needs the freshly loaded RP1 firmware and will reprogram the
+    /// MAC/DMA state from its own driver.
+    pub fn handoff_to_linux(&mut self) {
+        self.quiesce();
+
+        // Linux will install its own DMA rings.  After RX/TX are stopped, clear
+        // queue base registers and DMA configuration so no stale bootstrap
+        // descriptors remain advertised to the MAC.
+        self.reg_write(RBQP, 0);
+        self.reg_write(RBQPH, 0);
+        self.reg_write(TBQP, 0);
+        self.reg_write(TBQPH, 0);
+        self.reg_write(DMACFG, 0);
+
+        self.reg_write(TSR, u32::MAX);
+        self.reg_write(RSR, u32::MAX);
+        self.reg_write(ISR, u32::MAX);
+        dsb_sy();
+    }
+
     /// Stops DMA activity and leaves the GEM idle for a firmware or Linux handoff.
     ///
     /// Descriptor and packet storage remain allocated so this operation is safe
