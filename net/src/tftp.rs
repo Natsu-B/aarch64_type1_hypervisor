@@ -31,7 +31,6 @@ pub const TFTP_PORT: u16 = 69;
 /// TFTP base-protocol data payload length.
 pub const DATA_BLOCK_LEN: usize = 512;
 
-const CLIENT_PORT: u16 = 49_152;
 const MAX_FRAME_LEN: usize = 1536;
 const MAX_REQUEST_LEN: usize = 512;
 const MAX_POLLS_PER_WAIT: usize = 1_000_000;
@@ -51,6 +50,8 @@ pub struct TftpConfig<'a> {
     pub server_ip: Ipv4Addr,
     /// Initial server UDP port; use [`TFTP_PORT`] for standard TFTP.
     pub server_port: u16,
+    /// Local UDP port used for this TFTP transfer.
+    pub local_port: u16,
     /// Filename sent in the octet-mode RRQ.
     pub filename: &'a str,
     /// Per-attempt receive timeout in microseconds.
@@ -218,7 +219,7 @@ pub fn download_into(
     cfg: &TftpConfig<'_>,
     out: &mut [u8],
 ) -> Result<usize, TftpError> {
-    if cfg.timeout_us == 0 || cfg.server_port == 0 {
+    if cfg.timeout_us == 0 || cfg.server_port == 0 || cfg.local_port == 0 {
         return Err(TftpError::InvalidConfig);
     }
     if eth_io.max_frame_len() < eth::HEADER_LEN + arp::ARP_PAYLOAD_LEN {
@@ -245,7 +246,7 @@ pub fn download_into(
                     server_mac,
                     cfg.local_ip,
                     cfg.server_ip,
-                    CLIENT_PORT,
+                    cfg.local_port,
                     transfer_port.unwrap_or(cfg.server_port),
                     &packet[..packet_len],
                 )? {
@@ -271,7 +272,7 @@ pub fn download_into(
                 if datagram.src_mac != server_mac
                     || datagram.src_ip != cfg.server_ip
                     || datagram.dst_ip != cfg.local_ip
-                    || datagram.dst_port != CLIENT_PORT
+                    || datagram.dst_port != cfg.local_port
                 {
                     continue;
                 }
@@ -301,7 +302,7 @@ pub fn download_into(
                                 server_mac,
                                 cfg.local_ip,
                                 cfg.server_ip,
-                                CLIENT_PORT,
+                                cfg.local_port,
                                 datagram.src_port,
                                 &packet[..packet_len],
                             )? {
@@ -330,7 +331,7 @@ pub fn download_into(
                             server_mac,
                             cfg.local_ip,
                             cfg.server_ip,
-                            CLIENT_PORT,
+                            cfg.local_port,
                             datagram.src_port,
                             &packet[..packet_len],
                         )? {
@@ -435,6 +436,7 @@ mod tests {
     const SERVER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 2]);
     const LOCAL_IP: Ipv4Addr = [192, 0, 2, 10];
     const SERVER_IP: Ipv4Addr = [192, 0, 2, 1];
+    const LOCAL_PORT: u16 = 49_152;
 
     struct Clock;
 
@@ -478,6 +480,7 @@ mod tests {
             local_ip: LOCAL_IP,
             server_ip: SERVER_IP,
             server_port: TFTP_PORT,
+            local_port: LOCAL_PORT,
             filename: "BCM2712.img",
             timeout_us: 1,
             max_retries: 0,
@@ -568,7 +571,7 @@ mod tests {
             SERVER_IP,
             LOCAL_IP,
             20_000,
-            CLIENT_PORT,
+            LOCAL_PORT,
             &data,
         )
         .unwrap();
@@ -602,7 +605,7 @@ mod tests {
             SERVER_IP,
             LOCAL_IP,
             20_000,
-            CLIENT_PORT,
+            LOCAL_PORT,
             &first_data,
         )
         .unwrap();
@@ -614,7 +617,7 @@ mod tests {
             SERVER_IP,
             LOCAL_IP,
             20_000,
-            CLIENT_PORT,
+            LOCAL_PORT,
             &final_data,
         )
         .unwrap();
