@@ -1066,7 +1066,7 @@ impl BrcmStb {
         // Keep a late cold endpoint inside this initialization call. Returning
         // early lets a later Auto call mistake link-up for completed BAR setup.
         // This is a bounded local tolerance, not the Linux driver's 100 ms poll.
-        self.start_link(1_000)?;
+        self.start_link(5_000)?;
         // BCM2712 may clear command bits while the port comes out of reset.
         // Reapply and verify the bridge header only after LTSSM is active.
         self.configure_root_bridge(cfg)?;
