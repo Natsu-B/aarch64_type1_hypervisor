@@ -1944,7 +1944,7 @@ mod tests {
             if let Some(err) = self.read_error {
                 return Err(err);
             }
-            if (buf.len() % SECTOR_SIZE) != 0 {
+            if !buf.len().is_multiple_of(SECTOR_SIZE) {
                 return Err(IoError::Align);
             }
             let start = (lba as usize)
@@ -1963,7 +1963,7 @@ mod tests {
             if self.read_only {
                 return Err(IoError::ReadOnly);
             }
-            if (buf.len() % SECTOR_SIZE) != 0 {
+            if !buf.len().is_multiple_of(SECTOR_SIZE) {
                 return Err(IoError::Align);
             }
             let start = (lba as usize)
