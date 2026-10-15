@@ -79,7 +79,7 @@ impl<T: Copy + RawReg> Readable for ReadOnly<Le<T>> {
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile(&(*self.0.get()).0) }.from_le()
+        unsafe { read_volatile(&raw const (*self.0.get()).0) }.from_le()
     }
 }
 
@@ -93,7 +93,7 @@ impl<T: Copy + RawReg> Readable for ReadPure<Le<T>> {
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile(&(*self.0.get()).0) }.from_le()
+        unsafe { read_volatile(&raw const (*self.0.get()).0) }.from_le()
     }
 }
 
@@ -107,7 +107,7 @@ impl<T: Copy + RawReg> Readable for ReadWrite<Le<T>> {
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile(&(*self.0.get()).0) }.from_le()
+        unsafe { read_volatile(&raw const (*self.0.get()).0) }.from_le()
     }
 }
 
@@ -120,7 +120,7 @@ impl<T: RawReg> Writable for WriteOnly<Le<T>> {
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_le()) };
+        unsafe { write_volatile(&raw mut (*self.0.get()).0, val.to_le()) };
     }
 }
 
@@ -133,7 +133,7 @@ impl<T: RawReg> Writable for ReadWrite<Le<T>> {
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_le()) };
+        unsafe { write_volatile(&raw mut (*self.0.get()).0, val.to_le()) };
     }
 }
 
@@ -147,7 +147,7 @@ impl<T: Copy + RawReg> Readable for ReadOnly<Be<T>> {
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile(&(*self.0.get()).0) }.from_be()
+        unsafe { read_volatile(&raw const (*self.0.get()).0) }.from_be()
     }
 }
 
@@ -161,7 +161,7 @@ impl<T: Copy + RawReg> Readable for ReadPure<Be<T>> {
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile(&(*self.0.get()).0) }.from_be()
+        unsafe { read_volatile(&raw const (*self.0.get()).0) }.from_be()
     }
 }
 
@@ -175,7 +175,7 @@ impl<T: Copy + RawReg> Readable for ReadWrite<Be<T>> {
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile(&(*self.0.get()).0) }.from_be()
+        unsafe { read_volatile(&raw const (*self.0.get()).0) }.from_be()
     }
 }
 
@@ -188,7 +188,7 @@ impl<T: RawReg> Writable for WriteOnly<Be<T>> {
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_be()) };
+        unsafe { write_volatile(&raw mut (*self.0.get()).0, val.to_be()) };
     }
 }
 
@@ -201,7 +201,7 @@ impl<T: RawReg> Writable for ReadWrite<Be<T>> {
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_be()) };
+        unsafe { write_volatile(&raw mut (*self.0.get()).0, val.to_be()) };
     }
 }
 

@@ -169,7 +169,9 @@ macro_rules! impl_atomic_raw_int {
 
 #[cfg(target_has_atomic = "8")]
 mod impl8 {
-    use super::*;
+    use super::AtomicRaw;
+    use super::AtomicRawInt;
+    use super::Ordering;
     use core::sync::atomic::AtomicBool;
     use core::sync::atomic::AtomicI8;
     use core::sync::atomic::AtomicU8;
@@ -183,7 +185,9 @@ mod impl8 {
 
 #[cfg(target_has_atomic = "16")]
 mod impl16 {
-    use super::*;
+    use super::AtomicRaw;
+    use super::AtomicRawInt;
+    use super::Ordering;
     use core::sync::atomic::AtomicI16;
     use core::sync::atomic::AtomicU16;
 
@@ -195,7 +199,9 @@ mod impl16 {
 
 #[cfg(target_has_atomic = "32")]
 mod impl32 {
-    use super::*;
+    use super::AtomicRaw;
+    use super::AtomicRawInt;
+    use super::Ordering;
     use core::sync::atomic::AtomicI32;
     use core::sync::atomic::AtomicU32;
 
@@ -207,7 +213,9 @@ mod impl32 {
 
 #[cfg(target_has_atomic = "64")]
 mod impl64 {
-    use super::*;
+    use super::AtomicRaw;
+    use super::AtomicRawInt;
+    use super::Ordering;
     use core::sync::atomic::AtomicI64;
     use core::sync::atomic::AtomicU64;
 
@@ -219,7 +227,9 @@ mod impl64 {
 
 #[cfg(target_has_atomic = "ptr")]
 mod implptr {
-    use super::*;
+    use super::AtomicRaw;
+    use super::AtomicRawInt;
+    use super::Ordering;
     use core::sync::atomic::AtomicIsize;
     use core::sync::atomic::AtomicUsize;
 

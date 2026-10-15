@@ -124,15 +124,17 @@ impl<T: Copy + RawReg> Le<Unaligned<T>> {
 }
 
 mod volatile {
-    use super::*;
+    use super::MaybeUninit;
+    use super::RawReg;
+    use super::ptr;
 
     /// Reads `size_of::<T>()` bytes via `read_volatile` and returns the value.
     #[inline]
     pub(crate) unsafe fn read<T: RawReg>(data: *const T) -> T {
-        let data: *const u8 = data as *const u8;
+        let data: *const u8 = data.cast::<u8>();
 
         let mut tmp = MaybeUninit::<T>::uninit();
-        let dst = tmp.as_mut_ptr() as *mut u8;
+        let dst = tmp.as_mut_ptr().cast::<u8>();
 
         for i in 0..core::mem::size_of::<T>() {
             unsafe { ptr::write(dst.add(i), ptr::read_volatile(data.add(i))) };
@@ -144,9 +146,9 @@ mod volatile {
     /// Writes `size_of::<T>()` bytes via `write_volatile`.
     #[inline]
     pub(crate) unsafe fn write<T: RawReg>(data: *mut T, val: T) {
-        let data: *mut u8 = data as *mut u8;
+        let data: *mut u8 = data.cast::<u8>();
 
-        let src = &val as *const T as *const u8;
+        let src = (&raw const val).cast::<u8>();
         for i in 0..core::mem::size_of::<T>() {
             unsafe { ptr::write_volatile(data.add(i), ptr::read(src.add(i))) };
         }
@@ -214,7 +216,7 @@ impl<T: RawReg> WriteOnly<Le<Unaligned<T>>> {
             volatile::write(
                 addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
                 val.to_le(),
-            )
+            );
         };
     }
 }
@@ -228,7 +230,7 @@ impl<T: RawReg> ReadWrite<Le<Unaligned<T>>> {
             volatile::write(
                 addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
                 val.to_le(),
-            )
+            );
         };
     }
 }
@@ -272,7 +274,7 @@ impl<T: RawReg> WriteOnly<Be<Unaligned<T>>> {
             volatile::write(
                 addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
                 val.to_be(),
-            )
+            );
         };
     }
 }
@@ -286,7 +288,7 @@ impl<T: RawReg> ReadWrite<Be<Unaligned<T>>> {
             volatile::write(
                 addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
                 val.to_be(),
-            )
+            );
         };
     }
 }
@@ -327,7 +329,7 @@ impl<T: RawReg> WriteOnly<Unaligned<T>> {
             volatile::write(
                 addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0),
                 val,
-            )
+            );
         };
     }
 }
@@ -341,7 +343,7 @@ impl<T: RawReg> ReadWrite<Unaligned<T>> {
             volatile::write(
                 addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0),
                 val,
-            )
+            );
         };
     }
 }

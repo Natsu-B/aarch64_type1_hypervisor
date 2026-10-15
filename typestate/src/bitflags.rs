@@ -1242,7 +1242,6 @@ macro_rules! __bitregs_internal_view_overlap_fold {
 
 #[cfg(test)]
 mod tests {
-    use crate::RawReg;
     bitregs! {
         /// nested union test
         pub(super) struct PacketNested: u16 {
