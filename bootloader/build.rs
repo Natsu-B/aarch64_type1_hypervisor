@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -12,8 +13,8 @@ fn run_git(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn resolve_git_dir_from(repo_dir: &PathBuf) -> Option<PathBuf> {
-    let mut cur = repo_dir.clone();
+fn resolve_git_dir_from(repo_dir: &Path) -> Option<PathBuf> {
+    let mut cur = repo_dir.to_path_buf();
     loop {
         let dot_git = cur.join(".git");
         if dot_git.is_dir() {
