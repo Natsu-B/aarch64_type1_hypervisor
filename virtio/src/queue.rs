@@ -163,7 +163,7 @@ impl VirtQueue {
     pub(crate) fn set_available_ring(&self, desc_idx: u16) -> Result<(), VirtioErr> {
         let mut idx = self.idx.lock();
         // Check queue fullness by tracking in-flight entries.
-        let in_flight = idx.avail_idx.wrapping_sub(idx.used_idx) as u32;
+        let in_flight = u32::from(idx.avail_idx.wrapping_sub(idx.used_idx));
         if in_flight >= self.size {
             return Err(VirtioErr::OutOfAvailableDesc);
         }
@@ -192,7 +192,7 @@ impl VirtQueue {
         if delta == 0 {
             return Ok(None);
         }
-        if delta as u32 > self.size {
+        if u32::from(delta) > self.size {
             return Err(VirtioErr::QueueCorrupted);
         }
         // used_idx % qsize = used_idx & (qsize - 1)
@@ -213,7 +213,7 @@ impl VirtQueue {
         let mut lock = self.idx.lock();
         unsafe {
             lock.free_list
-                .push(self.descriptor_paddr as usize + desc_idx as usize * size_of::<VirtqDesc>())
+                .push(self.descriptor_paddr as usize + desc_idx as usize * size_of::<VirtqDesc>());
         };
         Ok(())
     }
