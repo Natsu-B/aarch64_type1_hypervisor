@@ -802,20 +802,17 @@ fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
         fn kill(pid: c_int, sig: c_int) -> c_int;
     }
 
-    let pgid = match i32::try_from(child.id()) {
-        Ok(pid) => pid,
-        Err(_) => {
-            eprintln!(
-                "Warning: PID {} for {} does not fit into i32; falling back to child.kill()",
-                child.id(),
-                label
-            );
-            if let Err(e) = child.kill() {
-                eprintln!("Warning: failed to kill {}: {}", label, e);
-            }
-            let _ = child.wait();
-            return;
+    let Ok(pgid) = i32::try_from(child.id()) else {
+        eprintln!(
+            "Warning: PID {} for {} does not fit into i32; falling back to child.kill()",
+            child.id(),
+            label
+        );
+        if let Err(e) = child.kill() {
+            eprintln!("Warning: failed to kill {}: {}", label, e);
         }
+        let _ = child.wait();
+        return;
     };
 
     let mut wait_for_exit = |deadline: Instant| -> bool {
