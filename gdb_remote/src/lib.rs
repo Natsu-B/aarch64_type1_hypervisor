@@ -1047,6 +1047,54 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         }
     }
 
+    /// Replies to a `qXfer:<object>:read` request with the `offset`/`length` window of `data`.
+    ///
+    /// The reply is `l` when the window starts at or past the end of `data`, otherwise `m`
+    /// (more data follows) or `l` (last chunk) followed by the RSP-binary-encoded bytes. Requests
+    /// whose offset/length do not fit in `usize`, or that cannot fit any encoded byte in the
+    /// output buffer, are answered with `E01`.
+    fn send_qxfer_chunk<T: Target>(
+        &mut self,
+        data: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> Result<(), GdbServerError<T>> {
+        let Ok(offset) = usize::try_from(offset) else {
+            return self.send::<T>(b"E01");
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return self.send::<T>(b"E01");
+        };
+
+        if offset >= data.len() {
+            return self.send::<T>(b"l");
+        }
+
+        let max_len = core::cmp::min(length, data.len() - offset);
+        if max_len == 0 {
+            let prefix = if offset < data.len() { b'm' } else { b'l' };
+            let reply = [prefix];
+            return self.send::<T>(&reply);
+        }
+
+        let cap = self.out_payload_cap();
+        if cap < 1 {
+            return self.send::<T>(b"E01");
+        }
+
+        let (consumed, encoded_len) = {
+            let reply = &mut self.scratch_b;
+            encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
+        };
+        if consumed == 0 {
+            return self.send::<T>(b"E01");
+        }
+
+        let more = offset + consumed < data.len();
+        self.scratch_b[0] = if more { b'm' } else { b'l' };
+        self.send_scratch_b::<T>(1 + encoded_len)
+    }
+
     fn handle_query<T: Target>(
         &mut self,
         target: &mut T,
@@ -1131,46 +1179,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 }
             };
 
-            let Ok(offset) = usize::try_from(offset) else {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            };
-            let Ok(length) = usize::try_from(length) else {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            };
-
-            if offset >= data.len() {
-                self.send::<T>(b"l")?;
-                return Ok(ProcessResult::None);
-            }
-
-            let max_len = core::cmp::min(length, data.len() - offset);
-            if max_len == 0 {
-                let prefix = if offset < data.len() { b'm' } else { b'l' };
-                let reply = [prefix];
-                self.send::<T>(&reply)?;
-                return Ok(ProcessResult::None);
-            }
-
-            let cap = self.out_payload_cap();
-            if cap < 1 {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            }
-
-            let (consumed, encoded_len) = {
-                let reply = &mut self.scratch_b;
-                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
-            };
-            if consumed == 0 {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            }
-
-            let more = offset + consumed < data.len();
-            self.scratch_b[0] = if more { b'm' } else { b'l' };
-            self.send_scratch_b::<T>(1 + encoded_len)?;
+            self.send_qxfer_chunk::<T>(data, offset, length)?;
             return Ok(ProcessResult::None);
         }
 
@@ -1202,46 +1211,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                 }
             };
 
-            let Ok(offset) = usize::try_from(offset) else {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            };
-            let Ok(length) = usize::try_from(length) else {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            };
-
-            if offset >= data.len() {
-                self.send::<T>(b"l")?;
-                return Ok(ProcessResult::None);
-            }
-
-            let max_len = core::cmp::min(length, data.len() - offset);
-            if max_len == 0 {
-                let prefix = if offset < data.len() { b'm' } else { b'l' };
-                let reply = [prefix];
-                self.send::<T>(&reply)?;
-                return Ok(ProcessResult::None);
-            }
-
-            let cap = self.out_payload_cap();
-            if cap < 1 {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            }
-
-            let (consumed, encoded_len) = {
-                let reply = &mut self.scratch_b;
-                encode_rsp_binary(&data[offset..offset + max_len], &mut reply[1..cap])
-            };
-            if consumed == 0 {
-                self.send::<T>(b"E01")?;
-                return Ok(ProcessResult::None);
-            }
-
-            let more = offset + consumed < data.len();
-            self.scratch_b[0] = if more { b'm' } else { b'l' };
-            self.send_scratch_b::<T>(1 + encoded_len)?;
+            self.send_qxfer_chunk::<T>(data, offset, length)?;
             return Ok(ProcessResult::None);
         }
 
