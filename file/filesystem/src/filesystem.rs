@@ -1,5 +1,4 @@
 use core::mem::MaybeUninit;
-use core::usize;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
