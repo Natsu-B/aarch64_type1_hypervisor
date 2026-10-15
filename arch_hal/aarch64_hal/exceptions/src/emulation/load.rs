@@ -41,10 +41,11 @@ pub(crate) fn emulate_pair(
 ) -> EmulationOutcome {
     let use_pair_ops = split0.is_none()
         && split1.is_none()
-        && (desc.size <= 1 || (ipa0 % desc.size as u64 == 0 && ipa1 % desc.size as u64 == 0));
+        && (desc.size <= 1
+            || (ipa0.is_multiple_of(desc.size as u64) && ipa1.is_multiple_of(desc.size as u64)));
 
     let (v0, v1) = if use_pair_ops {
-        if let Some(_) = handler.read_pair {
+        if handler.read_pair.is_some() {
             match handler.read_pair(ipa0, ipa1, desc.size) {
                 Ok(v) => v,
                 Err(MmioError::Unhandled) | Err(MmioError::Fault) => {
@@ -150,7 +151,8 @@ fn read_value(handler: &MmioHandler, ipa: u64, size: u8, split: Option<&SplitPla
         return execute_split_load(handler, plan, size);
     }
 
-    let needs_split = size > 1 && (ipa % size as u64 != 0 || crosses_stage2_page(ipa, size));
+    let needs_split =
+        size > 1 && (!ipa.is_multiple_of(size as u64) || crosses_stage2_page(ipa, size));
     if needs_split {
         // Split plans must be supplied by decode to enforce guest VA boundary checks.
         return None;

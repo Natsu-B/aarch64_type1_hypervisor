@@ -113,6 +113,12 @@ pub struct SplitPlan {
     len: u8,
 }
 
+impl Default for SplitPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SplitPlan {
     pub const EMPTY_SEGMENT: SplitSegment = SplitSegment {
         ipa: 0,
@@ -202,7 +208,7 @@ fn plan_split_with_page(base_ipa: u64, total_size: u8, page_size: u64) -> Option
             if candidate > (total_size - produced) {
                 continue;
             }
-            if ipa % candidate as u64 != 0 {
+            if !ipa.is_multiple_of(candidate as u64) {
                 continue;
             }
             if (candidate as u64) > page_remaining {
@@ -288,10 +294,10 @@ where
         DecodedAccess::Prefetch => Some(MmioDecoded::Prefetch { insn }),
         DecodedAccess::Single(desc) => {
             let insn_is_write = desc.is_store;
-            if let Some(iss_write) = iss_is_write {
-                if iss_write != insn_is_write {
-                    return None;
-                }
+            if let Some(iss_write) = iss_is_write
+                && iss_write != insn_is_write
+            {
+                return None;
             }
             if !sas_matches(esr, desc.size) {
                 return None;
@@ -339,10 +345,10 @@ where
         }
         DecodedAccess::Pair(desc) => {
             let insn_is_write = desc.is_store;
-            if let Some(iss_write) = iss_is_write {
-                if iss_write != insn_is_write {
-                    return None;
-                }
+            if let Some(iss_write) = iss_is_write
+                && iss_write != insn_is_write
+            {
+                return None;
             }
             if !sas_matches(esr, desc.size) {
                 return None;
@@ -410,7 +416,7 @@ where
 }
 
 fn split_plan_for_access(ipa: u64, size: u8) -> Option<Option<SplitPlan>> {
-    if size > 1 && (ipa % size as u64 != 0 || crosses_stage2_page(ipa, size)) {
+    if size > 1 && (!ipa.is_multiple_of(size as u64) || crosses_stage2_page(ipa, size)) {
         Some(Some(plan_split_access(ipa, size)?))
     } else {
         Some(None)
@@ -557,10 +563,12 @@ fn resolve_ipa_with_resolver<R>(
 where
     R: Fn(u64, bool) -> Option<u64>,
 {
-    if allow_hpfar && hpfar_valid(esr) && va == fault_va {
-        if let Some(ipa) = fault_ipa {
-            return Some(ipa);
-        }
+    if allow_hpfar
+        && hpfar_valid(esr)
+        && va == fault_va
+        && let Some(ipa) = fault_ipa
+    {
+        return Some(ipa);
     }
     resolver(va, is_write)
 }
@@ -648,11 +656,11 @@ fn decode_single(insn: u32) -> Option<SingleDesc> {
     let (addr_mode, offset) = match mode_bits {
         0b00 => (
             SingleAddrMode::Unscaled,
-            sign_extend_9(((insn >> 12) & 0x1ff) as u32) as i64,
+            sign_extend_9((insn >> 12) & 0x1ff) as i64,
         ),
         0b01 => (
             SingleAddrMode::PostIndex,
-            sign_extend_9(((insn >> 12) & 0x1ff) as u32) as i64,
+            sign_extend_9((insn >> 12) & 0x1ff) as i64,
         ),
         0b10 => {
             let imm12 = (insn >> 10) & 0xfff;
@@ -663,7 +671,7 @@ fn decode_single(insn: u32) -> Option<SingleDesc> {
         }
         0b11 => (
             SingleAddrMode::PreIndex,
-            sign_extend_9(((insn >> 12) & 0x1ff) as u32) as i64,
+            sign_extend_9((insn >> 12) & 0x1ff) as i64,
         ),
         _ => unreachable!(),
     };
@@ -712,7 +720,7 @@ fn decode_pair(insn: u32) -> Option<PairDesc> {
         _ => return None,
     };
 
-    let imm7 = ((insn >> 15) & 0x7f) as u32;
+    let imm7 = (insn >> 15) & 0x7f;
     let offset = (sign_extend_7(imm7) as i64) * (size as i64);
 
     Some(PairDesc {

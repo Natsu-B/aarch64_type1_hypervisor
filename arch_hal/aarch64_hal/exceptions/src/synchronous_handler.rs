@@ -234,7 +234,7 @@ fn fault_ipa_hint(esr_el2: &ESR_EL2) -> Option<u64> {
     if esr_el2.get(ESR_EL2::fnv) != 0 {
         return None;
     }
-    hpfar_el2_written_for_abort(esr_el2).then(|| fault_ipa_el2())
+    hpfar_el2_written_for_abort(esr_el2).then(fault_ipa_el2)
 }
 
 fn decode_access_from_esr(esr_el2: &ESR_EL2) -> Option<DataAbortAccess> {
