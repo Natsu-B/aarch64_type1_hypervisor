@@ -334,6 +334,8 @@ fn clear_pending() {
     guard.pending = false;
 }
 
+/// Clears a pending memfault report (test-only helper).
+#[cfg(test)]
 pub fn clear_memfault_pending() {
     clear_pending();
 }

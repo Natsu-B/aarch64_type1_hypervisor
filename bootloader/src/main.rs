@@ -284,10 +284,6 @@ impl GuestMmioRange {
     fn end(&self) -> usize {
         self.base.checked_add(self.size).unwrap_or(usize::MAX)
     }
-
-    fn contains(&self, addr: usize) -> bool {
-        addr >= self.base && addr < self.end()
-    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -898,10 +894,6 @@ fn lowest_memory_base() -> Option<usize> {
 fn guest_mmio_allowlist_slice() -> &'static [GuestMmioRange] {
     // SAFETY: allowlist is populated before the guest is started and then read-only.
     unsafe { (*GUEST_MMIO_ALLOWLIST.get()).as_deref().unwrap_or(&[]) }
-}
-
-pub(crate) fn guest_mmio_allowlist_contains(addr: usize) -> bool {
-    guest_mmio_allowlist_contains_range(addr, 1)
 }
 
 pub(crate) fn guest_mmio_allowlist_contains_range(addr: usize, size: usize) -> bool {
