@@ -7,12 +7,12 @@ pub fn ones_complement_sum(data: &[u8]) -> u32 {
     let mut sum = 0u32;
     let mut idx = 0usize;
     while idx + 1 < data.len() {
-        let word = u16::from_be_bytes([data[idx], data[idx + 1]]) as u32;
+        let word = u32::from(u16::from_be_bytes([data[idx], data[idx + 1]]));
         sum = sum.wrapping_add(word);
         idx += 2;
     }
     if idx < data.len() {
-        let word = u16::from_be_bytes([data[idx], 0]) as u32;
+        let word = u32::from(u16::from_be_bytes([data[idx], 0]));
         sum = sum.wrapping_add(word);
     }
     sum
