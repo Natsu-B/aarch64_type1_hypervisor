@@ -1,9 +1,7 @@
-use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::cell::SyncUnsafeCell;
 use core::mem;
 use core::slice;
-use cpu::isb;
 
 use cpu::registers::PARange;
 
@@ -47,7 +45,6 @@ struct Stage2Context {
     table_addr: usize,
     top_table_level: i8,
     num_of_tables: usize,
-    settings: Box<[Stage2PagingSetting]>,
 }
 
 static STAGE2_CONTEXT: SyncUnsafeCell<Option<Stage2Context>> = SyncUnsafeCell::new(None);
@@ -162,7 +159,6 @@ impl Stage2Paging {
                 table_addr: table,
                 top_table_level: initial_lookup_level_i8,
                 num_of_tables,
-                settings: Box::from(data),
             });
         }
 
@@ -299,13 +295,13 @@ impl Stage2Paging {
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] = if table_level == 3 {
-                    Stage2_48bitLeafDescriptor::new_page(*pa as u64, data[*i].types, data[*i].perm)
+                    Stage2_48bitLeafDescriptor::new_page(*pa as u64, setting.types, setting.perm)
                 } else {
                     Stage2_48bitLeafDescriptor::new_block(
                         *pa as u64,
                         table_level,
-                        data[*i].types,
-                        data[*i].perm,
+                        setting.types,
+                        setting.perm,
                     )
                 };
                 *pa += table_level_size;

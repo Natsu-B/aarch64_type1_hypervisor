@@ -2,7 +2,6 @@ use core::alloc::Layout;
 use core::slice;
 
 use cpu::get_sctlr_el2;
-use cpu::isb;
 
 use crate::PAGE_TABLE_SIZE;
 use crate::PagingErr;

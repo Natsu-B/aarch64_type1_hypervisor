@@ -596,6 +596,9 @@ bitregs! {
     }
 }
 
+// Complete architectural encoding table; only a subset is used by the
+// current stage-1 MAIR setup.
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MairDeviceAttr {
@@ -609,6 +612,9 @@ pub enum MairDeviceAttr {
     GRE = 0b1100,
 }
 
+// Complete architectural encoding table; only a subset is used by the
+// current stage-1 MAIR setup.
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MairNormalAttr {
