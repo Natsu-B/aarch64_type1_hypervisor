@@ -580,22 +580,6 @@ fn copy_required_soc_child(
     Ok(target_id)
 }
 
-fn copy_optional_soc_child(
-    source: &SourceTree<'_>,
-    source_parser: &DtbParser,
-    target: &mut TargetTree<'_>,
-    child_name: &str,
-) -> Result<Option<NodeId>, &'static str> {
-    let source_path = source_soc_child_path(source, child_name)?;
-    let Some(source_id) = source.find_node_by_path(&source_path) else {
-        return Ok(None);
-    };
-    let target_path = format!("{TARGET_SOC_PATH}/{child_name}");
-    let target_id = copy_subtree_to_path(source, target, source_id, &target_path)?;
-    rewrite_soc_child_reg_from_source(source_parser, &source_path, target, target_id)?;
-    Ok(Some(target_id))
-}
-
 fn project_rp1_subtree(
     source: &SourceTree<'_>,
     source_parser: &DtbParser,
@@ -885,30 +869,6 @@ fn node_phandle(tree: &SourceTree<'_>, node_id: NodeId) -> Option<u32> {
         .ok()
         .flatten()
         .or_else(|| property_u32(tree, node_id, "linux,phandle").ok().flatten())
-}
-
-fn find_node_by_phandle_owned(tree: &TargetTree<'_>, phandle: u32) -> Option<NodeId> {
-    tree.nodes.iter().enumerate().find_map(|(id, node)| {
-        let matches = node
-            .property("phandle")
-            .and_then(|prop| {
-                let bytes = prop.value.as_slice();
-                if bytes.len() != 4 {
-                    return None;
-                }
-                Some(u32::from_be_bytes(bytes.try_into().ok()?))
-            })
-            .or_else(|| {
-                node.property("linux,phandle").and_then(|prop| {
-                    let bytes = prop.value.as_slice();
-                    if bytes.len() != 4 {
-                        return None;
-                    }
-                    Some(u32::from_be_bytes(bytes.try_into().ok()?))
-                })
-            });
-        (matches == Some(phandle)).then_some(id)
-    })
 }
 
 const fn gic_dt_irq_flags_from_sense(sense: IrqSense) -> u32 {
