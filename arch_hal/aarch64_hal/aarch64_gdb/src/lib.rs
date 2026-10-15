@@ -23,6 +23,7 @@ use gdb_remote::ResumeAction;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
+use gdb_remote::TargetResult;
 pub use gdb_remote::WatchpointKind;
 use io_api::stream::PollByteStream;
 use mutex::pod::RawBytePod;
@@ -871,10 +872,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn xfer_features(
-        &mut self,
-        annex: &str,
-    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn xfer_features(&mut self, annex: &str) -> TargetResult<Option<&[u8]>, Self> {
         let data = self.state.desc.annex(annex);
         if data.is_some() {
             self.state.features_active = true;
@@ -882,17 +880,11 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(data)
     }
 
-    fn xfer_memory_map(
-        &mut self,
-    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn xfer_memory_map(&mut self) -> TargetResult<Option<&[u8]>, Self> {
         Ok(self.state.memory_map)
     }
 
-    fn monitor_command(
-        &mut self,
-        cmd: &[u8],
-        out: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn monitor_command(&mut self, cmd: &[u8], out: &mut [u8]) -> TargetResult<usize, Self> {
         if let Ok(text) = core::str::from_utf8(cmd)
             && let Some(len) = semihost::monitor_command(text, out, &mut self.state.mem)
         {
@@ -913,10 +905,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn read_registers(
-        &mut self,
-        dst: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn read_registers(&mut self, dst: &mut [u8]) -> TargetResult<usize, Self> {
         let total = if self.state.features_active {
             G_PACKET_BYTES
         } else {
@@ -955,10 +944,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn write_registers(
-        &mut self,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn write_registers(&mut self, src: &[u8]) -> TargetResult<(), Self> {
         let total = if self.state.features_active {
             G_PACKET_BYTES
         } else {
@@ -996,11 +982,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(())
     }
 
-    fn read_register(
-        &mut self,
-        regno: u32,
-        dst: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn read_register(&mut self, regno: u32, dst: &mut [u8]) -> TargetResult<usize, Self> {
         match regno as usize {
             REG_X0..=REG_X30 => {
                 let regs = self.regs.gprs_mut();
@@ -1024,11 +1006,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn write_register(
-        &mut self,
-        regno: u32,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn write_register(&mut self, regno: u32, src: &[u8]) -> TargetResult<(), Self> {
         match regno as usize {
             REG_X0..=REG_X30 => {
                 let regs = self.regs.gprs_mut();
@@ -1067,61 +1045,39 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(())
     }
 
-    fn read_memory(
-        &mut self,
-        addr: u64,
-        dst: &mut [u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn read_memory(&mut self, addr: u64, dst: &mut [u8]) -> TargetResult<(), Self> {
         self.state
             .mem
             .read(addr, dst)
             .map_err(|err| TargetError::Recoverable(Aarch64GdbError::Memory(err)))
     }
 
-    fn write_memory(
-        &mut self,
-        addr: u64,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn write_memory(&mut self, addr: u64, src: &[u8]) -> TargetResult<(), Self> {
         self.state
             .mem
             .write(addr, src)
             .map_err(|err| TargetError::Recoverable(Aarch64GdbError::Memory(err)))
     }
 
-    fn insert_sw_breakpoint(
-        &mut self,
-        addr: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn insert_sw_breakpoint(&mut self, addr: u64) -> TargetResult<(), Self> {
         self.state
             .insert_sw_breakpoint(addr)
             .map_err(TargetError::Recoverable)
     }
 
-    fn remove_sw_breakpoint(
-        &mut self,
-        addr: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn remove_sw_breakpoint(&mut self, addr: u64) -> TargetResult<(), Self> {
         self.state
             .remove_sw_breakpoint(addr)
             .map_err(TargetError::Recoverable)
     }
 
-    fn insert_hw_breakpoint(
-        &mut self,
-        addr: u64,
-        kind: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn insert_hw_breakpoint(&mut self, addr: u64, kind: u64) -> TargetResult<(), Self> {
         self.state
             .insert_hw_breakpoint(addr, kind)
             .map_err(TargetError::Recoverable)
     }
 
-    fn remove_hw_breakpoint(
-        &mut self,
-        addr: u64,
-        kind: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn remove_hw_breakpoint(&mut self, addr: u64, kind: u64) -> TargetResult<(), Self> {
         self.state
             .remove_hw_breakpoint(addr, kind)
             .map_err(TargetError::Recoverable)
@@ -1132,7 +1088,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         kind: WatchpointKind,
         addr: u64,
         len: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    ) -> TargetResult<(), Self> {
         self.state
             .insert_watchpoint(addr, len, kind)
             .map_err(TargetError::Recoverable)
@@ -1143,7 +1099,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         kind: WatchpointKind,
         addr: u64,
         len: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    ) -> TargetResult<(), Self> {
         self.state
             .remove_watchpoint(addr, len, kind)
             .map_err(TargetError::Recoverable)

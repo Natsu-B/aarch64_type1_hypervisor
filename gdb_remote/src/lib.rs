@@ -90,6 +90,7 @@ pub use target::ResumeAction;
 pub use target::Target;
 pub use target::TargetCapabilities;
 pub use target::TargetError;
+pub use target::TargetResult;
 pub use target::WatchpointKind;
 
 /// Errors that can occur while speaking the GDB Remote Serial Protocol.

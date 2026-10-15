@@ -20,6 +20,12 @@ pub enum TargetError<R, U> {
     Unrecoverable(U),
 }
 
+/// Result type returned by [`Target`] callbacks.
+///
+/// Shorthand for `Result<T, TargetError<Tgt::RecoverableError, Tgt::UnrecoverableError>>`.
+pub type TargetResult<T, Tgt> =
+    Result<T, TargetError<<Tgt as Target>::RecoverableError, <Tgt as Target>::UnrecoverableError>>;
+
 /// Target capabilities reported to the debugger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TargetCapabilities(u32);
@@ -104,17 +110,12 @@ pub trait Target {
     }
 
     /// Returns target description XML for the given annex.
-    fn xfer_features(
-        &mut self,
-        _annex: &str,
-    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn xfer_features(&mut self, _annex: &str) -> TargetResult<Option<&[u8]>, Self> {
         Ok(None)
     }
 
     /// Returns memory map XML.
-    fn xfer_memory_map(
-        &mut self,
-    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn xfer_memory_map(&mut self) -> TargetResult<Option<&[u8]>, Self> {
         Ok(None)
     }
 
@@ -124,80 +125,40 @@ pub trait Target {
     /// Return `Ok(0)` for "handled, no output" (server replies `OK`).
     /// Return `Ok(n > 0)` for "handled, output in `out[..n]`" (server replies with hex-encoded output).
     /// Return `Err(TargetError::NotSupported)` to indicate the command is unrecognized (server replies empty).
-    fn monitor_command(
-        &mut self,
-        _cmd: &[u8],
-        _out: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn monitor_command(&mut self, _cmd: &[u8], _out: &mut [u8]) -> TargetResult<usize, Self> {
         Err(TargetError::NotSupported)
     }
 
     /// Read all registers into `dst`, returning bytes written.
-    fn read_registers(
-        &mut self,
-        dst: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn read_registers(&mut self, dst: &mut [u8]) -> TargetResult<usize, Self>;
     /// Write all registers from `src`.
-    fn write_registers(
-        &mut self,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn write_registers(&mut self, src: &[u8]) -> TargetResult<(), Self>;
 
     /// Read a single register identified by GDB's register number.
-    fn read_register(
-        &mut self,
-        regno: u32,
-        dst: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn read_register(&mut self, regno: u32, dst: &mut [u8]) -> TargetResult<usize, Self>;
     /// Write a single register identified by GDB's register number.
-    fn write_register(
-        &mut self,
-        regno: u32,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn write_register(&mut self, regno: u32, src: &[u8]) -> TargetResult<(), Self>;
 
     /// Read target memory into `dst`.
-    fn read_memory(
-        &mut self,
-        addr: u64,
-        dst: &mut [u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn read_memory(&mut self, addr: u64, dst: &mut [u8]) -> TargetResult<(), Self>;
     /// Write target memory from `src`.
-    fn write_memory(
-        &mut self,
-        addr: u64,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn write_memory(&mut self, addr: u64, src: &[u8]) -> TargetResult<(), Self>;
 
     /// Insert a software breakpoint at `addr`.
     /// Implementations should be idempotent for repeated requests.
-    fn insert_sw_breakpoint(
-        &mut self,
-        addr: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn insert_sw_breakpoint(&mut self, addr: u64) -> TargetResult<(), Self>;
     /// Remove a software breakpoint at `addr`.
     /// Implementations should be idempotent for repeated requests.
-    fn remove_sw_breakpoint(
-        &mut self,
-        addr: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>>;
+    fn remove_sw_breakpoint(&mut self, addr: u64) -> TargetResult<(), Self>;
 
     /// Insert a hardware breakpoint at `addr`.
     /// Implementations should be idempotent for repeated requests.
-    fn insert_hw_breakpoint(
-        &mut self,
-        _addr: u64,
-        _kind: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn insert_hw_breakpoint(&mut self, _addr: u64, _kind: u64) -> TargetResult<(), Self> {
         Err(TargetError::NotSupported)
     }
     /// Remove a hardware breakpoint at `addr`.
     /// Implementations should be idempotent for repeated requests.
-    fn remove_hw_breakpoint(
-        &mut self,
-        _addr: u64,
-        _kind: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn remove_hw_breakpoint(&mut self, _addr: u64, _kind: u64) -> TargetResult<(), Self> {
         Err(TargetError::NotSupported)
     }
 
@@ -208,7 +169,7 @@ pub trait Target {
         _kind: WatchpointKind,
         _addr: u64,
         _len: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    ) -> TargetResult<(), Self> {
         Err(TargetError::NotSupported)
     }
     /// Remove a watchpoint for the given address range.
@@ -218,7 +179,7 @@ pub trait Target {
         _kind: WatchpointKind,
         _addr: u64,
         _len: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    ) -> TargetResult<(), Self> {
         Err(TargetError::NotSupported)
     }
 }
