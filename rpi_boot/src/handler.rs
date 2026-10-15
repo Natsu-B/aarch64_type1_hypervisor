@@ -202,12 +202,7 @@ fn data_abort_handler(
     let reg_size: InstructionRegisterSize = access.reg_size;
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
-    let access_bytes = match access_width {
-        SyndromeAccessSize::Byte => 1,
-        SyndromeAccessSize::HalfWord => 2,
-        SyndromeAccessSize::Word => 4,
-        SyndromeAccessSize::DoubleWord => 8,
-    };
+    let access_bytes = access_width.bytes();
 
     if vgic::handles_gicd(address as usize) {
         let Some(gic_access) = gic_access_size_from_bytes(access_bytes) else {

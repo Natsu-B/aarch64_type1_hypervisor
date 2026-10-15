@@ -589,13 +589,7 @@ fn sas_matches(esr: &ESR_EL2, expected_size: u8) -> bool {
         Some(v) => v,
         None => return false,
     };
-    let esr_size = match sas {
-        SyndromeAccessSize::Byte => 1,
-        SyndromeAccessSize::HalfWord => 2,
-        SyndromeAccessSize::Word => 4,
-        SyndromeAccessSize::DoubleWord => 8,
-    };
-    esr_size == expected_size
+    sas.bytes() == expected_size
 }
 
 fn decode_access(insn: u32) -> Option<DecodedAccess> {

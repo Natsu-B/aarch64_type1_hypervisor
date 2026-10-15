@@ -160,15 +160,6 @@ pub(crate) fn gic() -> Option<&'static Gicv2> {
     unsafe { &*GICV2.get() }.as_ref()
 }
 
-fn access_width_bytes(access_width: SyndromeAccessSize) -> usize {
-    match access_width {
-        SyndromeAccessSize::Byte => 1,
-        SyndromeAccessSize::HalfWord => 2,
-        SyndromeAccessSize::Word => 4,
-        SyndromeAccessSize::DoubleWord => 8,
-    }
-}
-
 fn should_log_unmapped_abort() -> bool {
     // SAFETY: data abort handler is synchronous and non-preemptible for this counter.
     unsafe {
@@ -288,7 +279,7 @@ fn data_abort_handler(
     let stop_kind = kind;
     let reg_opt = u8::try_from(reg_num).ok();
 
-    let access_bytes = access_width_bytes(access_width);
+    let access_bytes = usize::from(access_width.bytes());
     let reg_bits = match reg_size {
         InstructionRegisterSize::Instruction32bit => 32,
         InstructionRegisterSize::Instruction64bit => 64,
