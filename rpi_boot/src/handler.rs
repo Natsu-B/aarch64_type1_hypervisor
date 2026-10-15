@@ -94,7 +94,7 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
             1 => write_volatile(ipa as *mut u8, value as u8),
             2 => write_volatile(ipa as *mut u16, value as u16),
             4 => write_volatile(ipa as *mut u32, value as u32),
-            8 => write_volatile(ipa as *mut u64, value as u64),
+            8 => write_volatile(ipa as *mut u64, value),
             _ => return Err(MmioError::Unhandled),
         }
     }
@@ -303,7 +303,7 @@ fn data_abort_handler(
                         write_volatile(address as *mut u32, reg_val as u32);
                     }
                     SyndromeAccessSize::DoubleWord => {
-                        write_volatile(address as *mut u64, reg_val as u64);
+                        write_volatile(address as *mut u64, reg_val);
                     }
                 }
             }
@@ -507,10 +507,10 @@ fn pirq_error_requires_panic(err: GicError) -> bool {
 }
 
 fn note_rp1_passthrough_mmio_access(addr: usize, is_write: bool) {
-    if let Err(err) = bcm2712::pirq_hook::after_passthrough_mmio_access(addr, is_write) {
-        if IRQ_LOG_ONCE.fetch_or(LOG_RP1_MMIO_ERR, Ordering::Relaxed) & LOG_RP1_MMIO_ERR == 0 {
-            println!("rp1: passthrough MMIO completion failed: {:?}", err);
-        }
+    if let Err(err) = bcm2712::pirq_hook::after_passthrough_mmio_access(addr, is_write)
+        && IRQ_LOG_ONCE.fetch_or(LOG_RP1_MMIO_ERR, Ordering::Relaxed) & LOG_RP1_MMIO_ERR == 0
+    {
+        println!("rp1: passthrough MMIO completion failed: {:?}", err);
     }
 }
 
@@ -525,51 +525,48 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     let kick_sgi_intid = vgic::kick_sgi_intid();
     let mut pirq_delivery = None;
     if Some(irq.intid) == maintenance_intid {
-        if let Err(err) = vgic::handle_maintenance_irq() {
-            if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
-                println!("vgic: maintenance IRQ failed: {:?}", err);
-            }
+        if let Err(err) = vgic::handle_maintenance_irq()
+            && IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0
+        {
+            println!("vgic: maintenance IRQ failed: {:?}", err);
         }
     } else if irq.intid == kick_sgi_intid {
-        if let Err(err) = vgic::handle_kick_sgi() {
-            if IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0 {
-                println!("vgic: kick SGI handling failed: {:?}", err);
-            }
+        if let Err(err) = vgic::handle_kick_sgi()
+            && IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0
+        {
+            println!("vgic: kick SGI handling failed: {:?}", err);
         }
     } else {
         if irq.intid == 27 {
             // println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
         }
         let delivery = handle_acknowledged_pirq(irq.intid);
-        if let AckedPirqDelivery::Error(err) = delivery {
-            if err != GicError::UnsupportedIntId
-                && IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0
-            {
-                println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
-            }
+        if let AckedPirqDelivery::Error(err) = delivery
+            && err != GicError::UnsupportedIntId
+            && IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0
+        {
+            println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
         }
         pirq_delivery = Some(delivery);
     }
     let needs_deactivate =
         needs_deactivate_after_ack(irq.intid, maintenance_intid, kick_sgi_intid, pirq_delivery);
-    if let Err(err) = gicv2.end_of_interrupt(irq) {
-        if IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0 {
-            println!("gic: end_of_interrupt failed: {:?}", err);
-        }
+    if let Err(err) = gicv2.end_of_interrupt(irq)
+        && IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0
+    {
+        println!("gic: end_of_interrupt failed: {:?}", err);
     }
-    if needs_deactivate {
-        if let Err(err) = gicv2.deactivate(irq) {
-            if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
-                println!("gic: deactivate failed: {:?}", err);
-            }
-        }
+    if needs_deactivate
+        && let Err(err) = gicv2.deactivate(irq)
+        && IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0
+    {
+        println!("gic: deactivate failed: {:?}", err);
     }
-    if let Err(err) = bcm2712::pirq_hook::resample_level_sources(Some(irq.intid)) {
-        if IRQ_LOG_ONCE.fetch_or(LOG_RP1_RESAMPLE_ERR, Ordering::Relaxed) & LOG_RP1_RESAMPLE_ERR
+    if let Err(err) = bcm2712::pirq_hook::resample_level_sources(Some(irq.intid))
+        && IRQ_LOG_ONCE.fetch_or(LOG_RP1_RESAMPLE_ERR, Ordering::Relaxed) & LOG_RP1_RESAMPLE_ERR
             == 0
-        {
-            println!("rp1: level MSI-X resample failed: {:?}", err);
-        }
+    {
+        println!("rp1: level MSI-X resample failed: {:?}", err);
     }
 }
 

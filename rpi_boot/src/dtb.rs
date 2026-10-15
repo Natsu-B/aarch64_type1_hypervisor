@@ -328,7 +328,7 @@ fn add_virtio_mmio_blk_node(
     let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Edge);
     let interrupts = encode_gic_spi_interrupts_with_mapper(
         &[(virtio_blk::VIRTIO_BLK_IRQ_INTID, irq_flags)],
-        |intid| Ok(intid),
+        Ok,
     )?;
     node.set_property(NameRef::Borrowed("interrupts"), ValueRef::Owned(interrupts));
     node.set_property(
@@ -442,7 +442,7 @@ fn copy_cpus(source: &SourceTree<'_>, target: &mut TargetTree<'_>) -> Result<(),
     for child_id in children {
         let child = source.node(child_id).ok_or("dtb: invalid /cpus child")?;
         let name = child.name.as_str();
-        let keep_cpu = CPU_KEEP_NAMES.iter().any(|candidate| *candidate == name);
+        let keep_cpu = CPU_KEEP_NAMES.contains(&name);
         let keep_shared_cache =
             !name.starts_with("cpu@") && property_string_equals(child, "compatible", "cache");
         if !(keep_cpu || keep_shared_cache) {
@@ -675,8 +675,8 @@ fn rewrite_soc_child_reg_from_source(
 ) -> Result<(), &'static str> {
     let regs = with_source_node_view(source, source_path, &mut |view| {
         let mut values = Vec::new();
-        let mut iter = view.reg_raw_iter()?;
-        while let Some(entry) = iter.next() {
+        let iter = view.reg_raw_iter()?;
+        for entry in iter {
             let (base, size) = entry?;
             values.push((base as u64, size as u64));
         }
@@ -705,8 +705,8 @@ fn rewrite_projected_rp1_reg_from_source(
 ) -> Result<(), &'static str> {
     let source_regs = with_source_node_view(source, source_path, &mut |view| {
         let mut values = Vec::new();
-        let mut iter = view.reg_iter()?;
-        while let Some(entry) = iter.next() {
+        let iter = view.reg_iter()?;
+        for entry in iter {
             let (phys, size) = entry?;
             values.push((phys as u64, size as u64));
         }
@@ -787,7 +787,7 @@ fn rewrite_rp1_interrupts_from_source(
 
 fn encode_uart_passthrough_interrupts(uart_irq: vgic::UartIrq) -> Result<Vec<u8>, &'static str> {
     let specifiers = [(uart_irq.pintid, gic_dt_irq_flags_from_sense(uart_irq.sense))];
-    encode_gic_spi_interrupts_with_mapper(&specifiers, |intid| Ok(intid))
+    encode_gic_spi_interrupts_with_mapper(&specifiers, Ok)
 }
 
 fn with_source_node_view<R>(

@@ -753,7 +753,7 @@ extern "C" fn main() -> ! {
         .unwrap_or_else(|err| panic!("virtio-blk: backend install failed: {err}"));
     println!("virtio-blk: enabled with bcm2712 sdhc backend");
 
-    let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
+    let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000).unwrap();
     println!("allocator closed");
     let mut allocator_regions = Vec::new();
     GLOBAL_ALLOCATOR
@@ -770,7 +770,7 @@ extern "C" fn main() -> ! {
     cpu::clean_dcache_poc(dtb_box.as_ptr() as usize, dtb_box.len());
     core::mem::forget(dtb_box);
 
-    println!("jumping linux...\njump addr: 0x{:X}", jump_addr as usize);
+    println!("jumping linux...\njump addr: 0x{:X}", jump_addr);
     let el1_main = el1_main as *const fn() as usize as u64;
     let stack_addr =
         unsafe { alloc::alloc::alloc(Layout::from_size_align_unchecked(0x1000, 0x1000)) } as usize
@@ -940,7 +940,7 @@ fn panic(info: &PanicInfo) -> ! {
     debug_uart.write("\r\n\r\n=================================\r\n");
     debug_uart.write("kernel panicked!!!\r\n\r\n\r\n");
     if let Some(core_id) = tls::cpu_if_maybe_uninit() {
-        let _ = debug_uart.write("core ");
+        debug_uart.write("core ");
         // # Safety rpi5 core_id must be 0~3
         let _ = debug_uart.write_char((core_id + b'0') as char);
         let _ = debug_uart.write_fmt(format_args!(
