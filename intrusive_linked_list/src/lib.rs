@@ -193,10 +193,10 @@ mod tests {
         assert_eq!(list.pop(), None);
 
         let mut node1 = IntrusiveLinkedList { next: None };
-        let ptr1 = &mut node1 as *mut _ as usize;
+        let ptr1 = &raw mut node1 as usize;
 
         let mut node2 = IntrusiveLinkedList { next: None };
-        let ptr2 = &mut node2 as *mut _ as usize;
+        let ptr2 = &raw mut node2 as usize;
 
         unsafe {
             list.push(ptr1);
@@ -217,11 +217,11 @@ mod tests {
         let mut list = IntrusiveLinkedList::new();
 
         let mut node1 = IntrusiveLinkedList { next: None };
-        let ptr1 = &mut node1 as *mut _ as usize;
+        let ptr1 = &raw mut node1 as usize;
         let mut node2 = IntrusiveLinkedList { next: None };
-        let ptr2 = &mut node2 as *mut _ as usize;
+        let ptr2 = &raw mut node2 as usize;
         let mut node3 = IntrusiveLinkedList { next: None };
-        let ptr3 = &mut node3 as *mut _ as usize;
+        let ptr3 = &raw mut node3 as usize;
 
         // Push back to empty list
         unsafe {
@@ -251,11 +251,11 @@ mod tests {
         let mut list = IntrusiveLinkedList::new();
 
         let mut node1 = IntrusiveLinkedList { next: None };
-        let ptr1 = &mut node1 as *mut _ as usize;
+        let ptr1 = &raw mut node1 as usize;
         let mut node2 = IntrusiveLinkedList { next: None };
-        let ptr2 = &mut node2 as *mut _ as usize;
+        let ptr2 = &raw mut node2 as usize;
         let mut node3 = IntrusiveLinkedList { next: None };
-        let ptr3 = &mut node3 as *mut _ as usize;
+        let ptr3 = &raw mut node3 as usize;
 
         unsafe {
             list.push(ptr3);
@@ -312,7 +312,10 @@ mod tests {
             IntrusiveLinkedList { next: None },
             IntrusiveLinkedList { next: None },
         ];
-        let ptrs: Vec<usize> = nodes.iter_mut().map(|n| n as *mut _ as usize).collect();
+        let ptrs: Vec<usize> = nodes
+            .iter_mut()
+            .map(|n| std::ptr::from_mut(n) as usize)
+            .collect();
 
         // ptrs are sorted by address
         let ptr1 = ptrs[0];
