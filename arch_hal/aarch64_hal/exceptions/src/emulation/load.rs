@@ -18,9 +18,8 @@ pub(crate) fn emulate_single(
     split: Option<&SplitPlan>,
     handler: &MmioHandler,
 ) -> EmulationOutcome {
-    let raw_total = match read_value(handler, ipa, desc.size, split) {
-        Some(v) => v,
-        None => return EmulationOutcome::NotHandled,
+    let Some(raw_total) = read_value(handler, ipa, desc.size, split) else {
+        return EmulationOutcome::NotHandled;
     };
 
     let val = extend_loaded_value(raw_total, desc.size, desc.sign_extend, desc.rt_size);
@@ -69,13 +68,11 @@ pub(crate) fn emulate_pair(
             (first, second)
         }
     } else {
-        let first = match read_value(handler, ipa0, desc.size, split0) {
-            Some(v) => v,
-            None => return EmulationOutcome::NotHandled,
+        let Some(first) = read_value(handler, ipa0, desc.size, split0) else {
+            return EmulationOutcome::NotHandled;
         };
-        let second = match read_value(handler, ipa1, desc.size, split1) {
-            Some(v) => v,
-            None => return EmulationOutcome::NotHandled,
+        let Some(second) = read_value(handler, ipa1, desc.size, split1) else {
+            return EmulationOutcome::NotHandled;
         };
         (first, second)
     };

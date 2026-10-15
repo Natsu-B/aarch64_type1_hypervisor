@@ -585,9 +585,8 @@ fn sas_matches(esr: &ESR_EL2, expected_size: u8) -> bool {
     if esr.get(ESR_EL2::isv) == 0 {
         return true;
     }
-    let sas = match esr.get_enum::<_, SyndromeAccessSize>(ESR_EL2::sas) {
-        Some(v) => v,
-        None => return false,
+    let Some(sas) = esr.get_enum::<_, SyndromeAccessSize>(ESR_EL2::sas) else {
+        return false;
     };
     sas.bytes() == expected_size
 }
@@ -1037,9 +1036,8 @@ mod tests {
     static mut FAIL_SECOND_READ: bool = false;
 
     fn test_probe(_ctx: *const (), ipa: u64, size: u8, _is_write: bool) -> bool {
-        let end = match ipa.checked_add(size as u64) {
-            Some(v) => v,
-            None => return false,
+        let Some(end) = ipa.checked_add(size as u64) else {
+            return false;
         };
         matches!(size, 1 | 2 | 4 | 8) && end <= MEM_SIZE as u64
     }
