@@ -219,10 +219,10 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
         let mut offset = 0usize;
         let mut decoded = [0u32; Self::MAX_INTERRUPT_CELLS];
         while offset < data.len() {
-            for i in 0..cells {
+            for (i, cell) in decoded[..cells].iter_mut().enumerate() {
                 let base = offset + i * size_of::<u32>();
                 let chunk = &data[base..base + size_of::<u32>()];
-                decoded[i] = read_u32_be(chunk).map_err(WalkError::Dtb)?;
+                *cell = read_u32_be(chunk).map_err(WalkError::Dtb)?;
             }
             match f(&decoded[..cells])? {
                 ControlFlow::Continue(()) => {}

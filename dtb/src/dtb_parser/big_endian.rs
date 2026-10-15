@@ -150,7 +150,7 @@ pub struct Dtb<State> {
 
 impl Dtb<Unchecked> {
     pub fn new_unchecked(address: usize) -> Result<Self, &'static str> {
-        if address % core::mem::align_of::<FtdHeader>() != 0 {
+        if !address.is_multiple_of(core::mem::align_of::<FtdHeader>()) {
             return Err("dtb: unaligned fdt address");
         }
         let header = unsafe { *(address as *const FtdHeader) };
@@ -169,13 +169,14 @@ impl Dtb<Unchecked> {
         if self.header.last_comp_version() > DTB_VERSION {
             return Err("dtb: incompatible version");
         }
-        if self.header.struct_offset() as usize % align_of::<FdtProperty>() != 0 {
+        if !(self.header.struct_offset() as usize).is_multiple_of(align_of::<FdtProperty>()) {
             return Err("dtb: unaligned struct offset");
         }
-        if self.header.strings_offset() as usize % align_of::<u32>() != 0 {
+        if !(self.header.strings_offset() as usize).is_multiple_of(align_of::<u32>()) {
             return Err("dtb: unaligned strings offset");
         }
-        if self.header.mem_rsvmap_offset() as usize % align_of::<FdtReserveEntry>() != 0 {
+        if !(self.header.mem_rsvmap_offset() as usize).is_multiple_of(align_of::<FdtReserveEntry>())
+        {
             return Err("dtb: unaligned memreserve offset");
         }
         Ok(Dtb {

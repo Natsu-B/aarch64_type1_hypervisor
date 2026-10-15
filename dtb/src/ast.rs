@@ -44,7 +44,7 @@ fn read_be_u32(buf: &[u8], offset: usize) -> Result<u32, &'static str> {
     Ok(be.read())
 }
 
-fn read_cstr<'dtb>(buf: &'dtb [u8], offset: usize) -> Result<&'dtb str, &'static str> {
+fn read_cstr(buf: &[u8], offset: usize) -> Result<&str, &'static str> {
     let slice = buf
         .get(offset..)
         .ok_or("dtb: out of bounds in read_cstr start")?;
@@ -562,7 +562,7 @@ impl<'dtb, State> DeviceTree<'dtb, State> {
         let totalsize = off_dt_strings
             .checked_add(strings_size)
             .ok_or("dtb: overflow in totalsize")?;
-        if totalsize > core::u32::MAX as usize {
+        if totalsize > u32::MAX as usize {
             return Err("dtb: totalsize exceeds u32");
         }
 

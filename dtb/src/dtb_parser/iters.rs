@@ -18,7 +18,7 @@ impl<'a, const CELLS: usize> InterruptCellsIter<'a, CELLS> {
         if stride == 0 {
             return Err("interrupts: zero cell stride");
         }
-        if data.len() % stride != 0 {
+        if !data.len().is_multiple_of(stride) {
             return Err("interrupts: length not multiple of cell count");
         }
         Ok(Self { data, consumed: 0 })
@@ -96,7 +96,7 @@ impl<'a> RangesIter<'a> {
         if entry_stride == 0 {
             return Err("ranges: zero stride");
         }
-        if property.len() % entry_stride != 0 {
+        if !property.len().is_multiple_of(entry_stride) {
             return Err("ranges: length not multiple of stride");
         }
 
@@ -189,7 +189,7 @@ impl<'a> RangesIterWide<'a> {
         if entry_stride == 0 {
             return Err("ranges: zero stride");
         }
-        if property.len() % entry_stride != 0 {
+        if !property.len().is_multiple_of(entry_stride) {
             return Err("ranges: length not multiple of stride");
         }
 

@@ -208,12 +208,11 @@ fn string_list_contains(bytes: &[u8], needle: &str) -> bool {
             .position(|&b| b == 0)
             .map(|i| start + i)
             .unwrap_or(bytes.len());
-        if end > start {
-            if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
-                if entry == needle {
-                    return true;
-                }
-            }
+        if end > start
+            && let Ok(entry) = core::str::from_utf8(&bytes[start..end])
+            && entry == needle
+        {
+            return true;
         }
         if end == bytes.len() {
             break;
@@ -318,7 +317,7 @@ mod tests {
     use alloc::vec::Vec;
 
     fn parse_be_u32_cells(bytes: &[u8]) -> Result<Vec<u32>, &'static str> {
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             return Err("dtb: u32 cells must be 4-byte aligned");
         }
         let mut out = Vec::with_capacity(bytes.len() / 4);

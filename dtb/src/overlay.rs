@@ -45,21 +45,11 @@ pub enum OverlayError {
     StrictViolation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OverlayApplyOptions {
     pub update_symbols: bool,
     pub allow_custom_deletes: bool,
     pub strict: bool,
-}
-
-impl Default for OverlayApplyOptions {
-    fn default() -> Self {
-        Self {
-            update_symbols: false,
-            allow_custom_deletes: false,
-            strict: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -118,7 +108,7 @@ impl<'dtb> DeviceTree<'dtb, Owned> {
 
         adjust_overlay_phandles(&mut working_overlay, delta)?;
         apply_local_fixups(&mut working_overlay, delta)?;
-        apply_external_fixups(self, &mut working_overlay, opt.strict)?;
+        apply_external_fixups(self, &mut working_overlay)?;
         let fragments = collect_fragments(&working_overlay)?;
 
         let mut report = OverlayApplyReport::default();
@@ -397,7 +387,6 @@ fn apply_local_fixups_recursive(
 fn apply_external_fixups(
     base: &DeviceTree<'_>,
     overlay: &mut DeviceTree<'_>,
-    strict: bool,
 ) -> Result<(), OverlayError> {
     let fixups_root = match overlay.find_node_by_path("/__fixups__") {
         Some(id) => id,
@@ -667,7 +656,7 @@ fn read_phandle(base: &DeviceTree<'_>, node: NodeId) -> Result<u32, OverlayError
 }
 
 fn parse_u32_list(bytes: &[u8]) -> Result<Vec<u32>, OverlayError> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(OverlayError::MalformedFixup);
     }
     let mut values = Vec::new();
@@ -682,7 +671,7 @@ fn parse_u32_list(bytes: &[u8]) -> Result<Vec<u32>, OverlayError> {
 
 fn decode_first_string(bytes: &[u8]) -> Option<&str> {
     let list = parse_stringlist(bytes).ok()?;
-    list.get(0).copied()
+    list.first().copied()
 }
 
 fn parse_stringlist(bytes: &[u8]) -> Result<Vec<&str>, OverlayError> {

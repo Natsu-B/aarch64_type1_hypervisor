@@ -159,14 +159,11 @@ impl DtbParser<Validated> {
                 let name = self
                     .dtb
                     .read_cstr_from_strings(prop.name_offset() as usize)?;
-                if found.is_none() {
-                    if let Some(key) = key {
-                        if key == name {
-                            found = Some(unsafe {
-                                core::slice::from_raw_parts(cursor as *const u8, len)
-                            });
-                        }
-                    }
+                if found.is_none()
+                    && let Some(key) = key
+                    && key == name
+                {
+                    found = Some(unsafe { core::slice::from_raw_parts(cursor as *const u8, len) });
                 }
 
                 let padded_len = len.next_multiple_of(DTB_ALIGN);
@@ -434,8 +431,8 @@ impl DtbParser<Validated> {
                 return Ok(ControlFlow::Continue(()));
             }
 
-            let mut it = node.reg_iter().map_err(WalkError::Dtb)?;
-            while let Some(r) = it.next() {
+            let it = node.reg_iter().map_err(WalkError::Dtb)?;
+            for r in it {
                 let (addr, size) = r.map_err(WalkError::Dtb)?;
                 match f(addr, size)? {
                     ControlFlow::Continue(()) => {}
@@ -506,8 +503,8 @@ impl DtbParser<Validated> {
             let _ = node.for_each_child_view(&mut |child| {
                 let reg = child.property_bytes("reg").map_err(WalkError::Dtb)?;
                 if reg.is_some() {
-                    let mut it = child.reg_iter().map_err(WalkError::Dtb)?;
-                    while let Some(r) = it.next() {
+                    let it = child.reg_iter().map_err(WalkError::Dtb)?;
+                    for r in it {
                         let (addr, size) = r.map_err(WalkError::Dtb)?;
                         match f(addr, size)? {
                             ControlFlow::Continue(()) => {}

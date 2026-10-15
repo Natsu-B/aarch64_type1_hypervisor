@@ -47,6 +47,13 @@ pub use tree_copy::encode_reg_entries;
 pub use tree_copy::node_path;
 
 #[cfg(test)]
+#[macro_export]
+macro_rules! pr_debug {
+    ($fmt:expr) => (println!($fmt));
+    ($fmt:expr, $($arg:tt)*) => (println!($fmt, $($arg)*));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use allocator::AlignedSliceBox;
@@ -549,13 +556,6 @@ mod tests {
         assert_walk_ok(result);
         assert!(found);
     }
-}
-
-#[cfg(test)]
-#[macro_export]
-macro_rules! pr_debug {
-    ($fmt:expr) => (println!($fmt));
-    ($fmt:expr, $($arg:tt)*) => (println!($fmt, $($arg)*));
 }
 
 #[cfg(not(test))]
