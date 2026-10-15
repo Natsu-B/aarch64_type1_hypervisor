@@ -92,7 +92,7 @@ pub fn init(_base: usize, _clock_hz: u64, _baud: u32) {
     if GDB_UART_READY.load(Ordering::Acquire) {
         return;
     }
-    (&mut *guard).write(GdbUartState {
+    (*guard).write(GdbUartState {
         rx: RxRing::new(),
         prefetch_buf: [0; PREFETCH_CAP],
         prefetch_len: 0,
@@ -131,7 +131,7 @@ pub fn begin_stop_loop() -> StopLoopGuard {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     state.prefetch_len = 0;
     state.prefetch_pos = 0;
     StopLoopGuard {
@@ -155,7 +155,7 @@ impl Drop for StopLoopGuard {
         if GDB_UART_READY.load(Ordering::Acquire) {
             let mut guard = GDB_UART_STATE.lock_irqsave();
             // SAFETY: READY is published after full initialization with Release ordering.
-            let state = unsafe { (&mut *guard).assume_init_mut() };
+            let state = unsafe { (*guard).assume_init_mut() };
             state.rx.clear();
             state.prefetch_len = 0;
             state.prefetch_pos = 0;
@@ -178,7 +178,7 @@ pub fn poll_rx() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     crate::net::udp_uart::poll(
         |byte| {
             let _ = state.rx.push_drop_oldest(byte);
@@ -254,7 +254,7 @@ pub fn clear_prefetch() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     state.prefetch_len = 0;
     state.prefetch_pos = 0;
 }
@@ -351,7 +351,7 @@ fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     if *len >= state.prefetch_buf.len() {
         return false;
     }
@@ -366,7 +366,7 @@ fn store_prefetch(len: usize) -> bool {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     if len > state.prefetch_buf.len() {
         return false;
     }
@@ -398,7 +398,7 @@ fn flush_rx_input() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     for _ in 0..FLUSH_LIMIT {
         if state.rx.pop().is_none() {
             break;
@@ -414,7 +414,7 @@ pub fn try_read_byte() -> Option<u8> {
     {
         let mut guard = GDB_UART_STATE.lock_irqsave();
         // SAFETY: READY is published after full initialization with Release ordering.
-        let state = unsafe { (&mut *guard).assume_init_mut() };
+        let state = unsafe { (*guard).assume_init_mut() };
 
         if state.prefetch_pos < state.prefetch_len {
             let byte = state.prefetch_buf[state.prefetch_pos];
@@ -435,7 +435,7 @@ pub fn try_read_byte() -> Option<u8> {
         poll_rx();
         let mut guard = GDB_UART_STATE.lock_irqsave();
         // SAFETY: READY is published after full initialization with Release ordering.
-        let state = unsafe { (&mut *guard).assume_init_mut() };
+        let state = unsafe { (*guard).assume_init_mut() };
         return state.rx.pop();
     }
     None

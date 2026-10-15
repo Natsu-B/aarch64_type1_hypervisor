@@ -639,7 +639,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             guest_ipa_end
         );
         assert!(
-            sp_el1.checked_sub(0x20).unwrap_or(0) >= guest_ipa_base,
+            sp_el1.saturating_sub(0x20) >= guest_ipa_base,
             "stage2: sp_el1 - 0x20 ({:#X}) underflows guest_ipa_base ({:#X})",
             sp_el1.wrapping_sub(0x20),
             guest_ipa_base
@@ -668,11 +668,11 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         if guest_ipa_size != 0 {
             let mut rom_ranges = [(0u64, 0u64); 1];
             let mut rom_count = 0usize;
-            if let Some(mem_base) = lowest_memory_base() {
-                if guest_ipa_base > mem_base {
-                    rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
-                    rom_count = 1;
-                }
+            if let Some(mem_base) = lowest_memory_base()
+                && guest_ipa_base > mem_base
+            {
+                rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
+                rom_count = 1;
             }
 
             let mut io_ranges: Vec<(u64, u64)> = Vec::new();
@@ -766,7 +766,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         )
         .unwrap();
 
-        let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
+        let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000).unwrap();
         println!("allocator closed");
         reserved_memory.push((program_start, stack_start));
         reserved_memory.push((el1_stack_base, EL1_STACK_BYTES));
@@ -908,9 +908,8 @@ pub(crate) fn guest_mmio_allowlist_contains_range(addr: usize, size: usize) -> b
     if size == 0 {
         return false;
     }
-    let end = match addr.checked_add(size) {
-        Some(end) => end,
-        None => return false,
+    let Some(end) = addr.checked_add(size) else {
+        return false;
     };
     for range in guest_mmio_allowlist_slice() {
         if range.size == 0 {
@@ -1157,11 +1156,11 @@ fn push_guest_mmio_range(
         );
         return;
     }
-    if let Some(gdb_range) = denylist.gdb_range {
-        if ranges_overlap(range, gdb_range) {
-            stats.dropped_gdb += 1;
-            return;
-        }
+    if let Some(gdb_range) = denylist.gdb_range
+        && ranges_overlap(range, gdb_range)
+    {
+        stats.dropped_gdb += 1;
+        return;
     }
     if denylist.contains_overlap(range) {
         stats.dropped_deny += 1;
@@ -1181,13 +1180,13 @@ fn record_guest_mmio_allowlist_from_dtb(
 
     let guest_range = normalize_guest_mmio_range(guest_uart.base, guest_uart.size);
     let mut gdb_range = gdb_uart.and_then(|node| normalize_guest_mmio_range(node.base, node.size));
-    if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range) {
-        if ranges_overlap(guest_range, current_gdb_range) {
-            println!(
-                "warning: guest/gdb UART ranges overlap within normalized MMIO pages; not denying GDB range"
-            );
-            gdb_range = None;
-        }
+    if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range)
+        && ranges_overlap(guest_range, current_gdb_range)
+    {
+        println!(
+            "warning: guest/gdb UART ranges overlap within normalized MMIO pages; not denying GDB range"
+        );
+        gdb_range = None;
     }
     let mut denylist = GuestMmioDenyList {
         gdb_range,
@@ -1251,8 +1250,8 @@ fn record_guest_mmio_allowlist_from_dtb(
             node_is_memory(&node) || node_is_disabled(&node) || node_has_no_map(&node);
         if !skip_collect {
             match node.reg_iter() {
-                Ok(mut regs) => {
-                    while let Some(entry) = regs.next() {
+                Ok(regs) => {
+                    for entry in regs {
                         let (base, size) = match entry {
                             Ok(entry) => entry,
                             Err(err) => {
@@ -1288,8 +1287,8 @@ fn record_guest_mmio_allowlist_from_dtb(
             }
 
             match node.ranges_iter() {
-                Ok(Some(mut iter)) => {
-                    while let Some(entry) = iter.next() {
+                Ok(Some(iter)) => {
+                    for entry in iter {
                         let entry = match entry {
                             Ok(entry) => entry,
                             Err(err) => {
@@ -1400,7 +1399,7 @@ fn push_debug_io_range(io_ranges: &mut Vec<(u64, u64)>, base: usize, size: usize
         return;
     }
     let entry = (base as u64, size as u64);
-    if io_ranges.iter().any(|&existing| existing == entry) {
+    if io_ranges.contains(&entry) {
         return;
     }
     io_ranges.push(entry);
@@ -2008,28 +2007,28 @@ fn apply_guest_uart_dt_edit(
         }
     }
 
-    if let Some(chosen) = tree.find_node_by_path("/chosen") {
-        if let Some(path) = node_path(tree, guest_node) {
-            let mut value = Vec::with_capacity(path.len() + 1);
-            value.extend_from_slice(path.as_bytes());
-            value.push(0);
-            if let Some(node) = tree.node_mut(chosen) {
-                node.set_property(NameRef::Borrowed("stdout-path"), ValueRef::Owned(value));
-            }
+    if let Some(chosen) = tree.find_node_by_path("/chosen")
+        && let Some(path) = node_path(tree, guest_node)
+    {
+        let mut value = Vec::with_capacity(path.len() + 1);
+        value.extend_from_slice(path.as_bytes());
+        value.push(0);
+        if let Some(node) = tree.node_mut(chosen) {
+            node.set_property(NameRef::Borrowed("stdout-path"), ValueRef::Owned(value));
         }
     }
 
     if let Some(aliases) = tree.find_node_by_path("/aliases") {
         let mut remove: Vec<String> = Vec::new();
         for id in disable_nodes.iter().copied() {
-            if let Some(path) = node_path(tree, id) {
-                if let Some(node) = tree.node(aliases) {
-                    for prop in &node.properties {
-                        if let Some(value) = decode_cstr(prop.value.as_slice()) {
-                            if value == path {
-                                remove.push(String::from(prop.name.as_str()));
-                            }
-                        }
+            if let Some(path) = node_path(tree, id)
+                && let Some(node) = tree.node(aliases)
+            {
+                for prop in &node.properties {
+                    if let Some(value) = decode_cstr(prop.value.as_slice())
+                        && value == path
+                    {
+                        remove.push(String::from(prop.name.as_str()));
                     }
                 }
             }
@@ -2146,10 +2145,10 @@ fn node_compatible_contains(
             .position(|&b| b == 0)
             .map(|p| start + p)
             .unwrap_or(bytes.len());
-        if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
-            if entry == needle {
-                return Ok(true);
-            }
+        if let Ok(entry) = core::str::from_utf8(&bytes[start..end])
+            && entry == needle
+        {
+            return Ok(true);
         }
         start = end + 1;
     }

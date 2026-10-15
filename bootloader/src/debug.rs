@@ -243,13 +243,11 @@ fn guest_ipa_contains(ipa: u64, len: usize) -> bool {
         Ok(value) => value,
         Err(_) => return false,
     };
-    let end = match ipa.checked_add(len) {
-        Some(value) => value,
-        None => return false,
+    let Some(end) = ipa.checked_add(len) else {
+        return false;
     };
-    let limit = match base.checked_add(size) {
-        Some(value) => value,
-        None => return false,
+    let Some(limit) = base.checked_add(size) else {
+        return false;
     };
     ipa >= base && end <= limit
 }

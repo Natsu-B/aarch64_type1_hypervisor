@@ -136,7 +136,7 @@ fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<
             1 => write_volatile(ipa as *mut u8, value as u8),
             2 => write_volatile(ipa as *mut u16, value as u16),
             4 => write_volatile(ipa as *mut u32, value as u32),
-            8 => write_volatile(ipa as *mut u64, value as u64),
+            8 => write_volatile(ipa as *mut u64, value),
             _ => return Err(MmioError::Unhandled),
         }
     }
@@ -251,13 +251,13 @@ fn data_abort_handler(
     info: &DataAbortInfo,
     decoded: Option<&MmioDecoded>,
 ) {
-    if let Some(plan) = decoded {
-        if decoded_mmio_is_allowlisted(plan) {
-            match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
-                EmulationOutcome::Handled => return,
-                EmulationOutcome::NotHandled => {
-                    panic!("decoded MMIO request was not handled: {:?}", plan)
-                }
+    if let Some(plan) = decoded
+        && decoded_mmio_is_allowlisted(plan)
+    {
+        match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
+            EmulationOutcome::Handled => return,
+            EmulationOutcome::NotHandled => {
+                panic!("decoded MMIO request was not handled: {:?}", plan)
             }
         }
     }
@@ -341,15 +341,15 @@ fn data_abort_handler(
         };
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                if let Some(access) = gic_access_size(access_width) {
-                    if let Ok(value) = vgic::handle_gicd_read(addr, access) {
-                        *register = match reg_size {
-                            InstructionRegisterSize::Instruction32bit => {
-                                value as u64 & (u32::MAX as u64)
-                            }
-                            InstructionRegisterSize::Instruction64bit => value as u64,
-                        };
-                    }
+                if let Some(access) = gic_access_size(access_width)
+                    && let Ok(value) = vgic::handle_gicd_read(addr, access)
+                {
+                    *register = match reg_size {
+                        InstructionRegisterSize::Instruction32bit => {
+                            value as u64 & (u32::MAX as u64)
+                        }
+                        InstructionRegisterSize::Instruction64bit => value as u64,
+                    };
                 }
             }
             WriteNotRead::WritingMemoryAbort => {
@@ -442,7 +442,7 @@ fn data_abort_handler(
                             write_volatile(addr as *mut u32, reg_val as u32);
                         }
                         SyndromeAccessSize::DoubleWord => {
-                            write_volatile(addr as *mut u64, reg_val as u64);
+                            write_volatile(addr as *mut u64, reg_val);
                         }
                     }
                 }
@@ -639,10 +639,12 @@ fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortI
     let in_debug = gdb_uart::is_debug_active();
     let in_debug_stop = aarch64_gdb::in_debug_stop();
     let decision = monitor::record_memfault(memfault_info);
-    if decision.should_trap && !in_debug && !in_debug_stop {
-        if debug::enter_debug_from_memfault(regs, WatchpointKind::Access, addr_u64) {
-            return;
-        }
+    if decision.should_trap
+        && !in_debug
+        && !in_debug_stop
+        && debug::enter_debug_from_memfault(regs, WatchpointKind::Access, addr_u64)
+    {
+        return;
     }
 
     loop {

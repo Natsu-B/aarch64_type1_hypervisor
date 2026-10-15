@@ -136,7 +136,7 @@ pub fn begin_stop_loop() -> StopLoopGuard {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     // Disable RX/RT interrupts while the stop-loop is active (we will poll instead).
     let mask = UARTIMSC::new()
         .set(UARTIMSC::rxim, 1)
@@ -173,7 +173,7 @@ impl Drop for StopLoopGuard {
         if GDB_UART_READY.load(Ordering::Acquire) {
             let mut guard = GDB_UART_STATE.lock_irqsave();
             // SAFETY: READY is published after full initialization with Release ordering.
-            let state = unsafe { (&mut *guard).assume_init_mut() };
+            let state = unsafe { (*guard).assume_init_mut() };
             state.rx.clear();
             state.rsp.reset();
             state.prefetch_len = 0;
@@ -190,7 +190,7 @@ pub fn handle_irq() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     drain_uart_locked(state);
 }
 
@@ -200,7 +200,7 @@ pub fn poll_rx() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     drain_uart_locked(state);
 }
 
@@ -275,7 +275,7 @@ pub fn clear_prefetch() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     state.prefetch_len = 0;
     state.prefetch_pos = 0;
 }
@@ -369,7 +369,7 @@ fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     if *len >= state.prefetch_buf.len() {
         return false;
     }
@@ -384,7 +384,7 @@ fn store_prefetch(len: usize) -> bool {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     if len > state.prefetch_buf.len() {
         return false;
     }
@@ -416,7 +416,7 @@ fn flush_rx_input() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     for _ in 0..FLUSH_LIMIT {
         if state.rx.pop().is_none() {
             break;
@@ -440,7 +440,7 @@ pub fn try_read_byte() -> Option<u8> {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
 
     if state.prefetch_pos < state.prefetch_len {
         let byte = state.prefetch_buf[state.prefetch_pos];
@@ -467,7 +467,7 @@ pub fn try_write_byte(byte: u8) -> bool {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     state.uart.try_write_byte(byte)
 }
 
@@ -477,7 +477,7 @@ pub fn flush() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     state.uart.flush();
 }
 

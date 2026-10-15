@@ -389,12 +389,9 @@ pub fn poll_vbar_el1_change() {
     } else {
         VbarChangeReason::Retranslate
     };
-    let resolved_ipa = match cpu::va_to_ipa_el2_read(vbar) {
-        Some(ipa) => ipa,
-        None => {
-            record_vbar_error(&mut state, vbar, "va_to_ipa_el2_read failed", change_reason);
-            return;
-        }
+    let Some(resolved_ipa) = cpu::va_to_ipa_el2_read(vbar) else {
+        record_vbar_error(&mut state, vbar, "va_to_ipa_el2_read failed", change_reason);
+        return;
     };
     if !va_changed && resolved_ipa == state.current_vbar_ipa {
         return;
