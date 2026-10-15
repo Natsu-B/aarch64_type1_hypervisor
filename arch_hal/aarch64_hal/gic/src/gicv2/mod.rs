@@ -199,14 +199,14 @@ impl Gicv2 {
 
     #[inline]
     pub(crate) fn current_enable_groups(&self) -> Result<(bool, bool), GicError> {
-        if let Some(id) = tls::cpu_if() {
-            if id < 8 {
-                let table = self.affinity_table.read();
-                if let Some(entry) = table[id as usize] {
-                    if entry.0 == cpu::get_current_core_id() {
-                        return Ok((entry.1, entry.2));
-                    }
-                }
+        if let Some(id) = tls::cpu_if()
+            && id < 8
+        {
+            let table = self.affinity_table.read();
+            if let Some(entry) = table[id as usize]
+                && entry.0 == cpu::get_current_core_id()
+            {
+                return Ok((entry.1, entry.2));
             }
         }
         self.get_enable_group_from_affinity(cpu::get_current_core_id())

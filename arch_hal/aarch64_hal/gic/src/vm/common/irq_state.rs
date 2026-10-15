@@ -29,7 +29,7 @@ pub(crate) struct IrqState<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     vcpu_count: usize,
     group_local: [u32; VCPUS],
@@ -39,10 +39,10 @@ where
     priority_local: [[u8; LOCAL_INTID_COUNT]; VCPUS],
     trigger_local: [[TriggerMode; LOCAL_INTID_COUNT]; VCPUS],
 
-    group_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
-    enable_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
-    pending_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
-    active_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+    group_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)],
+    enable_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)],
+    pending_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)],
+    active_global: [u32; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)],
     priority_global: [u8; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
     trigger_global: [TriggerMode; crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT],
 }
@@ -51,7 +51,7 @@ impl<const VCPUS: usize> IrqState<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     pub(crate) fn new(vcpu_count: usize) -> Self {
         let mut trigger_local = [[TriggerMode::Level; LOCAL_INTID_COUNT]; VCPUS];
@@ -69,10 +69,14 @@ where
             priority_local: [[0u8; LOCAL_INTID_COUNT]; VCPUS],
             trigger_local,
 
-            group_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
-            enable_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
-            pending_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
-            active_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32],
+            group_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT)
+                .div_ceil(32)],
+            enable_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT)
+                .div_ceil(32)],
+            pending_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT)
+                .div_ceil(32)],
+            active_global: [0; (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT)
+                .div_ceil(32)],
             priority_global: [0u8; { crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT }],
             trigger_global: [TriggerMode::Level; {
                 crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT

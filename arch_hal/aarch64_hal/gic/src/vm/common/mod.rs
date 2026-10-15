@@ -33,7 +33,7 @@ pub(crate) struct RegsState<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     pub(crate) dist_enable: (bool, bool),
     pub(crate) irq_state: IrqStateTable<VCPUS>,
@@ -43,7 +43,7 @@ pub(crate) struct RoutingState<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     pub(crate) routing: SpiRouting<VCPUS>,
     pub(crate) pirqs: PirqTable<VCPUS>,
@@ -58,7 +58,7 @@ unsafe impl<const VCPUS: usize> Send for RoutingState<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
 }
 
@@ -66,7 +66,7 @@ pub(crate) struct VmCommon<const VCPUS: usize, V: VgicVcpuModel>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     pub(crate) vcpu_count: usize,
     pub(crate) vcpus: VcpuArray<VCPUS, V>,
@@ -79,7 +79,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel> VmCommon<VCPUS, V>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     pub(crate) fn new(vcpu_count: usize, make: impl FnMut(VcpuId) -> V) -> Result<Self, GicError> {
         Ok(Self {
@@ -169,7 +169,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VmCommon<VCPUS, V>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     #[inline(always)]
     fn state_from_attrs(attrs: IrqAttrs) -> IrqStateKind {

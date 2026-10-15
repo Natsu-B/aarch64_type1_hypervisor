@@ -99,7 +99,7 @@ fn decode_sgir_targets(
     if vcpu_count == 0 || vcpu_count > 8 {
         return Err(GicError::InvalidVcpuId);
     }
-    if requester.0 as u16 >= vcpu_count || requester.0 >= 8 {
+    if requester.0 >= vcpu_count || requester.0 >= 8 {
         return Err(GicError::InvalidVcpuId);
     }
     let valid_mask = (1u16 << vcpu_count) - 1;
@@ -133,7 +133,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         if count > 8 {
             return Err(GicError::UnsupportedFeature);
         }
-        if vcpu.0 as u16 >= count {
+        if vcpu.0 >= count {
             return Err(GicError::InvalidVcpuId);
         }
         Ok(())
@@ -297,11 +297,10 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         let update = match offset {
             GICD_CTLR_OFFSET => {
                 let ctlr = GICD_CTLR::from_bits(value);
-                let update = self.vgic_model.set_dist_enable(
+                self.vgic_model.set_dist_enable(
                     ctlr.get(GICD_CTLR::enable_grp0) != 0,
                     ctlr.get(GICD_CTLR::enable_grp1) != 0,
-                )?;
-                update
+                )?
             }
             GICD_TYPER_OFFSET | GICD_IIDR_OFFSET => {
                 // Read-only
@@ -394,7 +393,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                         let mut update = VgicUpdate::None;
                         for i in 0..4u32 {
                             let intid = base_intid + i;
-                            if intid < 32 || intid > MAX_VIRTUAL_INTID {
+                            if !(32..=MAX_VIRTUAL_INTID).contains(&intid) {
                                 continue;
                             }
                             let targets =
@@ -408,7 +407,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                     }
                     Gicv2AccessSize::U8 => {
                         let intid = base_intid + (byte_offset % 4);
-                        if intid < 32 || intid > MAX_VIRTUAL_INTID {
+                        if !(32..=MAX_VIRTUAL_INTID).contains(&intid) {
                             VgicUpdate::None
                         } else {
                             let targets = self.sanitize_gicv2_targets(value as u8)?;
@@ -605,7 +604,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             let word = make_word(word_index)?;
             match size {
                 Gicv2AccessSize::U32 => Ok(word),
-                Gicv2AccessSize::U8 => Ok(((word >> (lane * 8)) & 0xff) as u32),
+                Gicv2AccessSize::U8 => Ok((word >> (lane * 8)) & 0xff),
             }
         }
 
@@ -619,7 +618,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_TYPER_OFFSET..GICD_TYPER_END => {
                 let mut typer = GICD_TYPER::from_bits(self.dist_id.typer);
-                let it_lines_number = ((MAX_VIRTUAL_INTID + 1 + 31) / 32).saturating_sub(1) & 0x1f;
+                let it_lines_number = (MAX_VIRTUAL_INTID + 1).div_ceil(32).saturating_sub(1) & 0x1f;
                 let cpus = cmp::min(self.vgic_model.vcpu_count(), 8).saturating_sub(1) as u32 & 0x7;
                 typer = typer
                     .set(GICD_TYPER::it_lines_number, it_lines_number)

@@ -356,7 +356,7 @@ impl GicIrqMirror for Gicv2 {
 
 impl GicPpi for Gicv2 {
     fn set_ppi_enable(&self, intid: u32, enable: bool) -> Result<(), GicError> {
-        if intid < 16 || intid >= 32 {
+        if !(16..32).contains(&intid) {
             return Err(GicError::UnsupportedIntId);
         }
 
@@ -382,7 +382,7 @@ impl GicPpi for Gicv2 {
     ) -> Result<(), GicError> {
         let security_ext = self.is_security_extension_implemented();
 
-        if intid < 16 || intid >= 32 {
+        if !(16..32).contains(&intid) {
             return Err(GicError::UnsupportedIntId);
         }
         if security_ext && group == IrqGroup::Group0 {

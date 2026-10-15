@@ -696,7 +696,7 @@ impl<
             }
         }
 
-        if inner.resident.map_or(true, |r| r == current) {
+        if inner.resident.is_none_or(|r| r == current) {
             let pending_remaining = !inner.pending.is_empty();
             // Re-read after refill to drive overflow arming/disarming decisions.
             let empties_now = (hw.empty_lr_bitmap()? | inner.sw_empty_lrs) & mask;
@@ -1013,7 +1013,7 @@ impl<
             let inner = self.inner.lock_irqsave();
             (!inner.pending.is_empty(), inner.resident)
         };
-        if resident_now.map_or(true, |r| r == current) {
+        if resident_now.is_none_or(|r| r == current) {
             hw.set_underflow_irq(pending_remaining)?;
         }
 
@@ -1027,10 +1027,10 @@ impl<
 
         let current = cpu::get_current_core_id();
         let mut inner = self.inner.lock_irqsave();
-        if let Some(resident) = inner.resident {
-            if resident != current {
-                return Err(GicError::InvalidState);
-            }
+        if let Some(resident) = inner.resident
+            && resident != current
+        {
+            return Err(GicError::InvalidState);
         }
         // ensure no lingering EOI-maintenance arming across context switches.
         let num_lrs = hw.num_lrs()?.min(MAX_LRS);

@@ -200,10 +200,10 @@ where
         let idx = self.index(pintid)?;
         let v_idx = self.vindex(entry.vintid)?;
 
-        if let Some(existing_pintid) = self.global_v2p[v_idx] {
-            if existing_pintid != pintid {
-                return Err(GicError::InvalidState);
-            }
+        if let Some(existing_pintid) = self.global_v2p[v_idx]
+            && existing_pintid != pintid
+        {
+            return Err(GicError::InvalidState);
         }
 
         match self.global_entries[idx] {
@@ -230,10 +230,10 @@ where
         let p_idx = self.local_pindex(pintid)?;
         let v_idx = self.local_vindex(entry.vintid)?;
 
-        if let Some(existing_pintid) = self.local_v2p[t_idx][v_idx] {
-            if existing_pintid != pintid {
-                return Err(GicError::InvalidState);
-            }
+        if let Some(existing_pintid) = self.local_v2p[t_idx][v_idx]
+            && existing_pintid != pintid
+        {
+            return Err(GicError::InvalidState);
         }
 
         match self.local_entries[t_idx][p_idx] {
@@ -287,7 +287,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> GicVmModelGeneric<VCP
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); crate::vm::pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -360,10 +360,10 @@ where
 
         let mut routing = self.common.routing_lock.lock_irqsave();
         let existing = routing.pirqs.get_local(target, pintid)?;
-        if let Some(prev) = existing {
-            if prev != entry {
-                return Err(GicError::InvalidState);
-            }
+        if let Some(prev) = existing
+            && prev != entry
+        {
+            return Err(GicError::InvalidState);
         }
         let _ = routing.pirqs.ensure_local_entry(target, pintid, entry)?;
         Ok(VgicUpdate::None)
@@ -434,10 +434,10 @@ where
 
         let mut routing = self.common.routing_lock.lock_irqsave();
         let existing = routing.pirqs.get(pintid)?;
-        if let Some(prev) = existing {
-            if prev != entry {
-                return Err(GicError::InvalidState);
-            }
+        if let Some(prev) = existing
+            && prev != entry
+        {
+            return Err(GicError::InvalidState);
         }
         let _ = routing.pirqs.ensure_entry(pintid, entry)?;
         Ok(VgicUpdate::None)
@@ -488,10 +488,10 @@ where
             match scope {
                 VgicIrqScope::Local(local_target) => {
                     let existing = routing.pirqs.get_local(local_target, pintid)?;
-                    if let Some(prev) = existing {
-                        if prev != entry {
-                            return Err(GicError::InvalidState);
-                        }
+                    if let Some(prev) = existing
+                        && prev != entry
+                    {
+                        return Err(GicError::InvalidState);
                     }
                     (
                         routing
@@ -502,10 +502,10 @@ where
                 }
                 VgicIrqScope::Global => {
                     let existing = routing.pirqs.get(pintid)?;
-                    if let Some(prev) = existing {
-                        if prev != entry {
-                            return Err(GicError::InvalidState);
-                        }
+                    if let Some(prev) = existing
+                        && prev != entry
+                    {
+                        return Err(GicError::InvalidState);
                     }
                     (routing.pirqs.ensure_entry(pintid, entry)?, None)
                 }

@@ -52,7 +52,7 @@ pub struct VgicManager<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -66,7 +66,7 @@ impl<const VCPUS: usize> VgicManager<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -374,10 +374,7 @@ where
             if kick_count >= kick_targets.len() {
                 return Err(GicError::OutOfResources);
             }
-            if kick_targets[..kick_count]
-                .iter()
-                .any(|existing| *existing == Some(affinity))
-            {
+            if kick_targets[..kick_count].contains(&Some(affinity)) {
                 return Ok(());
             }
             kick_targets[kick_count] = Some(affinity);
@@ -412,7 +409,7 @@ unsafe fn manager_from_ctx<const VCPUS: usize>(
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -431,7 +428,7 @@ pub(crate) unsafe fn apply_mirror_op_from_ctx<const VCPUS: usize>(
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {

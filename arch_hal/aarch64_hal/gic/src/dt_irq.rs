@@ -69,7 +69,7 @@ pub fn dt_irq_flags_to_sense(flags: u32) -> Result<IrqSense, DtIrqDecodeError> {
     let trig = flags & 0x0f;
     match trig {
         0x0 => Ok(IrqSense::Level),
-        0x1 | 0x2 | 0x3 => Ok(IrqSense::Edge),
+        0x1..=0x3 => Ok(IrqSense::Edge),
         0x4 | 0x8 => Ok(IrqSense::Level),
         _ => Err(DtIrqDecodeError::InvalidFlags(flags)),
     }
