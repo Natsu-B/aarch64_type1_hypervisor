@@ -308,9 +308,8 @@ fn adjust_overlay_phandles(overlay: &mut DeviceTree<'_>, delta: u32) -> Result<(
 }
 
 fn apply_local_fixups(overlay: &mut DeviceTree<'_>, delta: u32) -> Result<(), OverlayError> {
-    let fixup_root = match overlay.find_node_by_path("/__local_fixups__") {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(fixup_root) = overlay.find_node_by_path("/__local_fixups__") else {
+        return Ok(());
     };
     let overlay_root = overlay.root;
 
@@ -388,9 +387,8 @@ fn apply_external_fixups(
     base: &DeviceTree<'_>,
     overlay: &mut DeviceTree<'_>,
 ) -> Result<(), OverlayError> {
-    let fixups_root = match overlay.find_node_by_path("/__fixups__") {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(fixups_root) = overlay.find_node_by_path("/__fixups__") else {
+        return Ok(());
     };
 
     let fixup_properties = overlay
@@ -418,9 +416,8 @@ fn apply_external_fixups(
 
     for prop in fixup_properties {
         let label = prop.name.as_str();
-        let target_path = match symbol_map.get(label) {
-            Some(p) => p,
-            None => return Err(OverlayError::SymbolNotFound),
+        let Some(target_path) = symbol_map.get(label) else {
+            return Err(OverlayError::SymbolNotFound);
         };
         let base_target = base
             .find_node_by_path(target_path)
@@ -768,9 +765,8 @@ fn update_symbols(
     fragments: &[FragmentInfo],
     report: &mut OverlayApplyReport,
 ) -> Result<(), OverlayError> {
-    let overlay_symbols = match overlay.find_node_by_path("/__symbols__") {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(overlay_symbols) = overlay.find_node_by_path("/__symbols__") else {
+        return Ok(());
     };
 
     let mut fragment_map: BTreeMap<&str, &FragmentTarget> = BTreeMap::new();
@@ -799,9 +795,8 @@ fn update_symbols(
         let path_str = normalize_overlay_path(path);
         let mut segments = path_str.split('/').filter(|s| !s.is_empty());
         let fragment_seg = segments.next().ok_or(OverlayError::MalformedOverlay)?;
-        let fragment_target = match fragment_map.get(fragment_seg) {
-            Some(t) => t,
-            None => return Err(OverlayError::MalformedOverlay),
+        let Some(fragment_target) = fragment_map.get(fragment_seg) else {
+            return Err(OverlayError::MalformedOverlay);
         };
         let base_prefix = match fragment_target {
             FragmentTarget::Phandle(p) => {

@@ -514,9 +514,8 @@ impl DtbParser<Validated> {
                     return Ok(ControlFlow::Continue(()));
                 }
 
-                let size = match child.property_bytes("size").map_err(WalkError::Dtb)? {
-                    Some(b) => b,
-                    None => return Ok(ControlFlow::Continue(())),
+                let Some(size) = child.property_bytes("size").map_err(WalkError::Dtb)? else {
+                    return Ok(ControlFlow::Continue(()));
                 };
                 let cells = child.parent_size_cells().map_err(WalkError::Dtb)?;
                 let sc_bytes = (cells as usize) * size_of::<u32>();

@@ -412,9 +412,8 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
     }
 
     fn translate_one_level_wide(&self, child: (u128, u128)) -> Result<(u128, u128), &'static str> {
-        let ranges = match self.property_bytes(Self::PROP_RANGES)? {
-            Some(r) => r,
-            None => return Ok(child),
+        let Some(ranges) = self.property_bytes(Self::PROP_RANGES)? else {
+            return Ok(child);
         };
         if ranges.is_empty() {
             return Ok(child); // empty => identity
