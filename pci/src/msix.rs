@@ -61,9 +61,9 @@ pub struct PciCapabilityMsiX {
 
 impl PciCapabilityMsiX {
     /// Reinterprets the first 3 elements of a u32 slice as this capability.
-    pub fn from_array<'a>(array: &'a [u32]) -> Option<&'a Self> {
+    pub fn from_array(array: &[u32]) -> Option<&Self> {
         let (head3, _) = array.split_first_chunk::<3>()?;
-        Some(unsafe { &*(head3.as_ptr() as *const Self) })
+        Some(unsafe { &*head3.as_ptr().cast::<Self>() })
     }
 }
 
@@ -91,10 +91,10 @@ pub struct PciMsiXTable {
 
 impl PciMsiXTable {
     /// Reinterprets a u32 slice as an array of MSI-X table entries.
-    pub fn from_array<'a>(array: &'a [u32], size: u32) -> Option<&'a [Self]> {
+    pub fn from_array(array: &[u32], size: u32) -> Option<&[Self]> {
         let (head, _) =
             array.split_at_checked(size as usize * size_of::<PciMsiXTable>() / size_of::<u32>())?;
-        Some(unsafe { &*slice_from_raw_parts(head.as_ptr() as *const Self, size as usize) })
+        Some(unsafe { &*slice_from_raw_parts(head.as_ptr().cast::<Self>(), size as usize) })
     }
 }
 
