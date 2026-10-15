@@ -70,7 +70,7 @@ pub const REG_CPSR: usize = 34;
 pub const CORE_REG_COUNT: usize = REG_CPSR + 1;
 pub const EXTRA_REG_BASE: usize = CORE_REG_COUNT;
 
-pub const REG_TPIDR_EL0: usize = EXTRA_REG_BASE + 0;
+pub const REG_TPIDR_EL0: usize = EXTRA_REG_BASE;
 pub const REG_TPIDRRO_EL0: usize = EXTRA_REG_BASE + 1;
 pub const REG_TPIDR_EL1: usize = EXTRA_REG_BASE + 2;
 pub const REG_MPIDR_EL1: usize = EXTRA_REG_BASE + 3;
@@ -155,6 +155,12 @@ pub trait MemoryAccess {
 }
 
 pub struct DirectMemory;
+
+impl Default for DirectMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DirectMemory {
     pub const fn new() -> Self {
@@ -402,7 +408,7 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
 
 impl<M, const N: usize> Aarch64GdbState<M, N> {
     pub fn new(mem: M) -> Self {
-        let mut state = Self {
+        let state = Self {
             mem,
             breakpoints: SwBreakpointTable::new(),
             hw_breakpoints: HwBreakpointTable::new(),
@@ -625,7 +631,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             return Err(Aarch64GdbError::UnalignedAddress);
         }
         self.validate_hw_breakpoint_kind(kind)?;
-        if let Some(_) = self.hw_breakpoints.find(addr) {
+        if self.hw_breakpoints.find(addr).is_some() {
             return Ok(());
         }
 
@@ -887,10 +893,10 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         cmd: &[u8],
         out: &mut [u8],
     ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
-        if let Ok(text) = core::str::from_utf8(cmd) {
-            if let Some(len) = semihost::monitor_command(text, out, &mut self.state.mem) {
-                return Ok(len);
-            }
+        if let Ok(text) = core::str::from_utf8(cmd)
+            && let Some(len) = semihost::monitor_command(text, out, &mut self.state.mem)
+        {
+            return Ok(len);
         }
         let Some(handler) = self.state.monitor_handler else {
             return Err(TargetError::NotSupported);
@@ -1524,25 +1530,24 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
-        if let DebugEntryCause::DebugException(ec) = cause {
-            if !semihost_trap
-                && matches!(
-                    ec,
-                    ExceptionClass::BreakpointLowerLevel
-                        | ExceptionClass::BrkInstructionAArch64LowerLevel
-                )
-            {
-                let pc = cpu::get_elr_el2();
-                if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
+        if let DebugEntryCause::DebugException(ec) = cause
+            && !semihost_trap
+            && matches!(
+                ec,
+                ExceptionClass::BreakpointLowerLevel
+                    | ExceptionClass::BrkInstructionAArch64LowerLevel
+            )
+        {
+            let pc = cpu::get_elr_el2();
+            if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
+                breakpoint_slot = Some(slot);
+                breakpoint_addr = pc;
+            } else {
+                let pc_prev = pc.wrapping_sub(4);
+                if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
                     breakpoint_slot = Some(slot);
-                    breakpoint_addr = pc;
-                } else {
-                    let pc_prev = pc.wrapping_sub(4);
-                    if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
-                        breakpoint_slot = Some(slot);
-                        breakpoint_addr = pc_prev;
-                        set_elr_el2_and_sync_frame(regs, pc_prev);
-                    }
+                    breakpoint_addr = pc_prev;
+                    set_elr_el2_and_sync_frame(regs, pc_prev);
                 }
             }
         }
@@ -1895,14 +1900,14 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             let _ = self.state.reinstall_sw_breakpoint_slot(slot);
         }
 
-        if matches!(resume_action, PendingStepAction::Step) {
-            if let Some(restore) = enable_single_step(regs) {
-                self.pending_step = Some(PendingStep {
-                    slot: None,
-                    action: resume_action,
-                    restore: Some(restore),
-                });
-            }
+        if matches!(resume_action, PendingStepAction::Step)
+            && let Some(restore) = enable_single_step(regs)
+        {
+            self.pending_step = Some(PendingStep {
+                slot: None,
+                action: resume_action,
+                restore: Some(restore),
+            });
         }
         self.state.resume_hw_watchpoints();
     }

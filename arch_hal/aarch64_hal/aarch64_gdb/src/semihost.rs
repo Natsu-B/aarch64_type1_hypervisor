@@ -132,17 +132,17 @@ pub fn is_semihost_hlt(insn: u32) -> bool {
 
 pub fn capture_from_debug<M: MemoryAccess>(mem: &mut M, regs: &Registers, pc: u64) -> bool {
     let mut insn_addr = None;
-    if let Ok(insn) = read_insn(mem, pc) {
-        if is_semihost_hlt(insn) {
-            insn_addr = Some(pc);
-        }
+    if let Ok(insn) = read_insn(mem, pc)
+        && is_semihost_hlt(insn)
+    {
+        insn_addr = Some(pc);
     }
     if insn_addr.is_none() && pc >= 4 {
         let pc_prev = pc.wrapping_sub(4);
-        if let Ok(insn) = read_insn(mem, pc_prev) {
-            if is_semihost_hlt(insn) {
-                insn_addr = Some(pc_prev);
-            }
+        if let Ok(insn) = read_insn(mem, pc_prev)
+            && is_semihost_hlt(insn)
+        {
+            insn_addr = Some(pc_prev);
         }
     }
 
@@ -394,9 +394,9 @@ pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) 
                     if parts.next().is_some() {
                         write_error(&mut out, "extra_args");
                     } else if fileio_enabled() {
-                        let _ = write!(out, "fileio=on\n");
+                        let _ = writeln!(out, "fileio=on");
                     } else {
-                        let _ = write!(out, "fileio=off\n");
+                        let _ = writeln!(out, "fileio=off");
                     }
                 }
                 "fileio" => {
@@ -410,11 +410,11 @@ pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) 
                         match mode {
                             "on" => {
                                 set_fileio_enabled(true);
-                                let _ = write!(out, "ok\n");
+                                let _ = writeln!(out, "ok");
                             }
                             "off" => {
                                 set_fileio_enabled(false);
-                                let _ = write!(out, "ok\n");
+                                let _ = writeln!(out, "ok");
                             }
                             _ => write_error(&mut out, "bad_args"),
                         }
@@ -437,7 +437,7 @@ pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) 
                                 if let Err(msg) = store_completion(result, errno) {
                                     write_error(&mut out, msg);
                                 } else {
-                                    let _ = write!(out, "ok\n");
+                                    let _ = writeln!(out, "ok");
                                 }
                             }
                             _ => write_error(&mut out, "bad_args"),
@@ -449,7 +449,7 @@ pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) 
                         write_error(&mut out, "extra_args");
                     } else {
                         let handle = alloc_handle();
-                        let _ = write!(out, "handle={}\n", handle);
+                        let _ = writeln!(out, "handle={}", handle);
                     }
                 }
                 "reset" => {
@@ -457,7 +457,7 @@ pub fn monitor_command<M: MemoryAccess>(cmd: &str, out: &mut [u8], mem: &mut M) 
                         write_error(&mut out, "extra_args");
                     } else {
                         reset_state();
-                        let _ = write!(out, "ok\n");
+                        let _ = writeln!(out, "ok");
                     }
                 }
                 _ => write_error(&mut out, "bad_args"),
@@ -595,17 +595,17 @@ fn reset_state() {
 fn write_semihost_query(out: &mut OutBuf<'_>) {
     let guard = SEMIHOST.lock_irqsave();
     if !guard.pending {
-        let _ = write!(out, "no\n");
+        let _ = writeln!(out, "no");
         return;
     }
     let Some(req) = guard.req else {
-        let _ = write!(out, "no\n");
+        let _ = writeln!(out, "no");
         return;
     };
     let op = (req.op & 0xffff_ffff) as u32;
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "yes op=0x{:x} args=0x{:x} insn=0x{:x}\n",
+        "yes op=0x{:x} args=0x{:x} insn=0x{:x}",
         op, req.args_ptr, req.insn_addr
     );
 }
@@ -630,24 +630,24 @@ fn write_semihost_info(out: &mut OutBuf<'_>) {
     }
     match kind {
         SemihostOp::Write0 => {
-            let _ = write!(out, "op=write0 str=0x{:x}\n", req.buf_ptr);
+            let _ = writeln!(out, "op=write0 str=0x{:x}", req.buf_ptr);
         }
         SemihostOp::Open => {
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "path=0x{:x} len={} mode={}\n",
+                "path=0x{:x} len={} mode={}",
                 req.buf_ptr, req.len, req.mode
             );
         }
         SemihostOp::Write => {
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "handle={} buf=0x{:x} len={}\n",
+                "handle={} buf=0x{:x} len={}",
                 req.handle, req.buf_ptr, req.len
             );
         }
         SemihostOp::Close => {
-            let _ = write!(out, "handle={}\n", req.handle);
+            let _ = writeln!(out, "handle={}", req.handle);
         }
     }
 }
@@ -674,7 +674,7 @@ fn write_semihost_read<M: MemoryAccess>(
         return Err("decode_failed");
     }
     if guard.read_done {
-        let _ = write!(out, "hex:\n");
+        let _ = writeln!(out, "hex:");
         return Ok(());
     }
 
@@ -690,7 +690,7 @@ fn write_semihost_read<M: MemoryAccess>(
                 .ok_or("addr_overflow")?;
             let read_len = limit;
             if read_len == 0 {
-                let _ = write!(out, "hex:\n");
+                let _ = writeln!(out, "hex:");
                 return Ok(());
             }
             mem.read(addr, &mut buf[..read_len])
@@ -711,7 +711,7 @@ fn write_semihost_read<M: MemoryAccess>(
             let offset = guard.read_offset;
             if offset >= total_len {
                 guard.read_done = true;
-                let _ = write!(out, "hex:\n");
+                let _ = writeln!(out, "hex:");
                 return Ok(());
             }
             let remaining = total_len - offset;
@@ -835,7 +835,7 @@ fn parse_i32_token(token: &str) -> Option<i32> {
 }
 
 fn write_error(out: &mut OutBuf<'_>, msg: &str) {
-    let _ = write!(out, "error {}\n", msg);
+    let _ = writeln!(out, "error {}", msg);
 }
 
 fn push_hex_bytes(out: &mut OutBuf<'_>, bytes: &[u8]) -> fmt::Result {
