@@ -1335,22 +1335,22 @@ impl Bcm2711GenetV5 {
                 next_log = now.wrapping_add(log_ticks);
             }
 
-            if let Some(deadline_ticks) = deadline {
-                if tick_reached(now, deadline_ticks) {
-                    debug_uart_log(format_args!(
-                        "genet: phy timeout phy={} link={} aneg={} bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
-                        self.phy_addr,
-                        ((last_bmsr & PHY_BMSR_LSTATUS) != 0) as u8,
-                        ((last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0) as u8,
-                        last_bmcr,
-                        last_bmsr,
-                        last_adv,
-                        last_lpa,
-                        last_ctrl1000,
-                        last_stat1000
-                    ));
-                    return Err(Bcm2711GenetError::PhyTimeout);
-                }
+            if let Some(deadline_ticks) = deadline
+                && tick_reached(now, deadline_ticks)
+            {
+                debug_uart_log(format_args!(
+                    "genet: phy timeout phy={} link={} aneg={} bmcr=0x{:04x} bmsr=0x{:04x} adv=0x{:04x} lpa=0x{:04x} c1000=0x{:04x} s1000=0x{:04x}\n",
+                    self.phy_addr,
+                    ((last_bmsr & PHY_BMSR_LSTATUS) != 0) as u8,
+                    ((last_bmsr & PHY_BMSR_ANEGCOMPLETE) != 0) as u8,
+                    last_bmcr,
+                    last_bmsr,
+                    last_adv,
+                    last_lpa,
+                    last_ctrl1000,
+                    last_stat1000
+                ));
+                return Err(Bcm2711GenetError::PhyTimeout);
             }
             spin_loop();
         }
@@ -1659,7 +1659,7 @@ impl Bcm2711GenetV5 {
         // After CPU consumed an RX buffer, clean it before giving ownership back to DMA.
         cpu::clean_dcache_range(addr_va as *const u8, RX_BUF_LENGTH);
 
-        self.c_index = self.c_index.wrapping_add(1) & 0xffff;
+        self.c_index = self.c_index.wrapping_add(1);
         self.rdma_ring().index_b.write(self.c_index as u32);
         self.rx_index = (self.rx_index + 1) & 0xff;
     }

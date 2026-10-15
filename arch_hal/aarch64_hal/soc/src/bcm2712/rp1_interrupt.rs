@@ -43,7 +43,7 @@ pub(crate) fn init_rp1_interrupt(brcm_stb: &BrcmStb, mip_base: u64) -> Result<()
     // check msi inbound window
     if !found {
         println!("PCIE: setting rp1 interrupt inbound window");
-        let Some(x) = (1..=10usize).filter(|x| !pcie[*x - 1]).next() else {
+        let Some(x) = (1..=10usize).find(|x| !pcie[*x - 1]) else {
             println!("PCIE: Inbound window are full");
             return Err(Bcm2712Error::InvalidWindow);
         };

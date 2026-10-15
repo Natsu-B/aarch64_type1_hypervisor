@@ -504,7 +504,7 @@ impl InboundBarLower {
         if size == 0 || (size & (size - 1)) != 0 {
             return Err(Bcm2712Error::InvalidWindow);
         }
-        let log2 = size.trailing_zeros() as u32;
+        let log2 = size.trailing_zeros();
 
         // Linux brcmstb: 4KB..32KB => 0x1c..0x1f, 64KB..64GB => 1..21 :contentReference[oaicite:5]{index=5}
         let enc = if (12..=15).contains(&log2) {

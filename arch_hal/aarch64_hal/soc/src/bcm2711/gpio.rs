@@ -245,8 +245,8 @@ pub fn gpio_mmio_from_dtb(dtb: &DtbParser) -> Result<common::MmioRegion, Bcm2711
             .ok_or(Bcm2711GpioError::InvalidMmioRegion)?
             .map_err(WalkError::Dtb)?;
 
-        let base = reg.0 as usize;
-        let dt_size = reg.1 as usize;
+        let base = reg.0;
+        let dt_size = reg.1;
         if base == 0 || dt_size == 0 {
             return Err(Bcm2711GpioError::InvalidMmioRegion.into());
         }

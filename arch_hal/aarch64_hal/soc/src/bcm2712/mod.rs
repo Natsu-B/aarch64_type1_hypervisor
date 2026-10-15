@@ -160,7 +160,7 @@ fn search_rp1(view: &DtbNodeView) -> WalkResult<Rp1Config, Bcm2712Error> {
 
                 let msi_x = unsafe { brcm_stb.get_msi_x_capability() }?;
                 let (msi_x_bar, msi_x_entries) = unsafe { brcm_stb.msi_x_table_bar_addr(msi_x)? };
-                let msi_x_end = msi_x_bar + (msi_x_entries as u64) * size_of::<PciMsiXTable>() as u64;
+                let msi_x_end = msi_x_bar + msi_x_entries * size_of::<PciMsiXTable>() as u64;
                 let bar1 = unsafe { brcm_stb.read_bar_address(1) }?;
                 let bar2 = unsafe { brcm_stb.read_bar_address(2) }?;
                 println!("PCIE: RP1 Pheripheral BAR addr: 0x{:x}", bar1);
