@@ -110,46 +110,14 @@ fn build_examples(args: &[String]) -> Result<String, String> {
 
     for manifest in manifests {
         eprintln!("\n--- Building example: {} ---", manifest.display());
-        let mut cmd = Command::new("cargo");
-        cmd.arg("build")
-            .arg("-Z")
-            .arg("build-std=core,alloc,compiler_builtins")
-            .arg("-Z")
-            .arg("build-std-features=compiler-builtins-mem")
-            .arg("--manifest-path")
+        let mut cmd = bare_metal_cargo_build();
+        cmd.arg("--manifest-path")
             .arg(&manifest)
-            .args(&forward_args)
-            .env("XTASK_BUILD", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to spawn cargo build for example manifest {}: {}",
-                    manifest.display(),
-                    e
-                )
-            })
-            .wait()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to wait for cargo build for example manifest {}: {}",
-                    manifest.display(),
-                    e
-                )
-            });
-        if !status.success() {
-            eprintln!(
-                "Error: cargo build failed for example manifest '{}' with status: {:?}",
-                manifest.display(),
-                status
-            );
-            std::process::exit(status.code().unwrap_or(1));
-        }
+            .args(&forward_args);
+        run_cargo_build(
+            &mut cmd,
+            &format!("example manifest {}", manifest.display()),
+        );
     }
 
     eprintln!("\n--- Examples built successfully ---");
@@ -311,104 +279,118 @@ fn manifest_matches_filter(manifest: &Path, filter: &str) -> bool {
     false
 }
 
-fn build_bootloader(args: &[String]) -> Result<String, String> {
-    let pkg = "elf-hypervisor";
-    eprintln!("\n--- Building bootloader package: {} ---", pkg);
+/// Creates a `cargo build` command for the bare-metal AArch64 target.
+///
+/// The command rebuilds `core`/`alloc` with `-Z build-std`, enables the
+/// compiler-builtins memory intrinsics, and sets `XTASK_BUILD` so build scripts
+/// can tell they are being driven by xtask. Callers append the package or
+/// manifest selection and any forwarded arguments.
+fn bare_metal_cargo_build() -> Command {
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("-Z")
         .arg("build-std=core,alloc,compiler_builtins")
         .arg("-Z")
         .arg("build-std-features=compiler-builtins-mem")
-        .arg("-p")
-        .arg(pkg)
-        .arg("--target")
-        .arg("aarch64-unknown-none-softfloat")
-        .args(args)
         .env("XTASK_BUILD", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    cmd
+}
 
+/// Runs a prepared `cargo build` command and exits the process on failure.
+///
+/// `label` describes what is being built (for example `package 'rpi_boot'`)
+/// and is used in the panic and error messages.
+fn run_cargo_build(cmd: &mut Command, label: &str) {
     eprintln!("Running: {:?}", cmd);
     let status = cmd
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", pkg, e))
+        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", label, e))
         .wait()
-        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", pkg, e));
+        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", label, e));
     if !status.success() {
         eprintln!(
-            "Error: cargo build failed for package '{}' with status: {:?}",
-            pkg, status
+            "Error: cargo build failed for {} with status: {:?}",
+            label, status
         );
         std::process::exit(status.code().unwrap_or(1));
     }
+}
 
-    eprintln!("\n--- Bootloader built successfully ---");
+/// Bare-metal firmware package built by xtask and copied into `./bin`.
+struct FirmwarePackage {
+    /// Cargo package name passed to `-p`.
+    pkg: &'static str,
+    /// Human-readable kind used in the "Building ..." banner.
+    kind: &'static str,
+    /// Name used in the "... built successfully" banner.
+    display_name: &'static str,
+    /// File name written under `./bin`.
+    destination_name: &'static str,
+}
+
+/// QEMU/U-Boot hypervisor image.
+const BOOTLOADER: FirmwarePackage = FirmwarePackage {
+    pkg: "elf-hypervisor",
+    kind: "bootloader",
+    display_name: "Bootloader",
+    destination_name: "elf-hypervisor.elf",
+};
+
+/// Raspberry Pi 5 hypervisor image.
+const RPI5: FirmwarePackage = FirmwarePackage {
+    pkg: "rpi_boot",
+    kind: "rpi5",
+    display_name: "rpi_boot",
+    destination_name: "rpi_boot.elf",
+};
+
+/// Builds a bare-metal firmware package and copies its ELF into `./bin`.
+fn build_firmware_package(package: &FirmwarePackage, args: &[String]) -> Result<String, String> {
+    let pkg = package.pkg;
+    eprintln!("\n--- Building {} package: {} ---", package.kind, pkg);
+    let mut cmd = bare_metal_cargo_build();
+    cmd.arg("-p")
+        .arg(pkg)
+        .arg("--target")
+        .arg("aarch64-unknown-none-softfloat")
+        .args(args);
+    run_cargo_build(&mut cmd, &format!("package '{}'", pkg));
+
+    eprintln!("\n--- {} built successfully ---", package.display_name);
     let profile = resolve_profile(args);
-    copy_artifact_to_bin("elf-hypervisor", "elf-hypervisor.elf", &profile)
+    copy_artifact_to_bin(pkg, package.destination_name, &profile)
+}
+
+fn build_bootloader(args: &[String]) -> Result<String, String> {
+    build_firmware_package(&BOOTLOADER, args)
+}
+
+/// Builds the bootloader with an extra cargo feature prepended to `args`.
+fn build_bootloader_with_feature(feature: &str, args: &[String]) -> Result<String, String> {
+    let mut combined_args = Vec::with_capacity(args.len() + 2);
+    combined_args.push("--features".to_string());
+    combined_args.push(feature.to_string());
+    combined_args.extend_from_slice(args);
+    build_bootloader(&combined_args)
 }
 
 fn build_rpi4(args: &[String]) -> Result<String, String> {
-    let mut combined_args = Vec::with_capacity(args.len() + 2);
-    combined_args.push("--features".to_string());
-    combined_args.push("rpi4".to_string());
-    combined_args.extend_from_slice(args);
-    build_bootloader(&combined_args)
+    build_bootloader_with_feature("rpi4", args)
 }
 
 fn build_rpi4_net(args: &[String]) -> Result<String, String> {
-    let mut combined_args = Vec::with_capacity(args.len() + 2);
-    combined_args.push("--features".to_string());
-    combined_args.push("rpi4_net".to_string());
-    combined_args.extend_from_slice(args);
-    build_bootloader(&combined_args)
+    build_bootloader_with_feature("rpi4_net", args)
 }
 
 fn build_virtio_net(args: &[String]) -> Result<String, String> {
-    let mut combined_args = Vec::with_capacity(args.len() + 2);
-    combined_args.push("--features".to_string());
-    combined_args.push("virtio_net".to_string());
-    combined_args.extend_from_slice(args);
-    build_bootloader(&combined_args)
+    build_bootloader_with_feature("virtio_net", args)
 }
 
 fn build_rpi5(args: &[String]) -> Result<String, String> {
-    let pkg = "rpi_boot";
-    eprintln!("\n--- Building rpi5 package: {} ---", pkg);
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
-        .arg("-Z")
-        .arg("build-std=core,alloc,compiler_builtins")
-        .arg("-Z")
-        .arg("build-std-features=compiler-builtins-mem")
-        .arg("-p")
-        .arg(pkg)
-        .arg("--target")
-        .arg("aarch64-unknown-none-softfloat")
-        .args(args)
-        .env("XTASK_BUILD", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    eprintln!("Running: {:?}", cmd);
-    let status = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", pkg, e))
-        .wait()
-        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", pkg, e));
-    if !status.success() {
-        eprintln!(
-            "Error: cargo build failed for package '{}' with status: {:?}",
-            pkg, status
-        );
-        std::process::exit(status.code().unwrap_or(1));
-    }
-
-    eprintln!("\n--- rpi_boot built successfully ---");
-    let profile = resolve_profile(args);
-    copy_artifact_to_bin("rpi_boot", "rpi_boot.elf", &profile)
+    build_firmware_package(&RPI5, args)
 }
 
 fn run(args: &[String]) -> Result<(), String> {
