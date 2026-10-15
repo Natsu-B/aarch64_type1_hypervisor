@@ -309,7 +309,7 @@ impl EL2Stage1Paging {
             return Err(PagingErr::OutOfMemory);
         }
         let table = unsafe { slice::from_raw_parts_mut(table_addr as usize as *mut u64, 512) };
-        for i in table.into_iter() {
+        for i in table.iter_mut() {
             *i = 0;
         }
         Ok(table)
