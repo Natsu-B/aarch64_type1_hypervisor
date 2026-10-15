@@ -151,7 +151,7 @@ impl<'a> Elf64<'a> {
 
     /// Returns actual header size and alignment for this ELF file.
     pub fn elf_real_header_size(&self) -> (usize /* size */, usize /* alignment */) {
-        let header = unsafe { &*(self.data.as_ptr() as *const Elf64Header) };
+        let header = unsafe { &*self.data.as_ptr().cast::<Elf64Header>() };
         (
             read(header.e_phoff, self.endian) as usize
                 + size_of::<Elf64ProgramHeader>() * read(header.e_phnum, self.endian) as usize,
@@ -171,7 +171,7 @@ impl<'a> Elf64<'a> {
         if elf.get(0..4) != Some(&[0x7F, b'E', b'L', b'F']) {
             return Err(ElfErr::InvalidMagic);
         }
-        let header = unsafe { &*(elf.as_ptr() as *const Elf64Header) };
+        let header = unsafe { &*elf.as_ptr().cast::<Elf64Header>() };
         if header.e_ident.class != 2 {
             // 64bit class is 2
             return Err(ElfErr::Unsupported);
@@ -215,7 +215,7 @@ impl<'a> Elf64<'a> {
         if self.data.len() < self.elf_real_header_size().0 {
             return Err(ElfErr::TooShort);
         }
-        let header = unsafe { &*(self.data.as_ptr() as *const Elf64Header) };
+        let header = unsafe { &*self.data.as_ptr().cast::<Elf64Header>() };
         for i in 0..read(header.e_phnum, self.endian) as usize {
             let program_header = unsafe {
                 &*((self.data.as_ptr() as usize
