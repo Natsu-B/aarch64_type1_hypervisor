@@ -1514,6 +1514,93 @@ fn test(args: &[String]) {
         None
     }
 
+    // Helper: `cargo test` command, wrapped with `timeout` when available
+    fn host_cargo_test_command(secs: u64) -> Command {
+        let mut cmd = if let Some(mut prefix) = timeout_prefix(secs) {
+            let mut c = Command::new(prefix.remove(0));
+            for p in prefix {
+                c.arg(p);
+            }
+            c.arg("cargo");
+            c
+        } else {
+            Command::new("cargo")
+        };
+        cmd.arg("test");
+        cmd
+    }
+
+    // Helper: spawn a host `cargo test` command and wait for it to finish
+    fn run_host_cargo_test(cmd: &mut Command, pkg: &str) -> std::process::ExitStatus {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        eprintln!("Running: {:?}", cmd);
+        cmd.spawn()
+            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
+            .wait()
+            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e))
+    }
+
+    // Helper: `cargo test` command for a bare-metal U-Boot test.
+    //
+    // Each U-Boot test gets its own fresh target dir to avoid mixing build-std
+    // artifacts (duplicate core lang items). `extra_rustflags` are inserted
+    // after the panic flags, before the relocation model and linker script.
+    fn uboot_cargo_test_command(
+        repo_root: &Path,
+        label: &str,
+        runner: &str,
+        pkg: &str,
+        extra_rustflags: &[&str],
+    ) -> Command {
+        let test_lds_path = repo_root.join("test.lds");
+        let test_lds = test_lds_path
+            .to_str()
+            .expect("test linker path contains invalid UTF-8")
+            .to_string();
+
+        let sanitized_label = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let target_dir = std::env::temp_dir()
+            .join("aarch64_hv_uboot_tests")
+            .join(format!("{}_{}", sanitized_label, std::process::id()));
+        let _ = fs::remove_dir_all(&target_dir);
+
+        let rustflags = {
+            let mut parts = Vec::new();
+            if let Ok(existing) = std::env::var("RUSTFLAGS") {
+                parts.push(existing);
+            }
+            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
+            parts.extend(extra_rustflags.iter().map(|flag| (*flag).to_string()));
+            parts.push("-C relocation-model=static".to_string());
+            parts.push(format!("-C link-arg=-T{}", test_lds));
+            parts.join(" ")
+        };
+
+        let mut cmd = Command::new("cargo");
+        cmd.arg("test")
+            .arg("--target")
+            .arg("aarch64-unknown-none-softfloat")
+            .arg("-p")
+            .arg(pkg)
+            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
+            .env("RUSTFLAGS", rustflags)
+            .env("CARGO_PROFILE_TEST_PANIC", "abort")
+            .env("CARGO_PROFILE_DEV_PANIC", "abort")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .env("CARGO_TERM_COLOR", "always")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    }
+
     fn scripts_need_sudo(
         tests: &[(String, String, String, Vec<String>)],
         repo_root: &PathBuf,
@@ -1688,36 +1775,15 @@ fn test(args: &[String]) {
     // Run std tests (each with 30s timeout if available)
     for (pkg, extra) in std_crates {
         eprintln!("\n--- Running host tests for: {} ---", pkg);
-        let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(prefix.remove(0));
-            for p in prefix {
-                c.arg(p);
-            }
-            c.arg("cargo");
-            c.arg("test");
-            c
-        } else {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            c
-        };
-
+        let mut cmd = host_cargo_test_command(30);
         cmd.arg("--target")
             .arg(&host_tuple)
             .arg("-p")
             .arg(&pkg)
             .args(&extra)
-            .args(&test_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .args(&test_args);
 
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
-            .wait()
-            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e));
+        let status = run_host_cargo_test(&mut cmd, &pkg);
         if status.success() {
             passed.push(format!("std:{}", pkg));
         } else {
@@ -1730,37 +1796,16 @@ fn test(args: &[String]) {
     // Run host unit tests explicitly (lib-only) with 30s timeout if available.
     for (pkg, extra) in unit_crates {
         eprintln!("\n--- Running host unit tests for: {} ---", pkg);
-        let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(prefix.remove(0));
-            for p in prefix {
-                c.arg(p);
-            }
-            c.arg("cargo");
-            c.arg("test");
-            c
-        } else {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            c
-        };
-
+        let mut cmd = host_cargo_test_command(30);
         cmd.arg("--target")
             .arg(&host_tuple)
             .arg("-p")
             .arg(&pkg)
             .arg("--lib")
             .args(&extra)
-            .args(&test_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .args(&test_args);
 
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
-            .wait()
-            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e));
+        let status = run_host_cargo_test(&mut cmd, &pkg);
         if status.success() {
             passed.push(format!("unit:{}", pkg));
         } else {
@@ -1849,12 +1894,6 @@ fn test(args: &[String]) {
             .to_str()
             .expect("runner path contains invalid UTF-8");
 
-        let test_lds_path = repo_root.join("test.lds");
-        let test_lds = test_lds_path
-            .to_str()
-            .expect("test linker path contains invalid UTF-8")
-            .to_string();
-
         let label = if testname.is_empty() {
             format!("uboot-unit:{}", pkg)
         } else {
@@ -1865,36 +1904,8 @@ fn test(args: &[String]) {
             label, runner
         );
 
-        let mut cmd = Command::new("cargo");
-
-        // Give each U-Boot test its own fresh target dir to avoid mixing build-std
-        // artifacts (duplicate core lang items).
-        let sanitized_label = label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect::<String>();
-        let target_dir = std::env::temp_dir()
-            .join("aarch64_hv_uboot_tests")
-            .join(format!("{}_{}", sanitized_label, std::process::id()));
-        let _ = fs::remove_dir_all(&target_dir);
-
-        let rustflags = {
-            let mut parts = Vec::new();
-            if let Ok(existing) = std::env::var("RUSTFLAGS") {
-                parts.push(existing);
-            }
-            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
-            parts.push("-C debuginfo=0".to_string());
-            parts.push("-C relocation-model=static".to_string());
-            parts.push(format!("-C link-arg=-T{}", test_lds));
-            parts.join(" ")
-        };
-
-        cmd.arg("test")
-            .arg("--target")
-            .arg("aarch64-unknown-none-softfloat")
-            .arg("-p")
-            .arg(&pkg);
+        let mut cmd =
+            uboot_cargo_test_command(&repo_root, &label, runner, &pkg, &["-C debuginfo=0"]);
 
         if !testname.is_empty() {
             cmd.arg("--test").arg(&testname);
@@ -1902,18 +1913,7 @@ fn test(args: &[String]) {
             cmd.arg("--lib");
         }
 
-        cmd.args(&extra)
-            .args(&test_args)
-            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
-            .env("RUSTFLAGS", rustflags)
-            .env("CARGO_PROFILE_TEST_PANIC", "abort")
-            .env("CARGO_PROFILE_DEV_PANIC", "abort")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .env("CARGO_TERM_COLOR", "always")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(&extra).args(&test_args);
 
         let code = run_uboot_test_with_timeout(cmd, &label, 300);
         if code == 0 {
@@ -1931,45 +1931,13 @@ fn test(args: &[String]) {
             .to_str()
             .expect("runner path contains invalid UTF-8");
 
-        let test_lds_path = repo_root.join("test.lds");
-        let test_lds = test_lds_path
-            .to_str()
-            .expect("test linker path contains invalid UTF-8")
-            .to_string();
-
         let label = format!("uboot-unit:{}", pkg);
         eprintln!(
             "\n--- Running U-Boot unit test for: {} (runner: {}) ---",
             pkg, runner
         );
 
-        let mut cmd = Command::new("cargo");
-
-        let sanitized_label = label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect::<String>();
-        let target_dir = std::env::temp_dir()
-            .join("aarch64_hv_uboot_tests")
-            .join(format!("{}_{}", sanitized_label, std::process::id()));
-        let _ = fs::remove_dir_all(&target_dir);
-
-        let rustflags = {
-            let mut parts = Vec::new();
-            if let Ok(existing) = std::env::var("RUSTFLAGS") {
-                parts.push(existing);
-            }
-            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
-            parts.push("-C relocation-model=static".to_string());
-            parts.push(format!("-C link-arg=-T{}", test_lds));
-            parts.join(" ")
-        };
-
-        cmd.arg("test")
-            .arg("--target")
-            .arg("aarch64-unknown-none-softfloat")
-            .arg("-p")
-            .arg(&pkg);
+        let mut cmd = uboot_cargo_test_command(&repo_root, &label, runner, &pkg, &[]);
 
         let has_explicit_target = extra.iter().any(|arg| {
             arg == "--bin"
@@ -1985,18 +1953,7 @@ fn test(args: &[String]) {
             cmd.arg("--lib");
         }
 
-        cmd.args(&extra)
-            .args(&test_args)
-            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
-            .env("RUSTFLAGS", rustflags)
-            .env("CARGO_PROFILE_TEST_PANIC", "abort")
-            .env("CARGO_PROFILE_DEV_PANIC", "abort")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .env("CARGO_TERM_COLOR", "always")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(&extra).args(&test_args);
 
         let code = run_uboot_test_with_timeout(cmd, &label, 300);
         if code == 0 {
