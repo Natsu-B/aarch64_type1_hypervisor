@@ -21,6 +21,7 @@ extern crate alloc;
 #[cfg(all(feature = "rpi4_net", feature = "virtio_net"))]
 compile_error!("rpi4_net and virtio_net cannot be enabled together");
 mod debug;
+mod gdb_session;
 mod gdb_stream;
 #[cfg(not(any(feature = "rpi4_net", feature = "virtio_net")))]
 mod gdb_uart;

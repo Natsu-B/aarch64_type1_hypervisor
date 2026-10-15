@@ -1,3 +1,14 @@
+use crate::gdb_session::ATTACH_REASON;
+use crate::gdb_session::DEBUG_SESSION_ACTIVE;
+use crate::gdb_session::RxRing;
+pub use crate::gdb_session::is_debug_active;
+pub use crate::gdb_session::is_debug_session_active;
+pub use crate::gdb_session::is_debug_session_initialized;
+pub use crate::gdb_session::peek_attach_reason;
+pub use crate::gdb_session::set_debug_active;
+pub use crate::gdb_session::set_debug_session_active;
+pub use crate::gdb_session::set_debug_session_initialized;
+pub use crate::gdb_session::take_attach_reason;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::pl011::FifoLevel;
 use arch_hal::pl011::Pl011Uart;
@@ -17,60 +28,7 @@ const PREFETCH_CAP: usize = 1024 + 4;
 const NAK_ATTEMPTS: usize = 32;
 const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
-// Publish debug entry state without relying on higher-level locking.
-static DEBUG_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
-// Set once a GDB session handshake has completed and we should emit async stop replies.
-static DEBUG_SESSION_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
-// Tracks whether we've completed an initial RSP handshake at least once.
-static DEBUG_SESSION_INITIALIZED: RawAtomicPod<bool> =
-    unsafe { RawAtomicPod::new_raw_unchecked(false) };
 static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
-static ATTACH_REASON: RawAtomicPod<u8> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
-
-struct RxRing<const N: usize> {
-    buf: [u8; N],
-    head: usize,
-    tail: usize,
-}
-
-impl<const N: usize> RxRing<N> {
-    const fn new() -> Self {
-        Self {
-            buf: [0; N],
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-
-    fn push_drop_oldest(&mut self, byte: u8) -> bool {
-        let next = (self.head + 1) % N;
-        if next == self.tail {
-            // Drop oldest to preserve the newest bytes for resync/attach.
-            self.tail = (self.tail + 1) % N;
-        }
-        self.buf[self.head] = byte;
-        self.head = next;
-        true
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.is_empty() {
-            return None;
-        }
-        let byte = self.buf[self.tail];
-        self.tail = (self.tail + 1) % N;
-        Some(byte)
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-    }
-}
 
 struct GdbUartState<const N: usize> {
     uart: Pl011Uart,
@@ -232,41 +190,6 @@ fn record_attach_byte(assembler: &mut RspFrameAssembler, byte: u8) {
         // Release publishes the attach request after RX buffering.
         ATTACH_REASON.store(1, Ordering::Release);
     }
-}
-
-pub fn is_debug_active() -> bool {
-    // Acquire pairs with Release stores so debug entry sees any buffered bytes.
-    DEBUG_ACTIVE.load(Ordering::Acquire)
-}
-
-pub fn set_debug_active(active: bool) {
-    // Release publishes debug-active transitions to IRQ readers.
-    DEBUG_ACTIVE.store(active, Ordering::Release);
-}
-
-pub fn is_debug_session_active() -> bool {
-    DEBUG_SESSION_ACTIVE.load(Ordering::Acquire)
-}
-
-pub fn set_debug_session_active(active: bool) {
-    DEBUG_SESSION_ACTIVE.store(active, Ordering::Release);
-}
-
-pub fn is_debug_session_initialized() -> bool {
-    DEBUG_SESSION_INITIALIZED.load(Ordering::Acquire)
-}
-
-pub fn set_debug_session_initialized(active: bool) {
-    DEBUG_SESSION_INITIALIZED.store(active, Ordering::Release);
-}
-
-pub fn take_attach_reason() -> u8 {
-    // AcqRel ensures we observe any IRQ-side buffering before consuming the reason.
-    ATTACH_REASON.swap(0, Ordering::AcqRel)
-}
-
-pub fn peek_attach_reason() -> u8 {
-    ATTACH_REASON.load(Ordering::Acquire)
 }
 
 pub fn clear_prefetch() {
@@ -484,6 +407,8 @@ pub fn flush() {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use crate::gdb_session::DEBUG_ACTIVE;
+    use crate::gdb_session::DEBUG_SESSION_INITIALIZED;
     use core::sync::atomic::Ordering;
 
     fn reset_attach_state() {
