@@ -1270,9 +1270,20 @@ fn run_uboot_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> 
     run_guest_test_with_timeout(cmd, label, timeout_secs, "U-Boot test")
 }
 
-fn parse_xtest_cli_args(
-    args: &[String],
-) -> Result<(Vec<String>, Vec<String>, Vec<String>, bool), String> {
+/// Parsed `cargo xtask test` command line.
+#[derive(Debug, Default)]
+struct XtestCliArgs {
+    /// Arguments forwarded to every `cargo test` invocation (including `--`).
+    forward_args: Vec<String>,
+    /// `-p`/`--package` filters applied to `xtest.txt` entries.
+    package_filters: Vec<String>,
+    /// `-t` filters applied to test names (or the reserved category tokens).
+    testname_filters: Vec<String>,
+    /// Whether `-h`/`--help` was given.
+    help_requested: bool,
+}
+
+fn parse_xtest_cli_args(args: &[String]) -> Result<XtestCliArgs, String> {
     let mut forward_args = Vec::new();
     let mut package_filters = Vec::new();
     let mut testname_filters = Vec::new();
@@ -1324,12 +1335,12 @@ fn parse_xtest_cli_args(
         i += 1;
     }
 
-    Ok((
+    Ok(XtestCliArgs {
         forward_args,
         package_filters,
         testname_filters,
         help_requested,
-    ))
+    })
 }
 
 fn apply_testname_filters(
@@ -1379,14 +1390,18 @@ fn print_xtest_usage() {
 }
 
 fn test(args: &[String]) {
-    let (test_args, package_filters, testname_filters, help_requested) =
-        match parse_xtest_cli_args(args) {
-            Ok(parsed) => parsed,
-            Err(msg) => {
-                eprintln!("{}", msg);
-                std::process::exit(1);
-            }
-        };
+    let XtestCliArgs {
+        forward_args: test_args,
+        package_filters,
+        testname_filters,
+        help_requested,
+    } = match parse_xtest_cli_args(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    };
 
     if help_requested {
         print_xtest_usage();
@@ -1600,7 +1615,7 @@ fn test(args: &[String]) {
 
     fn scripts_need_sudo(
         tests: &[(String, String, String, Vec<String>)],
-        repo_root: &PathBuf,
+        repo_root: &Path,
         kind: &str,
     ) -> bool {
         for (_, _, testscript, _) in tests {
@@ -2072,22 +2087,20 @@ mod tests {
             "--",
             "--nocapture",
         ]);
-        let (forward_args, package_filters, testname_filters, help_requested) =
-            parse_xtest_cli_args(&args).expect("parse should succeed");
+        let parsed = parse_xtest_cli_args(&args).expect("parse should succeed");
 
-        assert_eq!(package_filters, vec!["gdb_remote"]);
-        assert_eq!(testname_filters, vec!["uefi_packet_size"]);
-        assert_eq!(forward_args, vec!["--", "--nocapture"]);
-        assert!(!help_requested);
+        assert_eq!(parsed.package_filters, vec!["gdb_remote"]);
+        assert_eq!(parsed.testname_filters, vec!["uefi_packet_size"]);
+        assert_eq!(parsed.forward_args, vec!["--", "--nocapture"]);
+        assert!(!parsed.help_requested);
     }
 
     #[test]
     fn parses_compact_testname_flag() {
         let args = to_args(&["-tgicv2_pending"]);
-        let (_, _, testname_filters, help_requested) =
-            parse_xtest_cli_args(&args).expect("parse should succeed");
-        assert_eq!(testname_filters, vec!["gicv2_pending"]);
-        assert!(!help_requested);
+        let parsed = parse_xtest_cli_args(&args).expect("parse should succeed");
+        assert_eq!(parsed.testname_filters, vec!["gicv2_pending"]);
+        assert!(!parsed.help_requested);
     }
 
     #[test]
@@ -2100,12 +2113,11 @@ mod tests {
     #[test]
     fn parses_help_flag() {
         let args = to_args(&["--help"]);
-        let (forward_args, package_filters, testname_filters, help_requested) =
-            parse_xtest_cli_args(&args).expect("parse should succeed");
-        assert!(help_requested);
-        assert!(forward_args.is_empty());
-        assert!(package_filters.is_empty());
-        assert!(testname_filters.is_empty());
+        let parsed = parse_xtest_cli_args(&args).expect("parse should succeed");
+        assert!(parsed.help_requested);
+        assert!(parsed.forward_args.is_empty());
+        assert!(parsed.package_filters.is_empty());
+        assert!(parsed.testname_filters.is_empty());
     }
 
     #[test]
