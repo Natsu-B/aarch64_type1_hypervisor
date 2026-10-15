@@ -1,3 +1,5 @@
+use arch_hal::common::read_volatile_sized;
+use arch_hal::common::write_volatile_sized;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::exceptions::emulation::EmulationOutcome;
@@ -21,8 +23,6 @@ use arch_hal::psci::{self};
 use arch_hal::soc::bcm2712;
 use arch_hal::tls;
 use core::ffi::c_void;
-use core::ptr::read_volatile;
-use core::ptr::write_volatile;
 use core::sync::atomic::Ordering;
 use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
@@ -73,15 +73,7 @@ pub(crate) fn gic() -> Option<&'static Gicv2> {
 fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
     // SAFETY: `passthrough_probe` admits only aligned device-MMIO-sized accesses for trapped
     // identity-mapped regions; the access width is the decoded guest access size.
-    let value = unsafe {
-        match size {
-            1 => read_volatile(ipa as *const u8) as u64,
-            2 => read_volatile(ipa as *const u16) as u64,
-            4 => read_volatile(ipa as *const u32) as u64,
-            8 => read_volatile(ipa as *const u64),
-            _ => return Err(MmioError::Unhandled),
-        }
-    };
+    let value = unsafe { read_volatile_sized(ipa as usize, size) }.ok_or(MmioError::Unhandled)?;
     note_rp1_passthrough_mmio_access(ipa as usize, false);
     Ok(value)
 }
@@ -89,15 +81,7 @@ fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioErro
 fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
     // SAFETY: `passthrough_probe` admits only aligned device-MMIO-sized accesses for trapped
     // identity-mapped regions; the access width is the decoded guest access size.
-    unsafe {
-        match size {
-            1 => write_volatile(ipa as *mut u8, value as u8),
-            2 => write_volatile(ipa as *mut u16, value as u16),
-            4 => write_volatile(ipa as *mut u32, value as u32),
-            8 => write_volatile(ipa as *mut u64, value),
-            _ => return Err(MmioError::Unhandled),
-        }
-    }
+    unsafe { write_volatile_sized(ipa as usize, size, value) }.ok_or(MmioError::Unhandled)?;
     note_rp1_passthrough_mmio_access(ipa as usize, true);
     Ok(())
 }
@@ -256,12 +240,8 @@ fn data_abort_handler(
     unsafe {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                let v = match access_width {
-                    SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
-                    SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
-                    SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
-                    SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
-                };
+                let v = read_volatile_sized(address as usize, access_bytes)
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
 
                 write_guest_mmio_dest_reg(regs, reg_num, reg_size, v);
             }
@@ -287,20 +267,8 @@ fn data_abort_handler(
                         log_value
                     );
                 };
-                match access_width {
-                    SyndromeAccessSize::Byte => {
-                        write_volatile(address as *mut u8, reg_val as u8);
-                    }
-                    SyndromeAccessSize::HalfWord => {
-                        write_volatile(address as *mut u16, reg_val as u16);
-                    }
-                    SyndromeAccessSize::Word => {
-                        write_volatile(address as *mut u32, reg_val as u32);
-                    }
-                    SyndromeAccessSize::DoubleWord => {
-                        write_volatile(address as *mut u64, reg_val);
-                    }
-                }
+                write_volatile_sized(address as usize, access_bytes, reg_val)
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
             }
         }
     }

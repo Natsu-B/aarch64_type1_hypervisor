@@ -7,6 +7,8 @@ use crate::monitor;
 use crate::softirq;
 use crate::vgic;
 use arch_hal::aarch64_gdb;
+use arch_hal::common::read_volatile_sized;
+use arch_hal::common::write_volatile_sized;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::exceptions::emulation::EmulationOutcome;
@@ -28,8 +30,6 @@ use arch_hal::timer;
 use core::cell::SyncUnsafeCell;
 use core::ffi::c_void;
 use core::hint::spin_loop;
-use core::ptr::read_volatile;
-use core::ptr::write_volatile;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::TI;
@@ -119,28 +119,11 @@ pub(crate) fn setup_handler() {
 }
 
 fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
-    unsafe {
-        Ok(match size {
-            1 => read_volatile(ipa as *const u8) as u64,
-            2 => read_volatile(ipa as *const u16) as u64,
-            4 => read_volatile(ipa as *const u32) as u64,
-            8 => read_volatile(ipa as *const u64),
-            _ => return Err(MmioError::Unhandled),
-        })
-    }
+    unsafe { read_volatile_sized(ipa as usize, size) }.ok_or(MmioError::Unhandled)
 }
 
 fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
-    unsafe {
-        match size {
-            1 => write_volatile(ipa as *mut u8, value as u8),
-            2 => write_volatile(ipa as *mut u16, value as u16),
-            4 => write_volatile(ipa as *mut u32, value as u32),
-            8 => write_volatile(ipa as *mut u64, value),
-            _ => return Err(MmioError::Unhandled),
-        }
-    }
-    Ok(())
+    unsafe { write_volatile_sized(ipa as usize, size, value) }.ok_or(MmioError::Unhandled)
 }
 
 fn passthrough_probe(_ctx: *const (), _ipa: u64, size: u8, _is_write: bool) -> bool {
@@ -402,14 +385,8 @@ fn data_abort_handler(
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
                 // SAFETY: address is within a DTB-derived allowlisted MMIO range.
-                let v = unsafe {
-                    match access_width {
-                        SyndromeAccessSize::Byte => read_volatile(addr as *const u8) as u64,
-                        SyndromeAccessSize::HalfWord => read_volatile(addr as *const u16) as u64,
-                        SyndromeAccessSize::Word => read_volatile(addr as *const u32) as u64,
-                        SyndromeAccessSize::DoubleWord => read_volatile(addr as *const u64),
-                    }
-                };
+                let v = unsafe { read_volatile_sized(addr, access_width.bytes()) }
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
                 *register = match reg_size {
                     InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => v,
@@ -421,22 +398,8 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
                 // SAFETY: address is within a DTB-derived allowlisted MMIO range.
-                unsafe {
-                    match access_width {
-                        SyndromeAccessSize::Byte => {
-                            write_volatile(addr as *mut u8, reg_val as u8);
-                        }
-                        SyndromeAccessSize::HalfWord => {
-                            write_volatile(addr as *mut u16, reg_val as u16);
-                        }
-                        SyndromeAccessSize::Word => {
-                            write_volatile(addr as *mut u32, reg_val as u32);
-                        }
-                        SyndromeAccessSize::DoubleWord => {
-                            write_volatile(addr as *mut u64, reg_val);
-                        }
-                    }
-                }
+                unsafe { write_volatile_sized(addr, access_width.bytes(), reg_val) }
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
                 // SAFETY: guest UART is initialized before guests can generate aborts.
                 let guest_uart_base = unsafe { (*GUEST_UART.get()).map(|u| u.base) };
                 if guest_uart_base.is_some_and(|base| base == addr) && reg_val == b'\n' as u64 {
