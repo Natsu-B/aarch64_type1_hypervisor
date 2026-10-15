@@ -679,10 +679,8 @@ fn write_semihost_read<M: MemoryAccess>(
     }
 
     let mut buf = [0u8; SEMIHOST_READ_MAX];
-    let mut truncated = false;
-    let mut actual_len = 0usize;
 
-    match kind {
+    let (actual_len, truncated) = match kind {
         SemihostOp::Write0 => {
             let addr = req
                 .buf_ptr
@@ -696,14 +694,12 @@ fn write_semihost_read<M: MemoryAccess>(
             mem.read(addr, &mut buf[..read_len])
                 .map_err(|_| "mem_read")?;
             if let Some(pos) = buf[..read_len].iter().position(|&b| b == 0) {
-                actual_len = pos;
                 guard.read_done = true;
                 guard.read_offset = guard.read_offset.saturating_add(pos as u64 + 1);
-                truncated = false;
+                (pos, false)
             } else {
-                actual_len = read_len;
                 guard.read_offset = guard.read_offset.saturating_add(read_len as u64);
-                truncated = true;
+                (read_len, true)
             }
         }
         SemihostOp::Open | SemihostOp::Write => {
@@ -719,12 +715,11 @@ fn write_semihost_read<M: MemoryAccess>(
             let addr = req.buf_ptr.checked_add(offset).ok_or("addr_overflow")?;
             mem.read(addr, &mut buf[..read_len])
                 .map_err(|_| "mem_read")?;
-            actual_len = read_len;
             guard.read_offset = offset + read_len as u64;
-            truncated = guard.read_offset < total_len;
+            (read_len, guard.read_offset < total_len)
         }
         SemihostOp::Close => return Err("bad_op"),
-    }
+    };
 
     let _ = out.try_write_str("hex:");
     let _ = push_hex_bytes(out, &buf[..actual_len]);

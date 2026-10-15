@@ -1283,13 +1283,6 @@ pub struct StopReplyCounters {
     pub sent: u64,
 }
 
-fn debug_assert_stop_counters() {
-    #[cfg(debug_assertions)]
-    {
-        let _ = stop_reply_counters();
-    }
-}
-
 struct DebugStopGuard {
     prev: bool,
 }
