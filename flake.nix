@@ -34,6 +34,7 @@
             pkgs.dtc
             pkgs.cargo-binutils
             pkgs.gdb
+            pkgs.mtools
           ];
         };
       }
