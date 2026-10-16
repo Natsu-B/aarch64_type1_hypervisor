@@ -9,6 +9,13 @@ rm -rf "$SCRIPT_DIR/../bin/EFI"
 mkdir -p "$SCRIPT_DIR/../bin/EFI/BOOT/"
 cp "${PATH_TO_ELF}" "$SCRIPT_DIR/../bin/EFI/BOOT/BOOTAA64.EFI"
 
+# The test overwrites the raw disk, so boot from a scratch copy to keep the
+# checked-in fixture pristine across repeated runs. The copy lives outside
+# `bin/` because that directory is also exported to the guest as a vvfat disk.
+DISK_IMG=$(mktemp "${TMPDIR:-/tmp}/virtio_blk_test.XXXXXX")
+trap 'rm -f "$DISK_IMG"' EXIT
+cp "$SCRIPT_DIR/test.txt" "$DISK_IMG"
+
 QEMU_GDB_ARGS=""
 if [ -n "$XTASK_QEMU_GDB_SOCKET" ]; then
     rm -f "$XTASK_QEMU_GDB_SOCKET"
@@ -23,7 +30,7 @@ qemu-system-aarch64 \
   -nographic \
   -semihosting-config enable=on,target=native \
   -no-reboot -no-shutdown \
-  -drive id=drive0,file=$SCRIPT_DIR/test.txt,format=raw,if=none \
+  -drive id=drive0,file=$DISK_IMG,format=raw,if=none \
   -device virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0 \
   -drive file=fat:rw:$SCRIPT_DIR/../bin,format=raw,if=none,media=disk,id=disk \
   -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.1 \
