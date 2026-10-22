@@ -12,6 +12,10 @@ use crate::ast::NodeEditExt;
 use crate::ast::NodeQueryExt;
 use crate::ast::Owned;
 use crate::ast::ValueRef;
+use crate::cells::read_be_u32;
+use crate::cells::string_list_contains;
+use crate::cells::write_be_u32;
+use crate::cells::write_be_u32s;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pl011Spec {
@@ -200,28 +204,6 @@ fn compatible_contains(node: &crate::ast::Node<'_>, compat: &str) -> bool {
     string_list_contains(prop.value.as_slice(), compat)
 }
 
-fn string_list_contains(bytes: &[u8], needle: &str) -> bool {
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|i| start + i)
-            .unwrap_or(bytes.len());
-        if end > start
-            && let Ok(entry) = core::str::from_utf8(&bytes[start..end])
-            && entry == needle
-        {
-            return true;
-        }
-        if end == bytes.len() {
-            break;
-        }
-        start = end + 1;
-    }
-    false
-}
-
 fn property_u32(
     tree: &DeviceTree<'_, Owned>,
     node_id: usize,
@@ -235,49 +217,7 @@ fn property_u32(
     if bytes.len() != 4 {
         return Err("dtb: u32 property must be 4 bytes");
     }
-    Ok(Some(read_be_u32(bytes)?))
-}
-
-fn read_be_u32(bytes: &[u8]) -> Result<u32, &'static str> {
-    if bytes.len() != 4 {
-        return Err("dtb: read_be_u32 expects 4 bytes");
-    }
-    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slot = bytes
-        .get_mut(offset..end)
-        .ok_or("dtb: write_be_u32 out of bounds")?;
-    slot.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for idx in 0..cells {
-        let shift = (cells - 1 - idx)
-            .checked_mul(32)
-            .ok_or("dtb: write_be_u32s shift overflow")?;
-        let cell = if shift >= 64 {
-            0
-        } else {
-            ((value >> shift) & 0xffff_ffff) as u32
-        };
-        let cell_offset = offset
-            .checked_add(
-                idx.checked_mul(4)
-                    .ok_or("dtb: write_be_u32s offset overflow")?,
-            )
-            .ok_or("dtb: write_be_u32s offset overflow")?;
-        write_be_u32(bytes, cell_offset, cell)?;
-    }
-    Ok(())
+    Ok(Some(read_be_u32(bytes, 0)?))
 }
 
 fn allocate_phandle(tree: &DeviceTree<'_, Owned>) -> Result<u32, &'static str> {
@@ -291,7 +231,7 @@ fn allocate_phandle(tree: &DeviceTree<'_, Owned>) -> Result<u32, &'static str> {
             if value.len() != 4 {
                 return Err("dtb: phandle property must be 4 bytes");
             }
-            let phandle = read_be_u32(value)?;
+            let phandle = read_be_u32(value, 0)?;
             if phandle > max {
                 max = phandle;
             }

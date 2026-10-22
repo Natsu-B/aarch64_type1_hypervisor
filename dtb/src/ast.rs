@@ -13,8 +13,9 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::mem::align_of;
 use core::mem::size_of;
-use typestate::Be;
 
+use crate::cells::read_be_u32;
+use crate::cells::write_be_u32;
 use crate::dtb_parser::DtbParser;
 use crate::dtb_parser::Validated;
 use crate::dtb_parser::big_endian::Dtb;
@@ -33,17 +34,6 @@ fn align4(x: usize) -> usize {
     (x + 3) & !3
 }
 
-fn read_be_u32(buf: &[u8], offset: usize) -> Result<u32, &'static str> {
-    let end = offset
-        .checked_add(4)
-        .ok_or("dtb: overflow in read_be_u32")?;
-    let bytes = buf
-        .get(offset..end)
-        .ok_or("dtb: out of bounds in read_be_u32")?;
-    let be = unsafe { &*(bytes.as_ptr() as *const Be<u32>) };
-    Ok(be.read())
-}
-
 fn read_cstr(buf: &[u8], offset: usize) -> Result<&str, &'static str> {
     let slice = buf
         .get(offset..)
@@ -54,17 +44,6 @@ fn read_cstr(buf: &[u8], offset: usize) -> Result<&str, &'static str> {
         .ok_or("dtb: missing NUL terminator in read_cstr")?;
     let bytes = &slice[..len];
     core::str::from_utf8(bytes).map_err(|_| "dtb: invalid UTF-8 in string")
-}
-
-fn write_be_u32(buf: &mut [u8], offset: usize, v: u32) -> Result<(), &'static str> {
-    let end = offset
-        .checked_add(4)
-        .ok_or("dtb: overflow in write_be_u32")?;
-    let slice = buf
-        .get_mut(offset..end)
-        .ok_or("dtb: out of bounds in write_be_u32")?;
-    slice.copy_from_slice(&v.to_be_bytes());
-    Ok(())
 }
 
 fn write_be_u64(buf: &mut [u8], offset: usize, v: u64) -> Result<(), &'static str> {
