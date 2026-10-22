@@ -124,6 +124,9 @@ use dtb::NodeEditExt;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
 use dtb::WalkError;
+use dtb::cells::read_be_u32;
+use dtb::cells::write_be_u32s;
+use dtb::node_path;
 use file::AlignedSliceBox;
 
 unsafe extern "C" {
@@ -1978,7 +1981,10 @@ fn apply_guest_uart_dt_edit(
     let mut disable_nodes = Vec::new();
 
     for id in 0..tree.nodes.len() {
-        if !node_compatible_contains(tree, id, "arm,pl011")? {
+        if !tree
+            .node(id)
+            .is_some_and(|node| node.compatible_contains("arm,pl011"))
+        {
             continue;
         }
         let raw_base = node_reg_base(tree, id)?;
@@ -2001,7 +2007,7 @@ fn apply_guest_uart_dt_edit(
     }
 
     if let Some(chosen) = tree.find_node_by_path("/chosen")
-        && let Some(path) = node_path(tree, guest_node)
+        && let Ok(path) = node_path(tree, guest_node)
     {
         let mut value = Vec::with_capacity(path.len() + 1);
         value.extend_from_slice(path.as_bytes());
@@ -2014,7 +2020,7 @@ fn apply_guest_uart_dt_edit(
     if let Some(aliases) = tree.find_node_by_path("/aliases") {
         let mut remove: Vec<String> = Vec::new();
         for id in disable_nodes.iter().copied() {
-            if let Some(path) = node_path(tree, id)
+            if let Ok(path) = node_path(tree, id)
                 && let Some(node) = tree.node(aliases)
             {
                 for prop in &node.properties {
@@ -2074,7 +2080,10 @@ fn update_gicv2_cpu_interface_reg(
     let mut gic_node = None;
     for id in 0..tree.nodes.len() {
         for compat in COMPATS {
-            if node_compatible_contains(tree, id, compat)? {
+            if tree
+                .node(id)
+                .is_some_and(|node| node.compatible_contains(compat))
+            {
                 gic_node = Some(id);
                 break;
             }
@@ -2091,8 +2100,8 @@ fn update_gicv2_cpu_interface_reg(
         .node(node_id)
         .and_then(|n| n.parent)
         .unwrap_or(tree.root);
-    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
-    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
+    let addr_cells = property_u32(tree, parent, "#address-cells").unwrap_or(2) as usize;
+    let size_cells = property_u32(tree, parent, "#size-cells").unwrap_or(1) as usize;
     let stride = (addr_cells + size_cells) * 4;
     let Some(node) = tree.node(node_id) else {
         return Ok(());
@@ -2117,35 +2126,6 @@ fn update_gicv2_cpu_interface_reg(
         node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
     }
     Ok(())
-}
-
-fn node_compatible_contains(
-    tree: &DeviceTree<'static>,
-    node_id: usize,
-    needle: &str,
-) -> Result<bool, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(false);
-    };
-    let Some(prop) = node.property("compatible") else {
-        return Ok(false);
-    };
-    let bytes = prop.value.as_slice();
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| start + p)
-            .unwrap_or(bytes.len());
-        if let Ok(entry) = core::str::from_utf8(&bytes[start..end])
-            && entry == needle
-        {
-            return Ok(true);
-        }
-        start = end + 1;
-    }
-    Ok(false)
 }
 
 fn node_reg_base(
@@ -2186,8 +2166,8 @@ fn node_reg_first(
         return Ok(None);
     };
     let parent = node.parent.unwrap_or(tree.root);
-    let addr_cells = inherited_u32(tree, parent, "#address-cells")?.unwrap_or(2);
-    let size_cells = inherited_u32(tree, parent, "#size-cells")?.unwrap_or(1);
+    let addr_cells = inherited_u32(tree, parent, "#address-cells").unwrap_or(2);
+    let size_cells = inherited_u32(tree, parent, "#size-cells").unwrap_or(1);
 
     let addr_cells_usize =
         usize::try_from(addr_cells).map_err(|_| "reg: address/size cells overflow usize")?;
@@ -2248,10 +2228,10 @@ fn translate_one_level_ranges(
         return Ok(child);
     }
 
-    let child_address_cells = inherited_u32(tree, bus_node_id, "#address-cells")?.unwrap_or(2);
-    let child_size_cells = inherited_u32(tree, bus_node_id, "#size-cells")?.unwrap_or(1);
+    let child_address_cells = inherited_u32(tree, bus_node_id, "#address-cells").unwrap_or(2);
+    let child_size_cells = inherited_u32(tree, bus_node_id, "#size-cells").unwrap_or(1);
     let parent = bus.parent.ok_or("ranges: missing parent")?;
-    let parent_address_cells = inherited_u32(tree, parent, "#address-cells")?.unwrap_or(2);
+    let parent_address_cells = inherited_u32(tree, parent, "#address-cells").unwrap_or(2);
 
     let child_address_cells_usize = usize::try_from(child_address_cells)
         .map_err(|_| "ranges: address/size cells overflow usize")?;
@@ -2313,19 +2293,15 @@ fn translate_one_level_ranges(
     Err("ranges: address not covered")
 }
 
-fn inherited_u32(
-    tree: &DeviceTree<'static>,
-    node_id: usize,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
+fn inherited_u32(tree: &DeviceTree<'static>, node_id: usize, key: &str) -> Option<u32> {
     let mut current = Some(node_id);
     while let Some(id) = current {
-        if let Some(value) = property_u32(tree, id, key)? {
-            return Ok(Some(value));
+        if let Some(value) = property_u32(tree, id, key) {
+            return Some(value);
         }
         current = tree.node(id).and_then(|node| node.parent);
     }
-    Ok(None)
+    None
 }
 
 fn read_be_cells_u128(
@@ -2358,71 +2334,9 @@ fn read_be_cells_u128(
     Ok((value, consumed))
 }
 
-fn property_u32(
-    tree: &DeviceTree<'static>,
-    node_id: usize,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(None);
-    };
-    let Some(prop) = node.property(key) else {
-        return Ok(None);
-    };
-    let bytes = prop.value.as_slice();
-    if bytes.len() != 4 {
-        return Ok(None);
-    }
-    Ok(Some(read_be_u32(bytes, 0)?))
-}
-
-fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
-    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
-    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
-    slice.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for i in 0..cells {
-        let shift = 32 * (cells - 1 - i);
-        let cell = ((value >> shift) & 0xffff_ffff) as u32;
-        write_be_u32(bytes, offset + i * 4, cell)?;
-    }
-    Ok(())
-}
-
-fn node_path(tree: &DeviceTree<'static>, node_id: usize) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    let mut current = Some(node_id);
-    while let Some(id) = current {
-        let node = tree.node(id)?;
-        let name = node.name.as_str();
-        if !name.is_empty() && name != "/" {
-            parts.push(name);
-        }
-        current = node.parent;
-    }
-    parts.reverse();
-    let mut path = String::from("/");
-    for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
-            path.push('/');
-        }
-        path.push_str(part);
-    }
-    Some(path)
+/// Reads a single-cell property, treating a missing node or a malformed value as absent.
+fn property_u32(tree: &DeviceTree<'static>, node_id: usize, key: &str) -> Option<u32> {
+    tree.node(node_id)?.property_u32(key).ok().flatten()
 }
 
 fn decode_cstr(bytes: &[u8]) -> Option<&str> {
