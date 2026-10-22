@@ -1,7 +1,6 @@
 use core::arch::asm;
 use core::cell::SyncUnsafeCell;
 use core::fmt;
-use core::fmt::Write as _;
 use core::hint::spin_loop;
 use core::mem::MaybeUninit;
 use core::mem::offset_of;
@@ -1853,44 +1852,8 @@ fn ring_index_reached(cons: u16, expect: u16) -> bool {
     delta < 0x8000
 }
 
-struct UartLogBuf<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> UartLogBuf<N> {
-    fn new() -> Self {
-        Self {
-            buf: [0; N],
-            len: 0,
-        }
-    }
-
-    fn as_str(&self) -> Option<&str> {
-        core::str::from_utf8(&self.buf[..self.len]).ok()
-    }
-}
-
-impl<const N: usize> fmt::Write for UartLogBuf<N> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let avail = self.buf.len().saturating_sub(self.len);
-        if avail == 0 {
-            return Ok(());
-        }
-        let bytes = s.as_bytes();
-        let copy_len = bytes.len().min(avail);
-        self.buf[self.len..self.len + copy_len].copy_from_slice(&bytes[..copy_len]);
-        self.len += copy_len;
-        Ok(())
-    }
-}
-
 fn debug_uart_log(args: fmt::Arguments<'_>) {
-    let mut line = UartLogBuf::<288>::new();
-    let _ = line.write_fmt(args);
-    if let Some(s) = line.as_str() {
-        print::debug_uart::write(s);
-    }
+    print::debug_uart::write_fmt_truncated::<288>(args);
 }
 
 fn phy_mode_name(mode: PhyMode) -> &'static str {
