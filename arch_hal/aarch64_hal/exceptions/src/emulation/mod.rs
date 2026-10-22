@@ -320,19 +320,15 @@ where
                 &resolver,
             )?;
 
-            let ipa = if eff == fault_va {
-                first_ipa
-            } else {
-                resolve_ipa_with_resolver(
-                    eff,
-                    insn_is_write,
-                    esr,
-                    fault_ipa,
-                    false,
-                    fault_va,
-                    &resolver,
-                )?
-            };
+            let ipa = resolve_access_ipa(
+                eff,
+                first_ipa,
+                insn_is_write,
+                esr,
+                fault_ipa,
+                fault_va,
+                &resolver,
+            )?;
 
             let split = split_plan_for_access(ipa, desc.size)?;
 
@@ -373,32 +369,24 @@ where
                 fault_va,
                 &resolver,
             )?;
-            let ipa0 = if addr0 == fault_va {
-                first_ipa
-            } else {
-                resolve_ipa_with_resolver(
-                    addr0,
-                    insn_is_write,
-                    esr,
-                    fault_ipa,
-                    addr0 == fault_va,
-                    fault_va,
-                    &resolver,
-                )?
-            };
-            let ipa1 = if addr1 == fault_va {
-                first_ipa
-            } else {
-                resolve_ipa_with_resolver(
-                    addr1,
-                    insn_is_write,
-                    esr,
-                    fault_ipa,
-                    addr1 == fault_va,
-                    fault_va,
-                    &resolver,
-                )?
-            };
+            let ipa0 = resolve_access_ipa(
+                addr0,
+                first_ipa,
+                insn_is_write,
+                esr,
+                fault_ipa,
+                fault_va,
+                &resolver,
+            )?;
+            let ipa1 = resolve_access_ipa(
+                addr1,
+                first_ipa,
+                insn_is_write,
+                esr,
+                fault_ipa,
+                fault_va,
+                &resolver,
+            )?;
 
             let split0 = split_plan_for_access(ipa0, desc.size)?;
             let split1 = split_plan_for_access(ipa1, desc.size)?;
@@ -549,6 +537,28 @@ pub(crate) fn hpfar_el2_written_for_abort(esr: &ESR_EL2) -> bool {
                 | DataFaultStatusCade::AccessFlagLevel3,
         )
     )
+}
+
+/// Resolves the IPA accessed at `va`, reusing `first_ipa` when `va` is the faulting address.
+///
+/// Other addresses (base-writeback offsets, the second element of a pair) are translated
+/// without trusting `HPFAR_EL2`, which only describes the faulting address.
+fn resolve_access_ipa<R>(
+    va: u64,
+    first_ipa: u64,
+    is_write: bool,
+    esr: &ESR_EL2,
+    fault_ipa: Option<u64>,
+    fault_va: u64,
+    resolver: &R,
+) -> Option<u64>
+where
+    R: Fn(u64, bool) -> Option<u64>,
+{
+    if va == fault_va {
+        return Some(first_ipa);
+    }
+    resolve_ipa_with_resolver(va, is_write, esr, fault_ipa, false, fault_va, resolver)
 }
 
 fn resolve_ipa_with_resolver<R>(
