@@ -87,6 +87,33 @@ const GICD_SPENDSGIR_END: u32 =
 const GICD_PIDR_END: u32 = GICD_PIDR_OFFSET + size_of_field!(GicV2Distributor, pidr) as u32;
 const GICD_CIDR_END: u32 = GICD_CIDR_OFFSET + size_of_field!(GicV2Distributor, cidr) as u32;
 
+/// Bit mask of the implemented INTIDs in a one-bit-per-INTID register word starting at
+/// `base_intid`; INTIDs above `MAX_VIRTUAL_INTID` read as zero.
+fn word_mask(base_intid: u32, ints_per_word: u32) -> u32 {
+    if base_intid > MAX_VIRTUAL_INTID {
+        return 0;
+    }
+    let valid = cmp::min(ints_per_word, MAX_VIRTUAL_INTID - base_intid + 1);
+    if valid >= 32 {
+        0xffff_ffff
+    } else {
+        (1u32 << valid) - 1
+    }
+}
+
+/// Byte mask of the implemented INTIDs in a `GICD_IPRIORITYR` word starting at `base_intid`.
+fn priority_mask(base_intid: u32) -> u32 {
+    if base_intid > MAX_VIRTUAL_INTID {
+        return 0;
+    }
+    let valid = cmp::min(4, MAX_VIRTUAL_INTID - base_intid + 1);
+    if valid == 4 {
+        0xffff_ffff
+    } else {
+        ((1u64 << (valid * 8)) - 1) as u32
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Gicv2AccessSize {
     U8,
@@ -262,30 +289,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         if size == Gicv2AccessSize::U32 && !offset.is_multiple_of(4) {
             return Err(GicError::InvalidOffset);
         }
-
-        let word_mask = |base_intid: u32, ints_per_word: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(ints_per_word, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid >= 32 {
-                0xffff_ffff
-            } else {
-                (1u32 << valid) - 1
-            }
-        };
-
-        let priority_mask = |base_intid: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(4, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid == 4 {
-                0xffff_ffff
-            } else {
-                ((1u64 << (valid * 8)) - 1) as u32
-            }
-        };
 
         let icfgr_mask = |base_intid: u32| -> u32 {
             if base_intid > MAX_VIRTUAL_INTID {
@@ -493,30 +496,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         if size == Gicv2AccessSize::U32 && !offset.is_multiple_of(4) {
             return Err(GicError::InvalidOffset);
         }
-
-        let word_mask = |base_intid: u32, ints_per_word: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(ints_per_word, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid >= 32 {
-                0xffff_ffff
-            } else {
-                (1u32 << valid) - 1
-            }
-        };
-
-        let priority_mask = |base_intid: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(4, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid == 4 {
-                0xffff_ffff
-            } else {
-                ((1u64 << (valid * 8)) - 1) as u32
-            }
-        };
 
         let icfgr_mask = |base_intid: u32| -> u32 {
             if base_intid > MAX_VIRTUAL_INTID {
