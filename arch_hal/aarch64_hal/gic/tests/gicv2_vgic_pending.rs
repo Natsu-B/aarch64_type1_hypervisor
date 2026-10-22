@@ -52,11 +52,11 @@ fn entry() -> ! {
 
     match run() {
         Ok(()) => {
-            println!("gicv2_pending: PASS");
+            println!("gicv2_vgic_pending: PASS");
             exit_success();
         }
         Err(err) => {
-            println!("gicv2_pending: FAIL: {}", err);
+            println!("gicv2_vgic_pending: FAIL: {}", err);
             exit_failure();
         }
     }
