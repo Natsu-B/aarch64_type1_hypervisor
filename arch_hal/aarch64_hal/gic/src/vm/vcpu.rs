@@ -393,6 +393,33 @@ impl<
         })
     }
 
+    /// Restores per-LR EOI-maintenance to the policy default after an LR overflow clears.
+    ///
+    /// Overflow handling arms EOI-maintenance on every in-flight software LR; once the
+    /// condition is gone only SPIs (and above) keep it, local SGIs/PPIs drop it again.
+    fn disarm_overflow_eoi_maintenance<H: VgicHw>(
+        hw: &H,
+        inner: &mut Inner<MAX_VCPUS, MAX_INTIDS, MAX_LRS, PENDING_CAP>,
+        num_lrs: usize,
+    ) -> Result<(), GicError> {
+        for idx in 0..num_lrs {
+            if inner.in_lr[idx].is_some() {
+                let mut irq = hw.read_lr(idx)?;
+                inner.lr_state[idx] = irq.state();
+                if !irq.is_hw() && irq.state() != IrqState::Inactive {
+                    let want_eoi = irq.vintid() >= LOCAL_INTID_COUNT as u32;
+                    if irq.eoi_maintenance() != want_eoi {
+                        irq.set_eoi_maintenance(want_eoi);
+                        hw.write_lr(idx, irq)?;
+                        inner.lr_state[idx] = irq.state();
+                    }
+                }
+            }
+        }
+        inner.overflow_armed = false;
+        Ok(())
+    }
+
     fn invalidate_lr_entry<H: VgicHw>(
         &self,
         hw: &H,
@@ -729,40 +756,12 @@ impl<
                         }
                     } else if inner.overflow_armed {
                         // Condition cleared: restore EOI-maintenance to the policy default.
-                        for idx in 0..num_lrs {
-                            if inner.in_lr[idx].is_some() {
-                                let mut irq = hw.read_lr(idx)?;
-                                inner.lr_state[idx] = irq.state();
-                                if !irq.is_hw() && irq.state() != IrqState::Inactive {
-                                    let want_eoi = irq.vintid() >= LOCAL_INTID_COUNT as u32;
-                                    if irq.eoi_maintenance() != want_eoi {
-                                        irq.set_eoi_maintenance(want_eoi);
-                                        hw.write_lr(idx, irq)?;
-                                        inner.lr_state[idx] = irq.state();
-                                    }
-                                }
-                            }
-                        }
-                        inner.overflow_armed = false;
+                        Self::disarm_overflow_eoi_maintenance(hw, &mut inner, num_lrs)?;
                     }
                 }
                 EoiMode::DropOnly => {
                     if inner.overflow_armed {
-                        for idx in 0..num_lrs {
-                            if inner.in_lr[idx].is_some() {
-                                let mut irq = hw.read_lr(idx)?;
-                                inner.lr_state[idx] = irq.state();
-                                if !irq.is_hw() && irq.state() != IrqState::Inactive {
-                                    let want_eoi = irq.vintid() >= LOCAL_INTID_COUNT as u32;
-                                    if irq.eoi_maintenance() != want_eoi {
-                                        irq.set_eoi_maintenance(want_eoi);
-                                        hw.write_lr(idx, irq)?;
-                                        inner.lr_state[idx] = irq.state();
-                                    }
-                                }
-                            }
-                        }
-                        inner.overflow_armed = false;
+                        Self::disarm_overflow_eoi_maintenance(hw, &mut inner, num_lrs)?;
                     }
                 }
             }
