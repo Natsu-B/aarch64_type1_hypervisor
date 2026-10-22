@@ -15,6 +15,7 @@ use core::mem::align_of;
 use core::mem::size_of;
 
 use crate::cells::read_be_u32;
+use crate::cells::string_list_contains;
 use crate::cells::write_be_u32;
 use crate::dtb_parser::DtbParser;
 use crate::dtb_parser::Validated;
@@ -850,6 +851,15 @@ impl<'dtb> DeviceTreeEditExt<'dtb> for DeviceTree<'dtb, Owned> {
 
 pub trait NodeQueryExt<'dtb> {
     fn property(&self, name: &str) -> Option<&Property<'dtb>>;
+
+    /// Returns whether the node's `compatible` string list contains `compat`.
+    fn compatible_contains(&self, compat: &str) -> bool;
+
+    /// Reads a single-cell `u32` property.
+    ///
+    /// Returns `Ok(None)` when the property is absent and an error when its value is not
+    /// exactly one cell long.
+    fn property_u32(&self, name: &str) -> Result<Option<u32>, &'static str>;
 }
 
 impl<'dtb> NodeQueryExt<'dtb> for Node<'dtb> {
@@ -857,6 +867,22 @@ impl<'dtb> NodeQueryExt<'dtb> for Node<'dtb> {
         self.properties
             .iter()
             .find(|prop| prop.name.as_str() == name)
+    }
+
+    fn compatible_contains(&self, compat: &str) -> bool {
+        self.property("compatible")
+            .is_some_and(|prop| string_list_contains(prop.value.as_slice(), compat))
+    }
+
+    fn property_u32(&self, name: &str) -> Result<Option<u32>, &'static str> {
+        let Some(prop) = self.property(name) else {
+            return Ok(None);
+        };
+        let bytes = prop.value.as_slice();
+        if bytes.len() != 4 {
+            return Err("dtb: u32 property must be 4 bytes");
+        }
+        Ok(Some(read_be_u32(bytes, 0)?))
     }
 }
 
@@ -901,6 +927,26 @@ mod tests {
 
     fn aligned_fixture() -> &'static [u8] {
         &TEST_DTB.0
+    }
+
+    #[test]
+    fn node_query_helpers_decode_compatible_and_u32() {
+        let mut node = Node::new(NameRef::Borrowed("uart@0"));
+        node.set_property(
+            NameRef::Borrowed("compatible"),
+            ValueRef::Borrowed(b"arm,pl011\0arm,primecell\0"),
+        );
+        node.set_property(
+            NameRef::Borrowed("#address-cells"),
+            ValueRef::Borrowed(&[0, 0, 0, 2]),
+        );
+        node.set_property(NameRef::Borrowed("bad"), ValueRef::Borrowed(&[0, 1]));
+
+        assert!(node.compatible_contains("arm,primecell"));
+        assert!(!node.compatible_contains("arm,pl01"));
+        assert_eq!(node.property_u32("#address-cells"), Ok(Some(2)));
+        assert_eq!(node.property_u32("missing"), Ok(None));
+        assert!(node.property_u32("bad").is_err());
     }
 
     #[test]
