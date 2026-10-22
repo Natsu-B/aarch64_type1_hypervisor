@@ -48,7 +48,13 @@ pub struct SemihostRequest {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SemihostCompletion {
+    /// Return value reported back to the guest in `x0`.
     pub result: i64,
+    /// GDB-reported errno for the completed call.
+    ///
+    /// No semihosting operation consumes it yet (there is no `SYS_ERRNO` support), so only the
+    /// unit tests read it today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub errno: i32,
 }
 
@@ -186,15 +192,6 @@ pub fn fileio_pending() -> bool {
 pub fn fileio_inflight() -> bool {
     let guard = SEMIHOST.lock_irqsave();
     guard.fileio_inflight
-}
-
-pub fn fileio_clear_inflight() -> Result<(), &'static str> {
-    let mut guard = SEMIHOST.lock_irqsave();
-    if !guard.pending {
-        return Err("no_pending");
-    }
-    guard.fileio_inflight = false;
-    Ok(())
 }
 
 fn set_fileio_enabled(enabled: bool) {
