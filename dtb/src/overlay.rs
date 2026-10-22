@@ -21,6 +21,7 @@ use crate::ast::NodeEditExt;
 use crate::ast::NodeId;
 use crate::ast::NodeQueryExt;
 use crate::ast::Owned;
+use crate::node_path;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OverlayError {
@@ -511,13 +512,13 @@ fn merge_overlay_subtree(
             merge_overlay_subtree(base, overlay, child, existing, opt, report)?;
         } else {
             let new_id = copy_subtree(base, overlay, child, base_node, report)?;
-            let new_path = node_path(base, new_id);
+            let new_path = overlay_node_path(base, new_id)?;
             report.record_modified_node(new_path);
         }
     }
 
     if modifications {
-        let path = node_path(base, base_node);
+        let path = overlay_node_path(base, base_node)?;
         report.record_modified_node(path);
     }
 
@@ -718,6 +719,11 @@ fn normalize_overlay_path(path: &str) -> String {
     }
 }
 
+/// Resolves `node_id` to its absolute path, reporting dangling ids as a malformed overlay.
+fn overlay_node_path(tree: &DeviceTree<'_>, node_id: NodeId) -> Result<String, OverlayError> {
+    node_path(tree, node_id).map_err(|_| OverlayError::MalformedOverlay)
+}
+
 fn find_child_by_name(tree: &DeviceTree<'_>, parent: NodeId, name: &str) -> Option<NodeId> {
     let node = tree.node(parent)?;
     for &child in &node.children {
@@ -727,36 +733,6 @@ fn find_child_by_name(tree: &DeviceTree<'_>, parent: NodeId, name: &str) -> Opti
         }
     }
     None
-}
-
-fn node_path(tree: &DeviceTree<'_>, node_id: NodeId) -> String {
-    if node_id == tree.root {
-        return "/".to_string();
-    }
-    let mut parts = Vec::new();
-    let mut current = Some(node_id);
-    while let Some(id) = current {
-        if id == tree.root {
-            break;
-        }
-        if let Some(node) = tree.node(id) {
-            parts.push(node.name.as_str().to_string());
-            current = node.parent;
-        } else {
-            break;
-        }
-    }
-    let mut path = String::from("/");
-    for (i, part) in parts.iter().rev().enumerate() {
-        if i > 0 || path != "/" {
-            path.push('/');
-        }
-        path.push_str(part);
-    }
-    if path.len() > 1 && path.ends_with('/') {
-        path.pop();
-    }
-    path
 }
 
 fn update_symbols(
@@ -804,7 +780,7 @@ fn update_symbols(
                     .get(p)
                     .copied()
                     .ok_or(OverlayError::TargetNotFound)?;
-                node_path(base, target_node)
+                overlay_node_path(base, target_node)?
             }
             FragmentTarget::Path(p) => {
                 if p.starts_with('/') {
