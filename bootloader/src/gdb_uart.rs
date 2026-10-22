@@ -1,5 +1,9 @@
+use crate::gdb_session;
 use crate::gdb_session::ATTACH_REASON;
 use crate::gdb_session::DEBUG_SESSION_ACTIVE;
+use crate::gdb_session::GdbTransport;
+use crate::gdb_session::PrefetchBuf;
+pub use crate::gdb_session::PrefetchResult;
 use crate::gdb_session::RxRing;
 pub use crate::gdb_session::is_debug_active;
 pub use crate::gdb_session::is_debug_session_active;
@@ -15,7 +19,6 @@ use arch_hal::pl011::Pl011Uart;
 use arch_hal::pl011::UARTICR;
 use arch_hal::pl011::UARTIMSC;
 use arch_hal::timer;
-use core::hint::spin_loop;
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::sync::atomic::Ordering;
@@ -24,8 +27,6 @@ use gdb_remote::RspFrameEvent;
 use mutex::pod::RawAtomicPod;
 
 const RX_RING_SIZE: usize = 4096;
-const PREFETCH_CAP: usize = 1024 + 4;
-const NAK_ATTEMPTS: usize = 32;
 const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
 static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
@@ -34,9 +35,7 @@ struct GdbUartState<const N: usize> {
     uart: Pl011Uart,
     rx: RxRing<N>,
     rsp: RspFrameAssembler,
-    prefetch_buf: [u8; PREFETCH_CAP],
-    prefetch_len: usize,
-    prefetch_pos: usize,
+    prefetch: PrefetchBuf,
 }
 
 // SAFETY: `GDB_UART_READY` publishes initialization completion with Release ordering.
@@ -108,8 +107,7 @@ pub fn begin_stop_loop() -> StopLoopGuard {
     // IMPORTANT: Do NOT clear `state.rx` here.
     // The byte which triggered attach/Ctrl-C is buffered in `rx` by the IRQ handler and must be
     // preserved for `prefetch_first_rsp_frame()`.
-    state.prefetch_len = 0;
-    state.prefetch_pos = 0;
+    state.prefetch.clear();
     StopLoopGuard {
         restore: true,
         pause_start_ticks,
@@ -134,8 +132,7 @@ impl Drop for StopLoopGuard {
             let state = unsafe { (*guard).assume_init_mut() };
             state.rx.clear();
             state.rsp.reset();
-            state.prefetch_len = 0;
-            state.prefetch_pos = 0;
+            state.prefetch.clear();
             state.uart.enable_rx_interrupts(FifoLevel::OneQuarter, true);
         }
         STOP_LOOP_ACTIVE.store(false, Ordering::Release);
@@ -192,144 +189,40 @@ fn record_attach_byte(assembler: &mut RspFrameAssembler, byte: u8) {
     }
 }
 
-pub fn clear_prefetch() {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (*guard).assume_init_mut() };
-    state.prefetch_len = 0;
-    state.prefetch_pos = 0;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrefetchResult {
-    Success,
-    Timeout,
-    Overflow,
-    Unavailable,
-}
-
-// Wait for the first byte within the attach deadline, then extend the timeout
-// on every subsequent byte to avoid tearing down slow-but-active transfers.
+/// Prefetches the first incoming RSP frame for attach handling.
+///
+/// See [`gdb_session::prefetch_first_rsp_frame`] for the timeout semantics.
 pub fn prefetch_first_rsp_frame(
     attach_deadline_ticks: u64,
     idle_timeout_ticks: u64,
 ) -> PrefetchResult {
-    clear_prefetch();
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return PrefetchResult::Unavailable;
-    }
-
-    let mut assembler = RspFrameAssembler::new();
-    let mut len = 0usize;
-
-    let el2_timer = timer::El2PhysicalTimer::new();
-    let mut attached = false;
-    let mut deadline_ticks = attach_deadline_ticks;
-
-    loop {
-        let now = el2_timer.now();
-        if !attached {
-            if now >= deadline_ticks {
-                return fail_prefetch(PrefetchResult::Timeout);
-            }
-        } else if idle_timeout_ticks != 0 && now >= deadline_ticks {
-            return fail_prefetch(PrefetchResult::Timeout);
-        }
-
-        let Some(byte) = try_read_byte() else {
-            spin_loop();
-            continue;
-        };
-
-        let event = assembler.push(byte);
-        if !matches!(event, RspFrameEvent::Ignore) {
-            attached = true;
-            if idle_timeout_ticks != 0 {
-                deadline_ticks = el2_timer.now().saturating_add(idle_timeout_ticks);
-            }
-        }
-        match event {
-            RspFrameEvent::Ignore => {}
-            RspFrameEvent::Resync => {
-                len = 0;
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-            }
-            RspFrameEvent::NeedMore => {
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-            }
-            RspFrameEvent::CtrlC => {
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-                if !store_prefetch(len) {
-                    return PrefetchResult::Unavailable;
-                }
-                return PrefetchResult::Success;
-            }
-            RspFrameEvent::FrameComplete => {
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-                if !store_prefetch(len) {
-                    return PrefetchResult::Unavailable;
-                }
-                return PrefetchResult::Success;
-            }
-        }
-    }
+    gdb_session::prefetch_first_rsp_frame::<Transport>(attach_deadline_ticks, idle_timeout_ticks)
 }
 
-fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (*guard).assume_init_mut() };
-    if *len >= state.prefetch_buf.len() {
-        return false;
-    }
-    state.prefetch_buf[*len] = byte;
-    *len += 1;
-    true
-}
+/// PL011 hooks for the shared attach prefetch logic.
+struct Transport;
 
-fn store_prefetch(len: usize) -> bool {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (*guard).assume_init_mut() };
-    if len > state.prefetch_buf.len() {
-        return false;
-    }
-    state.prefetch_len = len;
-    state.prefetch_pos = 0;
-    true
-}
-
-fn fail_prefetch(result: PrefetchResult) -> PrefetchResult {
-    if matches!(result, PrefetchResult::Timeout | PrefetchResult::Overflow) {
-        try_send_nak();
-        flush_rx_input();
-        clear_prefetch();
-    }
-    result
-}
-
-fn try_send_nak() {
-    for _ in 0..NAK_ATTEMPTS {
-        if try_write_byte(b'-') {
-            break;
+impl GdbTransport for Transport {
+    fn with_prefetch<R>(f: impl FnOnce(&mut PrefetchBuf) -> R) -> Option<R> {
+        if !GDB_UART_READY.load(Ordering::Acquire) {
+            return None;
         }
+        let mut guard = GDB_UART_STATE.lock_irqsave();
+        // SAFETY: READY is published after full initialization with Release ordering.
+        let state = unsafe { (*guard).assume_init_mut() };
+        Some(f(&mut state.prefetch))
+    }
+
+    fn try_read_byte() -> Option<u8> {
+        self::try_read_byte()
+    }
+
+    fn try_write_byte(byte: u8) -> bool {
+        self::try_write_byte(byte)
+    }
+
+    fn flush_rx_input() {
+        self::flush_rx_input();
     }
 }
 
@@ -365,13 +258,7 @@ pub fn try_read_byte() -> Option<u8> {
     // SAFETY: READY is published after full initialization with Release ordering.
     let state = unsafe { (*guard).assume_init_mut() };
 
-    if state.prefetch_pos < state.prefetch_len {
-        let byte = state.prefetch_buf[state.prefetch_pos];
-        state.prefetch_pos += 1;
-        if state.prefetch_pos >= state.prefetch_len {
-            state.prefetch_pos = 0;
-            state.prefetch_len = 0;
-        }
+    if let Some(byte) = state.prefetch.pop() {
         return Some(byte);
     }
     if let Some(byte) = state.rx.pop() {
