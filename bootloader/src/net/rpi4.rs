@@ -4,7 +4,6 @@ use core::fmt;
 use core::fmt::Write as _;
 use core::time::Duration;
 use dtb::DtbParser;
-use io_api::ethernet::EthernetFrameIo;
 
 struct BootLogBuf<const N: usize> {
     buf: [u8; N],
@@ -46,21 +45,17 @@ fn debug_uart_log(args: fmt::Arguments<'_>) {
     }
 }
 
-/// Initializes and returns the board Ethernet frame I/O backend from DTB data.
+/// Initializes BCM2711 GENETv5 from DTB data with an optional PHY link wait limit.
 ///
 /// This is used by UDP UART networking setup in `bootloader/src/main.rs` when
 /// `feature = \"rpi4_net\"` is enabled.
 ///
-/// This default entry point waits indefinitely for PHY link bring-up.
-/// Use [`init_genet_from_dtb_with_link_wait`] for bounded waits.
-pub fn init_genet_from_dtb(dtb: &DtbParser) -> &'static mut Bcm2711GenetV5 {
-    init_genet_from_dtb_with_link_wait(dtb, None)
-}
-
-/// Initializes BCM2711 GENETv5 with an optional PHY link wait limit.
-///
 /// - `link_wait = Some(d)`: fail with `PhyTimeout` after approximately `d`.
 /// - `link_wait = None`: wait indefinitely for PHY link bring-up.
+///
+/// # Panics
+///
+/// Panics if the driver cannot be initialized, including when the PHY link wait times out.
 pub fn init_genet_from_dtb_with_link_wait(
     dtb: &DtbParser,
     link_wait: Option<Duration>,
@@ -82,8 +77,4 @@ pub fn init_genet_from_dtb_with_link_wait(
         }
         Err(err) => panic!("rpi4_net: failed to init BCM2711 GENETv5: {:?}", err),
     }
-}
-
-pub fn init_ethernet_from_dtb(dtb: &DtbParser) -> &'static mut dyn EthernetFrameIo {
-    init_genet_from_dtb(dtb) as &'static mut dyn EthernetFrameIo
 }
