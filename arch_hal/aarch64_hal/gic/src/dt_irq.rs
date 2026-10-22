@@ -39,8 +39,8 @@ pub fn decode_gicv2_irq(cells: &[u32]) -> Result<DtGicIrq, DtGicIrqError> {
     let flags = cells[2];
 
     let intid = match int_type {
-        0 => number + 32,
-        1 => number + 16,
+        0 => number + 32, // SPI IDs start at 32.
+        1 => number + 16, // PPI IDs start at 16.
         _ => return Err(DtGicIrqError::InvalidType(int_type)),
     };
 

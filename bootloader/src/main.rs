@@ -35,7 +35,6 @@ mod build_info {
 #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
 mod genet_selftest;
 mod handler;
-mod irq_decode;
 mod irq_monitor;
 mod monitor;
 #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
@@ -367,8 +366,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                         ControlFlow<()>,
                         WalkError<()>,
                     > {
-                        irq =
-                            Some(irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"));
+                        let decoded =
+                            gic::dt_irq::decode_gicv2_irq(cells).expect("uart: bad IRQ spec");
+                        irq = Some(decoded.intid);
                         Ok(ControlFlow::Break(()))
                     })
                     .unwrap();
@@ -1449,8 +1449,8 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
                 if maintenance_intid.is_some() {
                     return Ok(ControlFlow::Break(()));
                 }
-                if let Ok(intid) = irq_decode::dt_irq_to_pintid(cells) {
-                    maintenance_intid = Some(intid);
+                if let Ok(decoded) = gic::dt_irq::decode_gicv2_irq(cells) {
+                    maintenance_intid = Some(decoded.intid);
                 }
                 Ok(ControlFlow::Break(()))
             })?;
