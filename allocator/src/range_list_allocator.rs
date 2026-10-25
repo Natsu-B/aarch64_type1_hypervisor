@@ -2708,3 +2708,6 @@ mod tests {
         assert_eq!(res, Err("region end overflow"));
     }
 }
+
+#[cfg(test)]
+mod stateful_fuzz;
