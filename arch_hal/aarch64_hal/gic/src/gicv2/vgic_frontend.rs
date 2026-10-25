@@ -31,6 +31,89 @@ macro_rules! size_of_field {
     };
 }
 
+// Byte offsets and exclusive end offsets of the emulated GICD registers, shared by the
+// trapped read and write handlers.
+const GICD_CTLR_OFFSET: u32 = offset_of!(GicV2Distributor, ctlr) as u32;
+const GICD_TYPER_OFFSET: u32 = offset_of!(GicV2Distributor, typer) as u32;
+const GICD_IIDR_OFFSET: u32 = offset_of!(GicV2Distributor, iidr) as u32;
+const GICD_IGROUPR_OFFSET: u32 = offset_of!(GicV2Distributor, igroupr) as u32;
+const GICD_ISENABLER_OFFSET: u32 = offset_of!(GicV2Distributor, isenabler) as u32;
+const GICD_ICENABLER_OFFSET: u32 = offset_of!(GicV2Distributor, icenabler) as u32;
+const GICD_ISPENDR_OFFSET: u32 = offset_of!(GicV2Distributor, ispendr) as u32;
+const GICD_ICPENDR_OFFSET: u32 = offset_of!(GicV2Distributor, icpendr) as u32;
+const GICD_ISACTIVER_OFFSET: u32 = offset_of!(GicV2Distributor, isactiver) as u32;
+const GICD_ICACTIVER_OFFSET: u32 = offset_of!(GicV2Distributor, icactiver) as u32;
+const GICD_IPRIORITYR_OFFSET: u32 = offset_of!(GicV2Distributor, ipriorityr) as u32;
+const GICD_ITARGETSR0_7_OFFSET: u32 = offset_of!(GicV2Distributor, itargetsr0_7) as u32;
+const GICD_ITARGETSR_OFFSET: u32 = offset_of!(GicV2Distributor, itargetsr) as u32;
+const GICD_ICFGR_OFFSET: u32 = offset_of!(GicV2Distributor, icfgr) as u32;
+const GICD_NSACR_OFFSET: u32 = offset_of!(GicV2Distributor, nsacr) as u32;
+const GICD_SGIR_OFFSET: u32 = offset_of!(GicV2Distributor, sgir) as u32;
+const GICD_CPENDSGIR_OFFSET: u32 = offset_of!(GicV2Distributor, cpendsgir) as u32;
+const GICD_SPENDSGIR_OFFSET: u32 = offset_of!(GicV2Distributor, spendsgir) as u32;
+const GICD_PIDR_OFFSET: u32 = offset_of!(GicV2Distributor, pidr) as u32;
+const GICD_CIDR_OFFSET: u32 = offset_of!(GicV2Distributor, cidr) as u32;
+
+const GICD_CTLR_END: u32 = GICD_CTLR_OFFSET + size_of_field!(GicV2Distributor, ctlr) as u32;
+const GICD_TYPER_END: u32 = GICD_TYPER_OFFSET + size_of_field!(GicV2Distributor, typer) as u32;
+const GICD_IIDR_END: u32 = GICD_IIDR_OFFSET + size_of_field!(GicV2Distributor, iidr) as u32;
+const GICD_IGROUPR_END: u32 =
+    GICD_IGROUPR_OFFSET + size_of_field!(GicV2Distributor, igroupr) as u32;
+const GICD_ISENABLER_END: u32 =
+    GICD_ISENABLER_OFFSET + size_of_field!(GicV2Distributor, isenabler) as u32;
+const GICD_ICENABLER_END: u32 =
+    GICD_ICENABLER_OFFSET + size_of_field!(GicV2Distributor, icenabler) as u32;
+const GICD_ISPENDR_END: u32 =
+    GICD_ISPENDR_OFFSET + size_of_field!(GicV2Distributor, ispendr) as u32;
+const GICD_ICPENDR_END: u32 =
+    GICD_ICPENDR_OFFSET + size_of_field!(GicV2Distributor, icpendr) as u32;
+const GICD_ISACTIVER_END: u32 =
+    GICD_ISACTIVER_OFFSET + size_of_field!(GicV2Distributor, isactiver) as u32;
+const GICD_ICACTIVER_END: u32 =
+    GICD_ICACTIVER_OFFSET + size_of_field!(GicV2Distributor, icactiver) as u32;
+const GICD_IPRIORITYR_END: u32 =
+    GICD_IPRIORITYR_OFFSET + size_of_field!(GicV2Distributor, ipriorityr) as u32;
+const GICD_ITARGETSR0_7_END: u32 =
+    GICD_ITARGETSR0_7_OFFSET + size_of_field!(GicV2Distributor, itargetsr0_7) as u32;
+const GICD_ITARGETSR_END: u32 =
+    GICD_ITARGETSR_OFFSET + size_of_field!(GicV2Distributor, itargetsr) as u32;
+const GICD_ICFGR_END: u32 = GICD_ICFGR_OFFSET + size_of_field!(GicV2Distributor, icfgr) as u32;
+const GICD_NSACR_END: u32 = GICD_NSACR_OFFSET + size_of_field!(GicV2Distributor, nsacr) as u32;
+const GICD_SGIR_END: u32 = GICD_SGIR_OFFSET + size_of_field!(GicV2Distributor, sgir) as u32;
+const GICD_CPENDSGIR_END: u32 =
+    GICD_CPENDSGIR_OFFSET + size_of_field!(GicV2Distributor, cpendsgir) as u32;
+const GICD_SPENDSGIR_END: u32 =
+    GICD_SPENDSGIR_OFFSET + size_of_field!(GicV2Distributor, spendsgir) as u32;
+const GICD_PIDR_END: u32 = GICD_PIDR_OFFSET + size_of_field!(GicV2Distributor, pidr) as u32;
+const GICD_CIDR_END: u32 = GICD_CIDR_OFFSET + size_of_field!(GicV2Distributor, cidr) as u32;
+
+/// Bit mask of the implemented INTIDs in a one-bit-per-INTID register word starting at
+/// `base_intid`; INTIDs above `MAX_VIRTUAL_INTID` read as zero.
+fn word_mask(base_intid: u32, ints_per_word: u32) -> u32 {
+    if base_intid > MAX_VIRTUAL_INTID {
+        return 0;
+    }
+    let valid = cmp::min(ints_per_word, MAX_VIRTUAL_INTID - base_intid + 1);
+    if valid >= 32 {
+        0xffff_ffff
+    } else {
+        (1u32 << valid) - 1
+    }
+}
+
+/// Byte mask of the implemented INTIDs in a `GICD_IPRIORITYR` word starting at `base_intid`.
+fn priority_mask(base_intid: u32) -> u32 {
+    if base_intid > MAX_VIRTUAL_INTID {
+        return 0;
+    }
+    let valid = cmp::min(4, MAX_VIRTUAL_INTID - base_intid + 1);
+    if valid == 4 {
+        0xffff_ffff
+    } else {
+        ((1u64 << (valid * 8)) - 1) as u32
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Gicv2AccessSize {
     U8,
@@ -92,7 +175,7 @@ fn decode_sgir_targets(
     if vcpu_count == 0 || vcpu_count > 8 {
         return Err(GicError::InvalidVcpuId);
     }
-    if requester.0 as u16 >= vcpu_count || requester.0 >= 8 {
+    if requester.0 >= vcpu_count || requester.0 >= 8 {
         return Err(GicError::InvalidVcpuId);
     }
     let valid_mask = (1u16 << vcpu_count) - 1;
@@ -126,7 +209,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         if count > 8 {
             return Err(GicError::UnsupportedFeature);
         }
-        if vcpu.0 as u16 >= count {
+        if vcpu.0 >= count {
             return Err(GicError::InvalidVcpuId);
         }
         Ok(())
@@ -187,57 +270,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     ) -> Result<VgicUpdate, GicError> {
         self.ensure_vcpu(vcpu)?;
 
-        const GICD_CTLR_OFFSET: u32 = offset_of!(GicV2Distributor, ctlr) as u32;
-        const GICD_TYPER_OFFSET: u32 = offset_of!(GicV2Distributor, typer) as u32;
-        const GICD_IIDR_OFFSET: u32 = offset_of!(GicV2Distributor, iidr) as u32;
-        const GICD_IGROUPR_OFFSET: u32 = offset_of!(GicV2Distributor, igroupr) as u32;
-        const GICD_ISENABLER_OFFSET: u32 = offset_of!(GicV2Distributor, isenabler) as u32;
-        const GICD_ICENABLER_OFFSET: u32 = offset_of!(GicV2Distributor, icenabler) as u32;
-        const GICD_ISPENDR_OFFSET: u32 = offset_of!(GicV2Distributor, ispendr) as u32;
-        const GICD_ICPENDR_OFFSET: u32 = offset_of!(GicV2Distributor, icpendr) as u32;
-        const GICD_ISACTIVER_OFFSET: u32 = offset_of!(GicV2Distributor, isactiver) as u32;
-        const GICD_ICACTIVER_OFFSET: u32 = offset_of!(GicV2Distributor, icactiver) as u32;
-        const GICD_IPRIORITYR_OFFSET: u32 = offset_of!(GicV2Distributor, ipriorityr) as u32;
-        const GICD_ITARGETSR0_7_OFFSET: u32 = offset_of!(GicV2Distributor, itargetsr0_7) as u32;
-        const GICD_ITARGETSR_OFFSET: u32 = offset_of!(GicV2Distributor, itargetsr) as u32;
-        const GICD_ICFGR_OFFSET: u32 = offset_of!(GicV2Distributor, icfgr) as u32;
-        const GICD_NSACR_OFFSET: u32 = offset_of!(GicV2Distributor, nsacr) as u32;
-        const GICD_SGIR_OFFSET: u32 = offset_of!(GicV2Distributor, sgir) as u32;
-        const GICD_CPENDSGIR_OFFSET: u32 = offset_of!(GicV2Distributor, cpendsgir) as u32;
-        const GICD_SPENDSGIR_OFFSET: u32 = offset_of!(GicV2Distributor, spendsgir) as u32;
-        const GICD_PIDR_OFFSET: u32 = offset_of!(GicV2Distributor, pidr) as u32;
-        const GICD_CIDR_OFFSET: u32 = offset_of!(GicV2Distributor, cidr) as u32;
-
-        const GICD_IGROUPR_END: u32 =
-            GICD_IGROUPR_OFFSET + size_of_field!(GicV2Distributor, igroupr) as u32;
-        const GICD_ISENABLER_END: u32 =
-            GICD_ISENABLER_OFFSET + size_of_field!(GicV2Distributor, isenabler) as u32;
-        const GICD_ICENABLER_END: u32 =
-            GICD_ICENABLER_OFFSET + size_of_field!(GicV2Distributor, icenabler) as u32;
-        const GICD_ISPENDR_END: u32 =
-            GICD_ISPENDR_OFFSET + size_of_field!(GicV2Distributor, ispendr) as u32;
-        const GICD_ICPENDR_END: u32 =
-            GICD_ICPENDR_OFFSET + size_of_field!(GicV2Distributor, icpendr) as u32;
-        const GICD_ISACTIVER_END: u32 =
-            GICD_ISACTIVER_OFFSET + size_of_field!(GicV2Distributor, isactiver) as u32;
-        const GICD_ICACTIVER_END: u32 =
-            GICD_ICACTIVER_OFFSET + size_of_field!(GicV2Distributor, icactiver) as u32;
-        const GICD_IPRIORITYR_END: u32 =
-            GICD_IPRIORITYR_OFFSET + size_of_field!(GicV2Distributor, ipriorityr) as u32;
-        const GICD_ITARGETSR0_7_END: u32 =
-            GICD_ITARGETSR0_7_OFFSET + size_of_field!(GicV2Distributor, itargetsr0_7) as u32;
-        const GICD_ITARGETSR_END: u32 =
-            GICD_ITARGETSR_OFFSET + size_of_field!(GicV2Distributor, itargetsr) as u32;
-        const GICD_ICFGR_END: u32 =
-            GICD_ICFGR_OFFSET + size_of_field!(GicV2Distributor, icfgr) as u32;
-        const GICD_NSACR_END: u32 =
-            GICD_NSACR_OFFSET + size_of_field!(GicV2Distributor, nsacr) as u32;
-        const GICD_SGIR_END: u32 = GICD_SGIR_OFFSET + size_of_field!(GicV2Distributor, sgir) as u32;
-        const GICD_CPENDSGIR_END: u32 =
-            GICD_CPENDSGIR_OFFSET + size_of_field!(GicV2Distributor, cpendsgir) as u32;
-        const GICD_SPENDSGIR_END: u32 =
-            GICD_SPENDSGIR_OFFSET + size_of_field!(GicV2Distributor, spendsgir) as u32;
-
         if !matches!(
             offset,
             GICD_IPRIORITYR_OFFSET..GICD_IPRIORITYR_END
@@ -250,30 +282,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         if size == Gicv2AccessSize::U32 && !offset.is_multiple_of(4) {
             return Err(GicError::InvalidOffset);
         }
-
-        let word_mask = |base_intid: u32, ints_per_word: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(ints_per_word, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid >= 32 {
-                0xffff_ffff
-            } else {
-                (1u32 << valid) - 1
-            }
-        };
-
-        let priority_mask = |base_intid: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(4, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid == 4 {
-                0xffff_ffff
-            } else {
-                ((1u64 << (valid * 8)) - 1) as u32
-            }
-        };
 
         let icfgr_mask = |base_intid: u32| -> u32 {
             if base_intid > MAX_VIRTUAL_INTID {
@@ -290,11 +298,10 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         let update = match offset {
             GICD_CTLR_OFFSET => {
                 let ctlr = GICD_CTLR::from_bits(value);
-                let update = self.vgic_model.set_dist_enable(
+                self.vgic_model.set_dist_enable(
                     ctlr.get(GICD_CTLR::enable_grp0) != 0,
                     ctlr.get(GICD_CTLR::enable_grp1) != 0,
-                )?;
-                update
+                )?
             }
             GICD_TYPER_OFFSET | GICD_IIDR_OFFSET => {
                 // Read-only
@@ -387,7 +394,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                         let mut update = VgicUpdate::None;
                         for i in 0..4u32 {
                             let intid = base_intid + i;
-                            if intid < 32 || intid > MAX_VIRTUAL_INTID {
+                            if !(32..=MAX_VIRTUAL_INTID).contains(&intid) {
                                 continue;
                             }
                             let targets =
@@ -401,7 +408,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
                     }
                     Gicv2AccessSize::U8 => {
                         let intid = base_intid + (byte_offset % 4);
-                        if intid < 32 || intid > MAX_VIRTUAL_INTID {
+                        if !(32..=MAX_VIRTUAL_INTID).contains(&intid) {
                             VgicUpdate::None
                         } else {
                             let targets = self.sanitize_gicv2_targets(value as u8)?;
@@ -464,63 +471,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
     ) -> Result<u32, GicError> {
         self.ensure_vcpu(vcpu)?;
 
-        const GICD_CTLR_OFFSET: u32 = offset_of!(GicV2Distributor, ctlr) as u32;
-        const GICD_TYPER_OFFSET: u32 = offset_of!(GicV2Distributor, typer) as u32;
-        const GICD_IIDR_OFFSET: u32 = offset_of!(GicV2Distributor, iidr) as u32;
-        const GICD_IGROUPR_OFFSET: u32 = offset_of!(GicV2Distributor, igroupr) as u32;
-        const GICD_ISENABLER_OFFSET: u32 = offset_of!(GicV2Distributor, isenabler) as u32;
-        const GICD_ICENABLER_OFFSET: u32 = offset_of!(GicV2Distributor, icenabler) as u32;
-        const GICD_ISPENDR_OFFSET: u32 = offset_of!(GicV2Distributor, ispendr) as u32;
-        const GICD_ICPENDR_OFFSET: u32 = offset_of!(GicV2Distributor, icpendr) as u32;
-        const GICD_ISACTIVER_OFFSET: u32 = offset_of!(GicV2Distributor, isactiver) as u32;
-        const GICD_ICACTIVER_OFFSET: u32 = offset_of!(GicV2Distributor, icactiver) as u32;
-        const GICD_IPRIORITYR_OFFSET: u32 = offset_of!(GicV2Distributor, ipriorityr) as u32;
-        const GICD_ITARGETSR0_7_OFFSET: u32 = offset_of!(GicV2Distributor, itargetsr0_7) as u32;
-        const GICD_ITARGETSR_OFFSET: u32 = offset_of!(GicV2Distributor, itargetsr) as u32;
-        const GICD_ICFGR_OFFSET: u32 = offset_of!(GicV2Distributor, icfgr) as u32;
-        const GICD_NSACR_OFFSET: u32 = offset_of!(GicV2Distributor, nsacr) as u32;
-        const GICD_SGIR_OFFSET: u32 = offset_of!(GicV2Distributor, sgir) as u32;
-        const GICD_CPENDSGIR_OFFSET: u32 = offset_of!(GicV2Distributor, cpendsgir) as u32;
-        const GICD_SPENDSGIR_OFFSET: u32 = offset_of!(GicV2Distributor, spendsgir) as u32;
-        const GICD_PIDR_OFFSET: u32 = offset_of!(GicV2Distributor, pidr) as u32;
-        const GICD_CIDR_OFFSET: u32 = offset_of!(GicV2Distributor, cidr) as u32;
-
-        const GICD_CTLR_END: u32 = GICD_CTLR_OFFSET + size_of_field!(GicV2Distributor, ctlr) as u32;
-        const GICD_TYPER_END: u32 =
-            GICD_TYPER_OFFSET + size_of_field!(GicV2Distributor, typer) as u32;
-        const GICD_IIDR_END: u32 = GICD_IIDR_OFFSET + size_of_field!(GicV2Distributor, iidr) as u32;
-        const GICD_IGROUPR_END: u32 =
-            GICD_IGROUPR_OFFSET + size_of_field!(GicV2Distributor, igroupr) as u32;
-        const GICD_ISENABLER_END: u32 =
-            GICD_ISENABLER_OFFSET + size_of_field!(GicV2Distributor, isenabler) as u32;
-        const GICD_ICENABLER_END: u32 =
-            GICD_ICENABLER_OFFSET + size_of_field!(GicV2Distributor, icenabler) as u32;
-        const GICD_ISPENDR_END: u32 =
-            GICD_ISPENDR_OFFSET + size_of_field!(GicV2Distributor, ispendr) as u32;
-        const GICD_ICPENDR_END: u32 =
-            GICD_ICPENDR_OFFSET + size_of_field!(GicV2Distributor, icpendr) as u32;
-        const GICD_ISACTIVER_END: u32 =
-            GICD_ISACTIVER_OFFSET + size_of_field!(GicV2Distributor, isactiver) as u32;
-        const GICD_ICACTIVER_END: u32 =
-            GICD_ICACTIVER_OFFSET + size_of_field!(GicV2Distributor, icactiver) as u32;
-        const GICD_IPRIORITYR_END: u32 =
-            GICD_IPRIORITYR_OFFSET + size_of_field!(GicV2Distributor, ipriorityr) as u32;
-        const GICD_ITARGETSR0_7_END: u32 =
-            GICD_ITARGETSR0_7_OFFSET + size_of_field!(GicV2Distributor, itargetsr0_7) as u32;
-        const GICD_ITARGETSR_END: u32 =
-            GICD_ITARGETSR_OFFSET + size_of_field!(GicV2Distributor, itargetsr) as u32;
-        const GICD_ICFGR_END: u32 =
-            GICD_ICFGR_OFFSET + size_of_field!(GicV2Distributor, icfgr) as u32;
-        const GICD_NSACR_END: u32 =
-            GICD_NSACR_OFFSET + size_of_field!(GicV2Distributor, nsacr) as u32;
-        const GICD_SGIR_END: u32 = GICD_SGIR_OFFSET + size_of_field!(GicV2Distributor, sgir) as u32;
-        const GICD_CPENDSGIR_END: u32 =
-            GICD_CPENDSGIR_OFFSET + size_of_field!(GicV2Distributor, cpendsgir) as u32;
-        const GICD_SPENDSGIR_END: u32 =
-            GICD_SPENDSGIR_OFFSET + size_of_field!(GicV2Distributor, spendsgir) as u32;
-        const GICD_PIDR_END: u32 = GICD_PIDR_OFFSET + size_of_field!(GicV2Distributor, pidr) as u32;
-        const GICD_CIDR_END: u32 = GICD_CIDR_OFFSET + size_of_field!(GicV2Distributor, cidr) as u32;
-
         let subword_ok = matches!(
             offset,
             GICD_CTLR_OFFSET..GICD_CTLR_END
@@ -539,30 +489,6 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
         if size == Gicv2AccessSize::U32 && !offset.is_multiple_of(4) {
             return Err(GicError::InvalidOffset);
         }
-
-        let word_mask = |base_intid: u32, ints_per_word: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(ints_per_word, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid >= 32 {
-                0xffff_ffff
-            } else {
-                (1u32 << valid) - 1
-            }
-        };
-
-        let priority_mask = |base_intid: u32| -> u32 {
-            if base_intid > MAX_VIRTUAL_INTID {
-                return 0;
-            }
-            let valid = cmp::min(4, MAX_VIRTUAL_INTID - base_intid + 1);
-            if valid == 4 {
-                0xffff_ffff
-            } else {
-                ((1u64 << (valid * 8)) - 1) as u32
-            }
-        };
 
         let icfgr_mask = |base_intid: u32| -> u32 {
             if base_intid > MAX_VIRTUAL_INTID {
@@ -598,7 +524,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             let word = make_word(word_index)?;
             match size {
                 Gicv2AccessSize::U32 => Ok(word),
-                Gicv2AccessSize::U8 => Ok(((word >> (lane * 8)) & 0xff) as u32),
+                Gicv2AccessSize::U8 => Ok((word >> (lane * 8)) & 0xff),
             }
         }
 
@@ -612,7 +538,7 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_TYPER_OFFSET..GICD_TYPER_END => {
                 let mut typer = GICD_TYPER::from_bits(self.dist_id.typer);
-                let it_lines_number = ((MAX_VIRTUAL_INTID + 1 + 31) / 32).saturating_sub(1) & 0x1f;
+                let it_lines_number = (MAX_VIRTUAL_INTID + 1).div_ceil(32).saturating_sub(1) & 0x1f;
                 let cpus = cmp::min(self.vgic_model.vcpu_count(), 8).saturating_sub(1) as u32 & 0x7;
                 typer = typer
                     .set(GICD_TYPER::it_lines_number, it_lines_number)

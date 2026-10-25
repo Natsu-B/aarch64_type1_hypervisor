@@ -264,6 +264,18 @@ bitregs! {
     }
 }
 
+impl SyndromeAccessSize {
+    /// Returns the access size in bytes encoded by `ESR_EL2.SAS`.
+    pub const fn bytes(self) -> u8 {
+        match self {
+            Self::Byte => 1,
+            Self::HalfWord => 2,
+            Self::Word => 4,
+            Self::DoubleWord => 8,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SysRegIss {
     pub op0: u8,

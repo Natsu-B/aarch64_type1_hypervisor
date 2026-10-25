@@ -3,15 +3,19 @@
 
 extern crate alloc;
 
+#[path = "gicv2_test_common.rs"]
+mod common;
+
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("This test is intended to run on aarch64 targets only");
 
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
+use common::map_err;
+use common::read_mmio8;
+use common::read_mmio32;
+use common::write_mmio32;
 use core::arch::asm;
-use core::arch::naked_asm;
-use core::ptr;
-use core::ptr::NonNull;
 use cpu;
 use gic::BinaryPoint;
 use gic::EnableOp;
@@ -29,26 +33,12 @@ use gic::gicv2::GICV2_GICD_FRAME_SIZE;
 use gic::gicv2::Gicv2;
 use print::debug_uart;
 use print::println;
-use tls;
 
 const UART_BASE: usize = 0x900_0000;
 const UART_CLOCK_HZ: u32 = 48 * 1_000_000;
 const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
 const PPI_ID: u32 = 30;
-
-unsafe extern "C" {
-    static __bss_start: u8;
-    static __bss_end: u8;
-    static __stack_top: u8;
-}
-
-const TLS_BUF_SIZE: usize = 4096;
-
-#[repr(align(64))]
-struct TlsBuf([u8; TLS_BUF_SIZE]);
-
-static mut TLS_BUF: TlsBuf = TlsBuf([0; TLS_BUF_SIZE]);
 
 fn entry() -> ! {
     debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
@@ -63,36 +53,6 @@ fn entry() -> ! {
             exit_failure();
         }
     }
-}
-
-#[unsafe(no_mangle)]
-#[unsafe(naked)]
-extern "C" fn _start() -> ! {
-    naked_asm!("ldr x0, =__stack_top", "mov sp, x0", "bl rust_entry", "b .",);
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn rust_entry() -> ! {
-    unsafe { clear_bss() };
-    let need = tls::template_size();
-    if TLS_BUF_SIZE < need {
-        println!(
-            "tls buffer too small: need {} bytes, have {} bytes",
-            need, TLS_BUF_SIZE
-        );
-        exit_failure();
-    }
-    // SAFETY: TLS_BUF is a single-core test buffer, 64-byte aligned, and lives
-    // for the duration of the test. No other core aliases it.
-    let tls_result = unsafe {
-        let tls_ptr = core::ptr::addr_of_mut!(TLS_BUF.0).cast::<u8>();
-        tls::init_current_cpu(NonNull::new_unchecked(tls_ptr), TLS_BUF_SIZE)
-    };
-    if let Err(err) = tls_result {
-        println!("tls init failed: {:?}", err);
-        exit_failure();
-    }
-    entry()
 }
 
 fn run() -> Result<(), &'static str> {
@@ -244,41 +204,4 @@ fn run_error_cases(gic: &Gicv2, security_extension_implemented: bool) -> Result<
     }
 
     Ok(())
-}
-
-fn read_mmio8(base: usize, offset: usize) -> u8 {
-    unsafe { ptr::read_volatile((base + offset) as *const u8) }
-}
-
-fn read_mmio32(base: usize, offset: usize) -> u32 {
-    unsafe { ptr::read_volatile((base + offset) as *const u32) }
-}
-
-fn write_mmio32(base: usize, offset: usize, value: u32) {
-    unsafe { ptr::write_volatile((base + offset) as *mut u32, value) }
-}
-
-fn map_err(label: &'static str, err: GicError) -> &'static str {
-    println!("{}: {:?}", label, err);
-    label
-}
-
-unsafe fn clear_bss() {
-    let (start, end) = unsafe {
-        (
-            &__bss_start as *const u8 as usize,
-            &__bss_end as *const u8 as usize,
-        )
-    };
-    if end > start {
-        unsafe {
-            ptr::write_bytes(start as *mut u8, 0, end - start);
-        }
-    }
-}
-
-#[panic_handler]
-fn panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
-    println!("PANIC: {}", info);
-    exit_failure();
 }

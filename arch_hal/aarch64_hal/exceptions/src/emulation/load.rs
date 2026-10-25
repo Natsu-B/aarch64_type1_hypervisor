@@ -17,9 +17,8 @@ pub(crate) fn emulate_single(
     split: Option<&SplitPlan>,
     handler: &dyn MmioHandler,
 ) -> EmulationOutcome {
-    let raw_total = match read_value(handler, ipa, desc.size, split) {
-        Some(v) => v,
-        None => return EmulationOutcome::NotHandled,
+    let Some(raw_total) = read_value(handler, ipa, desc.size, split) else {
+        return EmulationOutcome::NotHandled;
     };
 
     let val = extend_loaded_value(raw_total, desc.size, desc.sign_extend, desc.rt_size);
@@ -40,7 +39,8 @@ pub(crate) fn emulate_pair(
 ) -> EmulationOutcome {
     let use_pair_ops = split0.is_none()
         && split1.is_none()
-        && (desc.size <= 1 || (ipa0 % desc.size as u64 == 0 && ipa1 % desc.size as u64 == 0));
+        && (desc.size <= 1
+            || (ipa0.is_multiple_of(desc.size as u64) && ipa1.is_multiple_of(desc.size as u64)));
 
     let (v0, v1) = if use_pair_ops {
         if let Some(result) = handler.read_pair(ipa0, ipa1, desc.size) {
@@ -67,13 +67,11 @@ pub(crate) fn emulate_pair(
             (first, second)
         }
     } else {
-        let first = match read_value(handler, ipa0, desc.size, split0) {
-            Some(v) => v,
-            None => return EmulationOutcome::NotHandled,
+        let Some(first) = read_value(handler, ipa0, desc.size, split0) else {
+            return EmulationOutcome::NotHandled;
         };
-        let second = match read_value(handler, ipa1, desc.size, split1) {
-            Some(v) => v,
-            None => return EmulationOutcome::NotHandled,
+        let Some(second) = read_value(handler, ipa1, desc.size, split1) else {
+            return EmulationOutcome::NotHandled;
         };
         (first, second)
     };
@@ -154,7 +152,8 @@ fn read_value(
         return execute_split_load(handler, plan, size);
     }
 
-    let needs_split = size > 1 && (ipa % size as u64 != 0 || crosses_stage2_page(ipa, size));
+    let needs_split =
+        size > 1 && (!ipa.is_multiple_of(size as u64) || crosses_stage2_page(ipa, size));
     if needs_split {
         // Split plans must be supplied by decode to enforce guest VA boundary checks.
         return None;

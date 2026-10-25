@@ -28,6 +28,8 @@ pub use mem::align_up_usize;
 pub use mem::is_aligned_u64;
 pub use mem::is_aligned_usize;
 pub use mmio::MmioRegion;
+pub use mmio::read_volatile_sized;
+pub use mmio::write_volatile_sized;
 pub use mmio_hook::AccessClass;
 pub use mmio_hook::MmioError;
 pub use mmio_hook::MmioHandler;

@@ -94,7 +94,7 @@ impl VirtIoMmio {
             return Err(VirtioErr::UnsupportedVersion(version));
         }
         let device = VirtIoDeviceTypes::try_from(registers.device_id.read())?;
-        Ok(Self { device, registers })
+        Ok(Self { registers, device })
     }
 }
 
@@ -110,7 +110,8 @@ impl VirtioTransport for VirtIoMmio {
 
     #[inline]
     fn get_configuration_addr(&self) -> usize {
-        self.registers as *const MmioDeviceRegister as usize + size_of::<MmioDeviceRegister>()
+        core::ptr::from_ref::<MmioDeviceRegister>(self.registers) as usize
+            + size_of::<MmioDeviceRegister>()
     }
 
     #[inline]
@@ -140,7 +141,7 @@ impl VirtioTransport for VirtIoMmio {
     }
 
     fn select_queue(&self, index: u16) {
-        self.registers.queue_sel.write(index as u32);
+        self.registers.queue_sel.write(u32::from(index));
     }
 
     fn is_queue_ready_equal_0(&self) -> bool {
@@ -178,6 +179,6 @@ impl VirtioTransport for VirtIoMmio {
     }
 
     fn queue_notify(&self, index: u16) {
-        self.registers.queue_notify.write(index as u32);
+        self.registers.queue_notify.write(u32::from(index));
     }
 }

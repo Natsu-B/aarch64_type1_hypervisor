@@ -4,12 +4,16 @@ PATH_TO_ELF="$1"
 
 # get absolute path
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-DISK_IMG="$SCRIPT_DIR/../bin/virtio_blk_test.img"
 
 rm -rf "$SCRIPT_DIR/../bin/EFI"
 mkdir -p "$SCRIPT_DIR/../bin/EFI/BOOT/"
 cp "${PATH_TO_ELF}" "$SCRIPT_DIR/../bin/EFI/BOOT/BOOTAA64.EFI"
-# QEMU writes to the device, so each run starts from a fresh fixture copy.
+
+# The test overwrites the raw disk, so boot from a scratch copy to keep the
+# checked-in fixture pristine across repeated runs. The copy lives outside
+# `bin/` because that directory is also exported to the guest as a vvfat disk.
+DISK_IMG=$(mktemp "${TMPDIR:-/tmp}/virtio_blk_test.XXXXXX")
+trap 'rm -f "$DISK_IMG"' EXIT
 cp "$SCRIPT_DIR/test.txt" "$DISK_IMG"
 
 QEMU_GDB_ARGS=""

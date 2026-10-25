@@ -114,6 +114,12 @@ pub struct SplitPlan {
     len: u8,
 }
 
+impl Default for SplitPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SplitPlan {
     pub const EMPTY_SEGMENT: SplitSegment = SplitSegment {
         ipa: 0,
@@ -228,7 +234,7 @@ fn plan_split_with_page(base_ipa: u64, total_size: u8, page_size: u64) -> Option
             if candidate > (total_size - produced) {
                 continue;
             }
-            if ipa % candidate as u64 != 0 {
+            if !ipa.is_multiple_of(candidate as u64) {
                 continue;
             }
             if (candidate as u64) > page_remaining {
@@ -314,10 +320,10 @@ where
         DecodedAccess::Prefetch => Some(MmioDecoded::Prefetch { insn }),
         DecodedAccess::Single(desc) => {
             let insn_is_write = desc.is_store;
-            if let Some(iss_write) = iss_is_write {
-                if iss_write != insn_is_write {
-                    return None;
-                }
+            if let Some(iss_write) = iss_is_write
+                && iss_write != insn_is_write
+            {
+                return None;
             }
             if !sas_matches(esr, desc.size) {
                 return None;
@@ -340,19 +346,15 @@ where
                 &resolver,
             )?;
 
-            let ipa = if eff == fault_va {
-                first_ipa
-            } else {
-                resolve_ipa_with_resolver(
-                    eff,
-                    insn_is_write,
-                    esr,
-                    fault_ipa,
-                    false,
-                    fault_va,
-                    &resolver,
-                )?
-            };
+            let ipa = resolve_access_ipa(
+                eff,
+                first_ipa,
+                insn_is_write,
+                esr,
+                fault_ipa,
+                fault_va,
+                &resolver,
+            )?;
 
             let split = split_plan_for_access(ipa, desc.size)?;
 
@@ -365,10 +367,10 @@ where
         }
         DecodedAccess::Pair(desc) => {
             let insn_is_write = desc.is_store;
-            if let Some(iss_write) = iss_is_write {
-                if iss_write != insn_is_write {
-                    return None;
-                }
+            if let Some(iss_write) = iss_is_write
+                && iss_write != insn_is_write
+            {
+                return None;
             }
             if !sas_matches(esr, desc.size) {
                 return None;
@@ -393,32 +395,24 @@ where
                 fault_va,
                 &resolver,
             )?;
-            let ipa0 = if addr0 == fault_va {
-                first_ipa
-            } else {
-                resolve_ipa_with_resolver(
-                    addr0,
-                    insn_is_write,
-                    esr,
-                    fault_ipa,
-                    addr0 == fault_va,
-                    fault_va,
-                    &resolver,
-                )?
-            };
-            let ipa1 = if addr1 == fault_va {
-                first_ipa
-            } else {
-                resolve_ipa_with_resolver(
-                    addr1,
-                    insn_is_write,
-                    esr,
-                    fault_ipa,
-                    addr1 == fault_va,
-                    fault_va,
-                    &resolver,
-                )?
-            };
+            let ipa0 = resolve_access_ipa(
+                addr0,
+                first_ipa,
+                insn_is_write,
+                esr,
+                fault_ipa,
+                fault_va,
+                &resolver,
+            )?;
+            let ipa1 = resolve_access_ipa(
+                addr1,
+                first_ipa,
+                insn_is_write,
+                esr,
+                fault_ipa,
+                fault_va,
+                &resolver,
+            )?;
 
             let split0 = split_plan_for_access(ipa0, desc.size)?;
             let split1 = split_plan_for_access(ipa1, desc.size)?;
@@ -436,7 +430,7 @@ where
 }
 
 fn split_plan_for_access(ipa: u64, size: u8) -> Option<Option<SplitPlan>> {
-    if size > 1 && (ipa % size as u64 != 0 || crosses_stage2_page(ipa, size)) {
+    if size > 1 && (!ipa.is_multiple_of(size as u64) || crosses_stage2_page(ipa, size)) {
         Some(Some(plan_split_access(ipa, size)?))
     } else {
         Some(None)
@@ -560,6 +554,28 @@ pub(crate) fn hpfar_el2_written_for_abort(esr: &ESR_EL2) -> bool {
     )
 }
 
+/// Resolves the IPA accessed at `va`, reusing `first_ipa` when `va` is the faulting address.
+///
+/// Other addresses (base-writeback offsets, the second element of a pair) are translated
+/// without trusting `HPFAR_EL2`, which only describes the faulting address.
+fn resolve_access_ipa<R>(
+    va: u64,
+    first_ipa: u64,
+    is_write: bool,
+    esr: &ESR_EL2,
+    fault_ipa: Option<u64>,
+    fault_va: u64,
+    resolver: &R,
+) -> Option<u64>
+where
+    R: Fn(u64, bool) -> Option<u64>,
+{
+    if va == fault_va {
+        return Some(first_ipa);
+    }
+    resolve_ipa_with_resolver(va, is_write, esr, fault_ipa, false, fault_va, resolver)
+}
+
 fn resolve_ipa_with_resolver<R>(
     va: u64,
     is_write: bool,
@@ -572,10 +588,12 @@ fn resolve_ipa_with_resolver<R>(
 where
     R: Fn(u64, bool) -> Option<u64>,
 {
-    if allow_hpfar && hpfar_valid(esr) && va == fault_va {
-        if let Some(ipa) = fault_ipa {
-            return Some(ipa);
-        }
+    if allow_hpfar
+        && hpfar_valid(esr)
+        && va == fault_va
+        && let Some(ipa) = fault_ipa
+    {
+        return Some(ipa);
     }
     resolver(va, is_write)
 }
@@ -592,17 +610,10 @@ fn sas_matches(esr: &ESR_EL2, expected_size: u8) -> bool {
     if esr.get(ESR_EL2::isv) == 0 {
         return true;
     }
-    let sas = match esr.get_enum::<_, SyndromeAccessSize>(ESR_EL2::sas) {
-        Some(v) => v,
-        None => return false,
+    let Some(sas) = esr.get_enum::<_, SyndromeAccessSize>(ESR_EL2::sas) else {
+        return false;
     };
-    let esr_size = match sas {
-        SyndromeAccessSize::Byte => 1,
-        SyndromeAccessSize::HalfWord => 2,
-        SyndromeAccessSize::Word => 4,
-        SyndromeAccessSize::DoubleWord => 8,
-    };
-    esr_size == expected_size
+    sas.bytes() == expected_size
 }
 
 fn decode_access(insn: u32) -> Option<DecodedAccess> {
@@ -663,11 +674,11 @@ fn decode_single(insn: u32) -> Option<SingleDesc> {
     let (addr_mode, offset) = match mode_bits {
         0b00 => (
             SingleAddrMode::Unscaled,
-            sign_extend_9(((insn >> 12) & 0x1ff) as u32) as i64,
+            sign_extend_9((insn >> 12) & 0x1ff) as i64,
         ),
         0b01 => (
             SingleAddrMode::PostIndex,
-            sign_extend_9(((insn >> 12) & 0x1ff) as u32) as i64,
+            sign_extend_9((insn >> 12) & 0x1ff) as i64,
         ),
         0b10 => {
             let imm12 = (insn >> 10) & 0xfff;
@@ -678,7 +689,7 @@ fn decode_single(insn: u32) -> Option<SingleDesc> {
         }
         0b11 => (
             SingleAddrMode::PreIndex,
-            sign_extend_9(((insn >> 12) & 0x1ff) as u32) as i64,
+            sign_extend_9((insn >> 12) & 0x1ff) as i64,
         ),
         _ => unreachable!(),
     };
@@ -727,7 +738,7 @@ fn decode_pair(insn: u32) -> Option<PairDesc> {
         _ => return None,
     };
 
-    let imm7 = ((insn >> 15) & 0x7f) as u32;
+    let imm7 = (insn >> 15) & 0x7f;
     let offset = (sign_extend_7(imm7) as i64) * (size as i64);
 
     Some(PairDesc {
@@ -1054,9 +1065,8 @@ mod tests {
     static mut FAIL_SECOND_READ: bool = false;
 
     fn test_probe(_ctx: *const (), ipa: u64, size: u8, _is_write: bool) -> bool {
-        let end = match ipa.checked_add(size as u64) {
-            Some(v) => v,
-            None => return false,
+        let Some(end) = ipa.checked_add(size as u64) else {
+            return false;
         };
         matches!(size, 1 | 2 | 4 | 8) && end <= MEM_SIZE as u64
     }

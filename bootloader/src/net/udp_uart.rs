@@ -74,7 +74,7 @@ pub fn init(eth: &'static mut dyn EthernetFrameIo, local_ip: Ipv4Addr) {
         debug_tx_len: 0,
     };
 
-    (&mut *guard).write(state);
+    (*guard).write(state);
     UDP_UART_READY.store(true, Ordering::Release);
 }
 
@@ -110,28 +110,28 @@ pub fn poll(mut on_gdb_byte: impl FnMut(u8), mut on_dbg_byte: impl FnMut(u8)) {
             let mut learned_dbg = None;
             {
                 let frame = &state.rx_frame[..frame_len];
-                if let Ok(arp_req) = net_proto::parse_arp_request(frame) {
-                    if arp_req.target_ip == state.local_ip {
-                        arp_reply_peer = Some((arp_req.sender_mac, arp_req.sender_ip));
-                    }
+                if let Ok(arp_req) = net_proto::parse_arp_request(frame)
+                    && arp_req.target_ip == state.local_ip
+                {
+                    arp_reply_peer = Some((arp_req.sender_mac, arp_req.sender_ip));
                 }
-                if let Ok(datagram) = net_proto::parse_udp_ipv4_frame(frame) {
-                    if datagram.dst_ip == state.local_ip {
-                        let learned = PeerEndpoint {
-                            peer_mac: datagram.src_mac,
-                            peer_ip: datagram.src_ip,
-                            peer_src_port: datagram.src_port,
-                        };
-                        if datagram.dst_port == GDB_DST_PORT {
-                            learned_gdb = Some(learned);
-                            for &byte in datagram.payload {
-                                on_gdb_byte(byte);
-                            }
-                        } else if datagram.dst_port == DEBUG_DST_PORT {
-                            learned_dbg = Some(learned);
-                            for &byte in datagram.payload {
-                                on_dbg_byte(byte);
-                            }
+                if let Ok(datagram) = net_proto::parse_udp_ipv4_frame(frame)
+                    && datagram.dst_ip == state.local_ip
+                {
+                    let learned = PeerEndpoint {
+                        peer_mac: datagram.src_mac,
+                        peer_ip: datagram.src_ip,
+                        peer_src_port: datagram.src_port,
+                    };
+                    if datagram.dst_port == GDB_DST_PORT {
+                        learned_gdb = Some(learned);
+                        for &byte in datagram.payload {
+                            on_gdb_byte(byte);
+                        }
+                    } else if datagram.dst_port == DEBUG_DST_PORT {
+                        learned_dbg = Some(learned);
+                        for &byte in datagram.payload {
+                            on_dbg_byte(byte);
                         }
                     }
                 }
@@ -162,10 +162,8 @@ pub fn gdb_try_write_byte(byte: u8) -> bool {
         if limit == 0 {
             return false;
         }
-        if state.gdb_tx_len >= limit {
-            if !flush_gdb_locked(state) {
-                return false;
-            }
+        if state.gdb_tx_len >= limit && !flush_gdb_locked(state) {
+            return false;
         }
         if state.gdb_tx_len >= limit {
             return false;
@@ -221,7 +219,7 @@ fn with_state<T>(f: impl FnOnce(&mut UdpUartState) -> T) -> Option<T> {
     }
     let mut guard = UDP_UART_STATE.lock_irqsave();
     // SAFETY: READY is set only after full initialization under the same lock.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     Some(f(state))
 }
 
@@ -311,12 +309,12 @@ fn flush_debug_locked(state: &mut UdpUartState) {
             payload,
         )
     };
-    if let Ok(frame_len) = frame_len {
-        if frame_len <= frame_cap {
-            let frame = &state.tx_frame[..frame_len];
-            // SAFETY: `state.eth` comes from `init` and access is serialized by the lock held here.
-            let _ = unsafe { (&mut *state.eth).try_send_frame(frame) };
-        }
+    if let Ok(frame_len) = frame_len
+        && frame_len <= frame_cap
+    {
+        let frame = &state.tx_frame[..frame_len];
+        // SAFETY: `state.eth` comes from `init` and access is serialized by the lock held here.
+        let _ = unsafe { (&mut *state.eth).try_send_frame(frame) };
     }
     state.debug_tx_len = 0;
 }

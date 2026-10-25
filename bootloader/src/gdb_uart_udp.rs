@@ -1,77 +1,32 @@
+use crate::gdb_session;
+use crate::gdb_session::ATTACH_REASON;
+use crate::gdb_session::DEBUG_SESSION_ACTIVE;
+use crate::gdb_session::GdbTransport;
+use crate::gdb_session::PrefetchBuf;
+pub use crate::gdb_session::PrefetchResult;
+use crate::gdb_session::RxRing;
+pub use crate::gdb_session::is_debug_active;
+pub use crate::gdb_session::is_debug_session_active;
+pub use crate::gdb_session::is_debug_session_initialized;
+pub use crate::gdb_session::peek_attach_reason;
+pub use crate::gdb_session::set_debug_active;
+pub use crate::gdb_session::set_debug_session_active;
+pub use crate::gdb_session::set_debug_session_initialized;
+pub use crate::gdb_session::take_attach_reason;
 use arch_hal::aarch64_mutex::RawSpinLockIrqSave;
 use arch_hal::timer;
-use core::hint::spin_loop;
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
-use gdb_remote::RspFrameAssembler;
-use gdb_remote::RspFrameEvent;
 use mutex::pod::RawAtomicPod;
 
 const RX_RING_SIZE: usize = 4096;
-const PREFETCH_CAP: usize = 1024 + 4;
-const NAK_ATTEMPTS: usize = 32;
 const FLUSH_LIMIT: usize = RX_RING_SIZE;
 
-// Publish debug entry state without relying on higher-level locking.
-static DEBUG_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
-// Set once a GDB session handshake has completed and we should emit async stop replies.
-static DEBUG_SESSION_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
-// Tracks whether we've completed an initial RSP handshake at least once.
-static DEBUG_SESSION_INITIALIZED: RawAtomicPod<bool> =
-    unsafe { RawAtomicPod::new_raw_unchecked(false) };
 static STOP_LOOP_ACTIVE: RawAtomicPod<bool> = unsafe { RawAtomicPod::new_raw_unchecked(false) };
-static ATTACH_REASON: RawAtomicPod<u8> = unsafe { RawAtomicPod::new_raw_unchecked(0) };
-
-struct RxRing<const N: usize> {
-    buf: [u8; N],
-    head: usize,
-    tail: usize,
-}
-
-impl<const N: usize> RxRing<N> {
-    const fn new() -> Self {
-        Self {
-            buf: [0; N],
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-
-    fn push_drop_oldest(&mut self, byte: u8) -> bool {
-        let next = (self.head + 1) % N;
-        if next == self.tail {
-            // Drop oldest to preserve the newest bytes for resync/attach.
-            self.tail = (self.tail + 1) % N;
-        }
-        self.buf[self.head] = byte;
-        self.head = next;
-        true
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.is_empty() {
-            return None;
-        }
-        let byte = self.buf[self.tail];
-        self.tail = (self.tail + 1) % N;
-        Some(byte)
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-    }
-}
 
 struct GdbUartState<const N: usize> {
     rx: RxRing<N>,
-    prefetch_buf: [u8; PREFETCH_CAP],
-    prefetch_len: usize,
-    prefetch_pos: usize,
+    prefetch: PrefetchBuf,
 }
 
 // SAFETY: `GDB_UART_READY` publishes initialization completion with Release ordering.
@@ -92,11 +47,9 @@ pub fn init(_base: usize, _clock_hz: u64, _baud: u32) {
     if GDB_UART_READY.load(Ordering::Acquire) {
         return;
     }
-    (&mut *guard).write(GdbUartState {
+    (*guard).write(GdbUartState {
         rx: RxRing::new(),
-        prefetch_buf: [0; PREFETCH_CAP],
-        prefetch_len: 0,
-        prefetch_pos: 0,
+        prefetch: PrefetchBuf::new(),
     });
     GDB_UART_READY.store(true, Ordering::Release);
 }
@@ -131,9 +84,8 @@ pub fn begin_stop_loop() -> StopLoopGuard {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
-    state.prefetch_len = 0;
-    state.prefetch_pos = 0;
+    let state = unsafe { (*guard).assume_init_mut() };
+    state.prefetch.clear();
     StopLoopGuard {
         restore: true,
         pause_start_ticks,
@@ -155,10 +107,9 @@ impl Drop for StopLoopGuard {
         if GDB_UART_READY.load(Ordering::Acquire) {
             let mut guard = GDB_UART_STATE.lock_irqsave();
             // SAFETY: READY is published after full initialization with Release ordering.
-            let state = unsafe { (&mut *guard).assume_init_mut() };
+            let state = unsafe { (*guard).assume_init_mut() };
             state.rx.clear();
-            state.prefetch_len = 0;
-            state.prefetch_pos = 0;
+            state.prefetch.clear();
         }
         STOP_LOOP_ACTIVE.store(false, Ordering::Release);
     }
@@ -178,7 +129,7 @@ pub fn poll_rx() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     crate::net::udp_uart::poll(
         |byte| {
             let _ = state.rx.push_drop_oldest(byte);
@@ -204,182 +155,40 @@ fn record_attach_byte(byte: u8) {
     }
 }
 
-/// Returns whether the debugger is currently active.
-pub fn is_debug_active() -> bool {
-    // Acquire pairs with Release stores so debug entry sees any buffered bytes.
-    DEBUG_ACTIVE.load(Ordering::Acquire)
-}
-
-/// Updates debug-active state.
-pub fn set_debug_active(active: bool) {
-    // Release publishes debug-active transitions to IRQ readers.
-    DEBUG_ACTIVE.store(active, Ordering::Release);
-}
-
-/// Returns whether the GDB session handshake has completed.
-pub fn is_debug_session_active() -> bool {
-    DEBUG_SESSION_ACTIVE.load(Ordering::Acquire)
-}
-
-/// Updates GDB session-active state.
-pub fn set_debug_session_active(active: bool) {
-    DEBUG_SESSION_ACTIVE.store(active, Ordering::Release);
-}
-
-/// Returns whether the first session initialization has happened.
-pub fn is_debug_session_initialized() -> bool {
-    DEBUG_SESSION_INITIALIZED.load(Ordering::Acquire)
-}
-
-/// Updates one-time session-initialized state.
-pub fn set_debug_session_initialized(active: bool) {
-    DEBUG_SESSION_INITIALIZED.store(active, Ordering::Release);
-}
-
-/// Consumes and returns the current attach reason.
-pub fn take_attach_reason() -> u8 {
-    // AcqRel ensures we observe any IRQ-side buffering before consuming the reason.
-    ATTACH_REASON.swap(0, Ordering::AcqRel)
-}
-
-/// Reads attach reason without consuming it.
-pub fn peek_attach_reason() -> u8 {
-    ATTACH_REASON.load(Ordering::Acquire)
-}
-
-/// Clears any buffered prefetch bytes.
-pub fn clear_prefetch() {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
-    state.prefetch_len = 0;
-    state.prefetch_pos = 0;
-}
-
-/// Result of first-frame prefetch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrefetchResult {
-    Success,
-    Timeout,
-    Overflow,
-    Unavailable,
-}
-
 /// Prefetches the first incoming RSP frame for attach handling.
 ///
-/// Waits for the first byte within `attach_deadline_ticks`, then extends the timeout
-/// by `idle_timeout_ticks` as long as bytes continue arriving.
+/// See [`gdb_session::prefetch_first_rsp_frame`] for the timeout semantics.
 pub fn prefetch_first_rsp_frame(
     attach_deadline_ticks: u64,
     idle_timeout_ticks: u64,
 ) -> PrefetchResult {
-    clear_prefetch();
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return PrefetchResult::Unavailable;
-    }
-
-    let mut assembler = RspFrameAssembler::new();
-    let mut len = 0usize;
-
-    let el2_timer = timer::El2PhysicalTimer::new();
-    let mut attached = false;
-    let mut deadline_ticks = attach_deadline_ticks;
-
-    loop {
-        let now = el2_timer.now();
-        if !attached {
-            if now >= deadline_ticks {
-                return fail_prefetch(PrefetchResult::Timeout);
-            }
-        } else if idle_timeout_ticks != 0 && now >= deadline_ticks {
-            return fail_prefetch(PrefetchResult::Timeout);
-        }
-
-        let Some(byte) = try_read_byte() else {
-            spin_loop();
-            continue;
-        };
-
-        let event = assembler.push(byte);
-        if !matches!(event, RspFrameEvent::Ignore) {
-            attached = true;
-            if idle_timeout_ticks != 0 {
-                deadline_ticks = el2_timer.now().saturating_add(idle_timeout_ticks);
-            }
-        }
-        match event {
-            RspFrameEvent::Ignore => {}
-            RspFrameEvent::Resync => {
-                len = 0;
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-            }
-            RspFrameEvent::NeedMore => {
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-            }
-            RspFrameEvent::CtrlC | RspFrameEvent::FrameComplete => {
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-                if !store_prefetch(len) {
-                    return PrefetchResult::Unavailable;
-                }
-                return PrefetchResult::Success;
-            }
-        }
-    }
+    gdb_session::prefetch_first_rsp_frame::<Transport>(attach_deadline_ticks, idle_timeout_ticks)
 }
 
-fn push_prefetch_byte_state(len: &mut usize, byte: u8) -> bool {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
-    if *len >= state.prefetch_buf.len() {
-        return false;
-    }
-    state.prefetch_buf[*len] = byte;
-    *len += 1;
-    true
-}
+/// UDP hooks for the shared attach prefetch logic.
+struct Transport;
 
-fn store_prefetch(len: usize) -> bool {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
-    if len > state.prefetch_buf.len() {
-        return false;
-    }
-    state.prefetch_len = len;
-    state.prefetch_pos = 0;
-    true
-}
-
-fn fail_prefetch(result: PrefetchResult) -> PrefetchResult {
-    if matches!(result, PrefetchResult::Timeout | PrefetchResult::Overflow) {
-        try_send_nak();
-        flush_rx_input();
-        clear_prefetch();
-    }
-    result
-}
-
-fn try_send_nak() {
-    for _ in 0..NAK_ATTEMPTS {
-        if try_write_byte(b'-') {
-            break;
+impl GdbTransport for Transport {
+    fn with_prefetch<R>(f: impl FnOnce(&mut PrefetchBuf) -> R) -> Option<R> {
+        if !GDB_UART_READY.load(Ordering::Acquire) {
+            return None;
         }
+        let mut guard = GDB_UART_STATE.lock_irqsave();
+        // SAFETY: READY is published after full initialization with Release ordering.
+        let state = unsafe { (*guard).assume_init_mut() };
+        Some(f(&mut state.prefetch))
+    }
+
+    fn try_read_byte() -> Option<u8> {
+        self::try_read_byte()
+    }
+
+    fn try_write_byte(byte: u8) -> bool {
+        self::try_write_byte(byte)
+    }
+
+    fn flush_rx_input() {
+        self::flush_rx_input();
     }
 }
 
@@ -389,7 +198,7 @@ fn flush_rx_input() {
     }
     let mut guard = GDB_UART_STATE.lock_irqsave();
     // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
+    let state = unsafe { (*guard).assume_init_mut() };
     for _ in 0..FLUSH_LIMIT {
         if state.rx.pop().is_none() {
             break;
@@ -405,15 +214,9 @@ pub fn try_read_byte() -> Option<u8> {
     {
         let mut guard = GDB_UART_STATE.lock_irqsave();
         // SAFETY: READY is published after full initialization with Release ordering.
-        let state = unsafe { (&mut *guard).assume_init_mut() };
+        let state = unsafe { (*guard).assume_init_mut() };
 
-        if state.prefetch_pos < state.prefetch_len {
-            let byte = state.prefetch_buf[state.prefetch_pos];
-            state.prefetch_pos += 1;
-            if state.prefetch_pos >= state.prefetch_len {
-                state.prefetch_pos = 0;
-                state.prefetch_len = 0;
-            }
+        if let Some(byte) = state.prefetch.pop() {
             return Some(byte);
         }
         if let Some(byte) = state.rx.pop() {
@@ -426,7 +229,7 @@ pub fn try_read_byte() -> Option<u8> {
         poll_rx();
         let mut guard = GDB_UART_STATE.lock_irqsave();
         // SAFETY: READY is published after full initialization with Release ordering.
-        let state = unsafe { (&mut *guard).assume_init_mut() };
+        let state = unsafe { (*guard).assume_init_mut() };
         return state.rx.pop();
     }
     None
@@ -451,6 +254,8 @@ pub fn flush() {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use crate::gdb_session::DEBUG_ACTIVE;
+    use crate::gdb_session::DEBUG_SESSION_INITIALIZED;
     use core::sync::atomic::Ordering;
 
     fn reset_attach_state() {

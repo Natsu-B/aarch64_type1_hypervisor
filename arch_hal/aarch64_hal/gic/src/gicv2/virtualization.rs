@@ -28,7 +28,7 @@ impl Gicv2 {
         [(); 16 - VCPUS]:,
         [(); crate::max_intids_for_vcpus(VCPUS)]:,
         [(); crate::max_intids_for_vcpus(VCPUS) - 32]:,
-        [(); (crate::max_intids_for_vcpus(VCPUS) - 32 + 31) / 32]:,
+        [(); (crate::max_intids_for_vcpus(VCPUS) - 32).div_ceil(32)]:,
         [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
         [(); crate::vm::pending_cap_for_vcpus(VCPUS)]:,
     {
@@ -107,10 +107,10 @@ pub fn encode_lr(irq: VirtualInterrupt) -> Result<GICH_LR, GicError> {
             if vintid < 16 && state != IrqState::Inactive && source.is_none() {
                 return Err(GicError::InvalidVgicIrq);
             }
-            if let Some(src) = source {
-                if src.0 >= 8 {
-                    return Err(GicError::InvalidCpuId);
-                }
+            if let Some(src) = source
+                && src.0 >= 8
+            {
+                return Err(GicError::InvalidCpuId);
             }
             // CPUID in the LR must match the guest vCPU id (0..7) as enforced at VM creation time.
             let cpuid = if vintid < 16 {
@@ -332,7 +332,7 @@ impl VgicHw for Gicv2 {
         // EOICount drives maintenance interrupts (LRENP). Treat this as a consume-on-read field:
         // read the current value, then clear it so the same condition does not retrigger.
         let mut hcr = virt.gich.hcr.read();
-        let count = hcr.get(GICH_HCR::eoicount) as u32;
+        let count = hcr.get(GICH_HCR::eoicount);
         if count != 0 {
             hcr = hcr.set(GICH_HCR::eoicount, 0);
             virt.gich.hcr.write(hcr);

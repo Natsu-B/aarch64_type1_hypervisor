@@ -8,6 +8,8 @@ use crate::monitor::MemfaultAccess;
 use crate::softirq;
 use crate::vgic;
 use arch_hal::aarch64_gdb;
+use arch_hal::common::read_volatile_sized;
+use arch_hal::common::write_volatile_sized;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::exceptions::emulation::EmulationOutcome;
@@ -28,8 +30,6 @@ use arch_hal::psci::PsciReturnCode;
 use arch_hal::timer;
 use core::cell::SyncUnsafeCell;
 use core::hint::spin_loop;
-use core::ptr::read_volatile;
-use core::ptr::write_volatile;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::TI;
@@ -107,27 +107,11 @@ pub(crate) fn setup_handler() {
 
 impl MmioHandler for PassthroughMmio {
     fn read(&self, ipa: u64, size: u8) -> Result<u64, MmioError> {
-        unsafe {
-            Ok(match size {
-                1 => read_volatile(ipa as *const u8) as u64,
-                2 => read_volatile(ipa as *const u16) as u64,
-                4 => read_volatile(ipa as *const u32) as u64,
-                8 => read_volatile(ipa as *const u64),
-                _ => return Err(MmioError::Unhandled),
-            })
-        }
+        unsafe { read_volatile_sized(ipa as usize, size) }.ok_or(MmioError::Unhandled)
     }
 
     fn write(&self, ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
-        unsafe {
-            match size {
-                1 => write_volatile(ipa as *mut u8, value as u8),
-                2 => write_volatile(ipa as *mut u16, value as u16),
-                4 => write_volatile(ipa as *mut u32, value as u32),
-                8 => write_volatile(ipa as *mut u64, value),
-                _ => return Err(MmioError::Unhandled),
-            }
-        }
+        unsafe { write_volatile_sized(ipa as usize, size, value) }.ok_or(MmioError::Unhandled)?;
         Ok(())
     }
 
@@ -155,15 +139,6 @@ pub(crate) fn register_gic(gic: Gicv2, gdb_uart_intid: Option<u32>) {
 pub(crate) fn gic() -> Option<&'static Gicv2> {
     // SAFETY: GIC is initialized once and then read-only.
     unsafe { &*GICV2.get() }.as_ref()
-}
-
-fn access_width_bytes(access_width: SyndromeAccessSize) -> usize {
-    match access_width {
-        SyndromeAccessSize::Byte => 1,
-        SyndromeAccessSize::HalfWord => 2,
-        SyndromeAccessSize::Word => 4,
-        SyndromeAccessSize::DoubleWord => 8,
-    }
 }
 
 fn should_log_unmapped_abort() -> bool {
@@ -256,13 +231,13 @@ fn data_abort_handler(
     info: &DataAbortInfo,
     decoded: Option<&MmioDecoded>,
 ) {
-    if let Some(plan) = decoded {
-        if decoded_mmio_is_allowlisted(plan) {
-            match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
-                EmulationOutcome::Handled => return,
-                EmulationOutcome::NotHandled => {
-                    panic!("decoded MMIO request was not handled: {:?}", plan)
-                }
+    if let Some(plan) = decoded
+        && decoded_mmio_is_allowlisted(plan)
+    {
+        match emulation::execute_mmio(regs, info, &PASSTHROUGH_MMIO, plan) {
+            EmulationOutcome::Handled => return,
+            EmulationOutcome::NotHandled => {
+                panic!("decoded MMIO request was not handled: {:?}", plan)
             }
         }
     }
@@ -286,7 +261,7 @@ fn data_abort_handler(
     let (kind, memfault_access, access_name) = classify_data_abort_access(write_access);
     let reg_opt = u8::try_from(reg_num).ok();
 
-    let access_bytes = access_width_bytes(access_width);
+    let access_bytes = usize::from(access_width.bytes());
     let reg_bits = match reg_size {
         InstructionRegisterSize::Instruction32bit => 32,
         InstructionRegisterSize::Instruction64bit => 64,
@@ -339,15 +314,15 @@ fn data_abort_handler(
         };
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                if let Some(access) = gic_access_size(access_width) {
-                    if let Ok(value) = vgic::handle_gicd_read(addr, access) {
-                        *register = match reg_size {
-                            InstructionRegisterSize::Instruction32bit => {
-                                value as u64 & (u32::MAX as u64)
-                            }
-                            InstructionRegisterSize::Instruction64bit => value as u64,
-                        };
-                    }
+                if let Some(access) = gic_access_size(access_width)
+                    && let Ok(value) = vgic::handle_gicd_read(addr, access)
+                {
+                    *register = match reg_size {
+                        InstructionRegisterSize::Instruction32bit => {
+                            value as u64 & (u32::MAX as u64)
+                        }
+                        InstructionRegisterSize::Instruction64bit => value as u64,
+                    };
                 }
             }
             WriteNotRead::WritingMemoryAbort => {
@@ -388,14 +363,8 @@ fn data_abort_handler(
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
                 // SAFETY: address is within a DTB-derived allowlisted MMIO range.
-                let v = unsafe {
-                    match access_width {
-                        SyndromeAccessSize::Byte => read_volatile(addr as *const u8) as u64,
-                        SyndromeAccessSize::HalfWord => read_volatile(addr as *const u16) as u64,
-                        SyndromeAccessSize::Word => read_volatile(addr as *const u32) as u64,
-                        SyndromeAccessSize::DoubleWord => read_volatile(addr as *const u64),
-                    }
-                };
+                let v = unsafe { read_volatile_sized(addr, access_width.bytes()) }
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
                 *register = match reg_size {
                     InstructionRegisterSize::Instruction32bit => v & (u32::MAX as u64),
                     InstructionRegisterSize::Instruction64bit => v,
@@ -407,22 +376,8 @@ fn data_abort_handler(
                     InstructionRegisterSize::Instruction64bit => *register,
                 };
                 // SAFETY: address is within a DTB-derived allowlisted MMIO range.
-                unsafe {
-                    match access_width {
-                        SyndromeAccessSize::Byte => {
-                            write_volatile(addr as *mut u8, reg_val as u8);
-                        }
-                        SyndromeAccessSize::HalfWord => {
-                            write_volatile(addr as *mut u16, reg_val as u16);
-                        }
-                        SyndromeAccessSize::Word => {
-                            write_volatile(addr as *mut u32, reg_val as u32);
-                        }
-                        SyndromeAccessSize::DoubleWord => {
-                            write_volatile(addr as *mut u64, reg_val as u64);
-                        }
-                    }
-                }
+                unsafe { write_volatile_sized(addr, access_width.bytes(), reg_val) }
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
                 // SAFETY: guest UART is initialized before guests can generate aborts.
                 let guest_uart_base = unsafe { (*GUEST_UART.get()).map(|u| u.base) };
                 if guest_uart_base.is_some_and(|base| base == addr) && reg_val == b'\n' as u64 {
@@ -583,10 +538,12 @@ fn instruction_abort_handler(regs: &mut cpu::Registers, info: &InstructionAbortI
     let in_debug = gdb_uart::is_debug_active();
     let in_debug_stop = aarch64_gdb::in_debug_stop();
     let decision = monitor::record_memfault(memfault_info);
-    if decision.should_trap && !in_debug && !in_debug_stop {
-        if debug::enter_debug_from_memfault(regs, WatchpointKind::Access, addr_u64) {
-            return;
-        }
+    if decision.should_trap
+        && !in_debug
+        && !in_debug_stop
+        && debug::enter_debug_from_memfault(regs, WatchpointKind::Access, addr_u64)
+    {
+        return;
     }
 
     loop {

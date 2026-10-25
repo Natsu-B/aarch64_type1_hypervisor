@@ -1389,7 +1389,7 @@ impl Bcm2712Sdhc {
         if buf.is_empty() {
             return Err(SdhcError::InvalidParam);
         }
-        if (buf.len() % SDHC_BLOCK_SIZE) != 0 {
+        if !buf.len().is_multiple_of(SDHC_BLOCK_SIZE) {
             return Err(SdhcError::Align);
         }
         let blocks =
@@ -1498,7 +1498,7 @@ impl BlockDevice for Bcm2712Sdhc {
         if buf.is_empty() {
             return Err(IoError::InvalidParam);
         }
-        if (buf.len() % SDHC_BLOCK_SIZE) != 0 {
+        if !buf.len().is_multiple_of(SDHC_BLOCK_SIZE) {
             return Err(IoError::Align);
         }
         let mut local = [0u8; SDHC_BLOCK_SIZE * 8];
@@ -1821,7 +1821,7 @@ fn decode_capacity_blocks(csd: &[u32; 4], high_capacity: bool) -> Result<u64, Sd
 
     let c_size = ((u64::from(csd[1]) & 0x3ff) << 2) | ((u64::from(csd[2]) & 0xc000_0000) >> 30);
     let c_mult = (u64::from(csd[2]) & 0x0003_8000) >> 15;
-    let read_bl_len_shift = ((csd[1] >> 16) & 0xf) as u32;
+    let read_bl_len_shift = (csd[1] >> 16) & 0xf;
     let read_bl_len = 1u64
         .checked_shl(read_bl_len_shift)
         .ok_or(SdhcError::OutOfRange)?;
@@ -1950,8 +1950,8 @@ fn parse_named_regions(view: &dtb::DtbNodeView<'_, '_>) -> Result<NamedRegions, 
 
     let mut regs = [HostRegion::default(); SDHC_MAX_REG_ENTRIES];
     let mut reg_count = 0usize;
-    let mut reg_iter = view.reg_iter().map_err(SdhcError::DtbParse)?;
-    while let Some(entry) = reg_iter.next() {
+    let reg_iter = view.reg_iter().map_err(SdhcError::DtbParse)?;
+    for entry in reg_iter {
         if reg_count >= regs.len() {
             return Err(SdhcError::DtbInvalid("sdhc: too many reg entries"));
         }

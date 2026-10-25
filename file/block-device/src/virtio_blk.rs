@@ -197,7 +197,7 @@ impl BlockDevice for VirtIoBlk {
         if len == 0 {
             return Err(IoError::InvalidParam);
         }
-        if len % self.block_size() != 0 {
+        if !len.is_multiple_of(self.block_size()) {
             return Err(IoError::Align);
         }
 
@@ -225,7 +225,7 @@ impl BlockDevice for VirtIoBlk {
         if len == 0 {
             return Err(IoError::InvalidParam);
         }
-        if len % self.block_size() != 0 {
+        if !len.is_multiple_of(self.block_size()) {
             return Err(IoError::Align);
         }
 
@@ -446,10 +446,10 @@ impl VirtIoBlk {
     fn release_descriptors(&self, desc_indices: &[u16]) -> Result<(), IoError> {
         let mut first_error = None;
         for &desc_idx in desc_indices {
-            if let Err(err) = self.virtio.dequeue_used(0, desc_idx) {
-                if first_error.is_none() {
-                    first_error = Some(error_from(err));
-                }
+            if let Err(err) = self.virtio.dequeue_used(0, desc_idx)
+                && first_error.is_none()
+            {
+                first_error = Some(error_from(err));
             }
         }
         if let Some(err) = first_error {

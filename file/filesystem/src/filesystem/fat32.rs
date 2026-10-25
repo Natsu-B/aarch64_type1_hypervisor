@@ -266,41 +266,41 @@ impl FAT32FileSystem {
                         if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name1, &mut long_name)? {
                             continue 'outer;
                         }
-                        if long_name.is_empty() || long_name.bytes().all(|c| c == b' ' || c == b'.')
+                        if (long_name.is_empty()
+                            || long_name.bytes().all(|c| c == b' ' || c == b'.'))
+                            && j == lde - 1
                         {
-                            if j == lde - 1 {
-                                return Ok(Some(Self::calculate_next_dir(
-                                    sde,
-                                    entry_lba,
-                                    entry_offset,
-                                )));
-                            }
+                            return Ok(Some(Self::calculate_next_dir(
+                                sde,
+                                entry_lba,
+                                entry_offset,
+                            )));
                         }
                         if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name2, &mut long_name)? {
                             continue 'outer;
                         }
-                        if long_name.is_empty() || long_name.bytes().all(|c| c == b' ' || c == b'.')
+                        if (long_name.is_empty()
+                            || long_name.bytes().all(|c| c == b' ' || c == b'.'))
+                            && j == lde - 1
                         {
-                            if j == lde - 1 {
-                                return Ok(Some(Self::calculate_next_dir(
-                                    sde,
-                                    entry_lba,
-                                    entry_offset,
-                                )));
-                            }
+                            return Ok(Some(Self::calculate_next_dir(
+                                sde,
+                                entry_lba,
+                                entry_offset,
+                            )));
                         }
                         if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name3, &mut long_name)? {
                             continue 'outer;
                         }
-                        if long_name.is_empty() || long_name.bytes().all(|c| c == b' ' || c == b'.')
+                        if (long_name.is_empty()
+                            || long_name.bytes().all(|c| c == b' ' || c == b'.'))
+                            && j == lde - 1
                         {
-                            if j == lde - 1 {
-                                return Ok(Some(Self::calculate_next_dir(
-                                    sde,
-                                    entry_lba,
-                                    entry_offset,
-                                )));
-                            }
+                            return Ok(Some(Self::calculate_next_dir(
+                                sde,
+                                entry_lba,
+                                entry_offset,
+                            )));
                         }
                     }
                 } else {
@@ -369,10 +369,8 @@ impl FAT32FileSystem {
             let sector_index = entry_byte / self.volume.bytes_per_sector as u64;
             if cached_sector != Some(sector_index) {
                 let lba = self.fat_lba(0, sector_index);
-                let mut uninit = slice_as_uninit(&mut sector_cache);
-                block_device
-                    .read_at(lba, &mut uninit)
-                    .map_err(from_io_err)?;
+                let uninit = slice_as_uninit(&mut sector_cache);
+                block_device.read_at(lba, uninit).map_err(from_io_err)?;
                 cached_sector = Some(sector_index);
             }
             let offset = (entry_byte % self.volume.bytes_per_sector as u64) as usize;
@@ -400,10 +398,8 @@ impl FAT32FileSystem {
         let mut sector_buf = vec![0u8; self.volume.bytes_per_sector as usize];
         for fat_idx in 0..self.volume.num_fats {
             let lba = self.fat_lba(fat_idx, sector_index);
-            let mut uninit = slice_as_uninit(&mut sector_buf);
-            block_device
-                .read_at(lba, &mut uninit)
-                .map_err(from_io_err)?;
+            let uninit = slice_as_uninit(&mut sector_buf);
+            block_device.read_at(lba, uninit).map_err(from_io_err)?;
             sector_buf[offset..offset + size_of::<FAT32FAT>()]
                 .copy_from_slice(&(value & FAT32FAT::MASK).to_le_bytes());
             block_device
@@ -438,9 +434,9 @@ impl FAT32FileSystem {
             return Err(FileSystemErr::Corrupted);
         }
         let mut sector = vec![0u8; self.volume.bytes_per_sector as usize];
-        let mut uninit = slice_as_uninit(&mut sector);
+        let uninit = slice_as_uninit(&mut sector);
         block_device
-            .read_at(meta.entry_lba, &mut uninit)
+            .read_at(meta.entry_lba, uninit)
             .map_err(from_io_err)?;
         let offset = meta.entry_offset as usize;
         if offset + size_of::<FAT32ByteDirectoryEntry>() > sector.len() {
@@ -458,7 +454,7 @@ impl FAT32FileSystem {
             .map_err(from_io_err)
     }
 
-    fn split_path_components<'a>(path: &'a str) -> Result<Vec<&'a str>, FileSystemErr> {
+    fn split_path_components(path: &str) -> Result<Vec<&str>, FileSystemErr> {
         let mut chars = path.chars();
         match chars.next() {
             Some('/') => {}
@@ -478,10 +474,10 @@ impl FAT32FileSystem {
         Ok(components)
     }
 
-    fn resolve_directory<'a>(
+    fn resolve_directory(
         &self,
         block_device: &Arc<dyn BlockDevice>,
-        components: &[&'a str],
+        components: &[&str],
     ) -> Result<(u32, Option<DirMeta>), FileSystemErr> {
         let mut dir_cluster = self.root_dir_cluster;
         let mut dir_meta = None;
@@ -524,10 +520,10 @@ impl FAT32FileSystem {
         if block_device.is_read_only().map_err(from_io_err)? {
             return Err(FileSystemErr::ReadOnly);
         }
-        if let Some(meta) = parent_meta {
-            if meta.is_readonly {
-                return Err(FileSystemErr::ReadOnly);
-            }
+        if let Some(meta) = parent_meta
+            && meta.is_readonly
+        {
+            return Err(FileSystemErr::ReadOnly);
         }
         Ok(())
     }
@@ -612,9 +608,9 @@ impl FAT32FileSystem {
         entry_bytes: &[u8],
     ) -> Result<(), FileSystemErr> {
         let mut sector = vec![0u8; self.volume.bytes_per_sector as usize];
-        let mut uninit = slice_as_uninit(&mut sector);
+        let uninit = slice_as_uninit(&mut sector);
         block_device
-            .read_at(entry_lba, &mut uninit)
+            .read_at(entry_lba, uninit)
             .map_err(from_io_err)?;
         let offset = entry_offset as usize;
         if offset + entry_bytes.len() > sector.len() {
@@ -635,9 +631,9 @@ impl FAT32FileSystem {
             return Err(FileSystemErr::Corrupted);
         }
         let mut sector = vec![0u8; self.volume.bytes_per_sector as usize];
-        let mut uninit = slice_as_uninit(&mut sector);
+        let uninit = slice_as_uninit(&mut sector);
         block_device
-            .read_at(meta.entry_lba, &mut uninit)
+            .read_at(meta.entry_lba, uninit)
             .map_err(from_io_err)?;
         let offset = meta.entry_offset as usize;
         if offset + size_of::<FAT32ByteDirectoryEntry>() > sector.len() {
@@ -656,7 +652,7 @@ impl FAT32FileSystem {
         if name.is_empty() || name.len() > 255 {
             return Err(FileSystemErr::InvalidInput);
         }
-        if let Some(_) = Self::is_encode_83(name)? {
+        if Self::is_encode_83(name)?.is_some() {
             let short = Self::encode_short_name_bytes(name)?;
             return Ok((short, Vec::new()));
         }
@@ -755,9 +751,9 @@ impl FAT32FileSystem {
         for info in FAT32FATIter::new(block_device, self, dir_cluster) {
             let info = info?;
             last_cluster = Some(info.cluster);
-            let mut uninit = slice_as_uninit(&mut buffer);
+            let uninit = slice_as_uninit(&mut buffer);
             block_device
-                .read_at(info.lba, &mut uninit)
+                .read_at(info.lba, uninit)
                 .map_err(from_io_err)?;
             for entry_off in (0..cluster_size).step_by(entry_size) {
                 let value = buffer[entry_off];
@@ -794,7 +790,7 @@ impl FAT32FileSystem {
         if entries_per_cluster == 0 {
             return Err(FileSystemErr::Corrupted);
         }
-        let clusters_needed = (count + entries_per_cluster - 1) / entries_per_cluster;
+        let clusters_needed = count.div_ceil(entries_per_cluster);
         let mut first_new = None;
         for _ in 0..clusters_needed {
             let new_cluster = self.find_free_cluster(block_device)?;
@@ -824,9 +820,9 @@ impl FAT32FileSystem {
         let mut buffer = vec![0u8; cluster_size];
         for info in FAT32FATIter::new(block_device, self, dir_cluster) {
             let info = info?;
-            let mut uninit = slice_as_uninit(&mut buffer);
+            let uninit = slice_as_uninit(&mut buffer);
             block_device
-                .read_at(info.lba, &mut uninit)
+                .read_at(info.lba, uninit)
                 .map_err(from_io_err)?;
             for entry_off in (0..cluster_size).step_by(entry_size) {
                 let name0 = buffer[entry_off];
@@ -899,10 +895,11 @@ impl FAT32FileSystem {
     }
 
     fn split_long_name(name: &str) -> (&str, Option<&str>) {
-        if let Some(idx) = name.rfind('.') {
-            if idx > 0 && idx < name.len() - 1 {
-                return (&name[..idx], Some(&name[idx + 1..]));
-            }
+        if let Some(idx) = name.rfind('.')
+            && idx > 0
+            && idx < name.len() - 1
+        {
+            return (&name[..idx], Some(&name[idx + 1..]));
         }
         (name, None)
     }
@@ -965,7 +962,7 @@ impl FAT32FileSystem {
         }
         let bytes = name.as_bytes();
         let chars_len = bytes.len() + 1;
-        let total_entries = (chars_len + 12) / 13;
+        let total_entries = chars_len.div_ceil(13);
         let checksum = Self::short_name_checksum(short_name);
         let mut entries = Vec::with_capacity(total_entries);
         for seq in 1..=total_entries {
@@ -1067,11 +1064,9 @@ impl FAT32FileSystem {
             return Err(FileSystemErr::Corrupted);
         }
         let mut buffer = vec![0u8; self.cluster_size_bytes()];
-        let mut uninit = slice_as_uninit(&mut buffer);
+        let uninit = slice_as_uninit(&mut buffer);
         let lba = self.volume.cluster_to_lba(dir_cluster)?;
-        block_device
-            .read_at(lba, &mut uninit)
-            .map_err(from_io_err)?;
+        block_device.read_at(lba, uninit).map_err(from_io_err)?;
         let entry_size = size_of::<FAT32ByteDirectoryEntry>();
         if entry_size * 2 > buffer.len() {
             return Err(FileSystemErr::Corrupted);
@@ -1094,11 +1089,9 @@ impl FAT32FileSystem {
             return Err(FileSystemErr::Corrupted);
         }
         let mut buffer = vec![0u8; self.cluster_size_bytes()];
-        let mut uninit = slice_as_uninit(&mut buffer);
+        let uninit = slice_as_uninit(&mut buffer);
         let lba = self.volume.cluster_to_lba(dir_cluster)?;
-        block_device
-            .read_at(lba, &mut uninit)
-            .map_err(from_io_err)?;
+        block_device.read_at(lba, uninit).map_err(from_io_err)?;
         let entry_size = size_of::<FAT32ByteDirectoryEntry>();
         if entry_size * 2 > buffer.len() {
             return Err(FileSystemErr::Corrupted);
@@ -1158,9 +1151,9 @@ impl FAT32FileSystem {
             if meta.entry_lba < start || meta.entry_lba >= end {
                 continue;
             }
-            let mut uninit = slice_as_uninit(&mut buffer);
+            let uninit = slice_as_uninit(&mut buffer);
             block_device
-                .read_at(info.lba, &mut uninit)
+                .read_at(info.lba, uninit)
                 .map_err(from_io_err)?;
             let sector_off = meta.entry_lba - start;
             let mut entry_off = sector_off as usize * sector_size + meta.entry_offset as usize;
@@ -1197,9 +1190,9 @@ impl FAT32FileSystem {
                     return Ok(());
                 }
                 current_cluster_idx -= 1;
-                let mut uninit = slice_as_uninit(&mut buffer);
+                let uninit = slice_as_uninit(&mut buffer);
                 block_device
-                    .read_at(cluster_lbas[current_cluster_idx], &mut uninit)
+                    .read_at(cluster_lbas[current_cluster_idx], uninit)
                     .map_err(from_io_err)?;
                 entry_off = buffer.len();
             }
@@ -1217,9 +1210,9 @@ impl FAT32FileSystem {
         let mut buffer = vec![0u8; cluster_size];
         for info in FAT32FATIter::new(block_device, self, dir_cluster) {
             let info = info?;
-            let mut uninit = slice_as_uninit(&mut buffer);
+            let uninit = slice_as_uninit(&mut buffer);
             block_device
-                .read_at(info.lba, &mut uninit)
+                .read_at(info.lba, uninit)
                 .map_err(from_io_err)?;
             for entry_off in (0..cluster_size).step_by(entry_size) {
                 let name0 = buffer[entry_off];
@@ -1393,7 +1386,7 @@ impl FileSystemTrait for FAT32FileSystem {
             block_device,
             parent_cluster,
             file_name,
-            |short_name| Self::build_file_entry(short_name),
+            Self::build_file_entry,
         )?;
         let meta = DirMeta {
             is_dir: false,
@@ -1466,7 +1459,7 @@ impl FileSystemTrait for FAT32FileSystem {
             block_device,
             dst_parent_cluster,
             dst_file_name,
-            |short_name| Self::build_file_entry(short_name),
+            Self::build_file_entry,
         )?;
 
         let mut new_meta = DirMeta {
@@ -1490,8 +1483,8 @@ impl FileSystemTrait for FAT32FileSystem {
             let current = cmp::min(remaining, chunk_size as u64) as usize;
             {
                 let chunk = &mut buffer[..current];
-                let mut uninit = slice_as_uninit(chunk);
-                self.read_at(block_device, offset, &mut uninit, &src_meta)?;
+                let uninit = slice_as_uninit(chunk);
+                self.read_at(block_device, offset, uninit, &src_meta)?;
             }
             let chunk = &buffer[..current];
             self.write_at(block_device, offset, chunk, &mut new_meta)?;
@@ -1582,26 +1575,26 @@ impl FileSystemTrait for FAT32FileSystem {
             return Err(err);
         }
 
-        if !same_parent && src_meta.is_dir {
-            if let Err(err) = self.update_directory_parent_cluster(
+        if !same_parent
+            && src_meta.is_dir
+            && let Err(err) = self.update_directory_parent_cluster(
                 block_device,
                 src_meta.first_cluster,
                 dst_parent_cluster,
-            ) {
-                let _ =
-                    self.delete_directory_entry(block_device, dst_parent_cluster, &new_entry_meta);
-                let _ = self.insert_entry_with_builder(
-                    block_device,
-                    src_parent_cluster,
-                    src_file_name,
-                    |short_name| {
-                        let mut entry = old_entry;
-                        entry.dir_name = short_name;
-                        entry
-                    },
-                );
-                return Err(err);
-            }
+            )
+        {
+            let _ = self.delete_directory_entry(block_device, dst_parent_cluster, &new_entry_meta);
+            let _ = self.insert_entry_with_builder(
+                block_device,
+                src_parent_cluster,
+                src_file_name,
+                |short_name| {
+                    let mut entry = old_entry;
+                    entry.dir_name = short_name;
+                    entry
+                },
+            );
+            return Err(err);
         }
         Ok(())
     }
@@ -1737,7 +1730,7 @@ impl FileSystemTrait for FAT32FileSystem {
         let required_clusters = if new_size == 0 {
             0
         } else {
-            ((new_size + cluster_size as u64 - 1) / cluster_size as u64) as usize
+            new_size.div_ceil(cluster_size as u64) as usize
         };
         let mut chain = self.collect_cluster_chain(block_device, meta.first_cluster)?;
         self.ensure_cluster_capacity(block_device, &mut chain, required_clusters, meta)?;
@@ -1757,10 +1750,8 @@ impl FileSystemTrait for FAT32FileSystem {
             };
             let cluster = *chain.get(cluster_index).ok_or(FileSystemErr::Corrupted)?;
             let lba = self.volume.cluster_to_lba(cluster)?;
-            let mut uninit = slice_as_uninit(cluster_buf.as_mut_slice());
-            block_device
-                .read_at(lba, &mut uninit)
-                .map_err(from_io_err)?;
+            let uninit = slice_as_uninit(cluster_buf.as_mut_slice());
+            block_device.read_at(lba, uninit).map_err(from_io_err)?;
             let within_cluster = (current_offset % cluster_size as u64) as usize;
             let writable = cmp::min(cluster_size - within_cluster, remaining);
             cluster_buf[within_cluster..within_cluster + writable]

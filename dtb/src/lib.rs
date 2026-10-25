@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod cells;
 pub(crate) mod dtb_parser;
 pub mod overlay;
 pub mod patch;
@@ -45,6 +46,13 @@ pub use tree_copy::copy_subtree_to_path;
 pub use tree_copy::encode_gic_spi_interrupts_with_mapper;
 pub use tree_copy::encode_reg_entries;
 pub use tree_copy::node_path;
+
+#[cfg(test)]
+#[macro_export]
+macro_rules! pr_debug {
+    ($fmt:expr) => (println!($fmt));
+    ($fmt:expr, $($arg:tt)*) => (println!($fmt, $($arg)*));
+}
 
 #[cfg(test)]
 mod tests {
@@ -554,13 +562,6 @@ mod tests {
         assert_walk_ok(result);
         assert!(found);
     }
-}
-
-#[cfg(test)]
-#[macro_export]
-macro_rules! pr_debug {
-    ($fmt:expr) => (println!($fmt));
-    ($fmt:expr, $($arg:tt)*) => (println!($fmt, $($arg)*));
 }
 
 #[cfg(not(test))]

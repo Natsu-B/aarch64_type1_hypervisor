@@ -20,6 +20,7 @@ extern crate alloc;
 #[cfg(all(feature = "rpi4_net", feature = "virtio_net"))]
 compile_error!("rpi4_net and virtio_net cannot be enabled together");
 mod debug;
+mod gdb_session;
 mod gdb_stream;
 #[cfg(not(any(feature = "rpi4_net", feature = "virtio_net")))]
 mod gdb_uart;
@@ -33,7 +34,6 @@ mod build_info {
 #[cfg(all(feature = "rpi4", feature = "rpi4_genet_loopback_selftest"))]
 mod genet_selftest;
 mod handler;
-mod irq_decode;
 mod irq_monitor;
 mod monitor;
 #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
@@ -121,6 +121,9 @@ use dtb::NodeEditExt;
 use dtb::NodeQueryExt;
 use dtb::ValueRef;
 use dtb::WalkError;
+use dtb::cells::read_be_u32;
+use dtb::cells::write_be_u32s;
+use dtb::node_path;
 use file::AlignedSliceBox;
 
 unsafe extern "C" {
@@ -282,10 +285,6 @@ impl GuestMmioRange {
     fn end(&self) -> usize {
         self.base.checked_add(self.size).unwrap_or(usize::MAX)
     }
-
-    fn contains(&self, addr: usize) -> bool {
-        addr >= self.base && addr < self.end()
-    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -365,8 +364,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                         ControlFlow<()>,
                         WalkError<()>,
                     > {
-                        irq =
-                            Some(irq_decode::dt_irq_to_pintid(cells).expect("uart: bad IRQ spec"));
+                        let decoded =
+                            gic::dt_irq::decode_gicv2_irq(cells).expect("uart: bad IRQ spec");
+                        irq = Some(decoded.intid);
                         Ok(ControlFlow::Break(()))
                     })
                     .unwrap();
@@ -637,7 +637,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
             guest_ipa_end
         );
         assert!(
-            sp_el1.checked_sub(0x20).unwrap_or(0) >= guest_ipa_base,
+            sp_el1.saturating_sub(0x20) >= guest_ipa_base,
             "stage2: sp_el1 - 0x20 ({:#X}) underflows guest_ipa_base ({:#X})",
             sp_el1.wrapping_sub(0x20),
             guest_ipa_base
@@ -666,11 +666,11 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         if guest_ipa_size != 0 {
             let mut rom_ranges = [(0u64, 0u64); 1];
             let mut rom_count = 0usize;
-            if let Some(mem_base) = lowest_memory_base() {
-                if guest_ipa_base > mem_base {
-                    rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
-                    rom_count = 1;
-                }
+            if let Some(mem_base) = lowest_memory_base()
+                && guest_ipa_base > mem_base
+            {
+                rom_ranges[0] = (mem_base as u64, (guest_ipa_base - mem_base) as u64);
+                rom_count = 1;
             }
 
             let mut io_ranges: Vec<(u64, u64)> = Vec::new();
@@ -764,7 +764,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         )
         .unwrap();
 
-        let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000 * 1).unwrap();
+        let mut reserved_memory = GLOBAL_ALLOCATOR.trim_for_boot(0x1000 * 0x1000).unwrap();
         println!("allocator closed");
         reserved_memory.push((program_start, stack_start));
         reserved_memory.push((el1_stack_base, EL1_STACK_BYTES));
@@ -898,17 +898,12 @@ fn guest_mmio_allowlist_slice() -> &'static [GuestMmioRange] {
     unsafe { (*GUEST_MMIO_ALLOWLIST.get()).as_deref().unwrap_or(&[]) }
 }
 
-pub(crate) fn guest_mmio_allowlist_contains(addr: usize) -> bool {
-    guest_mmio_allowlist_contains_range(addr, 1)
-}
-
 pub(crate) fn guest_mmio_allowlist_contains_range(addr: usize, size: usize) -> bool {
     if size == 0 {
         return false;
     }
-    let end = match addr.checked_add(size) {
-        Some(end) => end,
-        None => return false,
+    let Some(end) = addr.checked_add(size) else {
+        return false;
     };
     for range in guest_mmio_allowlist_slice() {
         if range.size == 0 {
@@ -1155,11 +1150,11 @@ fn push_guest_mmio_range(
         );
         return;
     }
-    if let Some(gdb_range) = denylist.gdb_range {
-        if ranges_overlap(range, gdb_range) {
-            stats.dropped_gdb += 1;
-            return;
-        }
+    if let Some(gdb_range) = denylist.gdb_range
+        && ranges_overlap(range, gdb_range)
+    {
+        stats.dropped_gdb += 1;
+        return;
     }
     if denylist.contains_overlap(range) {
         stats.dropped_deny += 1;
@@ -1179,13 +1174,13 @@ fn record_guest_mmio_allowlist_from_dtb(
 
     let guest_range = normalize_guest_mmio_range(guest_uart.base, guest_uart.size);
     let mut gdb_range = gdb_uart.and_then(|node| normalize_guest_mmio_range(node.base, node.size));
-    if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range) {
-        if ranges_overlap(guest_range, current_gdb_range) {
-            println!(
-                "warning: guest/gdb UART ranges overlap within normalized MMIO pages; not denying GDB range"
-            );
-            gdb_range = None;
-        }
+    if let (Some(guest_range), Some(current_gdb_range)) = (guest_range, gdb_range)
+        && ranges_overlap(guest_range, current_gdb_range)
+    {
+        println!(
+            "warning: guest/gdb UART ranges overlap within normalized MMIO pages; not denying GDB range"
+        );
+        gdb_range = None;
     }
     let mut denylist = GuestMmioDenyList {
         gdb_range,
@@ -1249,8 +1244,8 @@ fn record_guest_mmio_allowlist_from_dtb(
             node_is_memory(&node) || node_is_disabled(&node) || node_has_no_map(&node);
         if !skip_collect {
             match node.reg_iter() {
-                Ok(mut regs) => {
-                    while let Some(entry) = regs.next() {
+                Ok(regs) => {
+                    for entry in regs {
                         let (base, size) = match entry {
                             Ok(entry) => entry,
                             Err(err) => {
@@ -1286,8 +1281,8 @@ fn record_guest_mmio_allowlist_from_dtb(
             }
 
             match node.ranges_iter() {
-                Ok(Some(mut iter)) => {
-                    while let Some(entry) = iter.next() {
+                Ok(Some(iter)) => {
+                    for entry in iter {
                         let entry = match entry {
                             Ok(entry) => entry,
                             Err(err) => {
@@ -1398,7 +1393,7 @@ fn push_debug_io_range(io_ranges: &mut Vec<(u64, u64)>, base: usize, size: usize
         return;
     }
     let entry = (base as u64, size as u64);
-    if io_ranges.iter().any(|&existing| existing == entry) {
+    if io_ranges.contains(&entry) {
         return;
     }
     io_ranges.push(entry);
@@ -1452,8 +1447,8 @@ fn find_gicv2_info(dtb: &DtbParser) -> Result<Gicv2Info, &'static str> {
                 if maintenance_intid.is_some() {
                     return Ok(ControlFlow::Break(()));
                 }
-                if let Ok(intid) = irq_decode::dt_irq_to_pintid(cells) {
-                    maintenance_intid = Some(intid);
+                if let Ok(decoded) = gic::dt_irq::decode_gicv2_irq(cells) {
+                    maintenance_intid = Some(decoded.intid);
                 }
                 Ok(ControlFlow::Break(()))
             })?;
@@ -1936,7 +1931,10 @@ fn apply_guest_uart_dt_edit(
     let mut disable_nodes = Vec::new();
 
     for id in 0..tree.nodes.len() {
-        if !node_compatible_contains(tree, id, "arm,pl011")? {
+        if !tree
+            .node(id)
+            .is_some_and(|node| node.compatible_contains("arm,pl011"))
+        {
             continue;
         }
         let raw_base = node_reg_base(tree, id)?;
@@ -1958,28 +1956,28 @@ fn apply_guest_uart_dt_edit(
         }
     }
 
-    if let Some(chosen) = tree.find_node_by_path("/chosen") {
-        if let Some(path) = node_path(tree, guest_node) {
-            let mut value = Vec::with_capacity(path.len() + 1);
-            value.extend_from_slice(path.as_bytes());
-            value.push(0);
-            if let Some(node) = tree.node_mut(chosen) {
-                node.set_property(NameRef::Borrowed("stdout-path"), ValueRef::Owned(value));
-            }
+    if let Some(chosen) = tree.find_node_by_path("/chosen")
+        && let Ok(path) = node_path(tree, guest_node)
+    {
+        let mut value = Vec::with_capacity(path.len() + 1);
+        value.extend_from_slice(path.as_bytes());
+        value.push(0);
+        if let Some(node) = tree.node_mut(chosen) {
+            node.set_property(NameRef::Borrowed("stdout-path"), ValueRef::Owned(value));
         }
     }
 
     if let Some(aliases) = tree.find_node_by_path("/aliases") {
         let mut remove: Vec<String> = Vec::new();
         for id in disable_nodes.iter().copied() {
-            if let Some(path) = node_path(tree, id) {
-                if let Some(node) = tree.node(aliases) {
-                    for prop in &node.properties {
-                        if let Some(value) = decode_cstr(prop.value.as_slice()) {
-                            if value == path {
-                                remove.push(String::from(prop.name.as_str()));
-                            }
-                        }
+            if let Ok(path) = node_path(tree, id)
+                && let Some(node) = tree.node(aliases)
+            {
+                for prop in &node.properties {
+                    if let Some(value) = decode_cstr(prop.value.as_slice())
+                        && value == path
+                    {
+                        remove.push(String::from(prop.name.as_str()));
                     }
                 }
             }
@@ -2032,7 +2030,10 @@ fn update_gicv2_cpu_interface_reg(
     let mut gic_node = None;
     for id in 0..tree.nodes.len() {
         for compat in COMPATS {
-            if node_compatible_contains(tree, id, compat)? {
+            if tree
+                .node(id)
+                .is_some_and(|node| node.compatible_contains(compat))
+            {
                 gic_node = Some(id);
                 break;
             }
@@ -2049,8 +2050,8 @@ fn update_gicv2_cpu_interface_reg(
         .node(node_id)
         .and_then(|n| n.parent)
         .unwrap_or(tree.root);
-    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
-    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
+    let addr_cells = property_u32(tree, parent, "#address-cells").unwrap_or(2) as usize;
+    let size_cells = property_u32(tree, parent, "#size-cells").unwrap_or(1) as usize;
     let stride = (addr_cells + size_cells) * 4;
     let Some(node) = tree.node(node_id) else {
         return Ok(());
@@ -2075,35 +2076,6 @@ fn update_gicv2_cpu_interface_reg(
         node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
     }
     Ok(())
-}
-
-fn node_compatible_contains(
-    tree: &DeviceTree<'static>,
-    node_id: usize,
-    needle: &str,
-) -> Result<bool, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(false);
-    };
-    let Some(prop) = node.property("compatible") else {
-        return Ok(false);
-    };
-    let bytes = prop.value.as_slice();
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| start + p)
-            .unwrap_or(bytes.len());
-        if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
-            if entry == needle {
-                return Ok(true);
-            }
-        }
-        start = end + 1;
-    }
-    Ok(false)
 }
 
 fn node_reg_base(
@@ -2144,8 +2116,8 @@ fn node_reg_first(
         return Ok(None);
     };
     let parent = node.parent.unwrap_or(tree.root);
-    let addr_cells = inherited_u32(tree, parent, "#address-cells")?.unwrap_or(2);
-    let size_cells = inherited_u32(tree, parent, "#size-cells")?.unwrap_or(1);
+    let addr_cells = inherited_u32(tree, parent, "#address-cells").unwrap_or(2);
+    let size_cells = inherited_u32(tree, parent, "#size-cells").unwrap_or(1);
 
     let addr_cells_usize =
         usize::try_from(addr_cells).map_err(|_| "reg: address/size cells overflow usize")?;
@@ -2206,10 +2178,10 @@ fn translate_one_level_ranges(
         return Ok(child);
     }
 
-    let child_address_cells = inherited_u32(tree, bus_node_id, "#address-cells")?.unwrap_or(2);
-    let child_size_cells = inherited_u32(tree, bus_node_id, "#size-cells")?.unwrap_or(1);
+    let child_address_cells = inherited_u32(tree, bus_node_id, "#address-cells").unwrap_or(2);
+    let child_size_cells = inherited_u32(tree, bus_node_id, "#size-cells").unwrap_or(1);
     let parent = bus.parent.ok_or("ranges: missing parent")?;
-    let parent_address_cells = inherited_u32(tree, parent, "#address-cells")?.unwrap_or(2);
+    let parent_address_cells = inherited_u32(tree, parent, "#address-cells").unwrap_or(2);
 
     let child_address_cells_usize = usize::try_from(child_address_cells)
         .map_err(|_| "ranges: address/size cells overflow usize")?;
@@ -2271,19 +2243,15 @@ fn translate_one_level_ranges(
     Err("ranges: address not covered")
 }
 
-fn inherited_u32(
-    tree: &DeviceTree<'static>,
-    node_id: usize,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
+fn inherited_u32(tree: &DeviceTree<'static>, node_id: usize, key: &str) -> Option<u32> {
     let mut current = Some(node_id);
     while let Some(id) = current {
-        if let Some(value) = property_u32(tree, id, key)? {
-            return Ok(Some(value));
+        if let Some(value) = property_u32(tree, id, key) {
+            return Some(value);
         }
         current = tree.node(id).and_then(|node| node.parent);
     }
-    Ok(None)
+    None
 }
 
 fn read_be_cells_u128(
@@ -2316,71 +2284,9 @@ fn read_be_cells_u128(
     Ok((value, consumed))
 }
 
-fn property_u32(
-    tree: &DeviceTree<'static>,
-    node_id: usize,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(None);
-    };
-    let Some(prop) = node.property(key) else {
-        return Ok(None);
-    };
-    let bytes = prop.value.as_slice();
-    if bytes.len() != 4 {
-        return Ok(None);
-    }
-    Ok(Some(read_be_u32(bytes, 0)?))
-}
-
-fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
-    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
-    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
-    slice.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for i in 0..cells {
-        let shift = 32 * (cells - 1 - i);
-        let cell = ((value >> shift) & 0xffff_ffff) as u32;
-        write_be_u32(bytes, offset + i * 4, cell)?;
-    }
-    Ok(())
-}
-
-fn node_path(tree: &DeviceTree<'static>, node_id: usize) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    let mut current = Some(node_id);
-    while let Some(id) = current {
-        let node = tree.node(id)?;
-        let name = node.name.as_str();
-        if !name.is_empty() && name != "/" {
-            parts.push(name);
-        }
-        current = node.parent;
-    }
-    parts.reverse();
-    let mut path = String::from("/");
-    for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
-            path.push('/');
-        }
-        path.push_str(part);
-    }
-    Some(path)
+/// Reads a single-cell property, treating a missing node or a malformed value as absent.
+fn property_u32(tree: &DeviceTree<'static>, node_id: usize, key: &str) -> Option<u32> {
+    tree.node(node_id)?.property_u32(key).ok().flatten()
 }
 
 fn decode_cstr(bytes: &[u8]) -> Option<&str> {

@@ -91,8 +91,7 @@ impl FatVolume {
             return Err(FileSystemErr::Corrupted);
         }
 
-        let root_dir_sectors = (root_dir_entries as u32 * 32 + (bytes_per_sector as u32 - 1))
-            / bytes_per_sector as u32;
+        let root_dir_sectors = (root_dir_entries as u32 * 32).div_ceil(bytes_per_sector as u32);
         let fat_region = reserved_sectors as u32 + num_fats as u32 * sectors_per_fat;
         let total_system = fat_region
             .checked_add(root_dir_sectors)

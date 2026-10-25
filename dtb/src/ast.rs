@@ -13,8 +13,10 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::mem::align_of;
 use core::mem::size_of;
-use typestate::Be;
 
+use crate::cells::read_be_u32;
+use crate::cells::string_list_contains;
+use crate::cells::write_be_u32;
 use crate::dtb_parser::DtbParser;
 use crate::dtb_parser::Validated;
 use crate::dtb_parser::big_endian::Dtb;
@@ -33,18 +35,7 @@ fn align4(x: usize) -> usize {
     (x + 3) & !3
 }
 
-fn read_be_u32(buf: &[u8], offset: usize) -> Result<u32, &'static str> {
-    let end = offset
-        .checked_add(4)
-        .ok_or("dtb: overflow in read_be_u32")?;
-    let bytes = buf
-        .get(offset..end)
-        .ok_or("dtb: out of bounds in read_be_u32")?;
-    let be = unsafe { &*(bytes.as_ptr() as *const Be<u32>) };
-    Ok(be.read())
-}
-
-fn read_cstr<'dtb>(buf: &'dtb [u8], offset: usize) -> Result<&'dtb str, &'static str> {
+fn read_cstr(buf: &[u8], offset: usize) -> Result<&str, &'static str> {
     let slice = buf
         .get(offset..)
         .ok_or("dtb: out of bounds in read_cstr start")?;
@@ -54,17 +45,6 @@ fn read_cstr<'dtb>(buf: &'dtb [u8], offset: usize) -> Result<&'dtb str, &'static
         .ok_or("dtb: missing NUL terminator in read_cstr")?;
     let bytes = &slice[..len];
     core::str::from_utf8(bytes).map_err(|_| "dtb: invalid UTF-8 in string")
-}
-
-fn write_be_u32(buf: &mut [u8], offset: usize, v: u32) -> Result<(), &'static str> {
-    let end = offset
-        .checked_add(4)
-        .ok_or("dtb: overflow in write_be_u32")?;
-    let slice = buf
-        .get_mut(offset..end)
-        .ok_or("dtb: out of bounds in write_be_u32")?;
-    slice.copy_from_slice(&v.to_be_bytes());
-    Ok(())
 }
 
 fn write_be_u64(buf: &mut [u8], offset: usize, v: u64) -> Result<(), &'static str> {
@@ -562,7 +542,7 @@ impl<'dtb, State> DeviceTree<'dtb, State> {
         let totalsize = off_dt_strings
             .checked_add(strings_size)
             .ok_or("dtb: overflow in totalsize")?;
-        if totalsize > core::u32::MAX as usize {
+        if totalsize > u32::MAX as usize {
             return Err("dtb: totalsize exceeds u32");
         }
 
@@ -871,6 +851,15 @@ impl<'dtb> DeviceTreeEditExt<'dtb> for DeviceTree<'dtb, Owned> {
 
 pub trait NodeQueryExt<'dtb> {
     fn property(&self, name: &str) -> Option<&Property<'dtb>>;
+
+    /// Returns whether the node's `compatible` string list contains `compat`.
+    fn compatible_contains(&self, compat: &str) -> bool;
+
+    /// Reads a single-cell `u32` property.
+    ///
+    /// Returns `Ok(None)` when the property is absent and an error when its value is not
+    /// exactly one cell long.
+    fn property_u32(&self, name: &str) -> Result<Option<u32>, &'static str>;
 }
 
 impl<'dtb> NodeQueryExt<'dtb> for Node<'dtb> {
@@ -878,6 +867,22 @@ impl<'dtb> NodeQueryExt<'dtb> for Node<'dtb> {
         self.properties
             .iter()
             .find(|prop| prop.name.as_str() == name)
+    }
+
+    fn compatible_contains(&self, compat: &str) -> bool {
+        self.property("compatible")
+            .is_some_and(|prop| string_list_contains(prop.value.as_slice(), compat))
+    }
+
+    fn property_u32(&self, name: &str) -> Result<Option<u32>, &'static str> {
+        let Some(prop) = self.property(name) else {
+            return Ok(None);
+        };
+        let bytes = prop.value.as_slice();
+        if bytes.len() != 4 {
+            return Err("dtb: u32 property must be 4 bytes");
+        }
+        Ok(Some(read_be_u32(bytes, 0)?))
     }
 }
 
@@ -922,6 +927,26 @@ mod tests {
 
     fn aligned_fixture() -> &'static [u8] {
         &TEST_DTB.0
+    }
+
+    #[test]
+    fn node_query_helpers_decode_compatible_and_u32() {
+        let mut node = Node::new(NameRef::Borrowed("uart@0"));
+        node.set_property(
+            NameRef::Borrowed("compatible"),
+            ValueRef::Borrowed(b"arm,pl011\0arm,primecell\0"),
+        );
+        node.set_property(
+            NameRef::Borrowed("#address-cells"),
+            ValueRef::Borrowed(&[0, 0, 0, 2]),
+        );
+        node.set_property(NameRef::Borrowed("bad"), ValueRef::Borrowed(&[0, 1]));
+
+        assert!(node.compatible_contains("arm,primecell"));
+        assert!(!node.compatible_contains("arm,pl01"));
+        assert_eq!(node.property_u32("#address-cells"), Ok(Some(2)));
+        assert_eq!(node.property_u32("missing"), Ok(None));
+        assert!(node.property_u32("bad").is_err());
     }
 
     #[test]

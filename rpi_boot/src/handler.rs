@@ -1,3 +1,5 @@
+use arch_hal::common::read_volatile_sized;
+use arch_hal::common::write_volatile_sized;
 use arch_hal::cpu;
 use arch_hal::exceptions;
 use arch_hal::exceptions::emulation::EmulationOutcome;
@@ -19,8 +21,6 @@ use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
 use arch_hal::tls;
-use core::ptr::read_volatile;
-use core::ptr::write_volatile;
 use core::sync::atomic::Ordering;
 use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
@@ -77,15 +77,8 @@ impl MmioHandler for PassthroughMmio {
     fn read(&self, ipa: u64, size: u8) -> Result<u64, MmioError> {
         // SAFETY: `probe_subaccess` admits only aligned device-MMIO-sized accesses for trapped
         // identity-mapped regions; the access width is the decoded guest access size.
-        let value = unsafe {
-            match size {
-                1 => read_volatile(ipa as *const u8) as u64,
-                2 => read_volatile(ipa as *const u16) as u64,
-                4 => read_volatile(ipa as *const u32) as u64,
-                8 => read_volatile(ipa as *const u64),
-                _ => return Err(MmioError::Unhandled),
-            }
-        };
+        let value =
+            unsafe { read_volatile_sized(ipa as usize, size) }.ok_or(MmioError::Unhandled)?;
         note_passthrough_mmio_access(PassthroughMmioAccess {
             address: ipa as usize,
             kind: PassthroughMmioAccessKind::Read,
@@ -96,15 +89,7 @@ impl MmioHandler for PassthroughMmio {
     fn write(&self, ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
         // SAFETY: `probe_subaccess` admits only aligned device-MMIO-sized accesses for trapped
         // identity-mapped regions; the access width is the decoded guest access size.
-        unsafe {
-            match size {
-                1 => write_volatile(ipa as *mut u8, value as u8),
-                2 => write_volatile(ipa as *mut u16, value as u16),
-                4 => write_volatile(ipa as *mut u32, value as u32),
-                8 => write_volatile(ipa as *mut u64, value),
-                _ => return Err(MmioError::Unhandled),
-            }
-        }
+        unsafe { write_volatile_sized(ipa as usize, size, value) }.ok_or(MmioError::Unhandled)?;
         note_passthrough_mmio_access(PassthroughMmioAccess {
             address: ipa as usize,
             kind: PassthroughMmioAccessKind::Write,
@@ -220,12 +205,7 @@ fn data_abort_handler(
     let reg_size: InstructionRegisterSize = access.reg_size;
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
-    let access_bytes = match access_width {
-        SyndromeAccessSize::Byte => 1,
-        SyndromeAccessSize::HalfWord => 2,
-        SyndromeAccessSize::Word => 4,
-        SyndromeAccessSize::DoubleWord => 8,
-    };
+    let access_bytes = access_width.bytes();
 
     if vgic::handles_gicd(address as usize) {
         let Some(gic_access) = gic_access_size_from_bytes(access_bytes) else {
@@ -279,12 +259,8 @@ fn data_abort_handler(
     unsafe {
         match write_access {
             WriteNotRead::ReadingMemoryAbort => {
-                let v = match access_width {
-                    SyndromeAccessSize::Byte => read_volatile(address as *const u8) as u64,
-                    SyndromeAccessSize::HalfWord => read_volatile(address as *const u16) as u64,
-                    SyndromeAccessSize::Word => read_volatile(address as *const u32) as u64,
-                    SyndromeAccessSize::DoubleWord => read_volatile(address as *const u64),
-                };
+                let v = read_volatile_sized(address as usize, access_bytes)
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
 
                 write_guest_mmio_dest_reg(regs, reg_num, reg_size, v);
             }
@@ -310,20 +286,8 @@ fn data_abort_handler(
                         log_value
                     );
                 };
-                match access_width {
-                    SyndromeAccessSize::Byte => {
-                        write_volatile(address as *mut u8, reg_val as u8);
-                    }
-                    SyndromeAccessSize::HalfWord => {
-                        write_volatile(address as *mut u16, reg_val as u16);
-                    }
-                    SyndromeAccessSize::Word => {
-                        write_volatile(address as *mut u32, reg_val as u32);
-                    }
-                    SyndromeAccessSize::DoubleWord => {
-                        write_volatile(address as *mut u64, reg_val as u64);
-                    }
-                }
+                write_volatile_sized(address as usize, access_bytes, reg_val)
+                    .expect("SAS access widths are always 1, 2, 4, or 8 bytes");
             }
         }
     }
@@ -568,44 +532,42 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     let kick_sgi_intid = vgic::kick_sgi_intid();
     let mut pirq_delivery = None;
     if Some(irq.intid) == maintenance_intid {
-        if let Err(err) = vgic::handle_maintenance_irq() {
-            if IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0 {
-                println!("vgic: maintenance IRQ failed: {:?}", err);
-            }
+        if let Err(err) = vgic::handle_maintenance_irq()
+            && IRQ_LOG_ONCE.fetch_or(LOG_MAINT_ERR, Ordering::Relaxed) & LOG_MAINT_ERR == 0
+        {
+            println!("vgic: maintenance IRQ failed: {:?}", err);
         }
     } else if irq.intid == kick_sgi_intid {
-        if let Err(err) = vgic::handle_kick_sgi() {
-            if IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0 {
-                println!("vgic: kick SGI handling failed: {:?}", err);
-            }
+        if let Err(err) = vgic::handle_kick_sgi()
+            && IRQ_LOG_ONCE.fetch_or(LOG_KICK_ERR, Ordering::Relaxed) & LOG_KICK_ERR == 0
+        {
+            println!("vgic: kick SGI handling failed: {:?}", err);
         }
     } else {
         if irq.intid == 27 {
             // println!("IRQ 27 (physical) CpuId: {}", tls::cpu_if().unwrap());
         }
         let delivery = handle_acknowledged_pirq(irq.intid);
-        if let AckedPirqDelivery::Error(err) = delivery {
-            if err != GicError::UnsupportedIntId
-                && IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0
-            {
-                println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
-            }
+        if let AckedPirqDelivery::Error(err) = delivery
+            && err != GicError::UnsupportedIntId
+            && IRQ_LOG_ONCE.fetch_or(LOG_PIRQ_ERR, Ordering::Relaxed) & LOG_PIRQ_ERR == 0
+        {
+            println!("vgic: pIRQ {} handling failed: {:?}", irq.intid, err);
         }
         pirq_delivery = Some(delivery);
     }
     let needs_deactivate =
         needs_deactivate_after_ack(irq.intid, maintenance_intid, kick_sgi_intid, pirq_delivery);
-    if let Err(err) = gicv2.end_of_interrupt(irq) {
-        if IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0 {
-            println!("gic: end_of_interrupt failed: {:?}", err);
-        }
+    if let Err(err) = gicv2.end_of_interrupt(irq)
+        && IRQ_LOG_ONCE.fetch_or(LOG_EOI_ERR, Ordering::Relaxed) & LOG_EOI_ERR == 0
+    {
+        println!("gic: end_of_interrupt failed: {:?}", err);
     }
-    if needs_deactivate {
-        if let Err(err) = gicv2.deactivate(irq) {
-            if IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0 {
-                println!("gic: deactivate failed: {:?}", err);
-            }
-        }
+    if needs_deactivate
+        && let Err(err) = gicv2.deactivate(irq)
+        && IRQ_LOG_ONCE.fetch_or(LOG_DEACT_ERR, Ordering::Relaxed) & LOG_DEACT_ERR == 0
+    {
+        println!("gic: deactivate failed: {:?}", err);
     }
     note_host_irq_completion(irq.intid);
 }

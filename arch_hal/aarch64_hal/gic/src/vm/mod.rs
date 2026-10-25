@@ -50,7 +50,7 @@ pub(crate) struct GicVmModelGeneric<const VCPUS: usize, V: VgicVcpuModel>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     common: VmCommon<VCPUS, V>,
     v2: RawSpinLockIrqSave<V2SgiState<VCPUS>>,
@@ -79,12 +79,12 @@ impl<const VCPUS: usize>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     /// Construct a VM with vCPU ids fixed to `VcpuId(0..vcpu_count-1)`; callers must not assume
     /// alternative vCPU id mappings when using this backend.
     pub(crate) fn new(vcpu_count: u16) -> Result<Self, GicError> {
-        Self::new_with(vcpu_count, |id| GicVCpuGeneric::with_id(id))
+        Self::new_with(vcpu_count, GicVCpuGeneric::with_id)
     }
 }
 
@@ -92,7 +92,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel> GicVmModelGeneric<VCPUS, V>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     const fn global_intids() -> usize {
         crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT
@@ -350,7 +350,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel> VgicVmInfo for GicVmModelGeneric<VCPU
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     type VcpuModel = V;
 
@@ -368,7 +368,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VgicGuestRegs
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {
@@ -500,18 +500,16 @@ where
         let mut update = VgicUpdate::None;
         let intid = vintid.0 as usize;
 
-        if changed {
-            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
-                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
-                    self.emit_mirror_op(GicMirrorOp::SetEnable {
-                        scope: Self::mirror_scope(scope),
-                        intid: pintid.0,
-                        enable,
-                    })?;
-                }
-                if matches!(scope, VgicIrqScope::Global) {
-                    self.call_pirq_enable_hook(pintid, vintid, enable)?;
-                }
+        if changed && let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
+            if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
+                self.emit_mirror_op(GicMirrorOp::SetEnable {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    enable,
+                })?;
+            }
+            if matches!(scope, VgicIrqScope::Global) {
+                self.call_pirq_enable_hook(pintid, vintid, enable)?;
             }
         }
 
@@ -719,14 +717,14 @@ where
                 continue;
             }
             let vintid = VIntId(base.0 + bit);
-            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
-                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
-                    self.emit_mirror_op(GicMirrorOp::SetPending {
-                        scope: Self::mirror_scope(scope),
-                        intid: pintid.0,
-                        pending: true,
-                    })?;
-                }
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)?
+                && matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough)
+            {
+                self.emit_mirror_op(GicMirrorOp::SetPending {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    pending: true,
+                })?;
             }
             match scope {
                 VgicIrqScope::Local(vcpu) if (base.0 + bit) < SGI_COUNT as u32 => {
@@ -758,14 +756,14 @@ where
                 continue;
             }
             let vintid = VIntId(base.0 + bit);
-            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)? {
-                if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
-                    self.emit_mirror_op(GicMirrorOp::SetPending {
-                        scope: Self::mirror_scope(scope),
-                        intid: pintid.0,
-                        pending: false,
-                    })?;
-                }
+            if let Some((pintid, delivery)) = self.pirq_binding_for_irq(scope, vintid)?
+                && matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough)
+            {
+                self.emit_mirror_op(GicMirrorOp::SetPending {
+                    scope: Self::mirror_scope(scope),
+                    intid: pintid.0,
+                    pending: false,
+                })?;
             }
             update.combine(&self.cancel_for_scope(scope, vintid, None)?);
         }
@@ -957,19 +955,17 @@ where
                         .set_route(vintid, VSpiRouting::Targets(mask))?
                 };
 
-                if changed {
-                    if let Some((pintid, delivery)) =
+                if changed
+                    && let Some((pintid, delivery)) =
                         self.pirq_binding_for_irq(VgicIrqScope::Global, vintid)?
-                    {
-                        if matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough) {
-                            self.emit_mirror_op(GicMirrorOp::SetRoute {
-                                intid: pintid.0,
-                                route: GicMirrorRoute::Gicv2TargetMask(
-                                    Self::route_targets_to_gicv2_mask(mask)?,
-                                ),
-                            })?;
-                        }
-                    }
+                    && matches!(delivery.dist_mode(), DistMirrorMode::WriteThrough)
+                {
+                    self.emit_mirror_op(GicMirrorOp::SetRoute {
+                        intid: pintid.0,
+                        route: GicMirrorRoute::Gicv2TargetMask(Self::route_targets_to_gicv2_mask(
+                            mask,
+                        )?),
+                    })?;
                 }
 
                 Ok(Self::update_for_scope(VgicIrqScope::Global, changed))
@@ -991,7 +987,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VgicPirqModel
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - LOCAL_INTID_COUNT).div_ceil(32)]:,
     [(); crate::VgicVmConfig::<VCPUS>::MAX_LRS]:,
     [(); pending_cap_for_vcpus(VCPUS)]:,
 {

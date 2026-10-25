@@ -181,12 +181,9 @@ fn rw_read_lock_atomic(state: &AtomicUsize) {
             continue;
         }
 
-        let next_state = match current_state.checked_add(1) {
-            Some(next) => next,
-            None => {
-                core::hint::spin_loop();
-                continue;
-            }
+        let Some(next_state) = current_state.checked_add(1) else {
+            core::hint::spin_loop();
+            continue;
         };
 
         if next_state & WRITE_FLAG != 0 {
@@ -859,7 +856,7 @@ mod tests {
                     let reader = reader_lock_clone.read();
                     let value = *reader;
                     // The value should be within the expected range.
-                    assert!(value >= 0 && value <= 100);
+                    assert!((0..=100).contains(&value));
                     thread::sleep(Duration::from_millis(1));
                 }
             }));

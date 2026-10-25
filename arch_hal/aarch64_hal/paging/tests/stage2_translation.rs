@@ -76,12 +76,9 @@ fn run() -> Result<(), &'static str> {
     Stage2Paging::enable_stage2_translation(false, false);
 
     for (ipa, expected) in ipa_points.iter().zip(expected_pas.iter()) {
-        let translated = match Stage2Paging::ipa_to_pa(*ipa) {
-            Ok(pa) => pa,
-            Err(_) => {
-                baseline.restore();
-                return Err("stage2 translation faulted");
-            }
+        let Ok(translated) = Stage2Paging::ipa_to_pa(*ipa) else {
+            baseline.restore();
+            return Err("stage2 translation faulted");
         };
         if translated != *expected {
             baseline.restore();

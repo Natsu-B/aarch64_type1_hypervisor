@@ -21,6 +21,7 @@ use crate::ast::NodeEditExt;
 use crate::ast::NodeId;
 use crate::ast::NodeQueryExt;
 use crate::ast::Owned;
+use crate::node_path;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OverlayError {
@@ -308,9 +309,8 @@ fn adjust_overlay_phandles(overlay: &mut DeviceTree<'_>, delta: u32) -> Result<(
 }
 
 fn apply_local_fixups(overlay: &mut DeviceTree<'_>, delta: u32) -> Result<(), OverlayError> {
-    let fixup_root = match overlay.find_node_by_path("/__local_fixups__") {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(fixup_root) = overlay.find_node_by_path("/__local_fixups__") else {
+        return Ok(());
     };
     let overlay_root = overlay.root;
 
@@ -388,9 +388,8 @@ fn apply_external_fixups(
     base: &DeviceTree<'_>,
     overlay: &mut DeviceTree<'_>,
 ) -> Result<(), OverlayError> {
-    let fixups_root = match overlay.find_node_by_path("/__fixups__") {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(fixups_root) = overlay.find_node_by_path("/__fixups__") else {
+        return Ok(());
     };
 
     let fixup_properties = overlay
@@ -511,13 +510,13 @@ fn merge_overlay_subtree(
             merge_overlay_subtree(base, overlay, child, existing, opt, report)?;
         } else {
             let new_id = copy_subtree(base, overlay, child, base_node, report)?;
-            let new_path = node_path(base, new_id);
+            let new_path = overlay_node_path(base, new_id)?;
             report.record_modified_node(new_path);
         }
     }
 
     if modifications {
-        let path = node_path(base, base_node);
+        let path = overlay_node_path(base, base_node)?;
         report.record_modified_node(path);
     }
 
@@ -653,7 +652,7 @@ fn read_phandle(base: &DeviceTree<'_>, node: NodeId) -> Result<u32, OverlayError
 }
 
 fn parse_u32_list(bytes: &[u8]) -> Result<Vec<u32>, OverlayError> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(OverlayError::MalformedFixup);
     }
     Ok(bytes.chunks_exact(4).map(read_be_u32).collect())
@@ -694,6 +693,11 @@ fn normalize_overlay_path(path: &str) -> String {
     }
 }
 
+/// Resolves `node_id` to its absolute path, reporting dangling ids as a malformed overlay.
+fn overlay_node_path(tree: &DeviceTree<'_>, node_id: NodeId) -> Result<String, OverlayError> {
+    node_path(tree, node_id).map_err(|_| OverlayError::MalformedOverlay)
+}
+
 fn find_child_by_name(tree: &DeviceTree<'_>, parent: NodeId, name: &str) -> Option<NodeId> {
     let node = tree.node(parent)?;
     for &child in &node.children {
@@ -705,45 +709,14 @@ fn find_child_by_name(tree: &DeviceTree<'_>, parent: NodeId, name: &str) -> Opti
     None
 }
 
-fn node_path(tree: &DeviceTree<'_>, node_id: NodeId) -> String {
-    if node_id == tree.root {
-        return "/".to_string();
-    }
-    let mut parts = Vec::new();
-    let mut current = Some(node_id);
-    while let Some(id) = current {
-        if id == tree.root {
-            break;
-        }
-        if let Some(node) = tree.node(id) {
-            parts.push(node.name.as_str().to_string());
-            current = node.parent;
-        } else {
-            break;
-        }
-    }
-    let mut path = String::from("/");
-    for (i, part) in parts.iter().rev().enumerate() {
-        if i > 0 || path != "/" {
-            path.push('/');
-        }
-        path.push_str(part);
-    }
-    if path.len() > 1 && path.ends_with('/') {
-        path.pop();
-    }
-    path
-}
-
 fn update_symbols(
     base: &mut DeviceTree<'_>,
     overlay: &DeviceTree<'_>,
     fragments: &[FragmentInfo],
     report: &mut OverlayApplyReport,
 ) -> Result<(), OverlayError> {
-    let overlay_symbols = match overlay.find_node_by_path("/__symbols__") {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(overlay_symbols) = overlay.find_node_by_path("/__symbols__") else {
+        return Ok(());
     };
 
     let mut fragment_map: BTreeMap<&str, &FragmentTarget> = BTreeMap::new();
@@ -772,9 +745,8 @@ fn update_symbols(
         let path_str = normalize_overlay_path(path);
         let mut segments = path_str.split('/').filter(|s| !s.is_empty());
         let fragment_seg = segments.next().ok_or(OverlayError::MalformedOverlay)?;
-        let fragment_target = match fragment_map.get(fragment_seg) {
-            Some(t) => t,
-            None => return Err(OverlayError::MalformedOverlay),
+        let Some(fragment_target) = fragment_map.get(fragment_seg) else {
+            return Err(OverlayError::MalformedOverlay);
         };
         let base_prefix = match fragment_target {
             FragmentTarget::Phandle(p) => {
@@ -782,7 +754,7 @@ fn update_symbols(
                     .get(p)
                     .copied()
                     .ok_or(OverlayError::TargetNotFound)?;
-                node_path(base, target_node)
+                overlay_node_path(base, target_node)?
             }
             FragmentTarget::Path(p) => {
                 if p.starts_with('/') {

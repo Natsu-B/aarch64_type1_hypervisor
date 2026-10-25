@@ -27,7 +27,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> GicVmModelGeneric<VCP
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     pub(crate) fn enqueue_sgi_for_target(
         &self,
@@ -126,7 +126,7 @@ impl<const VCPUS: usize, V: VgicVcpuModel + VgicVcpuQueue> VgicSgiRegs
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
     [(); crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT]:,
-    [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT + 31) / 32]:,
+    [(); (crate::max_intids_for_vcpus(VCPUS) - crate::vm::common::LOCAL_INTID_COUNT).div_ceil(32)]:,
 {
     fn read_sgi_pending_sources_word(&self, target: VcpuId, sgi: u8) -> Result<u32, GicError> {
         let idx = self.common.vcpu_index(target)?;
@@ -172,7 +172,7 @@ where
 
             let lane = bit / 8;
             let sender = bit % 8;
-            if sender as usize >= self.common.vcpu_count() || sender >= 8 {
+            if sender >= self.common.vcpu_count() || sender >= 8 {
                 return Err(GicError::InvalidVcpuId);
             }
             if lane >= 4 {
@@ -261,7 +261,7 @@ where
                 }
                 let lane = bit / 8;
                 let sender = bit % 8;
-                if sender as usize >= self.common.vcpu_count() || sender >= 8 {
+                if sender >= self.common.vcpu_count() || sender >= 8 {
                     return Err(GicError::InvalidVcpuId);
                 }
                 if lane >= 4 {

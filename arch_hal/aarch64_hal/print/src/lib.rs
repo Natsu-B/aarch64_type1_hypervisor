@@ -2,6 +2,7 @@
 
 #![no_std]
 
+pub mod line_buf;
 pub mod pl011;
 pub mod stream;
 use core::cell::OnceCell;
@@ -10,6 +11,7 @@ use core::fmt::{self};
 
 use mutex::RawSpinLock;
 
+pub use line_buf::LineBuf;
 pub use pl011::Pl011Uart;
 
 pub static DEBUG_UART: RawSpinLock<DebugUart> = RawSpinLock::new(DebugUart::new());
@@ -190,6 +192,18 @@ pub mod debug_uart {
         }
         if let Some(mirror) = mirror {
             (mirror.write)(s);
+        }
+    }
+
+    /// Formats `args` into an `N`-byte stack buffer and writes it with a single [`write`].
+    ///
+    /// Output beyond `N` bytes is dropped, and nothing is written if truncation splits a
+    /// multi-byte character. Like [`write`], this is a no-op before the UART is initialized.
+    pub fn write_fmt_truncated<const N: usize>(args: fmt::Arguments<'_>) {
+        let mut line = LineBuf::<N>::new();
+        let _ = line.write_fmt(args);
+        if let Some(s) = line.as_str() {
+            write(s);
         }
     }
 

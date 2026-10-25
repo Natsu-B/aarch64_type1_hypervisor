@@ -12,6 +12,9 @@ use crate::ast::NodeEditExt;
 use crate::ast::NodeQueryExt;
 use crate::ast::Owned;
 use crate::ast::ValueRef;
+use crate::cells::read_be_u32;
+use crate::cells::write_be_u32;
+use crate::cells::write_be_u32s;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pl011Spec {
@@ -38,8 +41,7 @@ pub fn detach_by_compatible(
     for id in 0..nodes_len {
         let should_detach = tree
             .node(id)
-            .map(|node| compatible_contains(node, compat))
-            .unwrap_or(false);
+            .is_some_and(|node| node.compatible_contains(compat));
         if should_detach {
             tree.detach_node(id)?;
             detached += 1;
@@ -78,12 +80,14 @@ pub fn inject_standalone_pl011(
         return Err("dtb: pl011 pintid must be >= 32");
     }
 
-    let root = tree.root;
-    let addr_cells: usize = property_u32(tree, root, "#address-cells")?
+    let root_node = tree.node(tree.root).ok_or("dtb: invalid node id")?;
+    let addr_cells: usize = root_node
+        .property_u32("#address-cells")?
         .unwrap_or(2)
         .try_into()
         .map_err(|_| "dtb: #address-cells overflow")?;
-    let size_cells: usize = property_u32(tree, root, "#size-cells")?
+    let size_cells: usize = root_node
+        .property_u32("#size-cells")?
         .unwrap_or(2)
         .try_into()
         .map_err(|_| "dtb: #size-cells overflow")?;
@@ -193,77 +197,6 @@ pub fn inject_standalone_pl011(
     Ok(())
 }
 
-fn compatible_contains(node: &crate::ast::Node<'_>, compat: &str) -> bool {
-    let Some(prop) = node.property("compatible") else {
-        return false;
-    };
-    string_list_contains(prop.value.as_slice(), compat)
-}
-
-fn string_list_contains(bytes: &[u8], needle: &str) -> bool {
-    bytes.split(|&byte| byte == 0).any(|entry| {
-        !entry.is_empty() && core::str::from_utf8(entry).is_ok_and(|entry| entry == needle)
-    })
-}
-
-fn property_u32(
-    tree: &DeviceTree<'_, Owned>,
-    node_id: usize,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
-    let node = tree.node(node_id).ok_or("dtb: invalid node id")?;
-    let Some(prop) = node.property(key) else {
-        return Ok(None);
-    };
-    let bytes = prop.value.as_slice();
-    if bytes.len() != 4 {
-        return Err("dtb: u32 property must be 4 bytes");
-    }
-    Ok(Some(read_be_u32(bytes)?))
-}
-
-fn read_be_u32(bytes: &[u8]) -> Result<u32, &'static str> {
-    if bytes.len() != 4 {
-        return Err("dtb: read_be_u32 expects 4 bytes");
-    }
-    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slot = bytes
-        .get_mut(offset..end)
-        .ok_or("dtb: write_be_u32 out of bounds")?;
-    slot.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for idx in 0..cells {
-        let shift = (cells - 1 - idx)
-            .checked_mul(32)
-            .ok_or("dtb: write_be_u32s shift overflow")?;
-        let cell = if shift >= 64 {
-            0
-        } else {
-            ((value >> shift) & 0xffff_ffff) as u32
-        };
-        let cell_offset = offset
-            .checked_add(
-                idx.checked_mul(4)
-                    .ok_or("dtb: write_be_u32s offset overflow")?,
-            )
-            .ok_or("dtb: write_be_u32s offset overflow")?;
-        write_be_u32(bytes, cell_offset, cell)?;
-    }
-    Ok(())
-}
-
 fn allocate_phandle(tree: &DeviceTree<'_, Owned>) -> Result<u32, &'static str> {
     let mut max = 0u32;
     for node in &tree.nodes {
@@ -275,7 +208,7 @@ fn allocate_phandle(tree: &DeviceTree<'_, Owned>) -> Result<u32, &'static str> {
             if value.len() != 4 {
                 return Err("dtb: phandle property must be 4 bytes");
             }
-            let phandle = read_be_u32(value)?;
+            let phandle = read_be_u32(value, 0)?;
             if phandle > max {
                 max = phandle;
             }
@@ -301,7 +234,7 @@ mod tests {
     use alloc::vec::Vec;
 
     fn parse_be_u32_cells(bytes: &[u8]) -> Result<Vec<u32>, &'static str> {
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             return Err("dtb: u32 cells must be 4-byte aligned");
         }
         let mut out = Vec::with_capacity(bytes.len() / 4);
@@ -329,8 +262,11 @@ mod tests {
     #[test]
     fn string_lists_skip_empty_and_invalid_entries() {
         let entries = b"\0\xff\0arm,pl011";
-        assert!(string_list_contains(entries, "arm,pl011"));
-        assert!(!string_list_contains(entries, ""));
+        let mut tree = DeviceTree::with_root(NameRef::Borrowed("/"));
+        let node = tree.node_mut(tree.root).unwrap();
+        node.set_property(NameRef::Borrowed("compatible"), ValueRef::Borrowed(entries));
+        assert!(node.compatible_contains("arm,pl011"));
+        assert!(!node.compatible_contains(""));
     }
 
     #[test]
@@ -379,9 +315,8 @@ mod tests {
             .find_node_by_path("/uart@1c00030000")
             .expect("missing injected uart node");
         let uart = reparsed.node(uart_id).unwrap();
-        let compatible = uart.property("compatible").expect("missing compatible");
         assert!(
-            string_list_contains(compatible.value.as_slice(), "arm,pl011"),
+            uart.compatible_contains("arm,pl011"),
             "compatible list missing arm,pl011"
         );
 
@@ -407,10 +342,7 @@ mod tests {
             .expect("missing fixed-clock node");
         let clock = reparsed.node(clock_id).unwrap();
         assert!(
-            string_list_contains(
-                clock.property("compatible").unwrap().value.as_slice(),
-                "fixed-clock"
-            ),
+            clock.compatible_contains("fixed-clock"),
             "fixed-clock node has unexpected compatible"
         );
 

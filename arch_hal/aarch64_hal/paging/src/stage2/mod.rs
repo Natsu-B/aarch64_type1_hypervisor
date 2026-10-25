@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::cell::SyncUnsafeCell;
 use core::mem;
@@ -47,7 +46,6 @@ struct Stage2Context {
     table_addr: usize,
     top_table_level: i8,
     num_of_tables: usize,
-    settings: Box<[Stage2PagingSetting]>,
 }
 
 static STAGE2_CONTEXT: SyncUnsafeCell<Option<Stage2Context>> = SyncUnsafeCell::new(None);
@@ -162,7 +160,6 @@ impl Stage2Paging {
                 table_addr: table,
                 top_table_level: initial_lookup_level_i8,
                 num_of_tables,
-                settings: Box::from(data),
             });
         }
 
@@ -379,16 +376,16 @@ impl Stage2Paging {
         let ctx = unsafe { &*STAGE2_CONTEXT.get() }
             .as_ref()
             .ok_or(PagingErr::Corrupted)?;
-        let mut table = unsafe {
+        let table = unsafe {
             slice::from_raw_parts_mut(ctx.table_addr as *mut u64, ctx.num_of_tables * 512)
         };
-        Self::clear_dirty_bits_recursive(ctx.top_table_level, &mut table)?;
+        Self::clear_dirty_bits_recursive(ctx.top_table_level, table)?;
         cpu::flush_tlb_el2_el1();
         Ok(())
     }
 
     fn clear_dirty_bits_recursive(table_level: i8, table: &mut [u64]) -> Result<(), PagingErr> {
-        let table_bytes = table.len() * mem::size_of::<u64>();
+        let table_bytes = mem::size_of_val(table);
         for desc in table.iter_mut() {
             match *desc & 0b11 {
                 0b01 => {
@@ -434,10 +431,10 @@ fn update_4k_leaf(
         .ok_or(Stage2UpdateError::NotInitialized)?;
     let total_entries = ctx.num_of_tables * 512;
     // SAFETY: `table_addr` points to the stage-2 table pool with `total_entries` u64 entries.
-    let mut table = unsafe { slice::from_raw_parts_mut(ctx.table_addr as *mut u64, total_entries) };
+    let table = unsafe { slice::from_raw_parts_mut(ctx.table_addr as *mut u64, total_entries) };
 
     let mut level = ctx.top_table_level;
-    let mut table_slice: &mut [u64] = &mut table;
+    let mut table_slice: &mut [u64] = table;
 
     loop {
         let idx = if level == ctx.top_table_level {

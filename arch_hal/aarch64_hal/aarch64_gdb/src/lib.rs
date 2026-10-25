@@ -31,6 +31,7 @@ use gdb_remote::ResumeAction;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
+use gdb_remote::TargetResult;
 pub use gdb_remote::WatchpointKind;
 use io_api::stream::PollByteStream;
 use mutex::pod::RawBytePod;
@@ -78,7 +79,7 @@ pub const REG_CPSR: usize = 34;
 pub const CORE_REG_COUNT: usize = REG_CPSR + 1;
 pub const EXTRA_REG_BASE: usize = CORE_REG_COUNT;
 
-pub const REG_TPIDR_EL0: usize = EXTRA_REG_BASE + 0;
+pub const REG_TPIDR_EL0: usize = EXTRA_REG_BASE;
 pub const REG_TPIDRRO_EL0: usize = EXTRA_REG_BASE + 1;
 pub const REG_TPIDR_EL1: usize = EXTRA_REG_BASE + 2;
 pub const REG_MPIDR_EL1: usize = EXTRA_REG_BASE + 3;
@@ -163,6 +164,12 @@ pub trait MemoryAccess {
 }
 
 pub struct DirectMemory;
+
+impl Default for DirectMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DirectMemory {
     pub const fn new() -> Self {
@@ -629,7 +636,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             return Err(Aarch64GdbError::UnalignedAddress);
         }
         self.validate_hw_breakpoint_kind(kind)?;
-        if let Some(_) = self.hw_breakpoints.find(addr) {
+        if self.hw_breakpoints.find(addr).is_some() {
             return Ok(());
         }
 
@@ -855,10 +862,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn xfer_features(
-        &mut self,
-        annex: &str,
-    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn xfer_features(&mut self, annex: &str) -> TargetResult<Option<&[u8]>, Self> {
         let data = self.state.desc.annex(annex);
         if data.is_some() {
             self.state.features_active = true;
@@ -866,21 +870,15 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(data)
     }
 
-    fn xfer_memory_map(
-        &mut self,
-    ) -> Result<Option<&[u8]>, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn xfer_memory_map(&mut self) -> TargetResult<Option<&[u8]>, Self> {
         Ok(self.state.memory_map)
     }
 
-    fn monitor_command(
-        &mut self,
-        cmd: &[u8],
-        out: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
-        if let Ok(text) = core::str::from_utf8(cmd) {
-            if let Some(len) = semihost::monitor_command(text, out, &mut self.state.mem) {
-                return Ok(len);
-            }
+    fn monitor_command(&mut self, cmd: &[u8], out: &mut [u8]) -> TargetResult<usize, Self> {
+        if let Ok(text) = core::str::from_utf8(cmd)
+            && let Some(len) = semihost::monitor_command(text, out, &mut self.state.mem)
+        {
+            return Ok(len);
         }
         let Some(handler) = self.state.monitor_handler else {
             return Err(TargetError::NotSupported);
@@ -897,10 +895,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn read_registers(
-        &mut self,
-        dst: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn read_registers(&mut self, dst: &mut [u8]) -> TargetResult<usize, Self> {
         let total = if self.state.features_active {
             G_PACKET_BYTES
         } else {
@@ -939,10 +934,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn write_registers(
-        &mut self,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn write_registers(&mut self, src: &[u8]) -> TargetResult<(), Self> {
         let total = if self.state.features_active {
             G_PACKET_BYTES
         } else {
@@ -980,11 +972,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(())
     }
 
-    fn read_register(
-        &mut self,
-        regno: u32,
-        dst: &mut [u8],
-    ) -> Result<usize, TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn read_register(&mut self, regno: u32, dst: &mut [u8]) -> TargetResult<usize, Self> {
         match regno as usize {
             REG_X0..=REG_X30 => {
                 let regs = self.regs.gprs_mut();
@@ -1008,11 +996,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         }
     }
 
-    fn write_register(
-        &mut self,
-        regno: u32,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn write_register(&mut self, regno: u32, src: &[u8]) -> TargetResult<(), Self> {
         match regno as usize {
             REG_X0..=REG_X30 => {
                 let regs = self.regs.gprs_mut();
@@ -1051,61 +1035,39 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         Ok(())
     }
 
-    fn read_memory(
-        &mut self,
-        addr: u64,
-        dst: &mut [u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn read_memory(&mut self, addr: u64, dst: &mut [u8]) -> TargetResult<(), Self> {
         self.state
             .mem
             .read(addr, dst)
             .map_err(|err| TargetError::Recoverable(Aarch64GdbError::Memory(err)))
     }
 
-    fn write_memory(
-        &mut self,
-        addr: u64,
-        src: &[u8],
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn write_memory(&mut self, addr: u64, src: &[u8]) -> TargetResult<(), Self> {
         self.state
             .mem
             .write(addr, src)
             .map_err(|err| TargetError::Recoverable(Aarch64GdbError::Memory(err)))
     }
 
-    fn insert_sw_breakpoint(
-        &mut self,
-        addr: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn insert_sw_breakpoint(&mut self, addr: u64) -> TargetResult<(), Self> {
         self.state
             .insert_sw_breakpoint(addr)
             .map_err(TargetError::Recoverable)
     }
 
-    fn remove_sw_breakpoint(
-        &mut self,
-        addr: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn remove_sw_breakpoint(&mut self, addr: u64) -> TargetResult<(), Self> {
         self.state
             .remove_sw_breakpoint(addr)
             .map_err(TargetError::Recoverable)
     }
 
-    fn insert_hw_breakpoint(
-        &mut self,
-        addr: u64,
-        kind: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn insert_hw_breakpoint(&mut self, addr: u64, kind: u64) -> TargetResult<(), Self> {
         self.state
             .insert_hw_breakpoint(addr, kind)
             .map_err(TargetError::Recoverable)
     }
 
-    fn remove_hw_breakpoint(
-        &mut self,
-        addr: u64,
-        kind: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    fn remove_hw_breakpoint(&mut self, addr: u64, kind: u64) -> TargetResult<(), Self> {
         self.state
             .remove_hw_breakpoint(addr, kind)
             .map_err(TargetError::Recoverable)
@@ -1116,7 +1078,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         kind: WatchpointKind,
         addr: u64,
         len: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    ) -> TargetResult<(), Self> {
         self.state
             .insert_watchpoint(addr, len, kind)
             .map_err(TargetError::Recoverable)
@@ -1127,7 +1089,7 @@ impl<'a, M: MemoryAccess, const N: usize> Target for Aarch64GdbTarget<'a, M, N> 
         kind: WatchpointKind,
         addr: u64,
         len: u64,
-    ) -> Result<(), TargetError<Self::RecoverableError, Self::UnrecoverableError>> {
+    ) -> TargetResult<(), Self> {
         self.state
             .remove_watchpoint(addr, len, kind)
             .map_err(TargetError::Recoverable)
@@ -1265,13 +1227,6 @@ pub struct StopReplyCounters {
     pub queued: u64,
     pub overflow: u64,
     pub sent: u64,
-}
-
-fn debug_assert_stop_counters() {
-    #[cfg(debug_assertions)]
-    {
-        let _ = stop_reply_counters();
-    }
 }
 
 struct DebugStopGuard {
@@ -1494,25 +1449,24 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
 
         let mut breakpoint_slot = None;
         let mut breakpoint_addr = 0u64;
-        if let DebugEntryCause::DebugException(ec) = cause {
-            if !semihost_trap
-                && matches!(
-                    ec,
-                    ExceptionClass::BreakpointLowerLevel
-                        | ExceptionClass::BrkInstructionAArch64LowerLevel
-                )
-            {
-                let pc = cpu::get_elr_el2();
-                if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
+        if let DebugEntryCause::DebugException(ec) = cause
+            && !semihost_trap
+            && matches!(
+                ec,
+                ExceptionClass::BreakpointLowerLevel
+                    | ExceptionClass::BrkInstructionAArch64LowerLevel
+            )
+        {
+            let pc = cpu::get_elr_el2();
+            if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc) {
+                breakpoint_slot = Some(slot);
+                breakpoint_addr = pc;
+            } else {
+                let pc_prev = pc.wrapping_sub(4);
+                if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
                     breakpoint_slot = Some(slot);
-                    breakpoint_addr = pc;
-                } else {
-                    let pc_prev = pc.wrapping_sub(4);
-                    if let Ok(Some(slot)) = self.state.disable_sw_breakpoint_at(pc_prev) {
-                        breakpoint_slot = Some(slot);
-                        breakpoint_addr = pc_prev;
-                        set_elr_el2_and_sync_frame(regs, pc_prev);
-                    }
+                    breakpoint_addr = pc_prev;
+                    set_elr_el2_and_sync_frame(regs, pc_prev);
                 }
             }
         }
@@ -1865,14 +1819,14 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             let _ = self.state.reinstall_sw_breakpoint_slot(slot);
         }
 
-        if matches!(resume_action, PendingStepAction::Step) {
-            if let Some(restore) = enable_single_step(regs) {
-                self.pending_step = Some(PendingStep {
-                    slot: None,
-                    action: resume_action,
-                    restore: Some(restore),
-                });
-            }
+        if matches!(resume_action, PendingStepAction::Step)
+            && let Some(restore) = enable_single_step(regs)
+        {
+            self.pending_step = Some(PendingStep {
+                slot: None,
+                action: resume_action,
+                restore: Some(restore),
+            });
         }
         self.state.resume_hw_watchpoints();
     }

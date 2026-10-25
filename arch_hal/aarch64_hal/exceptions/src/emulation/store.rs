@@ -39,7 +39,8 @@ pub(crate) fn emulate_pair(
 
     let use_pair_ops = split0.is_none()
         && split1.is_none()
-        && (desc.size <= 1 || (ipa0 % desc.size as u64 == 0 && ipa1 % desc.size as u64 == 0));
+        && (desc.size <= 1
+            || (ipa0.is_multiple_of(desc.size as u64) && ipa1.is_multiple_of(desc.size as u64)));
 
     if use_pair_ops {
         if let Some(result) = handler.write_pair(ipa0, ipa1, desc.size, v0, v1) {
@@ -70,12 +71,10 @@ pub(crate) fn emulate_pair(
                 Err(_) => return EmulationOutcome::NotHandled,
             }
         }
-    } else {
-        if !write_value(handler, ipa0, desc.size, split0, v0)
-            || !write_value(handler, ipa1, desc.size, split1, v1)
-        {
-            return EmulationOutcome::NotHandled;
-        }
+    } else if !write_value(handler, ipa0, desc.size, split0, v0)
+        || !write_value(handler, ipa1, desc.size, split1, v1)
+    {
+        return EmulationOutcome::NotHandled;
     }
 
     apply_pair_writeback(regs, desc.rn, desc.offset, desc.writeback);
@@ -128,7 +127,8 @@ fn write_value(
         return execute_split_store(handler, plan, value_total);
     }
 
-    let needs_split = size > 1 && (ipa % size as u64 != 0 || crosses_stage2_page(ipa, size));
+    let needs_split =
+        size > 1 && (!ipa.is_multiple_of(size as u64) || crosses_stage2_page(ipa, size));
     if needs_split {
         // Split plans must be supplied by decode to enforce guest VA boundary checks.
         return false;

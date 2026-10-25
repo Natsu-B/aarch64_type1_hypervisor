@@ -740,6 +740,12 @@ pub struct PirqList {
     len: usize,
 }
 
+impl Default for PirqList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PirqList {
     pub const fn new() -> Self {
         Self {
@@ -766,6 +772,12 @@ pub struct PirqNotifications {
     pub eoi: PirqList,
     pub deactivate: PirqList,
     pub resample: PirqList,
+}
+
+impl Default for PirqNotifications {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PirqNotifications {

@@ -71,8 +71,8 @@ fn print_xtask_usage() {
 fn build(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("rpi5") => build_rpi5(&args[1..]),
-        Some("rpi4") => build_bootloader_with_feature(&args[1..], "rpi4"),
-        Some("rpi4_net") => build_bootloader_with_feature(&args[1..], "rpi4_net"),
+        Some("rpi4") => build_rpi4(&args[1..]),
+        Some("rpi4_net") => build_rpi4_net(&args[1..]),
         Some("example") => build_examples(&args[1..]),
         _ => build_bootloader(args),
     }
@@ -110,46 +110,14 @@ fn build_examples(args: &[String]) -> Result<String, String> {
 
     for manifest in manifests {
         eprintln!("\n--- Building example: {} ---", manifest.display());
-        let mut cmd = Command::new("cargo");
-        cmd.arg("build")
-            .arg("-Z")
-            .arg("build-std=core,alloc,compiler_builtins")
-            .arg("-Z")
-            .arg("build-std-features=compiler-builtins-mem")
-            .arg("--manifest-path")
+        let mut cmd = bare_metal_cargo_build();
+        cmd.arg("--manifest-path")
             .arg(&manifest)
-            .args(&forward_args)
-            .env("XTASK_BUILD", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to spawn cargo build for example manifest {}: {}",
-                    manifest.display(),
-                    e
-                )
-            })
-            .wait()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to wait for cargo build for example manifest {}: {}",
-                    manifest.display(),
-                    e
-                )
-            });
-        if !status.success() {
-            eprintln!(
-                "Error: cargo build failed for example manifest '{}' with status: {:?}",
-                manifest.display(),
-                status
-            );
-            std::process::exit(status.code().unwrap_or(1));
-        }
+            .args(&forward_args);
+        run_cargo_build(
+            &mut cmd,
+            &format!("example manifest {}", manifest.display()),
+        );
     }
 
     eprintln!("\n--- Examples built successfully ---");
@@ -311,86 +279,118 @@ fn manifest_matches_filter(manifest: &Path, filter: &str) -> bool {
     false
 }
 
-fn build_bootloader(args: &[String]) -> Result<String, String> {
-    let pkg = "elf-hypervisor";
-    eprintln!("\n--- Building bootloader package: {} ---", pkg);
+/// Creates a `cargo build` command for the bare-metal AArch64 target.
+///
+/// The command rebuilds `core`/`alloc` with `-Z build-std`, enables the
+/// compiler-builtins memory intrinsics, and sets `XTASK_BUILD` so build scripts
+/// can tell they are being driven by xtask. Callers append the package or
+/// manifest selection and any forwarded arguments.
+fn bare_metal_cargo_build() -> Command {
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("-Z")
         .arg("build-std=core,alloc,compiler_builtins")
         .arg("-Z")
         .arg("build-std-features=compiler-builtins-mem")
-        .arg("-p")
-        .arg(pkg)
-        .arg("--target")
-        .arg("aarch64-unknown-none-softfloat")
-        .args(args)
         .env("XTASK_BUILD", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    cmd
+}
 
+/// Runs a prepared `cargo build` command and exits the process on failure.
+///
+/// `label` describes what is being built (for example `package 'rpi_boot'`)
+/// and is used in the panic and error messages.
+fn run_cargo_build(cmd: &mut Command, label: &str) {
     eprintln!("Running: {:?}", cmd);
     let status = cmd
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", pkg, e))
+        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", label, e))
         .wait()
-        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", pkg, e));
+        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", label, e));
     if !status.success() {
         eprintln!(
-            "Error: cargo build failed for package '{}' with status: {:?}",
-            pkg, status
+            "Error: cargo build failed for {} with status: {:?}",
+            label, status
         );
         std::process::exit(status.code().unwrap_or(1));
     }
-
-    eprintln!("\n--- Bootloader built successfully ---");
-    let profile = resolve_profile(args);
-    copy_artifact_to_bin("elf-hypervisor", "elf-hypervisor.elf", &profile)
 }
 
-fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<String, String> {
-    let mut combined_args = vec!["--features".to_string(), feature.to_string()];
+/// Bare-metal firmware package built by xtask and copied into `./bin`.
+struct FirmwarePackage {
+    /// Cargo package name passed to `-p`.
+    pkg: &'static str,
+    /// Human-readable kind used in the "Building ..." banner.
+    kind: &'static str,
+    /// Name used in the "... built successfully" banner.
+    display_name: &'static str,
+    /// File name written under `./bin`.
+    destination_name: &'static str,
+}
+
+/// QEMU/U-Boot hypervisor image.
+const BOOTLOADER: FirmwarePackage = FirmwarePackage {
+    pkg: "elf-hypervisor",
+    kind: "bootloader",
+    display_name: "Bootloader",
+    destination_name: "elf-hypervisor.elf",
+};
+
+/// Raspberry Pi 5 hypervisor image.
+const RPI5: FirmwarePackage = FirmwarePackage {
+    pkg: "rpi_boot",
+    kind: "rpi5",
+    display_name: "rpi_boot",
+    destination_name: "rpi_boot.elf",
+};
+
+/// Builds a bare-metal firmware package and copies its ELF into `./bin`.
+fn build_firmware_package(package: &FirmwarePackage, args: &[String]) -> Result<String, String> {
+    let pkg = package.pkg;
+    eprintln!("\n--- Building {} package: {} ---", package.kind, pkg);
+    let mut cmd = bare_metal_cargo_build();
+    cmd.arg("-p")
+        .arg(pkg)
+        .arg("--target")
+        .arg("aarch64-unknown-none-softfloat")
+        .args(args);
+    run_cargo_build(&mut cmd, &format!("package '{}'", pkg));
+
+    eprintln!("\n--- {} built successfully ---", package.display_name);
+    let profile = resolve_profile(args);
+    copy_artifact_to_bin(pkg, package.destination_name, &profile)
+}
+
+fn build_bootloader(args: &[String]) -> Result<String, String> {
+    build_firmware_package(&BOOTLOADER, args)
+}
+
+/// Builds the bootloader with an extra cargo feature prepended to `args`.
+fn build_bootloader_with_feature(feature: &str, args: &[String]) -> Result<String, String> {
+    let mut combined_args = Vec::with_capacity(args.len() + 2);
+    combined_args.push("--features".to_string());
+    combined_args.push(feature.to_string());
     combined_args.extend_from_slice(args);
     build_bootloader(&combined_args)
 }
 
+fn build_rpi4(args: &[String]) -> Result<String, String> {
+    build_bootloader_with_feature("rpi4", args)
+}
+
+fn build_rpi4_net(args: &[String]) -> Result<String, String> {
+    build_bootloader_with_feature("rpi4_net", args)
+}
+
+fn build_virtio_net(args: &[String]) -> Result<String, String> {
+    build_bootloader_with_feature("virtio_net", args)
+}
+
 fn build_rpi5(args: &[String]) -> Result<String, String> {
-    let pkg = "rpi_boot";
-    eprintln!("\n--- Building rpi5 package: {} ---", pkg);
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
-        .arg("-Z")
-        .arg("build-std=core,alloc,compiler_builtins")
-        .arg("-Z")
-        .arg("build-std-features=compiler-builtins-mem")
-        .arg("-p")
-        .arg(pkg)
-        .arg("--target")
-        .arg("aarch64-unknown-none-softfloat")
-        .args(args)
-        .env("XTASK_BUILD", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    eprintln!("Running: {:?}", cmd);
-    let status = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn cargo build for {}: {}", pkg, e))
-        .wait()
-        .unwrap_or_else(|e| panic!("Failed to wait for cargo build for {}: {}", pkg, e));
-    if !status.success() {
-        eprintln!(
-            "Error: cargo build failed for package '{}' with status: {:?}",
-            pkg, status
-        );
-        std::process::exit(status.code().unwrap_or(1));
-    }
-
-    eprintln!("\n--- rpi_boot built successfully ---");
-    let profile = resolve_profile(args);
-    copy_artifact_to_bin("rpi_boot", "rpi_boot.elf", &profile)
+    build_firmware_package(&RPI5, args)
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -416,7 +416,7 @@ fn run_default(args: &[String]) -> ! {
 }
 
 fn run_rpi4(args: &[String]) -> ! {
-    let binary_path = build_bootloader_with_feature(args, "rpi4").unwrap_or_else(|err| {
+    let binary_path = build_rpi4(args).unwrap_or_else(|err| {
         panic!("Failed to build rpi4 bootloader: {}", err);
     });
 
@@ -530,7 +530,7 @@ fn run_single_gdb_bridge(
 }
 
 fn run_net(args: &[String]) -> Result<(), String> {
-    let binary_path = build_bootloader_with_feature(args, "virtio_net")?;
+    let binary_path = build_virtio_net(args)?;
     let stop = Arc::new(AtomicBool::new(false));
 
     let udp_gdb = UdpSocket::bind(PROXY_GDB_UDP_SRC_BIND).map_err(|e| {
@@ -802,20 +802,17 @@ fn kill_process_tree_best_effort(label: &str, child: &mut Child) {
         fn kill(pid: c_int, sig: c_int) -> c_int;
     }
 
-    let pgid = match i32::try_from(child.id()) {
-        Ok(pid) => pid,
-        Err(_) => {
-            eprintln!(
-                "Warning: PID {} for {} does not fit into i32; falling back to child.kill()",
-                child.id(),
-                label
-            );
-            if let Err(e) = child.kill() {
-                eprintln!("Warning: failed to kill {}: {}", label, e);
-            }
-            let _ = child.wait();
-            return;
+    let Ok(pgid) = i32::try_from(child.id()) else {
+        eprintln!(
+            "Warning: PID {} for {} does not fit into i32; falling back to child.kill()",
+            child.id(),
+            label
+        );
+        if let Err(e) = child.kill() {
+            eprintln!("Warning: failed to kill {}: {}", label, e);
         }
+        let _ = child.wait();
+        return;
     };
 
     let mut wait_for_exit = |deadline: Instant| -> bool {
@@ -1281,9 +1278,20 @@ impl Drop for UbootTargetDir {
     }
 }
 
-fn parse_xtest_cli_args(
-    args: &[String],
-) -> Result<(Vec<String>, Vec<String>, Vec<String>, bool), String> {
+/// Parsed `cargo xtask test` command line.
+#[derive(Debug, Default)]
+struct XtestCliArgs {
+    /// Arguments forwarded to every `cargo test` invocation (including `--`).
+    forward_args: Vec<String>,
+    /// `-p`/`--package` filters applied to `xtest.txt` entries.
+    package_filters: Vec<String>,
+    /// `-t` filters applied to test names (or the reserved category tokens).
+    testname_filters: Vec<String>,
+    /// Whether `-h`/`--help` was given.
+    help_requested: bool,
+}
+
+fn parse_xtest_cli_args(args: &[String]) -> Result<XtestCliArgs, String> {
     let mut forward_args = Vec::new();
     let mut package_filters = Vec::new();
     let mut testname_filters = Vec::new();
@@ -1335,12 +1343,12 @@ fn parse_xtest_cli_args(
         i += 1;
     }
 
-    Ok((
+    Ok(XtestCliArgs {
         forward_args,
         package_filters,
         testname_filters,
         help_requested,
-    ))
+    })
 }
 
 fn apply_testname_filters(
@@ -1390,14 +1398,18 @@ fn print_xtest_usage() {
 }
 
 fn test(args: &[String]) {
-    let (test_args, package_filters, testname_filters, help_requested) =
-        match parse_xtest_cli_args(args) {
-            Ok(parsed) => parsed,
-            Err(msg) => {
-                eprintln!("{}", msg);
-                std::process::exit(1);
-            }
-        };
+    let XtestCliArgs {
+        forward_args: test_args,
+        package_filters,
+        testname_filters,
+        help_requested,
+    } = match parse_xtest_cli_args(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    };
 
     if help_requested {
         print_xtest_usage();
@@ -1522,9 +1534,89 @@ fn test(args: &[String]) {
         None
     }
 
+    // Helper: `cargo test` command, wrapped with `timeout` when available
+    fn host_cargo_test_command(secs: u64) -> Command {
+        let mut cmd = if let Some(mut prefix) = timeout_prefix(secs) {
+            let mut c = Command::new(prefix.remove(0));
+            for p in prefix {
+                c.arg(p);
+            }
+            c.arg("cargo");
+            c
+        } else {
+            Command::new("cargo")
+        };
+        cmd.arg("test");
+        cmd
+    }
+
+    // Helper: spawn a host `cargo test` command and wait for it to finish
+    fn run_host_cargo_test(cmd: &mut Command, pkg: &str) -> std::process::ExitStatus {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        eprintln!("Running: {:?}", cmd);
+        cmd.spawn()
+            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
+            .wait()
+            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e))
+    }
+
+    // Helper: `cargo test` command for a bare-metal U-Boot test.
+    //
+    // Each U-Boot test gets its own fresh target dir to avoid mixing build-std
+    // artifacts (duplicate core lang items). `extra_rustflags` are inserted
+    // after the panic flags, before the relocation model and linker script.
+    fn uboot_cargo_test_command(
+        repo_root: &Path,
+        label: &str,
+        runner: &str,
+        pkg: &str,
+        extra_rustflags: &[&str],
+    ) -> (Command, UbootTargetDir) {
+        let test_lds_path = repo_root.join("test.lds");
+        let test_lds = test_lds_path
+            .to_str()
+            .expect("test linker path contains invalid UTF-8")
+            .to_string();
+
+        let target_dir = UbootTargetDir::new(label);
+
+        let rustflags = {
+            let mut parts = Vec::new();
+            if let Ok(existing) = std::env::var("RUSTFLAGS") {
+                parts.push(existing);
+            }
+            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
+            parts.extend(extra_rustflags.iter().map(|flag| (*flag).to_string()));
+            parts.push("-C relocation-model=static".to_string());
+            parts.push(format!("-C link-arg=-T{}", test_lds));
+            parts.join(" ")
+        };
+
+        let mut cmd = Command::new("cargo");
+        cmd.arg("test")
+            .arg("--target")
+            .arg("aarch64-unknown-none-softfloat")
+            .arg("-p")
+            .arg(pkg)
+            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
+            .env("RUSTFLAGS", rustflags)
+            .env("CARGO_PROFILE_TEST_PANIC", "abort")
+            .env("CARGO_PROFILE_DEV_PANIC", "abort")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", &target_dir.0)
+            .env("CARGO_TERM_COLOR", "always")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        (cmd, target_dir)
+    }
+
     fn scripts_need_sudo(
         tests: &[(String, String, String, Vec<String>)],
-        repo_root: &PathBuf,
+        repo_root: &Path,
         kind: &str,
     ) -> bool {
         for (_, _, testscript, _) in tests {
@@ -1699,36 +1791,15 @@ fn test(args: &[String]) {
     // Run std tests (each with 30s timeout if available)
     for (pkg, extra) in std_crates {
         eprintln!("\n--- Running host tests for: {} ---", pkg);
-        let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(prefix.remove(0));
-            for p in prefix {
-                c.arg(p);
-            }
-            c.arg("cargo");
-            c.arg("test");
-            c
-        } else {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            c
-        };
-
+        let mut cmd = host_cargo_test_command(30);
         cmd.arg("--target")
             .arg(&host_tuple)
             .arg("-p")
             .arg(&pkg)
             .args(&extra)
-            .args(&test_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .args(&test_args);
 
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
-            .wait()
-            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e));
+        let status = run_host_cargo_test(&mut cmd, &pkg);
         if status.success() {
             passed.push(format!("std:{}", pkg));
         } else {
@@ -1741,37 +1812,16 @@ fn test(args: &[String]) {
     // Run host unit tests explicitly (lib-only) with 30s timeout if available.
     for (pkg, extra) in unit_crates {
         eprintln!("\n--- Running host unit tests for: {} ---", pkg);
-        let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(prefix.remove(0));
-            for p in prefix {
-                c.arg(p);
-            }
-            c.arg("cargo");
-            c.arg("test");
-            c
-        } else {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            c
-        };
-
+        let mut cmd = host_cargo_test_command(30);
         cmd.arg("--target")
             .arg(&host_tuple)
             .arg("-p")
             .arg(&pkg)
             .arg("--lib")
             .args(&extra)
-            .args(&test_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .args(&test_args);
 
-        eprintln!("Running: {:?}", cmd);
-        let status = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to spawn cargo test for {}: {}", pkg, e))
-            .wait()
-            .unwrap_or_else(|e| panic!("Failed to wait for cargo test for {}: {}", pkg, e));
+        let status = run_host_cargo_test(&mut cmd, &pkg);
         if status.success() {
             passed.push(format!("unit:{}", pkg));
         } else {
@@ -1860,12 +1910,6 @@ fn test(args: &[String]) {
             .to_str()
             .expect("runner path contains invalid UTF-8");
 
-        let test_lds_path = repo_root.join("test.lds");
-        let test_lds = test_lds_path
-            .to_str()
-            .expect("test linker path contains invalid UTF-8")
-            .to_string();
-
         let label = if testname.is_empty() {
             format!("uboot-unit:{}", pkg)
         } else {
@@ -1876,31 +1920,13 @@ fn test(args: &[String]) {
             label, runner
         );
 
-        let mut cmd = Command::new("cargo");
-
-        // Give each U-Boot test its own fresh target dir to avoid mixing build-std
-        // artifacts (duplicate core lang items).
-        let target_dir = UbootTargetDir::new(&label);
-
-        let rustflags = {
-            let mut parts = Vec::new();
-            if let Ok(existing) = std::env::var("RUSTFLAGS") {
-                parts.push(existing);
-            }
-            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
-            if !testname.is_empty() {
-                parts.push("-C debuginfo=0".to_string());
-            }
-            parts.push("-C relocation-model=static".to_string());
-            parts.push(format!("-C link-arg=-T{}", test_lds));
-            parts.join(" ")
+        let extra_rustflags: &[&str] = if testname.is_empty() {
+            &[]
+        } else {
+            &["-C debuginfo=0"]
         };
-
-        cmd.arg("test")
-            .arg("--target")
-            .arg("aarch64-unknown-none-softfloat")
-            .arg("-p")
-            .arg(&pkg);
+        let (mut cmd, _target_dir) =
+            uboot_cargo_test_command(&repo_root, &label, runner, &pkg, extra_rustflags);
 
         if !testname.is_empty() {
             cmd.arg("--test").arg(&testname);
@@ -1920,18 +1946,7 @@ fn test(args: &[String]) {
             }
         }
 
-        cmd.args(&extra)
-            .args(&test_args)
-            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
-            .env("RUSTFLAGS", rustflags)
-            .env("CARGO_PROFILE_TEST_PANIC", "abort")
-            .env("CARGO_PROFILE_DEV_PANIC", "abort")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", &target_dir.0)
-            .env("CARGO_TERM_COLOR", "always")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(&extra).args(&test_args);
 
         let code = run_guest_test_with_timeout(cmd, &label, 300, "U-Boot test");
         if code == 0 {
@@ -2088,22 +2103,20 @@ mod tests {
             "--",
             "--nocapture",
         ]);
-        let (forward_args, package_filters, testname_filters, help_requested) =
-            parse_xtest_cli_args(&args).expect("parse should succeed");
+        let parsed = parse_xtest_cli_args(&args).expect("parse should succeed");
 
-        assert_eq!(package_filters, vec!["gdb_remote"]);
-        assert_eq!(testname_filters, vec!["uefi_packet_size"]);
-        assert_eq!(forward_args, vec!["--", "--nocapture"]);
-        assert!(!help_requested);
+        assert_eq!(parsed.package_filters, vec!["gdb_remote"]);
+        assert_eq!(parsed.testname_filters, vec!["uefi_packet_size"]);
+        assert_eq!(parsed.forward_args, vec!["--", "--nocapture"]);
+        assert!(!parsed.help_requested);
     }
 
     #[test]
     fn parses_compact_testname_flag() {
         let args = to_args(&["-tgicv2_pending"]);
-        let (_, _, testname_filters, help_requested) =
-            parse_xtest_cli_args(&args).expect("parse should succeed");
-        assert_eq!(testname_filters, vec!["gicv2_pending"]);
-        assert!(!help_requested);
+        let parsed = parse_xtest_cli_args(&args).expect("parse should succeed");
+        assert_eq!(parsed.testname_filters, vec!["gicv2_pending"]);
+        assert!(!parsed.help_requested);
     }
 
     #[test]
@@ -2116,12 +2129,11 @@ mod tests {
     #[test]
     fn parses_help_flag() {
         let args = to_args(&["--help"]);
-        let (forward_args, package_filters, testname_filters, help_requested) =
-            parse_xtest_cli_args(&args).expect("parse should succeed");
-        assert!(help_requested);
-        assert!(forward_args.is_empty());
-        assert!(package_filters.is_empty());
-        assert!(testname_filters.is_empty());
+        let parsed = parse_xtest_cli_args(&args).expect("parse should succeed");
+        assert!(parsed.help_requested);
+        assert!(parsed.forward_args.is_empty());
+        assert!(parsed.package_filters.is_empty());
+        assert!(parsed.testname_filters.is_empty());
     }
 
     #[test]

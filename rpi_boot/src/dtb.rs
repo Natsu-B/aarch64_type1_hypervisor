@@ -25,6 +25,7 @@ use ::dtb::NodeQueryExt;
 use ::dtb::Owned;
 use ::dtb::ValueRef;
 use ::dtb::WalkError;
+use ::dtb::cells::write_be_u32s;
 use ::dtb::copy_node_properties;
 use ::dtb::copy_subtree_to_path;
 use ::dtb::encode_gic_spi_interrupts_with_mapper;
@@ -328,7 +329,7 @@ fn add_virtio_mmio_blk_node(
     let irq_flags = gic_dt_irq_flags_from_sense(IrqSense::Edge);
     let interrupts = encode_gic_spi_interrupts_with_mapper(
         &[(virtio_blk::VIRTIO_BLK_IRQ_INTID, irq_flags)],
-        |intid| Ok(intid),
+        Ok,
     )?;
     node.set_property(NameRef::Borrowed("interrupts"), ValueRef::Owned(interrupts));
     node.set_property(
@@ -442,7 +443,7 @@ fn copy_cpus(source: &SourceTree<'_>, target: &mut TargetTree<'_>) -> Result<(),
     for child_id in children {
         let child = source.node(child_id).ok_or("dtb: invalid /cpus child")?;
         let name = child.name.as_str();
-        let keep_cpu = CPU_KEEP_NAMES.iter().any(|candidate| *candidate == name);
+        let keep_cpu = CPU_KEEP_NAMES.contains(&name);
         let keep_shared_cache =
             !name.starts_with("cpu@") && property_string_equals(child, "compatible", "cache");
         if !(keep_cpu || keep_shared_cache) {
@@ -669,8 +670,8 @@ fn rewrite_soc_child_reg_from_source(
 ) -> Result<(), &'static str> {
     let regs = with_source_node_view(source, source_path, &mut |view| {
         let mut values = Vec::new();
-        let mut iter = view.reg_raw_iter()?;
-        while let Some(entry) = iter.next() {
+        let iter = view.reg_raw_iter()?;
+        for entry in iter {
             let (base, size) = entry?;
             values.push((base as u64, size as u64));
         }
@@ -699,8 +700,8 @@ fn rewrite_projected_rp1_reg_from_source(
 ) -> Result<(), &'static str> {
     let source_regs = with_source_node_view(source, source_path, &mut |view| {
         let mut values = Vec::new();
-        let mut iter = view.reg_iter()?;
-        while let Some(entry) = iter.next() {
+        let iter = view.reg_iter()?;
+        for entry in iter {
             let (phys, size) = entry?;
             values.push((phys as u64, size as u64));
         }
@@ -781,7 +782,7 @@ fn rewrite_rp1_interrupts_from_source(
 
 fn encode_uart_passthrough_interrupts(uart_irq: vgic::UartIrq) -> Result<Vec<u8>, &'static str> {
     let specifiers = [(uart_irq.pintid, gic_dt_irq_flags_from_sense(uart_irq.sense))];
-    encode_gic_spi_interrupts_with_mapper(&specifiers, |intid| Ok(intid))
+    encode_gic_spi_interrupts_with_mapper(&specifiers, Ok)
 }
 
 fn with_source_node_view<R>(
@@ -875,34 +876,7 @@ fn copy_selected_properties(
 }
 
 fn node_phandle(tree: &SourceTree<'_>, node_id: NodeId) -> Option<u32> {
-    property_u32(tree, node_id, "phandle")
-        .ok()
-        .flatten()
-        .or_else(|| property_u32(tree, node_id, "linux,phandle").ok().flatten())
-}
-
-fn find_node_by_phandle_owned(tree: &TargetTree<'_>, phandle: u32) -> Option<NodeId> {
-    tree.nodes.iter().enumerate().find_map(|(id, node)| {
-        let matches = node
-            .property("phandle")
-            .and_then(|prop| {
-                let bytes = prop.value.as_slice();
-                if bytes.len() != 4 {
-                    return None;
-                }
-                Some(u32::from_be_bytes(bytes.try_into().ok()?))
-            })
-            .or_else(|| {
-                node.property("linux,phandle").and_then(|prop| {
-                    let bytes = prop.value.as_slice();
-                    if bytes.len() != 4 {
-                        return None;
-                    }
-                    Some(u32::from_be_bytes(bytes.try_into().ok()?))
-                })
-            });
-        (matches == Some(phandle)).then_some(id)
-    })
+    property_u32(tree, node_id, "phandle").or_else(|| property_u32(tree, node_id, "linux,phandle"))
 }
 
 const fn gic_dt_irq_flags_from_sense(sense: IrqSense) -> u32 {
@@ -1167,7 +1141,10 @@ fn update_gicv2_cpu_interface_reg(
     let mut gic_node = None;
     for node_id in 0..tree.nodes.len() {
         for compat in COMPATS {
-            if node_compatible_contains(tree, node_id, compat)? {
+            if tree
+                .node(node_id)
+                .is_some_and(|node| node.compatible_contains(compat))
+            {
                 gic_node = Some(node_id);
                 break;
             }
@@ -1184,8 +1161,8 @@ fn update_gicv2_cpu_interface_reg(
         .node(node_id)
         .and_then(|node| node.parent)
         .unwrap_or(tree.root);
-    let addr_cells = property_u32(tree, parent, "#address-cells")?.unwrap_or(2) as usize;
-    let size_cells = property_u32(tree, parent, "#size-cells")?.unwrap_or(1) as usize;
+    let addr_cells = property_u32(tree, parent, "#address-cells").unwrap_or(2) as usize;
+    let size_cells = property_u32(tree, parent, "#size-cells").unwrap_or(1) as usize;
     let stride = (addr_cells + size_cells) * 4;
     let Some(node) = tree.node(node_id) else {
         return Ok(());
@@ -1218,35 +1195,6 @@ fn update_gicv2_cpu_interface_reg(
         node.set_property(NameRef::Borrowed("reg"), ValueRef::Owned(bytes));
     }
     Ok(())
-}
-
-fn node_compatible_contains(
-    tree: &DeviceTree<'_>,
-    node_id: NodeId,
-    needle: &str,
-) -> Result<bool, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(false);
-    };
-    let Some(prop) = node.property("compatible") else {
-        return Ok(false);
-    };
-    let bytes = prop.value.as_slice();
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&byte| byte == 0)
-            .map(|offset| start + offset)
-            .unwrap_or(bytes.len());
-        if let Ok(entry) = core::str::from_utf8(&bytes[start..end])
-            && entry == needle
-        {
-            return Ok(true);
-        }
-        start = end + 1;
-    }
-    Ok(false)
 }
 
 fn is_memory_node(source: &SourceTree<'_>, node_id: NodeId) -> Result<bool, &'static str> {
@@ -1285,49 +1233,9 @@ fn first_cstr(bytes: &[u8]) -> Option<&str> {
     core::str::from_utf8(raw).ok()
 }
 
-fn property_u32<State>(
-    tree: &DeviceTree<'_, State>,
-    node_id: NodeId,
-    key: &str,
-) -> Result<Option<u32>, &'static str> {
-    let Some(node) = tree.node(node_id) else {
-        return Ok(None);
-    };
-    let Some(prop) = node.property(key) else {
-        return Ok(None);
-    };
-    let bytes = prop.value.as_slice();
-    if bytes.len() != 4 {
-        return Ok(None);
-    }
-    Ok(Some(read_be_u32(bytes, 0)?))
-}
-
-fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: read_be_u32 overflow")?;
-    let slice = bytes.get(offset..end).ok_or("dtb: read_be_u32 oob")?;
-    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
-    slice.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for index in 0..cells {
-        let shift = 32 * (cells - 1 - index);
-        let cell = ((value >> shift) & 0xffff_ffff) as u32;
-        write_be_u32(bytes, offset + index * 4, cell)?;
-    }
-    Ok(())
+/// Reads a single-cell property, treating a missing node or a malformed value as absent.
+fn property_u32<State>(tree: &DeviceTree<'_, State>, node_id: NodeId, key: &str) -> Option<u32> {
+    tree.node(node_id)?.property_u32(key).ok().flatten()
 }
 
 #[cfg(test)]

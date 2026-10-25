@@ -126,14 +126,14 @@ pub(crate) fn init(
         "vgic: map guest timer pirq"
     })?;
 
-    if let Some(pintid) = guest_uart.irq {
-        if Some(pintid) != gdb_uart_intid {
-            VGIC.bind_spi_pirq_passthrough(gic, PIntId(pintid), VIntId(pintid))
-                .map_err(|e| {
-                    println!("Failed to map guest UART PIRQ {}: {:?}", pintid, e);
-                    "vgic: map pirq"
-                })?;
-        }
+    if let Some(pintid) = guest_uart.irq
+        && Some(pintid) != gdb_uart_intid
+    {
+        VGIC.bind_spi_pirq_passthrough(gic, PIntId(pintid), VIntId(pintid))
+            .map_err(|e| {
+                println!("Failed to map guest UART PIRQ {}: {:?}", pintid, e);
+                "vgic: map pirq"
+            })?;
     }
 
     let max_intid = gic.max_intid();

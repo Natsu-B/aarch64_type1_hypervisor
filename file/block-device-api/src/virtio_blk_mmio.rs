@@ -1205,57 +1205,47 @@ where
     }
 
     fn read_from_guest(&mut self, dst: &mut [u8]) -> Result<(), VirtioBlkMmioError> {
-        if dst.len() > self.remaining {
-            return Err(VirtioBlkMmioError::InvalidState(
-                "virtio-blk: request data shorter than parsed length",
-            ));
-        }
-
+        self.ensure_remaining(dst.len())?;
         let mut copied = 0usize;
         while copied < dst.len() {
-            let desc = self.current_desc.ok_or(VirtioBlkMmioError::InvalidState(
-                "virtio-blk: request data chain ended before transfer completed",
-            ))?;
-            let desc_len = desc.len as usize;
-            if self.offset_in_desc > desc_len {
-                return Err(VirtioBlkMmioError::InvalidState(
-                    "virtio-blk: request data cursor exceeded descriptor length",
-                ));
-            }
-
-            let available = desc_len - self.offset_in_desc;
-            if available == 0 {
-                self.advance_desc()?;
-                continue;
-            }
-
-            let chunk = available.min(dst.len() - copied);
-            let addr = desc.addr.checked_add(self.offset_in_desc as u64).ok_or(
-                VirtioBlkMmioError::GuestMemory("virtio-blk: guest data address overflow"),
-            )?;
+            let (addr, chunk) = self.next_guest_chunk(dst.len() - copied)?;
             let dst_chunk = &mut dst[copied..copied + chunk];
             self.device.memory.read(addr, dst_chunk)?;
-
+            self.consume_guest_chunk(chunk)?;
             copied += chunk;
-            self.remaining -= chunk;
-            self.offset_in_desc += chunk;
-            if self.offset_in_desc == desc_len {
-                self.advance_desc()?;
-            }
         }
 
         Ok(())
     }
 
     fn write_to_guest(&mut self, src: &[u8]) -> Result<(), VirtioBlkMmioError> {
-        if src.len() > self.remaining {
+        self.ensure_remaining(src.len())?;
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let (addr, chunk) = self.next_guest_chunk(src.len() - copied)?;
+            let src_chunk = &src[copied..copied + chunk];
+            self.device.memory.write(addr, src_chunk)?;
+            self.consume_guest_chunk(chunk)?;
+            copied += chunk;
+        }
+
+        Ok(())
+    }
+
+    /// Rejects transfers longer than the data left in the parsed request.
+    fn ensure_remaining(&self, len: usize) -> Result<(), VirtioBlkMmioError> {
+        if len > self.remaining {
             return Err(VirtioBlkMmioError::InvalidState(
                 "virtio-blk: request data shorter than parsed length",
             ));
         }
+        Ok(())
+    }
 
-        let mut copied = 0usize;
-        while copied < src.len() {
+    /// Returns the guest address and length of the next contiguous data chunk, at most `max`
+    /// bytes, skipping exhausted descriptors in the chain.
+    fn next_guest_chunk(&mut self, max: usize) -> Result<(u64, usize), VirtioBlkMmioError> {
+        loop {
             let desc = self.current_desc.ok_or(VirtioBlkMmioError::InvalidState(
                 "virtio-blk: request data chain ended before transfer completed",
             ))?;
@@ -1272,21 +1262,23 @@ where
                 continue;
             }
 
-            let chunk = available.min(src.len() - copied);
+            let chunk = available.min(max);
             let addr = desc.addr.checked_add(self.offset_in_desc as u64).ok_or(
                 VirtioBlkMmioError::GuestMemory("virtio-blk: guest data address overflow"),
             )?;
-            let src_chunk = &src[copied..copied + chunk];
-            self.device.memory.write(addr, src_chunk)?;
-
-            copied += chunk;
-            self.remaining -= chunk;
-            self.offset_in_desc += chunk;
-            if self.offset_in_desc == desc_len {
-                self.advance_desc()?;
-            }
+            return Ok((addr, chunk));
         }
+    }
 
+    /// Advances the data cursor past a chunk returned by [`Self::next_guest_chunk`] once it
+    /// has been copied, moving to the next descriptor when the current one is exhausted.
+    fn consume_guest_chunk(&mut self, chunk: usize) -> Result<(), VirtioBlkMmioError> {
+        self.remaining -= chunk;
+        self.offset_in_desc += chunk;
+        let desc_len = self.current_desc.map_or(0, |desc| desc.len as usize);
+        if self.offset_in_desc == desc_len {
+            self.advance_desc()?;
+        }
         Ok(())
     }
 
@@ -1879,7 +1871,7 @@ mod tests {
             if let Some(err) = self.read_error {
                 return Err(err);
             }
-            if (buf.len() % SECTOR_SIZE) != 0 {
+            if !buf.len().is_multiple_of(SECTOR_SIZE) {
                 return Err(IoError::Align);
             }
             let start = (lba as usize)
@@ -1898,7 +1890,7 @@ mod tests {
             if self.read_only {
                 return Err(IoError::ReadOnly);
             }
-            if (buf.len() % SECTOR_SIZE) != 0 {
+            if !buf.len().is_multiple_of(SECTOR_SIZE) {
                 return Err(IoError::Align);
             }
             let start = (lba as usize)

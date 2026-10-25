@@ -19,8 +19,8 @@ pub fn init_pcie_with_node(view: &DtbNodeView) -> WalkResult<(), ()> {
     }
 
     let mut pcie_reg = None;
-    let mut iter = view.reg_iter().map_err(WalkError::Dtb)?;
-    while let Some(entry) = iter.next() {
+    let iter = view.reg_iter().map_err(WalkError::Dtb)?;
+    for entry in iter {
         pcie_reg = Some(entry.map_err(WalkError::Dtb)?);
         break;
     }

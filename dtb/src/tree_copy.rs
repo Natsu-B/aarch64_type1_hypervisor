@@ -14,6 +14,8 @@ use crate::NodeEditExt;
 use crate::NodeId;
 use crate::Owned;
 use crate::ValueRef;
+use crate::cells::write_be_u32;
+use crate::cells::write_be_u32s;
 
 pub fn node_path<'dtb, State>(
     tree: &DeviceTree<'dtb, State>,
@@ -226,27 +228,6 @@ where
         write_be_u32(&mut bytes, offset + 8, flags)?;
     }
     Ok(bytes)
-}
-
-fn write_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
-    let end = offset.checked_add(4).ok_or("dtb: write_be_u32 overflow")?;
-    let slice = bytes.get_mut(offset..end).ok_or("dtb: write_be_u32 oob")?;
-    slice.copy_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn write_be_u32s(
-    bytes: &mut [u8],
-    offset: usize,
-    cells: usize,
-    value: u64,
-) -> Result<(), &'static str> {
-    for index in 0..cells {
-        let shift = 32 * (cells - 1 - index);
-        let cell = ((value >> shift) & 0xffff_ffff) as u32;
-        write_be_u32(bytes, offset + index * 4, cell)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

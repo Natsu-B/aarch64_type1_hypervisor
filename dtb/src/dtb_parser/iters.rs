@@ -18,7 +18,7 @@ impl<'a, const CELLS: usize> InterruptCellsIter<'a, CELLS> {
         if stride == 0 {
             return Err("interrupts: zero cell stride");
         }
-        if data.len() % stride != 0 {
+        if !data.len().is_multiple_of(stride) {
             return Err("interrupts: length not multiple of cell count");
         }
         Ok(Self { data, consumed: 0 })
@@ -85,20 +85,12 @@ impl<'a> RangesIter<'a> {
             return Err("ranges: address/size cells overflow usize");
         }
 
-        let cell_count = child_address_cells
-            .checked_add(parent_address_cells)
-            .and_then(|v| v.checked_add(child_size_cells))
-            .ok_or("ranges: stride overflow")?;
-        let entry_stride = cell_count
-            .checked_mul(size_of::<u32>() as u32)
-            .ok_or("ranges: stride overflow")? as usize;
-
-        if entry_stride == 0 {
-            return Err("ranges: zero stride");
-        }
-        if property.len() % entry_stride != 0 {
-            return Err("ranges: length not multiple of stride");
-        }
+        let entry_stride = ranges_entry_stride(
+            property.len(),
+            child_address_cells,
+            parent_address_cells,
+            child_size_cells,
+        )?;
 
         Ok(Self {
             property,
@@ -179,19 +171,12 @@ impl<'a> RangesIterWide<'a> {
             return Err("ranges: address/size cells overflow u128");
         }
 
-        let cell_count = child_address_cells
-            .checked_add(parent_address_cells)
-            .and_then(|v| v.checked_add(child_size_cells))
-            .ok_or("ranges: stride overflow")?;
-        let entry_stride = cell_count
-            .checked_mul(size_of::<u32>() as u32)
-            .ok_or("ranges: stride overflow")? as usize;
-        if entry_stride == 0 {
-            return Err("ranges: zero stride");
-        }
-        if property.len() % entry_stride != 0 {
-            return Err("ranges: length not multiple of stride");
-        }
+        let entry_stride = ranges_entry_stride(
+            property.len(),
+            child_address_cells,
+            parent_address_cells,
+            child_size_cells,
+        )?;
 
         Ok(Self {
             property,
@@ -389,4 +374,29 @@ impl<'a, 'dtb, 's> Iterator for RegIter<'a, 'dtb, 's> {
     fn next(&mut self) -> Option<Self::Item> {
         self.next_internal().transpose()
     }
+}
+
+/// Computes the byte stride of one `ranges` entry and checks that `property_len` is a whole
+/// number of entries.
+fn ranges_entry_stride(
+    property_len: usize,
+    child_address_cells: u32,
+    parent_address_cells: u32,
+    child_size_cells: u32,
+) -> Result<usize, &'static str> {
+    let cell_count = child_address_cells
+        .checked_add(parent_address_cells)
+        .and_then(|v| v.checked_add(child_size_cells))
+        .ok_or("ranges: stride overflow")?;
+    let entry_stride = cell_count
+        .checked_mul(size_of::<u32>() as u32)
+        .ok_or("ranges: stride overflow")? as usize;
+
+    if entry_stride == 0 {
+        return Err("ranges: zero stride");
+    }
+    if !property_len.is_multiple_of(entry_stride) {
+        return Err("ranges: length not multiple of stride");
+    }
+    Ok(entry_stride)
 }

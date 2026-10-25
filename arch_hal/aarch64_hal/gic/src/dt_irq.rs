@@ -39,8 +39,8 @@ pub fn decode_gicv2_irq(cells: &[u32]) -> Result<DtGicIrq, DtGicIrqError> {
     let flags = cells[2];
 
     let intid = match int_type {
-        0 => number + 32,
-        1 => number + 16,
+        0 => number + 32, // SPI IDs start at 32.
+        1 => number + 16, // PPI IDs start at 16.
         _ => return Err(DtGicIrqError::InvalidType(int_type)),
     };
 
@@ -69,7 +69,7 @@ pub fn dt_irq_flags_to_sense(flags: u32) -> Result<IrqSense, DtIrqDecodeError> {
     let trig = flags & 0x0f;
     match trig {
         0x0 => Ok(IrqSense::Level),
-        0x1 | 0x2 | 0x3 => Ok(IrqSense::Edge),
+        0x1..=0x3 => Ok(IrqSense::Edge),
         0x4 | 0x8 => Ok(IrqSense::Level),
         _ => Err(DtIrqDecodeError::InvalidFlags(flags)),
     }

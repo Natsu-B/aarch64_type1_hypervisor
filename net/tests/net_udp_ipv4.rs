@@ -34,11 +34,11 @@ fn ipv4_checksum_local(header: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut idx = 0usize;
     while idx + 1 < header.len() {
-        sum += u16::from_be_bytes([header[idx], header[idx + 1]]) as u32;
+        sum += u32::from(u16::from_be_bytes([header[idx], header[idx + 1]]));
         idx += 2;
     }
     if idx < header.len() {
-        sum += u16::from_be_bytes([header[idx], 0]) as u32;
+        sum += u32::from(u16::from_be_bytes([header[idx], 0]));
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
