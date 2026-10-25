@@ -588,7 +588,15 @@ impl MemoryBlock {
         if self.region_size.saturating_add(10) > self.region_capacity
             || self.reserved_region_size.saturating_add(10) > self.reserved_region_capacity
         {
-            self.overflow_wrapping()?;
+            if let Err(error) = self.overflow_wrapping() {
+                // Each allocation can insert at most one entry into either
+                // array. Defer growth if both arrays still have spare slots.
+                if self.region_size >= self.region_capacity
+                    || self.reserved_region_size >= self.reserved_region_capacity
+                {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -1618,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allocation_fails_without_metadata_growth_space() {
+    fn test_allocation_uses_spare_slots_without_metadata_growth_space() {
         let mut allocator = MemoryBlock::init();
         for i in 0..119 {
             allocator
@@ -1630,12 +1638,55 @@ mod tests {
         }
         allocator.check_regions().unwrap();
 
-        // Free space exists, but no free range can hold the expanded arrays.
-        // Exhausting metadata headroom must not panic or modify the lists.
-        assert_eq!(allocator.allocate_region(0x10, 0x10), None);
+        // No free range can hold the expanded arrays, but there is enough
+        // metadata headroom for the allocation itself.
+        assert_eq!(allocator.allocate_region(0x10, 0x10), Some(0x1000));
         assert_eq!(allocator.region_size, 119);
-        assert_eq!(allocator.reserved_region_size, 0);
+        assert_eq!(allocator.reserved_region_size, 1);
         assert_eq!(allocator.region_capacity, 128);
+        assert_eq!(allocator.reserved_region_capacity, 128);
+        assert_eq!(
+            allocator.reserved_regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x10
+            }
+        );
+    }
+
+    #[test]
+    fn test_allocation_splits_with_spare_slot_without_metadata_growth_space() {
+        let mut allocator = MemoryBlock::init();
+        for i in 0..119 {
+            allocator
+                .add_region(&MemoryRegions {
+                    address: 0x1001 + i * 0x1000,
+                    size: 0x100,
+                })
+                .unwrap();
+        }
+        allocator.check_regions().unwrap();
+
+        // Aligning the candidate requires one additional free-list entry.
+        // This succeeds without a larger metadata backing allocation.
+        assert_eq!(allocator.allocate_region(0x10, 0x20), Some(0x1020));
+        assert_eq!(allocator.region_size, 120);
+        assert_eq!(allocator.reserved_region_size, 1);
+        assert_eq!(allocator.region_capacity, 128);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1001,
+                size: 0x1f
+            }
+        );
+        assert_eq!(
+            allocator.regions[1],
+            MemoryRegions {
+                address: 0x1030,
+                size: 0xd1
+            }
+        );
     }
 
     #[test]
