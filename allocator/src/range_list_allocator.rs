@@ -55,6 +55,56 @@ pub(crate) struct MemoryBlock {
     region_capacity: u32,
     reserved_region_capacity: u32,
     allocatable: bool,
+    /// Upper bound on live allocations (including pieces left by partial releases).
+    /// Each owns one spare slot in BOTH arrays, even when reserved ranges merge.
+    /// Thus `array live count + deallocation_credits <= capacity` for each array.
+    /// A complete release adds at most one entry to either list and consumes
+    /// one credit, preserving the inequality without allocating any metadata.
+    deallocation_credits: u32,
+}
+
+/// A prevalidated replacement of a contiguous section of a metadata array.
+/// Applying it never needs a temporary slot beyond the final live count.
+struct RegionEdit {
+    index: usize,
+    removed: usize,
+    first: Option<MemoryRegions>,
+    second: Option<MemoryRegions>,
+}
+
+impl RegionEdit {
+    fn new_len(&self, old_len: u32) -> u32 {
+        old_len - self.removed as u32
+            + u32::from(self.first.is_some())
+            + u32::from(self.second.is_some())
+    }
+
+    /// Caller checks final capacity before committing any edits.
+    fn commit(self, regions: &mut [MemoryRegions], len: &mut u32) {
+        let new_len = self.new_len(*len);
+        let inserted = usize::from(self.first.is_some()) + usize::from(self.second.is_some());
+        regions.copy_within(
+            self.index + self.removed..*len as usize,
+            self.index + inserted,
+        );
+        if let Some(first) = self.first {
+            regions[self.index] = first;
+        }
+        if let Some(second) = self.second {
+            regions[self.index + 1] = second;
+        }
+        if new_len < *len {
+            regions[new_len as usize..*len as usize].fill(EMPTY_REGION);
+        }
+        *len = new_len;
+    }
+}
+
+/// Both edits are calculated before either array is changed.
+struct RegionPlan {
+    free: RegionEdit,
+    reserved: RegionEdit,
+    address: usize,
 }
 
 impl fmt::Debug for MemoryBlock {
@@ -80,6 +130,7 @@ impl MemoryBlock {
             region_capacity: 128,
             reserved_region_capacity: 128,
             allocatable: false,
+            deallocation_credits: 0,
         }
     }
 
@@ -539,231 +590,175 @@ impl MemoryBlock {
         Ok(())
     }
 
-    fn allocate_region_internal(&mut self, size: usize, alignment: usize) -> Option<usize> {
-        if alignment == 0 {
+    /// Plans a union without touching the array, including all joined neighbors.
+    fn plan_insert(
+        regions: &[MemoryRegions],
+        region: MemoryRegions,
+    ) -> Result<RegionEdit, &'static str> {
+        let mut start = region.address;
+        let mut end = region.end_checked()?;
+        let mut index = regions.partition_point(|r| r.address < start);
+        if index > 0 && regions[index - 1].end_checked()? >= start {
+            index -= 1;
+            start = regions[index].address;
+            end = end.max(regions[index].end_checked()?);
+        }
+        let mut next = index;
+        while next < regions.len() && regions[next].address <= end {
+            end = end.max(regions[next].end_checked()?);
+            next += 1;
+        }
+        Ok(RegionEdit {
+            index,
+            removed: next - index,
+            first: Some(MemoryRegions::from_parts(start, end - start)),
+            second: None,
+        })
+    }
+
+    /// Plans removal only when the complete range belongs to one reserved entry.
+    fn plan_reserved_removal(
+        &self,
+        address: usize,
+        size: usize,
+    ) -> Result<RegionEdit, &'static str> {
+        let end = address.checked_add(size).ok_or("dealloc end overflow")?;
+        let reserved = &self.reserved_regions[..self.reserved_region_size as usize];
+        let next = reserved.partition_point(|r| r.address <= address);
+        let index = next
+            .checked_sub(1)
+            .ok_or("deallocation outside reserved region")?;
+        let region = reserved[index];
+        let region_end = region.end_checked()?;
+        if end > region_end {
+            return Err("deallocation outside reserved region");
+        }
+        let left = (address > region.address).then_some(MemoryRegions::from_parts(
+            region.address,
+            address - region.address,
+        ));
+        let right = (end < region_end).then_some(MemoryRegions::from_parts(end, region_end - end));
+        Ok(RegionEdit {
+            index,
+            removed: 1,
+            first: left.or(right),
+            second: if left.is_some() { right } else { None },
+        })
+    }
+
+    fn plan_allocation(&self, size: usize, alignment: usize) -> Option<RegionPlan> {
+        if size == 0 || alignment == 0 {
             return None;
         }
-        for mut i in 0..self.region_size as usize {
-            let (address, region_size) = {
-                let region = self.regions[i];
-                (region.address, region.size)
+        for (i, region) in self.regions[..self.region_size as usize].iter().enumerate() {
+            let end = region.end_checked().ok()?;
+            let Some(address) = checked_align_up(region.address, alignment) else {
+                continue;
             };
-            let end_addr = address.checked_add(region_size)?;
-            let address_multiple_of = checked_align_up(address, alignment)?;
-            let alloc_end = address_multiple_of.checked_add(size)?;
-            if alloc_end <= end_addr {
-                if self
-                    .add_reserved_alloc_record(address_multiple_of, size)
-                    .is_err()
-                {
-                    return None;
-                }
-                if !address.is_multiple_of(alignment) {
-                    let size = address_multiple_of - address;
-                    self.regions
-                        .copy_within(i..self.region_size as usize, i + 1);
-                    self.regions[i] = MemoryRegions { address, size };
-                    self.regions[i + 1].address = address_multiple_of;
-                    self.regions[i + 1].size -= size;
-                    i += 1;
-                    self.region_size += 1;
-                }
-                let new_addr = alloc_end;
-                if new_addr == end_addr {
-                    // The region is consumed completely.
-                    self.regions
-                        .copy_within(i + 1..self.region_size as usize, i);
-                    self.region_size -= 1;
-                } else {
-                    self.regions[i].address = new_addr;
-                    self.regions[i].size = end_addr - new_addr;
-                }
-                return Some(address_multiple_of);
+            let Some(alloc_end) = address.checked_add(size) else {
+                continue;
+            };
+            if alloc_end > end {
+                continue;
             }
+            let left = (address > region.address).then_some(MemoryRegions::from_parts(
+                region.address,
+                address - region.address,
+            ));
+            let right =
+                (alloc_end < end).then_some(MemoryRegions::from_parts(alloc_end, end - alloc_end));
+            return Some(RegionPlan {
+                free: RegionEdit {
+                    index: i,
+                    removed: 1,
+                    first: left.or(right),
+                    second: if left.is_some() { right } else { None },
+                },
+                reserved: Self::plan_insert(
+                    &self.reserved_regions[..self.reserved_region_size as usize],
+                    MemoryRegions::from_parts(address, size),
+                )
+                .ok()?,
+                address,
+            });
         }
         None
     }
 
-    fn ensure_overflow_headroom(&mut self) -> Result<(), &'static str> {
-        if self.region_size.saturating_add(10) > self.region_capacity
-            || self.reserved_region_size.saturating_add(10) > self.reserved_region_capacity
+    fn commit_plan(&mut self, plan: RegionPlan) -> usize {
+        plan.free.commit(&mut self.regions, &mut self.region_size);
+        plan.reserved
+            .commit(&mut self.reserved_regions, &mut self.reserved_region_size);
+        plan.address
+    }
+
+    /// Raw allocation for permanent metadata; it does not acquire a release credit.
+    fn allocate_region_internal(&mut self, size: usize, alignment: usize) -> Option<usize> {
+        let plan = self.plan_allocation(size, alignment)?;
+        if plan.free.new_len(self.region_size) > self.region_capacity
+            || plan.reserved.new_len(self.reserved_region_size) > self.reserved_region_capacity
         {
-            if let Err(error) = self.overflow_wrapping() {
-                // Each allocation can insert at most one entry into either
-                // array. Defer growth if both arrays still have spare slots.
-                if self.region_size >= self.region_capacity
-                    || self.reserved_region_size >= self.reserved_region_capacity
-                {
-                    return Err(error);
-                }
-            }
+            return None;
+        }
+        Some(self.commit_plan(plan))
+    }
+
+    /// Every live allocation reserves a worst-case insertion in BOTH arrays.
+    fn ensure_overflow_headroom(
+        &self,
+        plan: &RegionPlan,
+        credits: u32,
+    ) -> Result<(), &'static str> {
+        let free = plan.free.new_len(self.region_size).checked_add(credits);
+        let reserved = plan
+            .reserved
+            .new_len(self.reserved_region_size)
+            .checked_add(credits);
+        if free.is_none_or(|n| n > self.region_capacity)
+            || reserved.is_none_or(|n| n > self.reserved_region_capacity)
+        {
+            return Err("insufficient deallocation metadata headroom");
         }
         Ok(())
     }
 
-    // Deallocation can add at most one entry to each metadata array.
-    // If an array is full, check whether the released range can merge with
-    // existing entries before requiring any additional metadata storage.
     fn ensure_deallocation_headroom(
-        &mut self,
+        &self,
         address: usize,
         size: usize,
-    ) -> Result<(), &'static str> {
-        let free_full = self.region_size >= self.region_capacity;
-        let reserved_full = self.reserved_region_size >= self.reserved_region_capacity;
-        if !free_full && !reserved_full {
-            return Ok(());
-        }
-
-        let end = address.checked_add(size).ok_or("dealloc end overflow")?;
-        let needs_free_slot = if free_full {
-            let regions = &self.regions[..self.region_size as usize];
-            match regions.binary_search_by_key(&address, |region| region.address) {
-                Ok(_) => false,
-                Err(i) => {
-                    let merges_previous = i > 0 && regions[i - 1].end_checked()? >= address;
-                    let merges_next = i < regions.len() && end >= regions[i].address;
-                    !merges_previous && !merges_next
-                }
-            }
+        whole_allocation: bool,
+    ) -> Result<(RegionPlan, u32), &'static str> {
+        address.checked_add(size).ok_or("dealloc end overflow")?;
+        let reserved = self.plan_reserved_removal(address, size)?;
+        let credits = if whole_allocation || reserved.first.is_none() {
+            self.deallocation_credits
+                .checked_sub(1)
+                .ok_or("deallocation without an allocation credit")?
+        } else if reserved.second.is_some() {
+            // A partial release can turn one live allocation into two pieces.
+            self.deallocation_credits
+                .checked_add(1)
+                .ok_or("deallocation credit overflow")?
         } else {
-            false
+            self.deallocation_credits
         };
-
-        let needs_reserved_slot = if reserved_full {
-            let reserved = &self.reserved_regions[..self.reserved_region_size as usize];
-            match reserved.binary_search_by_key(&address, |region| region.address) {
-                Err(i) if i > 0 => {
-                    let region = &reserved[i - 1];
-                    address > region.address && end < region.end_checked()?
-                }
-                _ => false,
-            }
-        } else {
-            false
+        let plan = RegionPlan {
+            free: Self::plan_insert(
+                &self.regions[..self.region_size as usize],
+                MemoryRegions::from_parts(address, size),
+            )?,
+            reserved,
+            address,
         };
-
-        if needs_free_slot || needs_reserved_slot {
-            self.overflow_wrapping()?;
-        }
-        Ok(())
+        Ok((plan, credits))
     }
 
-    // Record allocation into reserved list: reserved := reserved ∪ [addr, addr+size)
-    fn add_reserved_alloc_record(
+    /// Stages growth in the new backing allocation before changing either old array.
+    /// If the requested operation fails, restore the original arrays and counters.
+    fn overflow_wrapping<T>(
         &mut self,
-        address: usize,
-        size: usize,
-    ) -> Result<(), &'static str> {
-        let insertion_point = self.reserved_regions[0..self.reserved_region_size as usize]
-            .binary_search_by_key(&address, |r| r.address)
-            .unwrap_or_else(|x| x);
-        MemoryBlock::add_and_merge_region(
-            &mut self.reserved_regions,
-            &mut self.reserved_region_size,
-            insertion_point,
-            &MemoryRegions { address, size },
-        )
-    }
-
-    // Remove allocation range from reserved list: reserved := reserved \ [addr, addr+size)
-    fn remove_reserved_alloc_record(
-        &mut self,
-        addr: usize,
-        size: usize,
-    ) -> Result<(), &'static str> {
-        if size == 0 {
-            return Ok(());
-        }
-        let reserved = &mut self.reserved_regions;
-        let rsize = &mut self.reserved_region_size;
-        let valid_reserved = &mut reserved[0..*rsize as usize];
-        let search = valid_reserved.binary_search_by_key(&addr, |r| r.address);
-        match search {
-            Ok(i) => {
-                let region = &mut reserved[i];
-                match size.cmp(&region.size) {
-                    core::cmp::Ordering::Less => {
-                        region.address = region
-                            .address
-                            .checked_add(size)
-                            .ok_or("region end overflow")?;
-                        region.size = region.size.checked_sub(size).ok_or("region end overflow")?;
-                    }
-                    core::cmp::Ordering::Equal | core::cmp::Ordering::Greater => {
-                        reserved.copy_within(i + 1..*rsize as usize, i);
-                        reserved[*rsize as usize - 1] = EMPTY_REGION;
-                        *rsize -= 1;
-                    }
-                }
-            }
-            Err(x) => {
-                if x == 0 {
-                    return Ok(());
-                }
-                let i = x - 1;
-                let region = &mut reserved[i];
-                let region_end = region.end_checked()?;
-                let dealloc_end = addr.checked_add(size).ok_or("dealloc end overflow")?;
-                if addr >= region.address && dealloc_end <= region_end {
-                    let starts_at_same = addr == region.address;
-                    let ends_at_same = dealloc_end == region_end;
-                    match (starts_at_same, ends_at_same) {
-                        (true, true) => {
-                            reserved.copy_within(i + 1..*rsize as usize, i);
-                            reserved[*rsize as usize - 1] = EMPTY_REGION;
-                            *rsize -= 1;
-                        }
-                        (true, false) => {
-                            region.address = region
-                                .address
-                                .checked_add(size)
-                                .ok_or("region end overflow")?;
-                            region.size =
-                                region.size.checked_sub(size).ok_or("region end overflow")?;
-                        }
-                        (false, true) => {
-                            region.size = addr - region.address;
-                        }
-                        (false, false) => {
-                            let original_end = region_end;
-                            region.size = addr - region.address;
-                            let insert_idx = i + 1;
-                            reserved.copy_within(insert_idx..*rsize as usize, insert_idx + 1);
-                            reserved[insert_idx] = MemoryRegions {
-                                address: dealloc_end,
-                                size: original_end - dealloc_end,
-                            };
-                            *rsize += 1;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn add_free_region_merge(&mut self, address: usize, size: usize) -> Result<(), &'static str> {
-        let insertion_point = self.regions[0..self.region_size as usize]
-            .binary_search_by_key(&address, |r| r.address)
-            .unwrap_or_else(|x| x);
-        MemoryBlock::add_and_merge_region(
-            &mut self.regions,
-            &mut self.region_size,
-            insertion_point,
-            &MemoryRegions { address, size },
-        )
-    }
-
-    fn overflow_wrapping(&mut self) -> Result<(), &'static str> {
-        // The metadata allocation itself can split a free range and insert a
-        // reserved range, so both current arrays must have a spare entry.
-        if self.region_size >= self.region_capacity
-            || self.reserved_region_size >= self.reserved_region_capacity
-        {
-            return Err("region metadata is full");
-        }
-
+        operation: impl FnOnce(&mut Self) -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
         let new_regions_capacity = self
             .region_capacity
             .checked_mul(2)
@@ -775,29 +770,31 @@ impl MemoryBlock {
         let allocate_size = (new_regions_capacity as usize)
             .checked_add(new_reserved_capacity as usize)
             .and_then(|capacity| capacity.checked_mul(size_of::<MemoryRegions>()))
+            .filter(|&bytes| bytes <= isize::MAX as usize)
             .ok_or("region metadata allocation size overflow")?;
-
-        let new_region = self
-            .allocate_region_internal(allocate_size, 4096)
+        let plan = self
+            .plan_allocation(allocate_size, 4096)
             .ok_or("out of memory for region metadata")?;
-
+        if plan.free.new_len(self.region_size) > new_regions_capacity
+            || plan.reserved.new_len(self.reserved_region_size) > new_reserved_capacity
+        {
+            return Err("region metadata is full");
+        }
+        let new_region = plan.address;
         let new_regions_ptr = new_region as *mut MemoryRegions;
         let new_reserved_ptr = (new_region
             + new_regions_capacity as usize * size_of::<MemoryRegions>())
             as *mut MemoryRegions;
-
-        unsafe {
-            // SAFETY: allocate_region_internal reserved a disjoint, writable,
-            // 4096-byte-aligned allocation of allocate_size bytes. Both
-            // MemoryRegions fields are usize, so all-zero bytes form a valid
-            // EMPTY_REGION. Initialize the full capacities before creating
-            // references to their elements.
+        // SAFETY: The plan selects a disjoint writable free range, aligned to
+        // 4096 (which satisfies MemoryRegions alignment), with allocate_size
+        // bytes and a checked end. No old metadata resides in this free range.
+        // All-zero usize fields form valid EMPTY_REGION values. Initialize every
+        // slot before constructing references, then copy the initialized live
+        // entries into disjoint arrays whose capacities were checked above.
+        // Access stays exclusive under &mut self. Successful growth permanently
+        // reserves the backing; rollback discards both staging references.
+        let (regions, reserved_regions) = unsafe {
             core::ptr::write_bytes(new_region as *mut u8, 0, allocate_size);
-
-            // SAFETY: The newly allocated arrays are disjoint from the old
-            // metadata storage. Each source contains at least its live count
-            // of initialized MemoryRegions, and each destination has enough
-            // aligned space for those entries.
             copy_nonoverlapping(
                 self.regions.as_ptr(),
                 new_regions_ptr,
@@ -808,55 +805,121 @@ impl MemoryBlock {
                 new_reserved_ptr,
                 self.reserved_region_size as usize,
             );
-
-            // SAFETY: Both arrays are fully initialized, aligned, disjoint,
-            // and backed by memory reserved for the allocator's lifetime.
-            self.regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
-                new_regions_ptr,
-                new_regions_capacity as usize,
-            )));
-            self.reserved_regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
-                new_reserved_ptr,
-                new_reserved_capacity as usize,
-            )));
-        }
+            (
+                RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
+                    new_regions_ptr,
+                    new_regions_capacity as usize,
+                ))),
+                RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
+                    new_reserved_ptr,
+                    new_reserved_capacity as usize,
+                ))),
+            )
+        };
+        let old_regions = core::mem::replace(&mut self.regions, regions);
+        let old_reserved = core::mem::replace(&mut self.reserved_regions, reserved_regions);
+        let old_state = (
+            self.region_size,
+            self.reserved_region_size,
+            self.region_capacity,
+            self.reserved_region_capacity,
+            self.deallocation_credits,
+        );
         self.region_capacity = new_regions_capacity;
         self.reserved_region_capacity = new_reserved_capacity;
-        Ok(())
+        self.allocate_region_internal(allocate_size, 4096)
+            .expect("the staged metadata plan fits the expanded arrays");
+        match operation(self) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Discard staging references and restore both arrays and all counters
+                // before another allocator operation can observe the free range.
+                self.regions = old_regions;
+                self.reserved_regions = old_reserved;
+                (
+                    self.region_size,
+                    self.reserved_region_size,
+                    self.region_capacity,
+                    self.reserved_region_capacity,
+                    self.deallocation_credits,
+                ) = old_state;
+                Err(error)
+            }
+        }
+    }
+
+    /// Commits an allocation only after reserving its eventual release metadata.
+    fn allocate_with_headroom(&mut self, size: usize, align: usize) -> Result<usize, &'static str> {
+        let plan = self
+            .plan_allocation(size, align)
+            .ok_or("allocation failed")?;
+        let credits = self
+            .deallocation_credits
+            .checked_add(1)
+            .ok_or("deallocation credit overflow")?;
+        self.ensure_overflow_headroom(&plan, credits)?;
+        let address = self.commit_plan(plan);
+        self.deallocation_credits = credits;
+        Ok(address)
     }
 
     pub fn allocate_region(&mut self, size: usize, align: usize) -> Option<usize> {
         if !self.allocatable {
             return None;
         }
-        self.ensure_overflow_headroom().ok()?;
-        self.allocate_region_internal(size, align)
+        // Do not grow if no free range fits the request to begin with.
+        let plan = self.plan_allocation(size, align)?;
+        let credits = self.deallocation_credits.checked_add(1)?;
+        if self.ensure_overflow_headroom(&plan, credits).is_ok() {
+            let address = self.commit_plan(plan);
+            self.deallocation_credits = credits;
+            return Some(address);
+        }
+        self.overflow_wrapping(|block| block.allocate_with_headroom(size, align))
+            .ok()
     }
 
+    /// Releases a reserved subrange transactionally. `whole_allocation` may be
+    /// true only for a complete live allocation returned by allocate_region;
+    /// such a release always has headroom. For a partial release, retain credits
+    /// for the remaining pieces and grow before committing if necessary.
     pub fn try_deallocate_region(
         &mut self,
         ptr: usize,
         layout: Layout,
+        whole_allocation: bool,
     ) -> Result<(), &'static str> {
         if !self.allocatable {
+            return Err("allocator not allocatable");
+        }
+        if layout.size() == 0 {
             return Ok(());
         }
-        let addr = ptr;
-        let size = layout.size();
-        if size == 0 {
-            return Ok(()); // Nothing to do
+        let (plan, credits) =
+            self.ensure_deallocation_headroom(ptr, layout.size(), whole_allocation)?;
+        if self.ensure_overflow_headroom(&plan, credits).is_ok() {
+            self.commit_plan(plan);
+            self.deallocation_credits = credits;
+            return Ok(());
         }
-        // Reserve only the metadata slots that deallocation could add.
-        self.ensure_deallocation_headroom(addr, size)?;
-
-        // Remove from reserved list and return to free list
-        self.remove_reserved_alloc_record(addr, size)?;
-        self.add_free_region_merge(addr, size)?;
-        Ok(())
+        self.overflow_wrapping(|block| {
+            let (plan, credits) =
+                block.ensure_deallocation_headroom(ptr, layout.size(), whole_allocation)?;
+            block.ensure_overflow_headroom(&plan, credits)?;
+            block.commit_plan(plan);
+            block.deallocation_credits = credits;
+            Ok(())
+        })
     }
 
+    /// Releases one complete live allocation. Its credit pays for at most one
+    /// new free entry AND one reserved split, so this never needs growth for a
+    /// valid allocation, regardless of fragmentation or available heap bytes.
+    /// The assertion diagnoses an invalid release or corrupted invariant;
+    /// resource exhaustion is handled when the allocation is requested.
     pub fn deallocate_region(&mut self, ptr: usize, layout: Layout) {
-        let _ = self.try_deallocate_region(ptr, layout);
+        self.try_deallocate_region(ptr, layout, true)
+            .expect("a complete live allocation owns deallocation metadata headroom");
     }
 
     /// Trims the allocator metadata and returns reserved regions for boot handoff.
@@ -875,9 +938,10 @@ impl MemoryBlock {
             return Err("allocator not allocatable");
         }
 
-        self.ensure_overflow_headroom()?;
+        let layout =
+            Layout::from_size_align(reserve_bytes, 1).map_err(|_| "invalid reserve size")?;
         let allocate = self
-            .allocate_region_internal(reserve_bytes, 1)
+            .allocate_region(reserve_bytes, 1)
             .ok_or("allocation failed")?;
 
         // Allocates while holding the guard; only valid in the pre-atomic/no-op lock phase.
@@ -900,8 +964,7 @@ impl MemoryBlock {
 
         self.allocatable = true;
 
-        self.remove_reserved_alloc_record(allocate, reserve_bytes)?;
-        self.add_free_region_merge(allocate, reserve_bytes)?;
+        self.deallocate_region(allocate, layout);
         Ok(vec)
     }
 
@@ -956,7 +1019,91 @@ macro_rules! debug_assert {
 #[cfg(test)]
 mod tests {
 
-    use std::alloc::alloc;
+    /// Real writable backing for tests that can grow metadata.
+    struct TestHeap {
+        address: usize,
+        layout: Layout,
+    }
+
+    impl TestHeap {
+        fn new(size: usize) -> Self {
+            let layout = Layout::from_size_align(size, 4096).unwrap();
+            // SAFETY: layout is nonzero and valid; the system allocator owns
+            // this backing independently of the allocator under test.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!ptr.is_null());
+            Self {
+                address: ptr as usize,
+                layout,
+            }
+        }
+    }
+
+    impl Drop for TestHeap {
+        fn drop(&mut self) {
+            // SAFETY: address is the live system allocation made in new with
+            // exactly this layout. Each test drops its MemoryBlock first.
+            unsafe { std::alloc::dealloc(self.address as *mut u8, self.layout) };
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Snapshot {
+        free: Vec<MemoryRegions>,
+        reserved: Vec<MemoryRegions>,
+        counts: (u32, u32),
+        capacities: (u32, u32),
+        credits: u32,
+    }
+
+    fn snapshot(block: &MemoryBlock) -> Snapshot {
+        Snapshot {
+            free: block.regions.to_vec(),
+            reserved: block.reserved_regions.to_vec(),
+            counts: (block.region_size, block.reserved_region_size),
+            capacities: (block.region_capacity, block.reserved_region_capacity),
+            credits: block.deallocation_credits,
+        }
+    }
+
+    fn assert_headroom(block: &MemoryBlock) {
+        assert!(block.region_size + block.deallocation_credits <= block.region_capacity);
+        assert!(
+            block.reserved_region_size + block.deallocation_credits
+                <= block.reserved_region_capacity
+        );
+        for list in [
+            &block.regions[..block.region_size as usize],
+            &block.reserved_regions[..block.reserved_region_size as usize],
+        ] {
+            for region in list {
+                assert!(region.size > 0);
+                region.end_checked().unwrap();
+            }
+            for pair in list.windows(2) {
+                assert!(pair[0].end_checked().unwrap() < pair[1].address);
+            }
+        }
+        for free in &block.regions[..block.region_size as usize] {
+            for reserved in &block.reserved_regions[..block.reserved_region_size as usize] {
+                assert!(
+                    free.end_checked().unwrap() <= reserved.address
+                        || reserved.end_checked().unwrap() <= free.address
+                );
+            }
+        }
+    }
+
+    fn fragmented_block(count: usize, stride: usize, size: usize) -> MemoryBlock {
+        let mut block = MemoryBlock::init();
+        for i in 0..count {
+            block
+                .add_region(&MemoryRegions::from_parts(0x1000 + i * stride, size))
+                .unwrap();
+        }
+        block.check_regions().unwrap();
+        block
+    }
 
     use super::*;
 
@@ -1568,12 +1715,12 @@ mod tests {
 
     #[test]
     fn test_overflow_wrapping() {
-        let heap = unsafe { alloc(Layout::from_size_align_unchecked(0x200000, 0x1000)) };
+        let heap = TestHeap::new(0x200000);
         let mut allocator = MemoryBlock::init();
         // Add a large region with an unaligned address.
         allocator
             .add_region(&MemoryRegions {
-                address: heap as usize,
+                address: heap.address,
                 size: 0x200000, // 2MB
             })
             .unwrap();
@@ -1583,32 +1730,22 @@ mod tests {
         let initial_reserved_capacity = allocator.reserved_region_capacity;
         assert_eq!(initial_region_capacity, 128);
 
-        // We need to increase region_size. Each allocation with a specific alignment
-        // on an unaligned region will split it, increasing region_size by 1.
-        // The overflow_wrapping is triggered when region_size + 10 > region_capacity.
-        // So we need to reach region_size = 119 to trigger it on the next allocation.
-        // Initial region_size is 1. We need 118 splits.
-        for _ in 0..119 {
+        for _ in 0..120 {
             assert!(allocator.allocate_region(0x10, 0x1000).is_some());
-            // Each allocation creates a split, increasing region_size.
+            assert_headroom(&allocator);
         }
-        // After 118 allocations, region_size should be 119.
-        assert_eq!(allocator.region_size, 119);
-        assert_eq!(allocator.region_capacity, initial_region_capacity);
-        // This allocation should trigger overflow_wrapping.
-        assert!(allocator.allocate_region(0x10, 0x1000).is_some());
-        // Verify that the capacities have been doubled.
-        assert_eq!(allocator.region_capacity, initial_region_capacity * 2);
-        assert_eq!(
-            allocator.reserved_region_capacity,
-            initial_reserved_capacity * 2
+        assert!(allocator.region_capacity > initial_region_capacity);
+        assert!(allocator.reserved_region_capacity > initial_reserved_capacity);
+        assert!(
+            allocator.regions[allocator.region_size as usize..]
+                .iter()
+                .all(|&region| region == EMPTY_REGION)
         );
-        assert!(allocator.regions[allocator.region_size as usize..]
-            .iter()
-            .all(|&region| region == EMPTY_REGION));
-        assert!(allocator.reserved_regions[allocator.reserved_region_size as usize..]
-            .iter()
-            .all(|&region| region == EMPTY_REGION));
+        assert!(
+            allocator.reserved_regions[allocator.reserved_region_size as usize..]
+                .iter()
+                .all(|&region| region == EMPTY_REGION)
+        );
 
         // region_size should be 120 now.
         assert_eq!(allocator.region_size, 120);
@@ -1703,9 +1840,9 @@ mod tests {
         allocator.check_regions().unwrap();
 
         // Simulate a live allocation made before the free list fragmented.
-        let addr = allocator.allocate_region_internal(0x10, 0x10).unwrap();
+        let addr = allocator.allocate_region(0x10, 0x10).unwrap();
         allocator
-            .try_deallocate_region(addr, Layout::from_size_align(0x10, 0x10).unwrap())
+            .try_deallocate_region(addr, Layout::from_size_align(0x10, 0x10).unwrap(), true)
             .unwrap();
         assert_eq!(allocator.region_capacity, 128);
         assert_eq!(allocator.region_size, 119);
@@ -1714,48 +1851,442 @@ mod tests {
 
     #[test]
     fn test_deallocation_at_full_capacity_can_merge() {
-        let mut allocator = MemoryBlock::init();
-        for i in 0..128 {
-            allocator
-                .add_region(&MemoryRegions {
-                    address: 0x1000 + i * 0x1000,
-                    size: 0x100,
-                })
-                .unwrap();
-        }
-        allocator.check_regions().unwrap();
-
-        let addr = allocator.allocate_region_internal(0x10, 0x10).unwrap();
+        let mut allocator = fragmented_block(119, 0x1000, 0x100);
+        let addr = allocator.allocate_region(0x10, 0x10).unwrap();
+        // Artificially constrain the backing array to its live count. This
+        // exercises the capacity boundary without bypassing finalization's limit.
+        allocator.region_capacity = allocator.region_size;
         allocator
-            .try_deallocate_region(addr, Layout::from_size_align(0x10, 0x10).unwrap())
+            .try_deallocate_region(addr, Layout::from_size_align(0x10, 0x10).unwrap(), true)
             .unwrap();
-        assert_eq!(allocator.region_size, 128);
+        assert_eq!(allocator.region_size, 119);
         assert_eq!(allocator.reserved_region_size, 0);
-        assert_eq!(allocator.region_capacity, 128);
+        assert_eq!(allocator.region_capacity, 119);
+        assert_headroom(&allocator);
     }
 
     #[test]
     fn test_deallocation_reports_metadata_exhaustion() {
+        let mut allocator = fragmented_block(119, 0x1000, 0x100);
+        let addr = allocator.allocate_region(0x80, 1).unwrap();
+        allocator.region_capacity = allocator.region_size;
+        // Release an interior portion of one allocation: this needs a new free
+        // entry and splits the reserved entry. No fragment can hold metadata.
+        let before = snapshot(&allocator);
+        let result = allocator.try_deallocate_region(
+            addr + 0x20,
+            Layout::from_size_align(0x20, 1).unwrap(),
+            false,
+        );
+        assert_eq!(result, Err("out of memory for region metadata"));
+        assert_eq!(snapshot(&allocator), before);
+    }
+
+    #[test]
+    fn allocation_reserves_release_slots_when_fragmented_metadata_cannot_grow() {
+        let mut allocator = fragmented_block(119, 0x1000, 0x100);
+        let original = snapshot(&allocator);
+        let layout = Layout::from_size_align(0x20, 1).unwrap();
+        for _ in 0..4 {
+            let mut allocated = Vec::new();
+            loop {
+                let before = snapshot(&allocator);
+                let Some(address) = allocator.allocate_region(layout.size(), layout.align()) else {
+                    assert_eq!(snapshot(&allocator), before);
+                    break;
+                };
+                allocated.push(address);
+                assert_headroom(&allocator);
+            }
+            assert!(allocated.len() > 1);
+            assert_eq!(allocator.region_capacity, 128);
+            // There are still fitting byte ranges; the limiting resource is
+            // capacity reserved for future deallocations, not available bytes.
+            assert!(
+                allocator
+                    .plan_allocation(layout.size(), layout.align())
+                    .is_some()
+            );
+            // Release alternating interior allocations first to force holes and
+            // splits in merged reserved entries, using only existing metadata.
+            for parity in [1, 0] {
+                for &address in allocated.iter().skip(parity).step_by(2) {
+                    allocator.deallocate_region(address, layout);
+                    assert_headroom(&allocator);
+                    assert_eq!(allocator.region_capacity, 128);
+                }
+            }
+            assert_eq!(snapshot(&allocator), original);
+        }
+    }
+
+    #[test]
+    fn complete_deallocation_can_fill_the_last_free_metadata_slot() {
+        let mut allocator = fragmented_block(119, 0x1000, 0x100);
+        let layout = Layout::from_size_align(0x100, 1).unwrap();
+        let address = allocator.allocate_region(layout.size(), 1).unwrap();
+        assert_eq!(allocator.region_size, 118);
+        // Exactly one slot remains, owned by the live allocation. No byte range
+        // can hold larger metadata. Returning this isolated region fills it.
+        allocator.region_capacity = 119;
+        assert_headroom(&allocator);
+        allocator.deallocate_region(address, layout);
+        assert_eq!(allocator.region_size, allocator.region_capacity);
+        assert_eq!(allocator.deallocation_credits, 0);
+        assert_headroom(&allocator);
+    }
+
+    #[test]
+    fn partial_deallocation_splits_one_allocation_and_preserves_remaining_pieces() {
+        let mut allocator = fragmented_block(1, 0x1000, 0x100);
+        let address = allocator.allocate_region(0x80, 1).unwrap();
+        allocator
+            .try_deallocate_region(
+                address + 0x20,
+                Layout::from_size_align(0x20, 1).unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(allocator.deallocation_credits, 2);
+        assert_eq!(allocator.reserved_region_size, 2);
+        assert_eq!(
+            allocator.reserved_regions[0],
+            MemoryRegions::from_parts(address, 0x20)
+        );
+        assert_eq!(
+            allocator.reserved_regions[1],
+            MemoryRegions::from_parts(address + 0x40, 0x40)
+        );
+        assert_headroom(&allocator);
+        // The original allocation was split; return its remaining pieces using
+        // the partial-release interface, rather than the original full layout.
+        allocator
+            .try_deallocate_region(address, Layout::from_size_align(0x20, 1).unwrap(), false)
+            .unwrap();
+        allocator
+            .try_deallocate_region(
+                address + 0x40,
+                Layout::from_size_align(0x40, 1).unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_headroom(&allocator);
+        assert_eq!(allocator.deallocation_credits, 0);
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions::from_parts(0x1000, 0x100)
+        );
+    }
+
+    #[test]
+    fn partial_deallocation_grows_both_full_metadata_arrays() {
+        let heap = TestHeap::new(0x20000);
         let mut allocator = MemoryBlock::init();
-        for i in 0..128 {
+        // Deliberately construct the boundary state left possible by the old
+        // allocator. Normal allocations now reserve credits before reaching it.
+        for i in 0..127 {
             allocator
-                .add_region(&MemoryRegions {
-                    address: 0x1000 + i * 0x1000,
-                    size: 0x100,
-                })
+                .add_region(&MemoryRegions::from_parts(heap.address + i * 0x200, 0x80))
                 .unwrap();
         }
-        allocator.check_regions().unwrap();
+        allocator
+            .add_region(&MemoryRegions::from_parts(heap.address + 0x10001, 0xFFFF))
+            .unwrap();
+        for i in 0..128 {
+            allocator
+                .add_reserved_region(&MemoryRegions::from_parts(
+                    heap.address + i * 0x200 + 0x100,
+                    0x80,
+                ))
+                .unwrap();
+        }
+        allocator.allocatable = true;
+        allocator.deallocation_credits = 1;
+        let address = heap.address + 0x120;
+        allocator
+            .try_deallocate_region(address, Layout::from_size_align(0x20, 1).unwrap(), false)
+            .unwrap();
+        assert_eq!(allocator.region_capacity, 256);
+        assert_eq!(allocator.reserved_region_capacity, 256);
+        // Metadata alignment itself splits a free range and creates a reserved
+        // entry. The release then adds a hole and splits a reserved entry.
+        assert_eq!(allocator.region_size, 130);
+        assert_eq!(allocator.reserved_region_size, 130);
+        assert_headroom(&allocator);
+        assert!(
+            allocator.regions[allocator.region_size as usize..]
+                .iter()
+                .all(|&r| r == EMPTY_REGION)
+        );
+        assert!(
+            allocator.reserved_regions[allocator.reserved_region_size as usize..]
+                .iter()
+                .all(|&r| r == EMPTY_REGION)
+        );
+        let reused = allocator.allocate_region(0x20, 1).unwrap();
+        allocator.deallocate_region(reused, Layout::from_size_align(0x20, 1).unwrap());
+        assert_headroom(&allocator);
+    }
 
-        // A previously allocated block lies in a gap between free regions.
-        // Returning it requires a new free-list entry, but metadata cannot
-        // expand without a contiguous allocation.
-        allocator.add_reserved_alloc_record(0x1800, 0x100).unwrap();
-        let result =
-            allocator.try_deallocate_region(0x1800, Layout::from_size_align(0x100, 0x10).unwrap());
-        assert_eq!(result, Err("region metadata is full"));
-        assert_eq!(allocator.region_size, 128);
-        assert_eq!(allocator.reserved_region_size, 1);
+    #[test]
+    fn metadata_growth_rolls_back_when_it_consumes_the_callers_only_fit() {
+        let heap = TestHeap::new(0x3000);
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions::from_parts(heap.address, 0x3000))
+            .unwrap();
+        allocator.check_regions().unwrap();
+        let mut allocated = Vec::new();
+        let first = Layout::from_size_align(0x1000 - 126 * 0x10, 1).unwrap();
+        allocated.push((allocator.allocate_region(first.size(), 1).unwrap(), first));
+        let small = Layout::from_size_align(0x10, 1).unwrap();
+        for _ in 0..126 {
+            allocated.push((allocator.allocate_region(0x10, 1).unwrap(), small));
+        }
+        assert_eq!(allocator.deallocation_credits, 127);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions::from_parts(heap.address + 0x1000, 0x2000)
+        );
+        assert_headroom(&allocator);
+        let before = snapshot(&allocator);
+        // Expanded arrays fit, but leave no bytes for the user's allocation.
+        assert_eq!(allocator.allocate_region(0x2000, 1), None);
+        assert_eq!(snapshot(&allocator), before);
+        for (address, layout) in allocated {
+            allocator.deallocate_region(address, layout);
+            assert_headroom(&allocator);
+        }
+        assert_eq!(allocator.allocate_region(0x3000, 1), Some(heap.address));
+        allocator.deallocate_region(heap.address, Layout::from_size_align(0x3000, 1).unwrap());
+        assert_headroom(&allocator);
+    }
+
+    #[test]
+    fn deallocation_validation_failure_does_not_remove_reserved_record() {
+        let mut allocator = fragmented_block(1, 0x1000, 0x100);
+        let address = allocator.allocate_region(0x80, 1).unwrap();
+        // A corrupt neighboring free range must be diagnosed before the
+        // prevalidated reserved removal is committed.
+        allocator.regions[0] = MemoryRegions::from_parts(address - 1, usize::MAX);
+        let before = snapshot(&allocator);
+        assert_eq!(
+            allocator.try_deallocate_region(
+                address,
+                Layout::from_size_align(0x80, 1).unwrap(),
+                true,
+            ),
+            Err("region end overflow")
+        );
+        assert_eq!(snapshot(&allocator), before);
+    }
+
+    #[test]
+    fn raw_allocation_at_full_capacity_does_not_need_a_temporary_split_slot() {
+        let mut allocator = fragmented_block(119, 0x1000, 0x100);
+        allocator.region_capacity = allocator.region_size;
+        allocator.regions[0] = MemoryRegions::from_parts(0x1001, 0xFF);
+        // Alignment leaves a prefix but consumes the entire suffix. The final
+        // free count is unchanged even though the old algorithm inserted first.
+        assert_eq!(allocator.allocate_region_internal(0xE0, 0x20), Some(0x1020));
+        assert_eq!(allocator.region_size, 119);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions::from_parts(0x1001, 0x1F)
+        );
+    }
+
+    #[test]
+    fn repeated_metadata_growth_then_deallocations_and_reuse() {
+        let heap = TestHeap::new(0x400000);
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions::from_parts(heap.address, 0x400000))
+            .unwrap();
+        allocator.check_regions().unwrap();
+        let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
+        let mut allocated = Vec::new();
+        for _ in 0..600 {
+            let address = allocator
+                .allocate_region(layout.size(), layout.align())
+                .unwrap();
+            assert_eq!(address % layout.align(), 0);
+            allocated.push(address);
+            assert_headroom(&allocator);
+        }
+        assert!(allocator.region_capacity >= 2048); // At least four doublings.
+        let capacity = allocator.region_capacity;
+        for parity in [1, 0] {
+            for &address in allocated.iter().skip(parity).step_by(2) {
+                allocator.deallocate_region(address, layout);
+                assert_headroom(&allocator);
+            }
+        }
+        assert_eq!(allocator.deallocation_credits, 0);
+        assert_eq!(allocator.region_capacity, capacity);
+        let before = snapshot(&allocator);
+        let large = Layout::from_size_align(0x4000, 0x1000).unwrap();
+        let address = allocator
+            .allocate_region(large.size(), large.align())
+            .unwrap();
+        allocator.deallocate_region(address, large);
+        assert_eq!(snapshot(&allocator), before);
+    }
+
+    #[test]
+    fn public_allocator_apis_grow_release_and_reuse_memory() {
+        use crate::DefaultAllocator;
+        use core::alloc::GlobalAlloc;
+
+        static ALLOCATOR: DefaultAllocator = DefaultAllocator::new();
+        let heap = TestHeap::new(0x400000);
+        ALLOCATOR.init();
+        assert_eq!(
+            ALLOCATOR.allocate_with_size_and_align(0x10, 1),
+            Err("allocator not finalized")
+        );
+        ALLOCATOR
+            .add_available_region(heap.address, heap.layout.size())
+            .unwrap();
+        ALLOCATOR.add_reserved_region(heap.address, 0x1000).unwrap();
+        ALLOCATOR.finalize().unwrap();
+        ALLOCATOR.finalize().unwrap();
+        assert_eq!(
+            ALLOCATOR.add_available_region(heap.address, 0x1000),
+            Err("allocator already finalized")
+        );
+        let layout = Layout::from_size_align(0x1800, 0x1000).unwrap();
+        let small = Layout::from_size_align(0x20, 0x20).unwrap();
+        let explicit = ALLOCATOR
+            .allocate_with_size_and_align(layout.size(), layout.align())
+            .unwrap();
+        let mut allocated = Vec::new();
+        for _ in 0..300 {
+            // SAFETY: The allocator has exclusive use of the live writable
+            // test heap, and layout is nonzero with valid power-of-two alignment.
+            let ptr = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(!ptr.is_null());
+            assert_eq!(ptr as usize % layout.align(), 0);
+            // SAFETY: This is a live returned allocation of layout.size bytes.
+            unsafe { ptr.write_bytes(0xA5, layout.size()) };
+            allocated.push(ptr);
+        }
+        // SAFETY: The initialized allocator owns enough writable test backing
+        // for this valid layout; this request exercises its buddy allocator.
+        let buddy = unsafe { ALLOCATOR.alloc(small) };
+        assert!(!buddy.is_null());
+        let before_failure = snapshot(ALLOCATOR.range_list_allocator.lock().get().unwrap());
+        let huge = Layout::from_size_align(heap.layout.size() * 2, 0x1000).unwrap();
+        // SAFETY: huge is a valid nonzero layout. Exhaustion must return null
+        // without changing any metadata or invalidating earlier allocations.
+        assert!(unsafe { ALLOCATOR.alloc(huge) }.is_null());
+        assert_eq!(
+            ALLOCATOR.allocate_with_size_and_align(huge.size(), huge.align()),
+            Err("failed to allocate")
+        );
+        assert_eq!(
+            snapshot(ALLOCATOR.range_list_allocator.lock().get().unwrap()),
+            before_failure
+        );
+        for &ptr in &allocated {
+            // SAFETY: Each pointer still owns layout.size bytes written above.
+            unsafe {
+                assert_eq!(ptr.read(), 0xA5);
+                assert_eq!(ptr.add(layout.size() - 1).read(), 0xA5);
+            }
+        }
+        let mut observed_reserved = 0;
+        ALLOCATOR
+            .for_each_reserved_region(|_, _| observed_reserved += 1)
+            .unwrap();
+        assert!(observed_reserved > 1);
+        for parity in [1, 0] {
+            for &ptr in allocated.iter().skip(parity).step_by(2) {
+                // SAFETY: Each pointer is a distinct live allocation with this
+                // exact layout, and the two parity passes release it once.
+                unsafe { ALLOCATOR.dealloc(ptr, layout) };
+            }
+        }
+        // SAFETY: explicit came from the public range API with this large
+        // layout (the same range path used by GlobalAlloc); buddy is a live
+        // allocation made with small. Neither has been released yet.
+        unsafe {
+            ALLOCATOR.dealloc(explicit as *mut u8, layout);
+            ALLOCATOR.dealloc(buddy, small);
+        }
+        let mut free_bytes = 0;
+        ALLOCATOR
+            .for_each_free_region(|_, size| free_bytes += size)
+            .unwrap();
+        assert!(free_bytes > 0x300000);
+        // Clear the static's metadata references before TestHeap frees backing.
+        ALLOCATOR.buddy_allocator.lock().take();
+        ALLOCATOR.range_list_allocator.lock().take();
+    }
+
+    #[test]
+    fn public_global_allocator_metadata_exhaustion_preserves_all_live_deallocations() {
+        use crate::MemoryAllocator;
+        use core::alloc::GlobalAlloc;
+
+        static ALLOCATOR: MemoryAllocator<64, { crate::levels!(64) }> = MemoryAllocator::new();
+        let heap = TestHeap::new(0x80000);
+        ALLOCATOR.init();
+        for i in 0..119 {
+            ALLOCATOR
+                .add_available_region(heap.address + i * 0x1000, 0x100)
+                .unwrap();
+        }
+        ALLOCATOR.finalize().unwrap();
+        let original = snapshot(ALLOCATOR.range_list_allocator.lock().get().unwrap());
+        // Requests above the buddy limit take the range path. Each fragment
+        // holds two adjacent allocations, so freeing the first creates a hole.
+        let layout = Layout::from_size_align(0x80, 0x80).unwrap();
+        for _ in 0..3 {
+            let mut allocated = Vec::new();
+            loop {
+                let before = snapshot(ALLOCATOR.range_list_allocator.lock().get().unwrap());
+                // SAFETY: The initialized allocator exclusively manages this
+                // live writable backing and layout is valid and nonzero.
+                let ptr = unsafe { ALLOCATOR.alloc(layout) };
+                if ptr.is_null() {
+                    assert_eq!(
+                        snapshot(ALLOCATOR.range_list_allocator.lock().get().unwrap()),
+                        before
+                    );
+                    break;
+                }
+                allocated.push(ptr);
+            }
+            assert!(allocated.len() > 2);
+            for parity in [0, 1] {
+                for &ptr in allocated.iter().skip(parity).step_by(2) {
+                    // SAFETY: Each distinct pointer came from this allocator
+                    // with this layout, and is released exactly once.
+                    unsafe { ALLOCATOR.dealloc(ptr, layout) };
+                    assert_headroom(ALLOCATOR.range_list_allocator.lock().get().unwrap());
+                }
+            }
+            assert_eq!(
+                snapshot(ALLOCATOR.range_list_allocator.lock().get().unwrap()),
+                original
+            );
+        }
+        ALLOCATOR.buddy_allocator.lock().take();
+        ALLOCATOR.range_list_allocator.lock().take();
+    }
+
+    #[test]
+    fn metadata_capacity_overflow_does_not_mutate_lists() {
+        let mut allocator = fragmented_block(1, 0x1000, 0x100);
+        allocator.region_capacity = 1 << 31;
+        let before = snapshot(&allocator);
+        assert_eq!(
+            allocator.overflow_wrapping(|_| Ok(())),
+            Err("region capacity overflow")
+        );
+        assert_eq!(snapshot(&allocator), before);
     }
 
     #[test]
@@ -2153,8 +2684,11 @@ mod tests {
         let pre_region_size = allocator.region_size;
         let pre_reserved_size = allocator.reserved_region_size;
 
-        let res = allocator
-            .try_deallocate_region(usize::MAX - 0x8, Layout::from_size_align(0x20, 1).unwrap());
+        let res = allocator.try_deallocate_region(
+            usize::MAX - 0x8,
+            Layout::from_size_align(0x20, 1).unwrap(),
+            true,
+        );
         assert_eq!(res, Err("dealloc end overflow"));
         assert_eq!(allocator.region_size, pre_region_size);
         assert_eq!(allocator.reserved_region_size, pre_reserved_size);

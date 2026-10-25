@@ -155,6 +155,9 @@ unsafe impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> GlobalAlloc
         if max(layout.size(), layout.align()) > MAX_ALLOCATABLE_BYTES {
             let mut range_list_allocator_guard = self.range_list_allocator.lock();
             if let Some(range_list_allocator) = range_list_allocator_guard.get_mut() {
+                // Successful range allocations reserve metadata for both a
+                // free-list insertion and a reserved-list split on release.
+                // This path therefore never needs to allocate metadata.
                 range_list_allocator.deallocate_region(ptr as usize, layout);
             }
         } else {
