@@ -241,6 +241,33 @@ fn randomized_allocate_free_state_transitions() {
                 let before = snapshot(&block);
                 match block.allocate_region(size, alignment) {
                     Some(address) => {
+                        let end = address.checked_add(size).expect("allocation end overflow");
+                        assert!(
+                            address >= arena.base && end <= arena.end(),
+                            "seed={seed:#x}, step={step}: allocation outside test backing"
+                        );
+                        assert_eq!(
+                            address % alignment,
+                            0,
+                            "seed={seed:#x}, step={step}: invalid alignment"
+                        );
+                        for entry in &live {
+                            let live_end = entry.address + entry.layout.size();
+                            assert!(
+                                end <= entry.address || live_end <= address,
+                                "seed={seed:#x}, step={step}: duplicate allocation"
+                            );
+                        }
+                        for storage in [&block.regions.0, &block.reserved_regions.0] {
+                            if let RegionData::Heap(entries) = storage {
+                                let start = entries.as_ptr() as usize;
+                                let metadata_end = start + entries.len() * size_of::<MemoryRegions>();
+                                assert!(
+                                    end <= start || metadata_end <= address,
+                                    "seed={seed:#x}, step={step}: allocation overlaps metadata"
+                                );
+                            }
+                        }
                         if old_capacities
                             == (block.region_capacity, block.reserved_region_capacity)
                         {
