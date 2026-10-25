@@ -77,6 +77,18 @@ fn snapshot(block: &MemoryBlock) -> Snapshot {
     }
 }
 
+fn assert_live_pattern(entry: &Live, seed: u64, step: usize) {
+    // SAFETY: This live block was allocated within the writable Arena and
+    // has not been released. Its original byte length is still valid.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(entry.address as *const u8, entry.layout.size()) };
+    assert!(
+        bytes.iter().all(|&b| b == entry.pattern),
+        "seed={seed:#x}, step={step}: live allocation contents corrupted at {:#x}",
+        entry.address
+    );
+}
+
 fn validate(block: &MemoryBlock, arena: &Arena, live: &[Live], seed: u64, step: usize) {
     let context = || format!("seed={seed:#x}, step={step}");
     assert_eq!(
@@ -148,16 +160,7 @@ fn validate(block: &MemoryBlock, arena: &Arena, live: &[Live], seed: u64, step: 
         );
         used.push((entry.address, end));
 
-        // SAFETY: This live block was allocated within the writable Arena and
-        // has not been released. Its original byte length is still valid.
-        let bytes =
-            unsafe { core::slice::from_raw_parts(entry.address as *const u8, entry.layout.size()) };
-        assert!(
-            bytes.iter().all(|&b| b == entry.pattern),
-            "{}: live allocation contents corrupted at {:#x}",
-            context(),
-            entry.address
-        );
+        assert_live_pattern(entry, seed, step);
     }
     used.sort_unstable_by_key(|r| r.0);
     for pair in used.windows(2) {
@@ -206,6 +209,18 @@ fn randomized_allocate_free_state_transitions() {
     let steps = std::env::var("ALLOCATOR_FUZZ_STEPS")
         .map(|value| value.parse::<usize>().expect("invalid ALLOCATOR_FUZZ_STEPS"))
         .unwrap_or(2_000);
+    // Full interval validation is expensive for million-step runs. The
+    // memory pattern of each allocation is still checked before its release.
+    let default_interval = if steps > 10_000 { 256 } else { 8 };
+    let validation_interval = std::env::var("ALLOCATOR_FUZZ_VALIDATE_EVERY")
+        .map(|value| {
+            let interval = value
+                .parse::<usize>()
+                .expect("invalid ALLOCATOR_FUZZ_VALIDATE_EVERY");
+            assert!(interval > 0, "ALLOCATOR_FUZZ_VALIDATE_EVERY must be positive");
+            interval
+        })
+        .unwrap_or(default_interval);
 
     for seed in seeds {
         // Metadata growth writes to the managed area, so fake addresses
@@ -218,7 +233,9 @@ fn randomized_allocate_free_state_transitions() {
         block.check_regions().unwrap();
         let mut rng = Rng::new(seed);
         let mut live = Vec::<Live>::new();
-        std::eprintln!("allocator fuzz seed={seed:#x}, steps={steps}");
+        std::eprintln!(
+            "allocator fuzz seed={seed:#x}, steps={steps}, validate_every={validation_interval}"
+        );
 
         for step in 0..steps {
             if live.is_empty() || (live.len() < 400 && rng.next() % 100 < 63) {
@@ -298,6 +315,7 @@ fn randomized_allocate_free_state_transitions() {
             } else {
                 let index = (rng.next() as usize) % live.len();
                 let entry = live.swap_remove(index);
+                assert_live_pattern(&entry, seed, step);
                 block.deallocate_region(entry.address, entry.layout);
             }
 
@@ -318,8 +336,15 @@ fn randomized_allocate_free_state_transitions() {
                 );
                 assert_eq!(snapshot(&block), before);
             }
-            if step % 8 == 0 {
+            if step % validation_interval == 0 {
                 validate(&block, &arena, &live, seed, step);
+            }
+            if steps >= 100_000 && (step + 1) % 100_000 == 0 {
+                std::eprintln!(
+                    "allocator fuzz seed={seed:#x}: {}/{} operations completed",
+                    step + 1,
+                    steps
+                );
             }
         }
 
@@ -327,6 +352,7 @@ fn randomized_allocate_free_state_transitions() {
         while !live.is_empty() {
             let index = (rng.next() as usize) % live.len();
             let entry = live.swap_remove(index);
+            assert_live_pattern(&entry, seed, steps + 1);
             block.deallocate_region(entry.address, entry.layout);
         }
         validate(&block, &arena, &live, seed, steps + 1);
