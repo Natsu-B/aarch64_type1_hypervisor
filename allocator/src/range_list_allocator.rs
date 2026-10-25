@@ -584,12 +584,24 @@ impl MemoryBlock {
         None
     }
 
-    fn ensure_overflow_headroom(&mut self) {
-        if self.region_size + 10 > self.region_capacity
-            || self.reserved_region_size + 10 > self.reserved_region_capacity
+    fn ensure_overflow_headroom(&mut self) -> Result<(), &'static str> {
+        if self.region_size.saturating_add(10) > self.region_capacity
+            || self.reserved_region_size.saturating_add(10) > self.reserved_region_capacity
         {
-            self.overflow_wrapping();
+            self.overflow_wrapping()?;
         }
+        Ok(())
+    }
+
+    // Deallocation can add at most one entry to each metadata array. Do not
+    // require the larger allocation headroom when those slots already exist.
+    fn ensure_deallocation_headroom(&mut self) -> Result<(), &'static str> {
+        if self.region_size >= self.region_capacity
+            || self.reserved_region_size >= self.reserved_region_capacity
+        {
+            self.overflow_wrapping()?;
+        }
+        Ok(())
     }
 
     // Record allocation into reserved list: reserved := reserved ∪ [addr, addr+size)
@@ -698,52 +710,80 @@ impl MemoryBlock {
         )
     }
 
-    fn overflow_wrapping(&mut self) {
-        let allocate_size = (self.region_capacity + self.reserved_region_capacity) as usize
-            * 2
-            * core::mem::size_of::<MemoryRegions>();
+    fn overflow_wrapping(&mut self) -> Result<(), &'static str> {
+        // The metadata allocation itself can split a free range and insert a
+        // reserved range, so both current arrays must have a spare entry.
+        if self.region_size >= self.region_capacity
+            || self.reserved_region_size >= self.reserved_region_capacity
+        {
+            return Err("region metadata is full");
+        }
+
+        let new_regions_capacity = self
+            .region_capacity
+            .checked_mul(2)
+            .ok_or("region capacity overflow")?;
+        let new_reserved_capacity = self
+            .reserved_region_capacity
+            .checked_mul(2)
+            .ok_or("reserved region capacity overflow")?;
+        let allocate_size = (new_regions_capacity as usize)
+            .checked_add(new_reserved_capacity as usize)
+            .and_then(|capacity| capacity.checked_mul(size_of::<MemoryRegions>()))
+            .ok_or("region metadata allocation size overflow")?;
+
         let new_region = self
             .allocate_region_internal(allocate_size, 4096)
-            .expect("out of memory");
-
-        let new_regions_capacity = self.region_capacity * 2;
-        let new_reserved_capacity = self.reserved_region_capacity * 2;
+            .ok_or("out of memory for region metadata")?;
 
         let new_regions_ptr = new_region as *mut MemoryRegions;
         let new_reserved_ptr = (new_region
-            + new_regions_capacity as usize * core::mem::size_of::<MemoryRegions>())
+            + new_regions_capacity as usize * size_of::<MemoryRegions>())
             as *mut MemoryRegions;
 
         unsafe {
+            // SAFETY: allocate_region_internal reserved a disjoint, writable,
+            // 4096-byte-aligned allocation of allocate_size bytes. Both
+            // MemoryRegions fields are usize, so all-zero bytes form a valid
+            // EMPTY_REGION. Initialize the full capacities before creating
+            // references to their elements.
+            core::ptr::write_bytes(new_region as *mut u8, 0, allocate_size);
+
+            // SAFETY: The newly allocated arrays are disjoint from the old
+            // metadata storage. Each source contains at least its live count
+            // of initialized MemoryRegions, and each destination has enough
+            // aligned space for those entries.
             copy_nonoverlapping(
                 self.regions.as_ptr(),
                 new_regions_ptr,
                 self.region_size as usize,
             );
-            self.regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
-                new_regions_ptr,
-                new_regions_capacity as usize,
-            )));
-
             copy_nonoverlapping(
                 self.reserved_regions.as_ptr(),
                 new_reserved_ptr,
                 self.reserved_region_size as usize,
             );
-            self.reserved_regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
-                new_reserved_ptr,
-                new_reserved_capacity as usize,
+
+            // SAFETY: Both arrays are fully initialized, aligned, disjoint,
+            // and backed by memory reserved for the allocator's lifetime.
+            self.regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
+                new_regions_ptr,
+                new_regions_capacity as usize,
             )));
+            self.reserved_regions = RegionContainer(RegionData::Heap(
+                slice::from_raw_parts_mut(new_reserved_ptr, new_reserved_capacity as usize),
+            ));
         }
         self.region_capacity = new_regions_capacity;
         self.reserved_region_capacity = new_reserved_capacity;
+        Ok(())
     }
 
     pub fn allocate_region(&mut self, size: usize, align: usize) -> Option<usize> {
         if !self.allocatable {
             return None;
         }
-        self.ensure_overflow_headroom();
+        self.ensure_overflow_headroom().ok()?;
         self.allocate_region_internal(size, align)
     }
 
@@ -760,8 +800,8 @@ impl MemoryBlock {
         if size == 0 {
             return Ok(()); // Nothing to do
         }
-        // Ensure headroom for metadata operations
-        self.ensure_overflow_headroom();
+        // Reserve only the metadata slots that deallocation could add.
+        self.ensure_deallocation_headroom()?;
 
         // Remove from reserved list and return to free list
         self.remove_reserved_alloc_record(addr, size)?;
@@ -789,7 +829,7 @@ impl MemoryBlock {
             return Err("allocator not allocatable");
         }
 
-        self.ensure_overflow_headroom();
+        self.ensure_overflow_headroom()?;
         let allocate = self
             .allocate_region_internal(reserve_bytes, 1)
             .ok_or("allocation failed")?;
@@ -1517,6 +1557,12 @@ mod tests {
             allocator.reserved_region_capacity,
             initial_reserved_capacity * 2
         );
+        assert!(allocator.regions[allocator.region_size as usize..]
+            .iter()
+            .all(|&region| region == EMPTY_REGION));
+        assert!(allocator.reserved_regions[allocator.reserved_region_size as usize..]
+            .iter()
+            .all(|&region| region == EMPTY_REGION));
 
         // region_size should be 120 now.
         assert_eq!(allocator.region_size, 120);
@@ -1531,6 +1577,71 @@ mod tests {
         assert_eq!(allocator.region_capacity, capacity);
         assert_eq!(allocator.region_size, 1);
         assert!(allocator.regions[1..].iter().all(|&r| r == EMPTY_REGION));
+    }
+
+    #[test]
+    fn test_allocation_fails_without_metadata_growth_space() {
+        let mut allocator = MemoryBlock::init();
+        for i in 0..119 {
+            allocator
+                .add_region(&MemoryRegions {
+                    address: 0x1000 + i * 0x1000,
+                    size: 0x100,
+                })
+                .unwrap();
+        }
+        allocator.check_regions().unwrap();
+
+        // Free space exists, but no free range can hold the expanded arrays.
+        // Exhausting metadata headroom must not panic or modify the lists.
+        assert_eq!(allocator.allocate_region(0x10, 0x10), None);
+        assert_eq!(allocator.region_size, 119);
+        assert_eq!(allocator.reserved_region_size, 0);
+        assert_eq!(allocator.region_capacity, 128);
+    }
+
+    #[test]
+    fn test_deallocation_uses_existing_metadata_slots() {
+        let mut allocator = MemoryBlock::init();
+        for i in 0..119 {
+            allocator
+                .add_region(&MemoryRegions {
+                    address: 0x1000 + i * 0x1000,
+                    size: 0x100,
+                })
+                .unwrap();
+        }
+        allocator.check_regions().unwrap();
+
+        // Simulate a live allocation made before the free list fragmented.
+        let addr = allocator.allocate_region_internal(0x10, 0x10).unwrap();
+        allocator
+            .try_deallocate_region(addr, Layout::from_size_align(0x10, 0x10).unwrap())
+            .unwrap();
+        assert_eq!(allocator.region_capacity, 128);
+        assert_eq!(allocator.region_size, 119);
+        assert_eq!(allocator.reserved_region_size, 0);
+    }
+
+    #[test]
+    fn test_deallocation_reports_metadata_exhaustion() {
+        let mut allocator = MemoryBlock::init();
+        for i in 0..128 {
+            allocator
+                .add_region(&MemoryRegions {
+                    address: 0x1000 + i * 0x1000,
+                    size: 0x100,
+                })
+                .unwrap();
+        }
+        allocator.check_regions().unwrap();
+
+        let addr = allocator.allocate_region_internal(0x10, 0x10).unwrap();
+        let result =
+            allocator.try_deallocate_region(addr, Layout::from_size_align(0x10, 0x10).unwrap());
+        assert_eq!(result, Err("region metadata is full"));
+        assert_eq!(allocator.region_size, 128);
+        assert_eq!(allocator.reserved_region_size, 1);
     }
 
     #[test]
