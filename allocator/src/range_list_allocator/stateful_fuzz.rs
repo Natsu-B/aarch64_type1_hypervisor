@@ -196,9 +196,9 @@ fn seed_from_environment(value: &str) -> u64 {
 fn randomized_allocate_free_state_transitions() {
     const SEEDS: [u64; 4] = [
         0x19a4_d7e2_87bf_6431,
-        0x775e_d2c3_1327_9a41,
+        0x775e_d2c3_1327_9a40,
         0xc50b_783d_ffa2_1087,
-        0xfeca_b357_1130_945d,
+        0xfeca_b357_1130_945c,
     ];
     let seeds = std::env::var("ALLOCATOR_FUZZ_SEED")
         .map(|value| std::vec![seed_from_environment(&value)])
