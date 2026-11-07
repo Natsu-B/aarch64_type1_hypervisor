@@ -61,7 +61,6 @@ mod tests {
     use core::mem::MaybeUninit;
     use core::mem::align_of;
     use core::ops::ControlFlow;
-    use std::env;
     use std::path::PathBuf;
 
     fn align_dtb(bytes: &[u8]) -> AlignedSliceBox<u8> {
@@ -498,7 +497,7 @@ mod tests {
 
     #[test]
     fn ranges_pci_3cells_translation_works() {
-        let out_dir = env::var_os("OUT_DIR").unwrap();
+        let out_dir = env!("OUT_DIR");
         let mut path = PathBuf::from(out_dir);
         path.push("ranges_pci_3cells.dtb");
 
@@ -523,7 +522,7 @@ mod tests {
 
     #[test]
     fn pcie_reg_iter_skips_self_ranges() {
-        let out_dir = env::var_os("OUT_DIR").unwrap();
+        let out_dir = env!("OUT_DIR");
         let mut path = PathBuf::from(out_dir);
         path.push("pcie_reg_ranges_not_covered.dtb");
 
