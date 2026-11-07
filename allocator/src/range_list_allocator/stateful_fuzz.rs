@@ -1,8 +1,12 @@
 //! Reproducible stateful allocator fuzz tests, without third-party crates.
 
-use super::{MemoryBlock, MemoryRegions, RegionData};
+use super::MemoryBlock;
+use super::MemoryRegions;
+use super::RegionData;
 use core::mem::size_of;
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::Layout;
+use std::alloc::alloc_zeroed;
+use std::alloc::dealloc;
 use std::vec::Vec;
 
 struct Arena {
@@ -98,14 +102,16 @@ fn validate(block: &MemoryBlock, arena: &Arena, live: &[Live], seed: u64, step: 
         context()
     );
     assert!(
-        block.region_size
+        block
+            .region_size
             .checked_add(block.deallocation_credits)
             .is_some_and(|n| n <= block.region_capacity),
         "{}: free metadata headroom exhausted",
         context()
     );
     assert!(
-        block.reserved_region_size
+        block
+            .reserved_region_size
             .checked_add(block.deallocation_credits)
             .is_some_and(|n| n <= block.reserved_region_capacity),
         "{}: reserved metadata headroom exhausted",
@@ -175,7 +181,9 @@ fn validate(block: &MemoryBlock, arena: &Arena, live: &[Live], seed: u64, step: 
     for storage in [&block.regions.0, &block.reserved_regions.0] {
         if let RegionData::Heap(entries) = storage {
             let start = entries.as_ptr() as usize;
-            let end = start.checked_add(entries.len() * size_of::<MemoryRegions>()).unwrap();
+            let end = start
+                .checked_add(entries.len() * size_of::<MemoryRegions>())
+                .unwrap();
             assert!(
                 reserved
                     .iter()
@@ -207,7 +215,11 @@ fn randomized_allocate_free_state_transitions() {
         .map(|value| std::vec![seed_from_environment(&value)])
         .unwrap_or_else(|_| SEEDS.to_vec());
     let steps = std::env::var("ALLOCATOR_FUZZ_STEPS")
-        .map(|value| value.parse::<usize>().expect("invalid ALLOCATOR_FUZZ_STEPS"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("invalid ALLOCATOR_FUZZ_STEPS")
+        })
         .unwrap_or(2_000);
     // Full interval validation is expensive for million-step runs. The
     // memory pattern of each allocation is still checked before its release.
@@ -217,7 +229,10 @@ fn randomized_allocate_free_state_transitions() {
             let interval = value
                 .parse::<usize>()
                 .expect("invalid ALLOCATOR_FUZZ_VALIDATE_EVERY");
-            assert!(interval > 0, "ALLOCATOR_FUZZ_VALIDATE_EVERY must be positive");
+            assert!(
+                interval > 0,
+                "ALLOCATOR_FUZZ_VALIDATE_EVERY must be positive"
+            );
             interval
         })
         .unwrap_or(default_interval);
@@ -246,14 +261,13 @@ fn randomized_allocate_free_state_transitions() {
                     _ => 1 + (rng.next() % 256) as usize,
                 };
                 let layout = Layout::from_size_align(size, alignment).unwrap();
-                let first_fit =
-                    block.regions[..block.region_size as usize]
-                        .iter()
-                        .find_map(|r| {
-                            let address = r.address.checked_next_multiple_of(alignment)?;
-                            let end = address.checked_add(size)?;
-                            (end <= r.end_checked().ok()?).then_some(address)
-                        });
+                let first_fit = block.regions[..block.region_size as usize]
+                    .iter()
+                    .find_map(|r| {
+                        let address = r.address.checked_next_multiple_of(alignment)?;
+                        let end = address.checked_add(size)?;
+                        (end <= r.end_checked().ok()?).then_some(address)
+                    });
                 let old_capacities = (block.region_capacity, block.reserved_region_capacity);
                 let before = snapshot(&block);
                 match block.allocate_region(size, alignment) {
@@ -278,15 +292,15 @@ fn randomized_allocate_free_state_transitions() {
                         for storage in [&block.regions.0, &block.reserved_regions.0] {
                             if let RegionData::Heap(entries) = storage {
                                 let start = entries.as_ptr() as usize;
-                                let metadata_end = start + entries.len() * size_of::<MemoryRegions>();
+                                let metadata_end =
+                                    start + entries.len() * size_of::<MemoryRegions>();
                                 assert!(
                                     end <= start || metadata_end <= address,
                                     "seed={seed:#x}, step={step}: allocation overlaps metadata"
                                 );
                             }
                         }
-                        if old_capacities
-                            == (block.region_capacity, block.reserved_region_capacity)
+                        if old_capacities == (block.region_capacity, block.reserved_region_capacity)
                         {
                             assert_eq!(
                                 Some(address),
