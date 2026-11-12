@@ -78,7 +78,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     pub(crate) fn alloc(
         &mut self,
         layout: Layout,
-        alloc_heap: Option<&dyn Fn() -> Option<usize>>,
+        alloc_heap: Option<&dyn Fn() -> Option<(usize, usize)>>,
     ) -> Result<usize, &'static str> {
         pr_debug!("buddy_allocator: alloc before: {:#?}", self);
         let required_size = Self::required_size(layout);
@@ -91,8 +91,8 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
 
         if free_level == LEVELS {
             if let Some(allocator) = alloc_heap {
-                let new_heap = allocator().ok_or("failed to allocate memory from heap")?;
-                self.set_memory(new_heap, MAX_ALLOCATABLE_BYTES);
+                let (new_heap, size) = allocator().ok_or("failed to allocate memory from heap")?;
+                self.set_memory(new_heap, size);
                 // After adding memory, we should have a block at the highest level
                 free_level = LEVELS - 1;
             } else {
@@ -355,7 +355,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         // Test the case where the external allocator is called but returns None.
         static EXTERNAL_HEAP_CALLED: AtomicBool = AtomicBool::new(false);
-        static HEAP_ALLOCATOR: fn() -> Option<usize> = || {
+        static HEAP_ALLOCATOR: fn() -> Option<(usize, usize)> = || {
             EXTERNAL_HEAP_CALLED.store(true, Ordering::SeqCst);
             None // Simulate always returning None.
         };

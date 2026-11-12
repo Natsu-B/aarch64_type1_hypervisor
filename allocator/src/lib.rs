@@ -61,6 +61,10 @@ macro_rules! levels {
     };
 }
 
+/// Number of `MAX_ALLOCATABLE_BYTES` blocks the buddy allocator takes from the
+/// range-list allocator per refill.
+const BUDDY_REFILL_BLOCKS: usize = 16;
+
 /// Default allocator with 4096-byte maximum block size.
 pub type DefaultAllocator = MemoryAllocator<4096, { levels!(4096) }>;
 
@@ -118,12 +122,22 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         }
     }
 
-    /// Allocates a block for the buddy allocator from the range-list allocator.
-    pub fn alloc_for_buddy_allocator(&self) -> Option<usize> {
+    /// Allocates backing for the buddy allocator from the range-list allocator.
+    ///
+    /// Buddy pages are never returned to the range list, so refilling several
+    /// pages at once keeps them physically together and spends one range-list
+    /// allocation (and its release credit) per chunk instead of per page.
+    /// Falls back to a single page when no chunk-sized range is available.
+    /// Returns the chunk address and size.
+    pub fn alloc_for_buddy_allocator(&self) -> Option<(usize, usize)> {
         let mut range_list_allocator_guard = self.range_list_allocator.lock();
         let range_list_allocator = range_list_allocator_guard.get_mut()?;
-        let layout = Layout::from_size_align(MAX_ALLOCATABLE_BYTES, MAX_ALLOCATABLE_BYTES).ok()?;
-        range_list_allocator.allocate_region(layout.size(), layout.align())
+        [BUDDY_REFILL_BLOCKS, 1].into_iter().find_map(|blocks| {
+            let size = MAX_ALLOCATABLE_BYTES.checked_mul(blocks)?;
+            range_list_allocator
+                .allocate_region(size, MAX_ALLOCATABLE_BYTES)
+                .map(|address| (address, size))
+        })
     }
 
     /// Rounds a range-list request to buddy-page granularity.
@@ -503,5 +517,63 @@ mod tests {
             .for_each_free_region(|address, size| free.push((address, size)))
             .unwrap();
         assert_eq!(free, [(heap_base, 0x2_000)]);
+    }
+
+    #[test]
+    fn buddy_refills_in_chunks_and_falls_back_to_single_pages() {
+        const PAGE: usize = 0x1_000;
+        const CHUNK: usize = PAGE * BUDDY_REFILL_BLOCKS;
+
+        static REFILL_ALLOCATOR: MemoryAllocator<PAGE, { levels!(PAGE) }> = MemoryAllocator::new();
+
+        fn free_bytes() -> usize {
+            let mut bytes = 0;
+            REFILL_ALLOCATOR
+                .for_each_free_region(|_, size| bytes += size)
+                .unwrap();
+            bytes
+        }
+
+        let heap_layout = Layout::from_size_align(CHUNK + PAGE, PAGE).unwrap();
+        // SAFETY: heap_layout is nonzero; the system allocator owns this
+        // backing independently of the allocator under test.
+        let heap = unsafe { std::alloc::alloc_zeroed(heap_layout) };
+        assert!(!heap.is_null());
+
+        REFILL_ALLOCATOR.init();
+        REFILL_ALLOCATOR
+            .add_available_region(heap as usize, heap_layout.size())
+            .unwrap();
+        REFILL_ALLOCATOR.finalize().unwrap();
+
+        let page = Layout::from_size_align(PAGE, PAGE).unwrap();
+        let mut pages = Vec::new();
+        for _ in 0..BUDDY_REFILL_BLOCKS {
+            // SAFETY: the allocator manages live writable backing; page is valid.
+            let ptr = unsafe { REFILL_ALLOCATOR.alloc(page) };
+            assert!(!ptr.is_null());
+            pages.push(ptr);
+        }
+        // One chunk served every page so far.
+        assert_eq!(free_bytes(), PAGE);
+
+        // No chunk-sized range remains, so the refill takes a single page.
+        // SAFETY: as above.
+        let ptr = unsafe { REFILL_ALLOCATOR.alloc(page) };
+        assert!(!ptr.is_null());
+        pages.push(ptr);
+        assert_eq!(free_bytes(), 0);
+        // SAFETY: as above.
+        assert!(unsafe { REFILL_ALLOCATOR.alloc(page) }.is_null());
+
+        for ptr in pages {
+            // SAFETY: each pointer came from this allocator with this layout.
+            unsafe { REFILL_ALLOCATOR.dealloc(ptr, page) };
+        }
+        // Clear the static's metadata references before freeing the backing.
+        REFILL_ALLOCATOR.buddy_allocator.lock().take();
+        REFILL_ALLOCATOR.range_list_allocator.lock().take();
+        // SAFETY: heap was allocated above with heap_layout.
+        unsafe { std::alloc::dealloc(heap, heap_layout) };
     }
 }
