@@ -36,17 +36,17 @@ impl<T> AlignedSliceBox<T> {
         len: usize,
         align: usize,
     ) -> Result<AlignedSliceBox<MaybeUninit<T>>, &'static str> {
+        let a = validate_align::<T>(align)?;
         if size_of::<T>() == 0 || len == 0 {
-            let a = NonZeroUsize::new(align_of::<T>()).unwrap();
             return Ok(AlignedSliceBox {
-                ptr: NonNull::dangling(),
+                // A dangling pointer that still honors the requested alignment.
+                ptr: NonNull::new(ptr::without_provenance_mut(a.get())).unwrap(),
                 len,
                 align: a,
                 _pd: PhantomData,
             });
         }
 
-        let a = validate_align::<T>(align)?;
         let elem = size_of::<T>();
         let size = elem.checked_mul(len).ok_or("size overflow")?;
         let layout = Layout::from_size_align(size, a.get()).map_err(|_| "invalid layout")?;
@@ -178,4 +178,23 @@ fn validate_align<T>(align: usize) -> Result<NonZeroUsize, &'static str> {
         return Err("align must be >= align_of::<T>()");
     }
     Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_box_honors_requested_alignment() {
+        let empty = AlignedSliceBox::<u8>::new_uninit_with_align(0, 0x1000).unwrap();
+        assert_eq!(empty.align().get(), 0x1000);
+        assert_eq!(empty.ptr.as_ptr() as usize % 0x1000, 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn empty_box_rejects_invalid_alignment() {
+        assert!(AlignedSliceBox::<u8>::new_uninit_with_align(0, 3).is_err());
+        assert!(AlignedSliceBox::<u64>::new_uninit_with_align(0, 1).is_err());
+    }
 }
