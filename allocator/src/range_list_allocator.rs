@@ -555,6 +555,10 @@ impl MemoryBlock {
 
     /// Stages growth in the new backing allocation before changing either old array.
     /// If the requested operation fails, restore the original arrays and counters.
+    ///
+    /// On success the previous heap-backed arrays stay reserved and are never
+    /// reused. Capacity doubles on each growth, so the retired metadata never
+    /// exceeds the size of the live arrays.
     fn overflow_wrapping<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, &'static str>,
