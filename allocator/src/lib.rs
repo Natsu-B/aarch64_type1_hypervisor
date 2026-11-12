@@ -181,16 +181,25 @@ unsafe impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> GlobalAlloc
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         if max(layout.size(), layout.align()) > MAX_ALLOCATABLE_BYTES {
-            let mut range_list_allocator_guard = self.range_list_allocator.lock();
-            if let Some((size, align)) = Self::range_request(layout.size(), layout.align())
-                && let Some(range_list_allocator) = range_list_allocator_guard.get_mut()
-            {
-                // Successful range allocations reserve metadata for both a
-                // free-list insertion and a reserved-list split on release.
-                // This path therefore never needs to allocate metadata.
-                // SAFETY: range_request validated this size/alignment pair.
-                let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
-                range_list_allocator.deallocate_region(ptr as usize, layout);
+            let result = {
+                let mut range_list_allocator_guard = self.range_list_allocator.lock();
+                if let Some((size, align)) = Self::range_request(layout.size(), layout.align())
+                    && let Some(range_list_allocator) = range_list_allocator_guard.get_mut()
+                {
+                    // Successful range allocations reserve metadata for both a
+                    // free-list insertion and a reserved-list split on release.
+                    // This path therefore never needs to allocate metadata.
+                    // SAFETY: range_request validated this size/alignment pair.
+                    let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
+                    range_list_allocator.try_deallocate_region(ptr as usize, layout, true)
+                } else {
+                    Ok(())
+                }
+            };
+            // Panic only after the lock is released so the panic path can
+            // still use the allocator.
+            if let Err(error) = result {
+                panic!("invalid range-list deallocation: {error}");
             }
         } else {
             let mut buddy_allocator_guard = self.buddy_allocator.lock();
