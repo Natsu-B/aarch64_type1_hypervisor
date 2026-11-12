@@ -125,6 +125,20 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         let layout = Layout::from_size_align(MAX_ALLOCATABLE_BYTES, MAX_ALLOCATABLE_BYTES).ok()?;
         range_list_allocator.allocate_region(layout.size(), layout.align())
     }
+
+    /// Rounds a range-list request to buddy-page granularity.
+    ///
+    /// Keeping every range-list allocation a multiple of `MAX_ALLOCATABLE_BYTES`
+    /// in size and alignment keeps free-list boundaries on that granule, so the
+    /// free list never holds sub-page fragments that neither a buddy refill nor
+    /// a range-list request could use. `alloc` and `dealloc` derive the same
+    /// value from the same layout.
+    fn range_request(size: usize, align: usize) -> Option<(usize, usize)> {
+        let size = size.checked_next_multiple_of(MAX_ALLOCATABLE_BYTES)?;
+        let align = max(align, MAX_ALLOCATABLE_BYTES);
+        Layout::from_size_align(size, align).ok()?;
+        Some((size, align))
+    }
 }
 
 unsafe impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> GlobalAlloc
@@ -133,9 +147,9 @@ unsafe impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> GlobalAlloc
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         if max(layout.size(), layout.align()) > MAX_ALLOCATABLE_BYTES {
             let mut range_list_allocator_guard = self.range_list_allocator.lock();
-            if let Some(range_list_allocator) = range_list_allocator_guard.get_mut()
-                && let Some(heap_mem) =
-                    range_list_allocator.allocate_region(layout.size(), layout.align())
+            if let Some((size, align)) = Self::range_request(layout.size(), layout.align())
+                && let Some(range_list_allocator) = range_list_allocator_guard.get_mut()
+                && let Some(heap_mem) = range_list_allocator.allocate_region(size, align)
             {
                 return heap_mem as *mut u8;
             }
@@ -154,10 +168,14 @@ unsafe impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize> GlobalAlloc
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         if max(layout.size(), layout.align()) > MAX_ALLOCATABLE_BYTES {
             let mut range_list_allocator_guard = self.range_list_allocator.lock();
-            if let Some(range_list_allocator) = range_list_allocator_guard.get_mut() {
+            if let Some((size, align)) = Self::range_request(layout.size(), layout.align())
+                && let Some(range_list_allocator) = range_list_allocator_guard.get_mut()
+            {
                 // Successful range allocations reserve metadata for both a
                 // free-list insertion and a reserved-list split on release.
                 // This path therefore never needs to allocate metadata.
+                // SAFETY: range_request validated this size/alignment pair.
+                let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
                 range_list_allocator.deallocate_region(ptr as usize, layout);
             }
         } else {
@@ -243,6 +261,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
             return Err("allocator not finalized");
         }
 
+        let (size, align) = Self::range_request(size, align).ok_or("invalid size or alignment")?;
         block
             .allocate_region(size, align)
             .ok_or("failed to allocate")
@@ -272,7 +291,9 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
             }
             let needed = block.trim_for_boot_capacity();
             if reserved.capacity() >= needed {
-                block.trim_for_boot(reserve_bytes, &mut reserved)?;
+                let (reserve_bytes, align) =
+                    Self::range_request(reserve_bytes, 1).ok_or("invalid reserve size")?;
+                block.trim_for_boot(reserve_bytes, align, &mut reserved)?;
                 return Ok(reserved);
             }
             // Leave slack for entries added by the next buffer allocation.
@@ -441,5 +462,46 @@ mod tests {
             .for_each_free_region(|address, size| free.push((address, size)))
             .unwrap();
         assert_eq!(free, [(page + 0x1_000, 0x1_000)]);
+    }
+
+    #[test]
+    fn range_path_keeps_free_list_page_granular() {
+        const HEAP_SIZE: usize = 0x3_000;
+
+        #[repr(align(4096))]
+        struct Heap([u8; HEAP_SIZE]);
+
+        static GRANULE_ALLOCATOR: MemoryAllocator<4096, { levels!(4096) }> = MemoryAllocator::new();
+
+        let mut heap = Heap([0; HEAP_SIZE]);
+        let heap_base = heap.0.as_mut_ptr() as usize;
+
+        GRANULE_ALLOCATOR.init();
+        GRANULE_ALLOCATOR
+            .add_available_region(heap_base, HEAP_SIZE)
+            .unwrap();
+        GRANULE_ALLOCATOR.finalize().unwrap();
+
+        // Just above the buddy limit: an exact-size allocation would leave a
+        // 0xFFF-byte hole and the following page could not be handed out.
+        let large = Layout::from_size_align(0x1_001, 8).unwrap();
+        let page = Layout::from_size_align(0x1_000, 0x1_000).unwrap();
+        let large_ptr = unsafe { GRANULE_ALLOCATOR.alloc(large) };
+        let page_ptr = unsafe { GRANULE_ALLOCATOR.alloc(page) };
+        assert_eq!(large_ptr as usize, heap_base);
+        assert_eq!(page_ptr as usize, heap_base + 0x2_000);
+
+        let mut free_regions = 0;
+        GRANULE_ALLOCATOR
+            .for_each_free_region(|_, _| free_regions += 1)
+            .unwrap();
+        assert_eq!(free_regions, 0);
+
+        unsafe { GRANULE_ALLOCATOR.dealloc(large_ptr, large) };
+        let mut free = Vec::new();
+        GRANULE_ALLOCATOR
+            .for_each_free_region(|address, size| free.push((address, size)))
+            .unwrap();
+        assert_eq!(free, [(heap_base, 0x2_000)]);
     }
 }

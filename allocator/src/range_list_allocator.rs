@@ -736,6 +736,7 @@ impl MemoryBlock {
     pub fn trim_for_boot(
         &mut self,
         reserve_bytes: usize,
+        align: usize,
         out: &mut Vec<(usize, usize)>,
     ) -> Result<(), &'static str> {
         if !self.allocatable {
@@ -746,9 +747,9 @@ impl MemoryBlock {
         }
 
         let layout =
-            Layout::from_size_align(reserve_bytes, 1).map_err(|_| "invalid reserve size")?;
+            Layout::from_size_align(reserve_bytes, align).map_err(|_| "invalid reserve size")?;
         let allocate = self
-            .allocate_region(reserve_bytes, 1)
+            .allocate_region(reserve_bytes, align)
             .ok_or("allocation failed")?;
 
         for region in &self.reserved_regions[..self.reserved_region_size as usize] {
@@ -1642,7 +1643,7 @@ mod tests {
         let capacity = allocator.region_capacity;
         let mut reserved = Vec::with_capacity(allocator.trim_for_boot_capacity());
         let reserved_capacity = reserved.capacity();
-        allocator.trim_for_boot(0x10, &mut reserved).unwrap();
+        allocator.trim_for_boot(0x10, 1, &mut reserved).unwrap();
         assert_eq!(reserved.len(), 121);
         assert_eq!(reserved.capacity(), reserved_capacity);
         assert_eq!(allocator.region_capacity, capacity);
@@ -2088,7 +2089,19 @@ mod tests {
         ALLOCATOR
             .for_each_reserved_region(|_, _| observed_reserved += 1)
             .unwrap();
-        assert!(observed_reserved > 1);
+        // Page-granular range allocations pack without sub-page holes, so the
+        // adjacent allocations merge into one reserved range. Their release
+        // credits still force metadata growth.
+        assert_eq!(observed_reserved, 1);
+        assert!(
+            ALLOCATOR
+                .range_list_allocator
+                .lock()
+                .get()
+                .unwrap()
+                .reserved_region_capacity
+                > 128
+        );
         for parity in [1, 0] {
             for &ptr in allocated.iter().skip(parity).step_by(2) {
                 // SAFETY: Each pointer is a distinct live allocation with this
