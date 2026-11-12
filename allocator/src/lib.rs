@@ -254,24 +254,30 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// to another kernel or ELF payload (e.g., Linux), after `finalize()`
     /// has succeeded.
     ///
-    /// # Safety
-    /// - Do not call this after `enable_raw_atomics` has been invoked.
-    /// - This function does not support atomic access and may cause a deadlock.
-    /// - Internally calls `MemoryBlock::trim_for_boot`, which allocates a `Vec`
-    ///   while the range-list allocator guard is held and can re-enter the
-    ///   global allocator.
-    /// - Only valid before `enable_raw_atomics()` when `RawSpinLock::lock()` is a
-    ///   no-op and during single-threaded bring-up; after atomic locking is
-    ///   enabled this path can deadlock or spin indefinitely.
+    /// The returned `Vec` is allocated while the range-list lock is released,
+    /// so trimming never re-enters the global allocator under that lock.
+    ///
     /// # Errors
     /// Returns `Err` if allocator is not initialized or not finalized.
     pub fn trim_for_boot(&self, reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
-        let mut guard = self.range_list_allocator.lock();
-        let block = guard.get_mut().ok_or("allocator not initialized")?;
-        if !block.is_finalized() {
-            return Err("allocator not finalized");
+        let mut required = 0;
+        loop {
+            // Allocating the buffer can add reserved entries (e.g. a buddy refill),
+            // so re-check the requirement under the lock and retry if it grew.
+            let mut reserved = Vec::with_capacity(required);
+            let mut guard = self.range_list_allocator.lock();
+            let block = guard.get_mut().ok_or("allocator not initialized")?;
+            if !block.is_finalized() {
+                return Err("allocator not finalized");
+            }
+            let needed = block.trim_for_boot_capacity();
+            if reserved.capacity() >= needed {
+                block.trim_for_boot(reserve_bytes, &mut reserved)?;
+                return Ok(reserved);
+            }
+            // Leave slack for entries added by the next buffer allocation.
+            required = needed + 4;
         }
-        block.trim_for_boot(reserve_bytes)
     }
 
     /// Iterates over each free memory region.
@@ -402,5 +408,38 @@ mod tests {
                 GLOBAL_ALLOCATOR.dealloc(ptr, layout);
             }
         }
+    }
+
+    #[test]
+    fn trim_for_boot_reports_live_allocations_and_keeps_reserve_free() {
+        const HEAP_SIZE: usize = 0x3_000;
+
+        #[repr(align(4096))]
+        struct Heap([u8; HEAP_SIZE]);
+
+        static TRIM_ALLOCATOR: MemoryAllocator<4096, { levels!(4096) }> = MemoryAllocator::new();
+
+        let mut heap = Heap([0; HEAP_SIZE]);
+        let heap_base = heap.0.as_mut_ptr() as usize;
+
+        TRIM_ALLOCATOR.init();
+        TRIM_ALLOCATOR
+            .add_available_region(heap_base, HEAP_SIZE)
+            .unwrap();
+        TRIM_ALLOCATOR.finalize().unwrap();
+
+        let page = TRIM_ALLOCATOR
+            .allocate_with_size_and_align(0x1_000, 0x1_000)
+            .unwrap();
+
+        let reserved = TRIM_ALLOCATOR.trim_for_boot(0x1_000).unwrap();
+        // The reserve chunk is still allocated when the snapshot is taken.
+        assert_eq!(reserved, [(page, 0x2_000)]);
+
+        let mut free = Vec::new();
+        TRIM_ALLOCATOR
+            .for_each_free_region(|address, size| free.push((address, size)))
+            .unwrap();
+        assert_eq!(free, [(page + 0x1_000, 0x1_000)]);
     }
 }

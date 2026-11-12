@@ -722,20 +722,27 @@ impl MemoryBlock {
             .expect("a complete live allocation owns deallocation metadata headroom");
     }
 
-    /// Trims the allocator metadata and returns reserved regions for boot handoff.
+    /// Upper bound on the reserved entries `trim_for_boot` reports: the reserve
+    /// allocation and a possible metadata growth can each add one entry.
+    pub(crate) fn trim_for_boot_capacity(&self) -> usize {
+        self.reserved_region_size as usize + 2
+    }
+
+    /// Trims the allocator metadata and appends reserved regions for boot handoff.
     ///
-    /// # Safety
-    /// Allocates a `Vec` while `self` is exclusively borrowed under the allocator
-    /// lock; callers must ensure this path only runs before `enable_raw_atomics`
-    /// (when `RawSpinLock::lock()` is a no-op) and while execution is
-    /// single-threaded. After atomic locking is enabled, re-entering the global
-    /// allocator here may deadlock or spin forever.
+    /// `out` must have spare capacity for `trim_for_boot_capacity()` entries so
+    /// that this function never re-enters the global allocator while `self` is
+    /// exclusively borrowed.
     pub fn trim_for_boot(
         &mut self,
         reserve_bytes: usize,
-    ) -> Result<Vec<(usize, usize)>, &'static str> {
+        out: &mut Vec<(usize, usize)>,
+    ) -> Result<(), &'static str> {
         if !self.allocatable {
             return Err("allocator not allocatable");
+        }
+        if out.capacity() - out.len() < self.trim_for_boot_capacity() {
+            return Err("insufficient handoff buffer capacity");
         }
 
         let layout =
@@ -744,17 +751,8 @@ impl MemoryBlock {
             .allocate_region(reserve_bytes, 1)
             .ok_or("allocation failed")?;
 
-        // Allocates while holding the guard; only valid in the pre-atomic/no-op lock phase.
-        let mut vec = Vec::with_capacity(self.reserved_region_size as usize);
-
-        self.allocatable = false;
-
-        for region in self
-            .reserved_regions
-            .iter()
-            .take(self.reserved_region_size as usize)
-        {
-            vec.push((region.address, region.size));
+        for region in &self.reserved_regions[..self.reserved_region_size as usize] {
+            out.push((region.address, region.size));
         }
 
         // clean memory region (free list)
@@ -762,10 +760,8 @@ impl MemoryBlock {
         self.region_capacity = self.regions.len() as u32; // 128 for inline storage.
         self.region_size = 0;
 
-        self.allocatable = true;
-
         self.deallocate_region(allocate, layout);
-        Ok(vec)
+        Ok(())
     }
 
     pub fn for_each_free_region<F: FnMut(usize, usize)>(&self, mut f: F) {
@@ -1644,8 +1640,11 @@ mod tests {
         assert_eq!(allocator.region_size, 121);
 
         let capacity = allocator.region_capacity;
-        let reserved = allocator.trim_for_boot(0x10).unwrap();
+        let mut reserved = Vec::with_capacity(allocator.trim_for_boot_capacity());
+        let reserved_capacity = reserved.capacity();
+        allocator.trim_for_boot(0x10, &mut reserved).unwrap();
         assert_eq!(reserved.len(), 121);
+        assert_eq!(reserved.capacity(), reserved_capacity);
         assert_eq!(allocator.region_capacity, capacity);
         assert_eq!(allocator.region_size, 1);
         assert!(allocator.regions[1..].iter().all(|&r| r == EMPTY_REGION));
