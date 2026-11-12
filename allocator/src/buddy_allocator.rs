@@ -73,7 +73,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         }
     }
 
-    // Assumes that sizes and alignments greater than or equal to MAX_ALLOCATABLE_BYTES will not be requested.
+    // Sizes and alignments greater than MAX_ALLOCATABLE_BYTES are rejected.
     // According to the Layout specification, align must be greater than 0 and a power of 2.
     pub(crate) fn alloc(
         &mut self,
@@ -82,6 +82,9 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     ) -> Result<usize, &'static str> {
         pr_debug!("buddy_allocator: alloc before: {:#?}", self);
         let required_size = Self::required_size(layout);
+        if required_size > MAX_ALLOCATABLE_BYTES {
+            return Err("allocation exceeds buddy block size");
+        }
         let level = Self::size2level_next_power(required_size);
 
         let mut free_level = level;
@@ -396,6 +399,24 @@ mod tests {
         let layout = Layout::from_size_align(MAX_ALLOC + 1, 8).unwrap();
         let result = allocator.alloc(layout, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_too_large_allocation_does_not_refill() {
+        static HEAP_ALLOCATOR: fn() -> Option<(usize, usize)> =
+            || panic!("oversized requests must not refill the buddy allocator");
+
+        let mut allocator = TestAlloc::<MAX_ALLOC>::new();
+        let layout = Layout::from_size_align(MAX_ALLOC + 1, 8).unwrap();
+        assert_eq!(
+            allocator.alloc(layout, Some(&HEAP_ALLOCATOR)),
+            Err("allocation exceeds buddy block size")
+        );
+        let layout = Layout::from_size_align(8, MAX_ALLOC * 2).unwrap();
+        assert_eq!(
+            allocator.alloc(layout, Some(&HEAP_ALLOCATOR)),
+            Err("allocation exceeds buddy block size")
+        );
     }
 
     #[test]
